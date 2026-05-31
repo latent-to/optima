@@ -1,0 +1,7 @@
+{
+  "op": "activation.silu_and_mul",
+  "dtypes": ["bfloat16", "float16"],
+  "architectures": ["sm80", "sm86", "sm89", "sm90", "sm100"],
+  "max_last_dim": 65536,
+  "notes": "Adversarial sparse cheat fixture: drops SiLU on every 64th row. Eligibility metadata only."
+}

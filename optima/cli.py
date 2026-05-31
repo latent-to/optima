@@ -137,6 +137,8 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
         prompt_seed=args.prompt_seed,
         top_logprobs_num=args.top_logprobs,
         kl_threshold=None if args.kl_advisory else args.kl_threshold,
+        argmax_disagree_rate_threshold=args.argmax_disagree_rate,
+        p99_kl_threshold=args.p99_kl_threshold,
         deterministic=not args.no_deterministic,
         mem_fraction_static=args.mem_fraction,
         tp_size=args.tp_size,
@@ -204,6 +206,8 @@ def cmd_bench(args: argparse.Namespace) -> int:
         prompt_seed=args.prompt_seed,
         top_logprobs_num=args.top_logprobs,
         kl_threshold=None if args.kl_advisory else args.kl_threshold,
+        argmax_disagree_rate_threshold=args.argmax_disagree_rate,
+        p99_kl_threshold=args.p99_kl_threshold,
         deterministic=not args.no_deterministic,
         mem_fraction_static=args.mem_fraction,
         tp_size=args.tp_size,
@@ -234,8 +238,10 @@ def cmd_bench(args: argparse.Namespace) -> int:
         kl_note = "n/a (no logprobs)"
     else:
         kl_note = f"<= {args.kl_threshold:.1e}"
+    rate_note = "" if args.kl_advisory else f" (<= {args.argmax_disagree_rate:.1%})"
     print(f"quality    no-accuracy-regression + KL mean_kl={kl.mean_kl:.3e} ({kl_note}), "
-          f"argmax_disagree={kl.argmax_disagreements}/{kl.num_positions} -> "
+          f"argmax_disagree={kl.argmax_disagreements}/{kl.num_positions} "
+          f"({kl.argmax_disagree_rate:.2%}{rate_note}) -> "
           f"{'PASS' if report.passed_quality else 'FAIL'}")
     print(f"SCORE      {report.score:.3f}")
 
@@ -351,6 +357,9 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--prompt-seed", type=int, default=0, help="per-epoch prompt sampling seed")
     sp.add_argument("--top-logprobs", type=int, default=20)
     sp.add_argument("--kl-threshold", type=float, default=5e-3)
+    sp.add_argument("--argmax-disagree-rate", type=float, default=0.01,
+                    help="max fraction of positions whose top token may flip (sparse-cheat guard)")
+    sp.add_argument("--p99-kl-threshold", type=float, default=None, help="optional p99 KL gate (catastrophic tail)")
     sp.add_argument("--kl-advisory", action="store_true", help="report KL but don't gate on it")
     sp.add_argument("--mem-fraction", type=float, default=0.6,
                     help="sglang mem_fraction_static (use ~0.9 for big models like gpt-oss-120b)")
@@ -378,6 +387,9 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--prompt-seed", type=int, default=0)
     sp.add_argument("--acc-tolerance", type=float, default=0.02)
     sp.add_argument("--kl-threshold", type=float, default=5e-3, help="dense KL gate on the benchmark prompts")
+    sp.add_argument("--argmax-disagree-rate", type=float, default=0.01,
+                    help="max fraction of positions whose top token may flip (sparse-cheat guard)")
+    sp.add_argument("--p99-kl-threshold", type=float, default=None, help="optional p99 KL gate (catastrophic tail)")
     sp.add_argument("--kl-advisory", action="store_true",
                     help="report KL but don't gate on it (big MoE: noise-dominated; rely on accuracy)")
     sp.add_argument("--top-logprobs", type=int, default=20, help="top-k logprobs for the KL gate (0 disables)")

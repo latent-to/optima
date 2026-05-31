@@ -164,3 +164,55 @@ def test_aligned_kl_flags_nan_candidate():
     rep = aligned_kl(base, cand)
     assert rep.num_positions == 1
     assert rep.mean_kl >= DEGENERATE_KL  # the NaN->0 bug would report 0.0 here
+
+
+# ---- the gate: mean + p99 + argmax-rate (sparse-cheat hardening, 2b) ----------
+
+
+def _report(num_positions, mean_kl, *, p99_kl=0.0, max_kl=0.0, disagreements=0):
+    from optima.eval.kl import KLReport
+
+    return KLReport(num_positions=num_positions, mean_kl=mean_kl, max_kl=max_kl,
+                    p99_kl=p99_kl, argmax_disagreements=disagreements)
+
+
+def test_gate_catches_sparse_cheat_that_mean_misses():
+    from optima.eval.kl import kl_gate_ok
+
+    # The adversary the harness never faced: bit-exact almost everywhere, a few
+    # tokens flipped. mean_kl stays under threshold (the flips average out) but the
+    # argmax-disagreement RATE is 3% (30/1000).
+    sparse = _report(1000, mean_kl=0.001, disagreements=30)
+    # OLD behaviour (mean only) would PASS it:
+    assert kl_gate_ok(sparse, kl_threshold=5e-3, argmax_disagree_rate_threshold=None) is True
+    # NEW gate with a 1% rate cap FAILS it:
+    assert kl_gate_ok(sparse, kl_threshold=5e-3, argmax_disagree_rate_threshold=0.01) is False
+
+
+def test_gate_passes_faithful_kernel():
+    from optima.eval.kl import kl_gate_ok
+
+    faithful = _report(1000, mean_kl=0.0, disagreements=0)  # deterministic floor
+    assert kl_gate_ok(faithful, kl_threshold=5e-3, argmax_disagree_rate_threshold=0.01) is True
+
+
+def test_gate_advisory_never_blocks():
+    from optima.eval.kl import kl_gate_ok
+
+    catastrophic = _report(1000, mean_kl=10.0, p99_kl=50.0, disagreements=900)
+    assert kl_gate_ok(catastrophic, kl_threshold=None, argmax_disagree_rate_threshold=0.01) is True
+
+
+def test_gate_p99_catches_catastrophic_tail():
+    from optima.eval.kl import kl_gate_ok
+
+    # low mean, few flips, but a handful of positions are wildly off (high p99)
+    tail = _report(1000, mean_kl=0.004, p99_kl=20.0, disagreements=2)
+    assert kl_gate_ok(tail, kl_threshold=5e-3, p99_kl_threshold=1.0) is False
+    assert kl_gate_ok(tail, kl_threshold=5e-3, p99_kl_threshold=None) is True  # p99 opt-in
+
+
+def test_gate_num_positions_zero_defers():
+    from optima.eval.kl import kl_gate_ok
+
+    assert kl_gate_ok(_report(0, mean_kl=0.0), kl_threshold=5e-3) is True  # no logprobs -> defer

@@ -91,6 +91,13 @@ caught a *subtle* real drift a per-op check missed.
    `--kl-advisory` and let the **accuracy gate** carry quality. (KL is also now
    hardened: a genuinely degenerate candidate — all-non-finite logprobs — reads as
    maximal divergence, not 0.)
+5. **The KL gate is not mean-only.** `kl_gate_ok` also caps the **argmax-disagreement
+   rate** (default 1%) and an opt-in **p99 KL** — so a *sparse* cheat (bit-exact
+   almost everywhere, a few tokens flipped) that keeps `mean_kl` under the threshold
+   is still caught by the magnitude-independent flip rate. Calibrate the rate to the
+   noise floor: in deterministic mode a faithful kernel sits at **0 flips**, so the
+   default is safe; in advisory mode (big MoE) all KL checks are off and accuracy
+   carries quality.
 
 ## Repo layout
 

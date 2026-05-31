@@ -78,6 +78,48 @@ class KLReport:
     # number of positions where the argmax token differs between ref and cand
     argmax_disagreements: int
 
+    @property
+    def argmax_disagree_rate(self) -> float:
+        """Fraction of compared positions where the candidate picked a different
+        top token. Catches sparse cheats the mean misses: a flip counts regardless
+        of its KL magnitude, so a kernel that's bit-exact almost everywhere but
+        corrupts a few positions still shows a non-trivial rate."""
+        return self.argmax_disagreements / self.num_positions if self.num_positions else 0.0
+
+
+def kl_gate_ok(
+    report: "KLReport",
+    *,
+    kl_threshold: Optional[float],
+    p99_kl_threshold: Optional[float] = None,
+    argmax_disagree_rate_threshold: Optional[float] = None,
+) -> bool:
+    """The fidelity gate over a ``KLReport``.
+
+    ``kl_threshold is None`` -> advisory (always OK; rely on the accuracy gate, e.g.
+    on big MoE where KL is noise-dominated). Otherwise the candidate must clear ALL
+    configured checks:
+
+      * ``mean_kl``   <= ``kl_threshold``                 — diffuse drift
+      * ``p99_kl``    <= ``p99_kl_threshold`` (if set)    — a catastrophic tail
+      * ``argmax_disagree_rate`` <= rate threshold (if set) — sparse argmax flips
+
+    Mean alone is blind to a sparse/targeted cheat (bit-exact 99.9% of the time,
+    wrong on a rare pattern) because the few bad positions average out. The rate
+    check is magnitude-independent, so those flips are caught.
+    """
+    if kl_threshold is None:
+        return True
+    if report.num_positions == 0:
+        return True  # no logprobs returned -> defer to the accuracy gate
+    if report.mean_kl > kl_threshold:
+        return False
+    if p99_kl_threshold is not None and report.p99_kl > p99_kl_threshold:
+        return False
+    if argmax_disagree_rate_threshold is not None and report.argmax_disagree_rate > argmax_disagree_rate_threshold:
+        return False
+    return True
+
 
 def _argmax(topk: TopK) -> Optional[int]:
     best_lp = -math.inf

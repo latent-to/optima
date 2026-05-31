@@ -645,7 +645,7 @@ in-process variant is the real residual risk.**
 | # | Attack | Verdict | How |
 |---|---|---|---|
 | 1 | Return wrong `out` cheaply, hope it's "close enough" | **Mitigated** | KL gate. Demonstrated: broken silo → KL 14 → score 0. |
-| 2 | Compute only some tokens/positions, leave the rest stale | **Bounded** | Degradation shows up in KL; how much is allowed = `kl_threshold`. Tighten it. A *tiny* skip might pass but then it's not much of a speedup. |
+| 2 | Compute only some tokens/positions, leave the rest stale | **Mitigated** | The gate is no longer mean-only: `kl_gate_ok` also caps the **argmax-disagreement rate** and (opt-in) **p99 KL** (`kl.py`). A sparse cheat that keeps `mean_kl` low by corrupting a few positions still trips the flip-rate, which is magnitude-independent. (CPU regression test: a 3%-flip cheat with `mean_kl=1e-3` passes the old mean-only gate, fails the new one.) |
 | 3 | Memoize/replay op outputs across calls | **Mitigated** | Activations differ per prompt/token; and prompts are fresh per epoch (`sample_prompts(seed)`). Caching doesn't help at the op level. |
 | 4 | Behave correctly when measured for correctness, garbage when measured for speed | **Mitigated** | Quality and speed are measured on the **same** candidate run; there's no separate "correctness mode" to detect. |
 | 5 | Special-case the op-correctness inputs (fixed seed/shapes in `verify_entry`) | **Partial** | Re-randomize the verify seed/shapes per epoch (the caller can pass `shapes`/`seed`). End-to-end KL on fresh prompts is the backstop. Residual: a kernel can still branch on shape. |
@@ -655,9 +655,9 @@ in-process variant is the real residual risk.**
 | # | Attack | Verdict | How |
 |---|---|---|---|
 | 6 | Monkeypatch the timer | **Mitigated** | `seam.mark_driver()` — the timing process never imports miner code (Part 5.5). |
-| 7 | Fabricate the token count | **Mitigated** | Count comes from sglang's `completion_tokens`, not the miner. |
+| 7 | Fabricate the token count | **Needs isolation** | `completion_tokens` is computed *in the scheduler process — where the miner kernel also runs* (Part 5.5), so an in-process escape (8.4 #11) can inflate it without touching the driver's clock. **General rule: everything the scheduler sends the driver — token count, logprobs, text — is only as trustworthy as the (unbuilt) isolation; the wall-clock *denominator* is the only genuinely tamper-proof half of throughput.** Partial hardening short of isolation: count from the returned `output_ids` rather than a separate field, and/or fix the budget (`ignore_eos` + a set `max_new_tokens`) so the driver knows the count *a priori*. |
 | 8 | Offload work to an untimed stream / return early | **Mitigated** | `torch.cuda.synchronize()` brackets the timer; async work is counted. |
-| 9 | Be fast only on the benchmark shapes | **Partial** | Prompts (and thus token shapes) are sampled per epoch; but a kernel can still branch on the shape. Rotate/expand the corpus; consider random sequence lengths. |
+| 9 | Be fast only on the benchmark shapes | **Partial** | The scoring corpus is now **real benchmarks** (GSM8K + MMLU, long CoT generation), sampled per epoch — far more shape-diverse than the old 40-prompt toy set — and a kernel that corrupts only certain shapes trips the argmax-rate gate (#2). Residual: a kernel can still *branch* on shape to be fast-where-measured; rotate/expand toward the serving distribution and consider random sequence lengths. |
 | 10 | Manipulate GPU clocks | **Needs host op** | Lock clocks (`nvidia-smi -lgc`) at the validator host; not enforced in code yet. |
 
 ### 8.4 Escape the abstraction — arbitrary code execution

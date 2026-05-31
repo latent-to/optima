@@ -1,0 +1,14 @@
+# Adversarial SPARSE silu bundle: drops SiLU on a thin stride of rows. The mean-KL
+# gate misses it (corruption diluted); the argmax-disagreement-rate gate catches it.
+# A test fixture, not a real submission.
+
+bundle_id = "example-silu-sparse-v1"
+abi_version = "optima-op-abi-v0"
+
+[[ops]]
+slot = "activation.silu_and_mul"
+source = "kernels/silu_and_mul.py"
+entry = "silu_and_mul"
+dtypes = ["bfloat16", "float16"]
+architectures = ["sm80", "sm86", "sm89", "sm90", "sm100"]
+metadata = "metadata/silu_and_mul.json"

@@ -29,7 +29,7 @@ import torch
 
 from optima.eval._launch import call_in_subprocess, launched_engine
 from optima.eval.benchmarks import Problem, get_benchmark
-from optima.eval.kl import KLReport, aligned_kl, extract_per_prompt
+from optima.eval.kl import KLReport, aligned_kl, extract_per_prompt, kl_gate_ok
 from optima.eval.throughput_kl import EvalConfig
 
 
@@ -162,16 +162,17 @@ def evaluate_capability(
             regressions.append(f"{name}: {bs.baseline_acc:.1%} -> {bs.candidate_acc:.1%}")
 
     # Dense fidelity gate on the SAME realistic prompts: KL between the two runs.
-    #  * kl_threshold is None  -> advisory: report KL but don't gate on it. Use on
-    #    big MoE models where the nondeterminism floor is above any sane threshold;
-    #    the accuracy gate carries quality there.
-    #  * num_positions == 0    -> no logprobs returned; fall back to the accuracy
-    #    floor rather than failing spuriously.
+    # mean_kl (diffuse drift) AND p99/argmax-rate (sparse cheats) — see kl_gate_ok.
+    #  * kl_threshold is None  -> advisory: report KL but don't gate. Use on big MoE
+    #    where the nondeterminism floor exceeds any sane threshold; accuracy carries it.
+    #  * num_positions == 0    -> no logprobs; fall back to the accuracy floor.
     kl = aligned_kl(base_pp, cand_pp)
-    if cfg.kl_threshold is None:
-        kl_ok = True
-    else:
-        kl_ok = kl.num_positions == 0 or kl.mean_kl <= cfg.kl_threshold
+    kl_ok = kl_gate_ok(
+        kl,
+        kl_threshold=cfg.kl_threshold,
+        p99_kl_threshold=cfg.p99_kl_threshold,
+        argmax_disagree_rate_threshold=cfg.argmax_disagree_rate_threshold,
+    )
 
     speedup = (cand_tok_s / base_tok_s) if base_tok_s > 0 else 0.0
     passed_quality = len(regressions) == 0 and kl_ok

@@ -22,9 +22,10 @@ def install(registry: KernelRegistry = REGISTRY) -> None:
     """Patch RMSNorm.forward_cuda/native. No-ops until layernorm is imported."""
     import sys
 
-    if "sglang.srt.layers.layernorm" not in sys.modules:
+    mod = sys.modules.get("sglang.srt.layers.layernorm")
+    RMSNorm = getattr(mod, "RMSNorm", None) if mod is not None else None
+    if RMSNorm is None:
         return
-    from sglang.srt.layers.layernorm import RMSNorm
 
     if getattr(RMSNorm, _PATCH_FLAG, False):
         return

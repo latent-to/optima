@@ -152,11 +152,18 @@ def load_entry(source_path: str | Path, entry: str) -> Callable:
         raise PermissionError("kernel source failed policy scan:\n  " + "\n  ".join(scan.violations))
 
     import importlib.util
+    import sys
 
-    spec = importlib.util.spec_from_file_location(f"optima_kernel_{p.stem}", p)
+    mod_name = f"optima_kernel_{p.stem}"
+    spec = importlib.util.spec_from_file_location(mod_name, p)
     if spec is None or spec.loader is None:
         raise ImportError(f"cannot load kernel module from {p}")
     module = importlib.util.module_from_spec(spec)
+    # Register in sys.modules BEFORE exec so the module is resolvable by name.
+    # sglang 0.5.12+ traces the swapped kernel through torch.compile / piecewise
+    # CUDA graph and imports it by module name; without this the scheduler raises
+    # ModuleNotFoundError ("No module named 'optima_kernel_<stem>'") during capture.
+    sys.modules[mod_name] = module
     spec.loader.exec_module(module)  # runs the miner module body
 
     fn = getattr(module, entry, None)

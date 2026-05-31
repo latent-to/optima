@@ -20,7 +20,7 @@ from dataclasses import dataclass
 
 # The sglang version scored against. Bump DELIBERATELY and in a coordinated way —
 # see docs/SGLANG_TRACKING.md. All validators must run the same version (consensus).
-PINNED_SGLANG = "0.5.9"
+PINNED_SGLANG = "0.5.12.post1"
 
 
 @dataclass
@@ -79,6 +79,16 @@ def run_checks() -> list[Check]:
         add("seam: RMSNorm (layernorm)", ok, f"forward_cuda params={tuple(params)}")
     except Exception as exc:  # noqa: BLE001
         add("seam: RMSNorm (layernorm)", False, repr(exc))
+
+    # attention seam (the attention BLOCK slot chokepoint: RadixAttention.forward)
+    try:
+        from sglang.srt.layers.radix_attention import RadixAttention
+
+        params = set(inspect.signature(RadixAttention.forward).parameters)
+        ok = hasattr(RadixAttention, "forward") and {"q", "k", "v", "forward_batch"} <= params
+        add("seam: RadixAttention (attention)", ok, f"forward params={tuple(sorted(params))}")
+    except Exception as exc:  # noqa: BLE001
+        add("seam: RadixAttention (attention)", False, repr(exc))
 
     # Engine logprob API (we read top-k logprobs for KL)
     try:

@@ -60,9 +60,14 @@ lium rsync brave-orbit-7c ~/Downloads/github/optima/examples
 
 # on the pod (lium ssh, or wrap each in `lium exec brave-orbit-7c "..."`):
 curl -LsSf https://astral.sh/uv/install.sh | sh
-cd /root/optima && uv venv --python 3.12 .venv
-uv pip install --python .venv/bin/python sglang ninja datasets -e .
-SP=$(.venv/bin/python -c 'import site;print(site.getsitepackages()[0])')
+cd /root/optima && uv venv --python 3.12 .venv && source .venv/bin/activate
+# Latest stable sglang on CUDA 13. --prerelease is needed (0.5.12 depends on the
+# flash-attn-4 beta, a pure-python wheel); --torch-backend routes the torch family to
+# the cu130 index. Then PIN kernels<0.13 — transformers 5.6 breaks against kernels
+# 0.15 ("Either a revision or a version must be specified").
+uv pip install --prerelease=allow --torch-backend=cu130 "sglang==0.5.12.post1"
+uv pip install "kernels>=0.12,<0.13" datasets pytest -e .
+SP=$(python -c 'import site;print(site.getsitepackages()[0])')
 echo 'import optima.bootstrap' > "$SP/optima.pth"     # install the seam everywhere
 
 export CUDA_HOME=/usr/local/cuda
@@ -79,8 +84,56 @@ export TORCH_CUDA_ARCH_LIST=12.0                       # 12.0 = RTX PRO 6000 Bla
   Hopper — expect possible build/runtime friction; `uv` may resolve a
   Blackwell-capable sgl-kernel/torch. If `pip install sglang` pulls a Hopper-only
   build, you may need a CUDA-13 / Blackwell wheel or a source build.
-- nvfp4/mxfp4 is the *optimized* path on Blackwell (native FP4), unlike Hopper
-  where we saw "mxfp4 not fully optimized" — quant kernels should be *better* here.
+- GPT-OSS-120B on the Blackwell box is an active native-MXFP4 target under the
+  pinned stack (`sglang==0.5.9`, `torch==2.9.1+cu128`, `flashinfer==0.6.3`).
+  Stock behavior: `moe_runner_backend=auto` selects `flashinfer_mxfp4` but fails
+  weight prep with `assert M % 128 == 0`; forcing `triton_kernel` hits a Triton
+  `ptxas` failure for `sm_120a`; forcing plain `triton` works at TP=4 but OOMs at
+  TP=2 because it expands MXFP4 weights.
+  - Dev-pod result: the `flashinfer_mxfp4` path can be made correct on `sm_120a`.
+    The necessary fixes were: pad GPT-OSS TP shards to FlashInfer's 256-wide
+    shape, use plain packed FP4 weight bytes (no row shuffle), run FlashInfer's
+    `nvfp4_block_scale_interleave` on the MXFP4 block-scale tensors, pass
+    `swizzled_input_sf=False` for the activation scales, and disable PDL for the
+    CUTLASS MoE call. Deterministic component probes moved from `cos ~0.86` to
+    `cos ~0.9999`; TP=4 GPT-OSS output became coherent.
+  - Current measured smoke on the 4× RTX PRO 6000 Blackwell pod, one prompt,
+    64 generated tokens, warmup=1/timed=2: patched `flashinfer_mxfp4` median
+    `46.0 tok/s`; plain Triton fallback median `38.9 tok/s`. Treat this as a
+    promising dev result, not an upstreamed production baseline.
+  - Latest-stack replication (`torch==2.12.0+cu130`,
+    `sglang==0.5.12.post1`, `flashinfer-python==0.6.12`) also works after a
+    smaller SGLang-only patch plus rebuilding `sglang-kernel` `common_ops` for
+    Torch 2.12 / `sm_120a`. The key extra fix was TP=4 GPT-OSS MXFP4 loader
+    padding: ranks receive 736 intermediate values from 32-value block-ceil
+    checkpoint slicing even though SGLang's partition size is 720. Batch-32
+    GPT-OSS-120B TP=4 decode, max-new=64, warmup=1/timed=3, piecewise CUDA graph
+    disabled: the standardized runner passed with patched `flashinfer_mxfp4`
+    median `915.6 tok/s`; plain `triton` median `742.6 tok/s`; speedup `1.23x`.
+    A previous manual run measured `926.7 tok/s` versus `741.6 tok/s`.
+  - Stronger best-stock check: the no-graph Triton number above is not the
+    headline baseline. With CUDA graph enabled, explicit Triton attention,
+    radix cache enabled, and custom all-reduce tested, the best stock SGLang
+    batch-32 result so far is `830.7 tok/s` (`triton` MoE + `triton` attention +
+    CUDA graph + radix). The patched `flashinfer_mxfp4` path under the symmetric
+    CUDA-graph/radix setup measured `1062.4 tok/s` with custom all-reduce enabled,
+    a `1.28x` speedup over the stronger stock baseline. Startup was ~126-129s for
+    these CUDA-graph runs and is reported separately from timed decode throughput.
+  - Long-context sanity: with prompts padded to ~2k tokens and forced 1024-token
+    decode at batch 4, the same best-stock config measured `321.6 tok/s` while
+    patched `flashinfer_mxfp4` measured `402.1 tok/s` (`1.25x`). Both runs found
+    the expected fixed arithmetic answers in all timed iterations.
+  - SGLang-packaged CUDA 13 envs are also viable for dependency hygiene:
+    `uv --torch-backend cu130 --prerelease=allow sglang==0.5.12.post1`
+    resolves to `torch==2.11.0+cu130`, `flashinfer-python==0.6.11.post1`,
+    `sglang-kernel==0.4.2.post2`, and `xgrammar==0.2.0`. Loader smoke and the
+    synthetic SwiGLU probe pass after the candidate patch, but the full
+    `flashinfer_mxfp4` model path currently aborts inside FlashInfer/CUTE
+    RMSNorm with `Expected an MLIR object`. That is the next packaged-stack
+    blocker, separate from the MoE layout fix.
+  - Plain Triton config tuning is not enough: a small fused-MoE config sweep on
+    the GPT-OSS TP=4 shape found only ~1% isolated-kernel movement, and copied
+    B200/RTX configs made the full TP=4 smoke slower than the no-config baseline.
 - For multi-GPU work (the reason for this box): `--tp-size 4` etc. Throughput will
   be PCIe-comms-bound (no NVLink) — that's expected; the point is exploring the
   multi-GPU optimization surface (TP/PD/EP), not peak throughput.

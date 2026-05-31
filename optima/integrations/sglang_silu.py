@@ -35,9 +35,12 @@ def install(registry: KernelRegistry = REGISTRY) -> None:
     """
     import sys
 
-    if "sglang.srt.layers.activation" not in sys.modules:
+    mod = sys.modules.get("sglang.srt.layers.activation")
+    SiluAndMul = getattr(mod, "SiluAndMul", None) if mod is not None else None
+    if SiluAndMul is None:
+        # not imported yet, or still mid-import (class not yet defined) -> the
+        # bootstrap post-import hook calls install() again when the module finishes.
         return
-    from sglang.srt.layers.activation import SiluAndMul
 
     if getattr(SiluAndMul, _PATCH_FLAG, False):
         return

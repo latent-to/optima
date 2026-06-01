@@ -1,8 +1,13 @@
-# GPT-OSS / RTX Blackwell framework-mode bundle for the MXFP4 fused MoE slot.
-# The rebuild plan applies the SM120 FlashInfer/SGLang source patch inside the
-# isolated candidate process before SGLang imports. The candidate is then launched
-# with `moe_runner_backend=flashinfer_mxfp4` while the baseline can stay on stock
-# `triton`, so `optima bench --framework-mode` scores the real backend win.
+# GPT-OSS / RTX Blackwell (sm120) bundle for the MXFP4 fused-MoE BLOCK slot.
+# A real miner submission, scored entirely through the FusedMoE block seam — NO sglang
+# source patch and NO framework mode. The validator runs stock pinned sglang (its MoE
+# auto-resolves to the triton fallback on sm120); the seam routes the experts through
+# this bundle's (prepare, forward): `prepare` repacks the dequantized bf16 experts into
+# CUTLASS [up; gate] MXFP4 + interleaved scales (with biases), `forward` MXFP8-quantizes
+# the activations and runs flashinfer cutlass_fused_moe (autotuned). On 4x RTX PRO 6000
+# at TP=4 this matches the hand-forked `flashinfer_mxfp4` backend (~912-926 tok/s, batch
+# 32) while staying inside SlotSpec. Run: `OPTIMA_MOE_SEAM=1 optima bench <bundle>` (or
+# `optima verify <bundle> --device cuda`).
 
 bundle_id = "example-moe-mxfp4-sm120"
 abi_version = "optima-op-abi-v0"

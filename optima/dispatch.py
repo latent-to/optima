@@ -15,11 +15,16 @@ Triton/CuteDSL submission while still letting it own the actual computation.
 
 from __future__ import annotations
 
+import logging
 from typing import Callable, Optional
 
 import torch
 
 from optima.registry import REGISTRY, KernelRegistry
+
+logger = logging.getLogger("optima.dispatch")
+_MOE_LOGGED_ACTIVE = False
+_MOE_LOGGED_FALLBACK = False
 
 
 def _arch_tag(device_index: int = 0) -> Optional[str]:
@@ -216,6 +221,219 @@ def _run_decode_kernel(self, q, k, v, forward_batch, save_kv_cache, impl):
     out = torch.empty((B, Hq, D), dtype=q.dtype, device=q.device)
     impl.entry(q3, k_pad, v_pad, seq_lens, float(self.scaling), out)  # miner fills out
     return out.reshape(B, Hq * D)
+
+
+def make_moe_dispatcher(
+    baseline_forward: Callable[..., object],
+    *,
+    registry: KernelRegistry = REGISTRY,
+    slots: tuple[str, ...] = ("moe.fused_experts_mxfp4", "moe.fused_experts"),
+) -> Callable[..., object]:
+    """Build a replacement for ``FusedMoE.forward`` — the single chokepoint every MoE
+    layer funnels through (``sglang.srt.layers.moe.fused_moe_triton.layer``), so the
+    seam is backend-agnostic (triton / cutlass sm90 / sm100 / sm120 / marlin all sit
+    *below* it).
+
+    MoE experts are a *block*, and a (prepare, forward) one: the validator owns routing
+    (``topk_output`` is computed upstream and handed in), owns the expert weights, and
+    owns the output allocation; the miner only (1) transforms the raw weights once via
+    ``prepare`` (the FP4 repack / scale-interleave / padding) and (2) fills the
+    validator-allocated ``out`` each step via ``entry``. The combined expert output
+    feeds the residual stream -> downstream layers -> sampler (all stock) — so there is
+    no final output to substitute, the same property that makes the op slots safe, and
+    no source patch / engine reconfigure (unlike the framework/rebuild path).
+
+    ARCHITECTURE-GENERAL by design: nothing here is sm120-specific. A miner kernel
+    declares the arch(es) it supports via eligibility; the dispatcher routes to it only
+    on matching hardware and otherwise trusts the baseline. (sm120 was merely the first
+    box with a real win; the B200/sm100 endgame uses the identical contract.)
+
+    SCOPE (MVP, mirrors the attention seam): routes the **standard** routing format
+    through the ``moe.fused_experts`` contract, **eager-only** and **non-expert-parallel**
+    (the ``(M,H)->(M,H)`` contract does not model EP token dispatch/combine), and only
+    when ``OPTIMA_MOE_SEAM=1`` (opt-in until validated end-to-end). Tensor-parallel
+    experts are supported: the kernel fills this rank's partial ``out`` and the
+    validator replays ``FusedMoE.forward_impl``'s TP all-reduce. Bypassed / triton-kernel
+    routing formats, EP>1, and CUDA-graph capture all fall back to the trusted backend.
+    Conservative by construction: when in doubt, trust the baseline.
+    """
+
+    def dispatched(self, hidden_states, topk_output):
+        _maybe_inspect_moe(self, hidden_states, topk_output)
+        if _moe_seam_active():
+            try:
+                if _moe_supported(self) and hidden_states.dim() == 2 and not _in_cuda_graph():
+                    routed = _standard_topk(topk_output)
+                    if routed is not None:
+                        x = hidden_states
+                        arch = _arch_tag(x.device.index or 0) if x.is_cuda else None
+                        for slot in slots:
+                            impl = registry.lookup(
+                                slot, dtype_name=_dtype_name(x.dtype), last_dim=x.shape[-1], arch=arch
+                            )
+                            # (prepare, forward) slot: a registered kernel MUST carry
+                            # prepare, else we can't honor the contract -> skip it.
+                            if impl is not None and impl.prepare is not None:
+                                out = _run_moe_kernel(self, x, routed, impl, slot)
+                                _log_once_active(slot)
+                                return out
+            except Exception as exc:  # noqa: BLE001
+                if registry.strict:
+                    raise
+                _log_once_fallback(exc)
+                # any mismatch with this sglang's internals -> trust the baseline
+        return baseline_forward(self, hidden_states, topk_output)
+
+    return dispatched
+
+
+_MOE_INSPECTED = False
+
+
+def _maybe_inspect_moe(self, hidden_states, topk_output) -> None:
+    """Debug aid (off unless ``OPTIMA_MOE_INSPECT`` is set): dump the live FusedMoE
+    layer's tensors + the topk_output structure ONCE, so seam integration on a new
+    model/quant format can be written against the real layout. Writes to the path in
+    ``OPTIMA_MOE_INSPECT`` (or /tmp/optima_moe_inspect.txt if set to "1"). Never raises.
+    """
+    import os
+
+    path = os.environ.get("OPTIMA_MOE_INSPECT")
+    if not path:
+        return
+    global _MOE_INSPECTED
+    if _MOE_INSPECTED:
+        return
+    _MOE_INSPECTED = True
+    if path == "1":
+        path = "/tmp/optima_moe_inspect.txt"
+    try:
+        lines = ["=== FusedMoE layer tensors (name: shape dtype) ==="]
+        for n in sorted(dir(self)):
+            if n.startswith("__"):
+                continue
+            try:
+                v = getattr(self, n)
+            except Exception:  # noqa: BLE001
+                continue
+            t = v if torch.is_tensor(v) else getattr(v, "data", None)
+            if torch.is_tensor(t):
+                lines.append(f"  {n}: {tuple(t.shape)} {t.dtype}")
+        for n in ("moe_tp_size", "moe_ep_size", "reduce_results", "hidden_size",
+                  "intermediate_size_per_partition", "num_local_experts", "layer_id"):
+            lines.append(f"  .{n} = {getattr(self, n, None)}")
+        lines.append(f"  hidden_states: {tuple(hidden_states.shape)} {hidden_states.dtype}")
+        fields = getattr(topk_output, "_fields", None)
+        lines.append(f"  topk_output: {type(topk_output).__name__} fields={fields}")
+        for f in fields or []:
+            v = getattr(topk_output, f, None)
+            if torch.is_tensor(v):
+                lines.append(f"    {f}: {tuple(v.shape)} {v.dtype}")
+        with open(path, "w") as fh:
+            fh.write("\n".join(lines) + "\n")
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _log_once_active(slot: str) -> None:
+    global _MOE_LOGGED_ACTIVE
+    if not _MOE_LOGGED_ACTIVE:
+        _MOE_LOGGED_ACTIVE = True
+        logger.warning("optima: MoE seam ACTIVE — experts routed through miner kernel (slot=%s)", slot)
+
+
+def _log_once_fallback(exc: Exception) -> None:
+    global _MOE_LOGGED_FALLBACK
+    if not _MOE_LOGGED_FALLBACK:
+        _MOE_LOGGED_FALLBACK = True
+        logger.warning("optima: MoE seam FELL BACK to baseline after kernel error: %r", exc)
+
+
+def _moe_seam_active() -> bool:
+    # Opt-in until the seam is validated end-to-end on the pod (graph-safe TP path,
+    # quant weight view); keeps it inert in production until then.
+    import os
+
+    return os.environ.get("OPTIMA_MOE_SEAM") == "1"
+
+
+def _moe_supported(self) -> bool:
+    # The (M,H)->(M,H) expert contract models local experts only. Expert parallelism
+    # adds an all-to-all token dispatch/combine the contract doesn't express, so EP>1
+    # falls back to the trusted backend. (Pure tensor-parallel IS supported — see the
+    # all-reduce in _run_moe_kernel.)
+    if getattr(self, "moe_ep_size", 1) != 1:
+        return False
+    # Need the dense expert-weight params the (w13, w2) contract hands to prepare().
+    if not (hasattr(self, "w13_weight") and hasattr(self, "w2_weight")):
+        return False
+    # Dense (unquantized) experts only for now: a quantized layer exposes packed FP4/FP8
+    # bytes plus separate *_scale params, which the dense contract would mis-read. The
+    # quantized win (GPT-OSS MXFP4, the B200 endgame) needs the richer weight view — the
+    # explicit next rung — so fall back until that lands rather than feed prepare() bytes.
+    if hasattr(self, "w13_weight_scale") or hasattr(self, "w2_weight_scale"):
+        return False
+    return True
+
+
+def _in_cuda_graph() -> bool:
+    # Eager-only MVP: a kernel captured into a piecewise CUDA graph isn't validated yet.
+    # If we can't tell (helper missing), assume NOT in a graph (CPU tests / older sglang);
+    # the env opt-in + eager eval keep this safe in practice.
+    try:
+        from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cuda_graph
+    except Exception:  # noqa: BLE001
+        return False
+    try:
+        return bool(is_in_piecewise_cuda_graph())
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _standard_topk(topk_output):
+    """Return ``(topk_ids, topk_weights)`` iff routing is already materialized (the
+    STANDARD format), else None. BypassedTopKOutput / TritonKernelTopKOutput don't carry
+    explicit topk tensors -> fall back (conservative; no implicit re-routing here)."""
+    topk_ids = getattr(topk_output, "topk_ids", None)
+    topk_weights = getattr(topk_output, "topk_weights", None)
+    if topk_ids is None or topk_weights is None:
+        return None
+    return topk_ids, topk_weights
+
+
+def _moe_prepared(self, impl, slot):
+    """Run the miner's ``prepare`` ONCE on this layer's expert weights, memoized on the
+    layer (one bundle per process, fresh process per eval). The slot's
+    ``prepare_from_layer`` (validator-owned) maps the live sglang layer to the prepare
+    call shape — weights + biases + layout flags — so the miner owns only the transform."""
+    if not getattr(self, "_optima_moe_prepared_done", False):
+        from optima.slots import get_slot
+
+        spec = get_slot(slot)
+        if spec.prepare_from_layer is not None:
+            args = spec.prepare_from_layer(self)
+        else:
+            args = (self.w13_weight.data, self.w2_weight.data)
+        self._optima_moe_prepared = impl.prepare(*args)
+        self._optima_moe_prepared_done = True
+    return self._optima_moe_prepared
+
+
+def _run_moe_kernel(self, x, routed, impl, slot):
+    """Allocate the output (validator-owned), run the miner's fused-experts kernel, then
+    replay FusedMoE.forward_impl's tensor-parallel all-reduce. EP is excluded upstream."""
+    topk_ids, topk_weights = routed
+    prepared = _moe_prepared(self, impl, slot)
+    M, H = x.shape[0], x.shape[-1]
+    out = torch.empty((M, H), dtype=x.dtype, device=x.device)
+    impl.entry(x, topk_ids, topk_weights, prepared, out)  # miner fills `out` (local experts)
+    if getattr(self, "reduce_results", False) and getattr(self, "moe_tp_size", 1) > 1:
+        # Sum this rank's partial expert output across the TP group (raises if the
+        # collective is unavailable -> caller falls back to the trusted baseline).
+        from sglang.srt.distributed.communication_op import tensor_model_parallel_all_reduce
+
+        out = tensor_model_parallel_all_reduce(out)
+    return out
 
 
 def _dtype_name(dtype: torch.dtype) -> str:

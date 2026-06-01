@@ -90,6 +90,16 @@ def run_checks() -> list[Check]:
     except Exception as exc:  # noqa: BLE001
         add("seam: RadixAttention (attention)", False, repr(exc))
 
+    # MoE seam (the MoE BLOCK slot chokepoint: FusedMoE.forward(hidden_states, topk_output))
+    try:
+        from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+
+        params = set(inspect.signature(FusedMoE.forward).parameters)
+        ok = hasattr(FusedMoE, "forward") and {"hidden_states", "topk_output"} <= params
+        add("seam: FusedMoE (moe.fused_experts)", ok, f"forward params={tuple(sorted(params))}")
+    except Exception as exc:  # noqa: BLE001
+        add("seam: FusedMoE (moe.fused_experts)", False, repr(exc))
+
     # Engine logprob API (we read top-k logprobs for KL)
     try:
         gp = set(inspect.signature(sglang.Engine.generate).parameters)

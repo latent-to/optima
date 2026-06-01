@@ -37,8 +37,9 @@ class ShapeResult:
     passed: bool
     max_abs_err: float
     max_rel_err: float
-    pass_ratio: float = 1.0  # fraction of elements within tolerance (informative; == 1.0 for allclose passes)
+    pass_ratio: float = 1.0  # fraction within tol (matched_ratio) OR cosine (cosine mode); informative
     detail: str = ""
+    metric: str = "ratio"  # label for pass_ratio: "ratio" | "cosine"
 
 
 @dataclass
@@ -64,27 +65,43 @@ def _as_list(x) -> list:
 
 
 def _compare(
-    actual: torch.Tensor, expected: torch.Tensor, *, atol: float, rtol: float, mode: str, min_ratio: float
-) -> tuple[bool, float, float, float, str]:
-    # Returns (passed, max_abs, max_rel, ratio_within_tol, detail).
+    actual: torch.Tensor, expected: torch.Tensor, *, atol: float, rtol: float, correctness
+) -> tuple[bool, float, float, float, str, str]:
+    # Returns (passed, max_abs, max_rel, score, detail, metric_label).
     if actual.shape != expected.shape:
-        return False, float("inf"), float("inf"), 0.0, f"shape mismatch {tuple(actual.shape)} vs {tuple(expected.shape)}"
+        return False, float("inf"), float("inf"), 0.0, f"shape mismatch {tuple(actual.shape)} vs {tuple(expected.shape)}", "ratio"
     a = actual.float()
     e = expected.float()
     if not torch.isfinite(a).all():
-        return False, float("inf"), float("inf"), 0.0, "actual has non-finite values"
+        return False, float("inf"), float("inf"), 0.0, "actual has non-finite values", "ratio"
     abs_err = (a - e).abs()
     rel_err = abs_err / (e.abs() + 1e-12)
+    mode = correctness.mode
+    if mode == "cosine":
+        # Low-bit fidelity: direction (and optionally energy) vs the HP reference.
+        cos = float(torch.nn.functional.cosine_similarity(a.flatten(), e.flatten(), dim=0))
+        ne = float(e.flatten().norm())
+        rel_norm = abs(float(a.flatten().norm()) - ne) / (ne + 1e-12)
+        ok_cos = cos >= correctness.min_cosine
+        ok_norm = correctness.max_rel_norm_err <= 0 or rel_norm <= correctness.max_rel_norm_err
+        passed = ok_cos and ok_norm
+        if passed:
+            detail = ""
+        elif not ok_cos:
+            detail = f"cosine {cos:.5f} < min_cosine {correctness.min_cosine}"
+        else:
+            detail = f"rel_norm_err {rel_norm:.3f} > {correctness.max_rel_norm_err}"
+        return passed, float(abs_err.max()), float(rel_err.max()), cos, detail, "cosine"
     slack = atol + rtol * e.abs()  # allclose: |a-e| <= atol + rtol*|e|
     within = abs_err <= slack
     ratio = float(within.float().mean())
     if mode == "matched_ratio":
-        passed = ratio >= min_ratio
-        detail = "" if passed else f"matched {ratio:.4f} < min_ratio {min_ratio}"
+        passed = ratio >= correctness.min_ratio
+        detail = "" if passed else f"matched {ratio:.4f} < min_ratio {correctness.min_ratio}"
     else:
         passed = bool(within.all())
         detail = ""
-    return passed, float(abs_err.max()), float(rel_err.max()), ratio, detail
+    return passed, float(abs_err.max()), float(rel_err.max()), ratio, detail, "ratio"
 
 
 def verify_entry(
@@ -107,8 +124,6 @@ def verify_entry(
     """
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     tol = slot.tolerance_for(dtype)
-    mode = slot.correctness.mode
-    min_ratio = slot.correctness.min_ratio
     test_shapes = shapes if shapes is not None else list(slot.shapes)
 
     results: list[ShapeResult] = []
@@ -137,20 +152,21 @@ def verify_entry(
         passed = True
         max_abs = 0.0
         max_rel = 0.0
-        min_ratio_seen = 1.0
+        min_score_seen = 1.0
+        metric = "ratio"
         details: list[str] = []
         for j, (o, e) in enumerate(zip(outs, expected)):
-            p, ma, mr, ratio, detail = _compare(o, e, atol=tol.atol, rtol=tol.rtol, mode=mode, min_ratio=min_ratio)
+            p, ma, mr, score, detail, metric = _compare(o, e, atol=tol.atol, rtol=tol.rtol, correctness=slot.correctness)
             passed = passed and p
             max_abs = max(max_abs, ma)
             max_rel = max(max_rel, mr)
-            min_ratio_seen = min(min_ratio_seen, ratio)
+            min_score_seen = min(min_score_seen, score)
             if detail:
                 details.append(f"out[{j}]: {detail}" if len(outs) > 1 else detail)
         results.append(
             ShapeResult(shape=shape, dtype=_name(dtype), passed=passed,
-                        max_abs_err=max_abs, max_rel_err=max_rel, pass_ratio=min_ratio_seen,
-                        detail="; ".join(details))
+                        max_abs_err=max_abs, max_rel_err=max_rel, pass_ratio=min_score_seen,
+                        detail="; ".join(details), metric=metric)
         )
 
     return VerifyResult(
@@ -169,9 +185,12 @@ def format_verify(result: VerifyResult) -> str:
     lines = [f"[{'PASS' if result.passed else 'FAIL'}] {result.slot} dtype={result.dtype}"]
     for r in result.shape_results:
         status = "ok " if r.passed else "FAIL"
-        ratio = "" if r.pass_ratio >= 1.0 else f" ratio={r.pass_ratio:.4f}"
+        if r.metric == "cosine":
+            score = f" cos={r.pass_ratio:.5f}"
+        else:
+            score = "" if r.pass_ratio >= 1.0 else f" ratio={r.pass_ratio:.4f}"
         lines.append(
-            f"  {status} shape={r.shape} max_abs={r.max_abs_err:.3e} max_rel={r.max_rel_err:.3e}{ratio}"
+            f"  {status} shape={r.shape} max_abs={r.max_abs_err:.3e} max_rel={r.max_rel_err:.3e}{score}"
             + (f"  {r.detail}" if r.detail else "")
         )
     return "\n".join(lines)

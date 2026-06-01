@@ -21,12 +21,14 @@ import sys
 
 # Modules whose import should trigger seam installation. activation -> SiluAndMul,
 # layernorm -> RMSNorm, radix_attention -> RadixAttention (the attention BLOCK slot
-# chokepoint, backend-agnostic). seam.activate() installs whatever is loaded.
+# chokepoint), fused_moe_triton.layer -> FusedMoE (the MoE BLOCK slot chokepoint). All
+# backend-agnostic; seam.activate() installs whatever is loaded.
 _TARGETS = frozenset(
     {
         "sglang.srt.layers.activation",
         "sglang.srt.layers.layernorm",
         "sglang.srt.layers.radix_attention",
+        "sglang.srt.layers.moe.fused_moe_triton.layer",
     }
 )
 

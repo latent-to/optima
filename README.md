@@ -70,6 +70,26 @@ op-correctness (bf16 tolerance) passed**. Wins here: the RMSNorm seam **fires on
 is inert but `RMSNorm` fires), the cheat is caught hard (75%→0%), and the gate
 caught a *subtle* real drift a per-op check missed.
 
+**gpt-oss-120b (MXFP4) on 4× RTX PRO 6000 Blackwell (sm120) — first throughput win, through SlotSpec:**
+
+The `moe.fused_experts_mxfp4` bundle implements GPT-OSS's MXFP4 fused experts (CUTLASS
+MXFP8×MXFP4, autotuned) as a `(prepare, forward)` **block** slot, routed in via the
+`FusedMoE.forward` seam — no sglang fork. Apples-to-apples, TP=4, batch 32, eager:
+
+| MoE path | tok/s | forks sglang? |
+|---|---|---|
+| stock sm120 best (triton + CUDA graphs) | 767 | — |
+| **seam → MXFP4 kernel (autotuned)** | **912–922** | **no** |
+| hand-forked `flashinfer_mxfp4` backend | 926 | yes |
+
+The seam **ties the forked backend (~99%)** while the validator runs stock pinned sglang,
+and beats the stock-realizable path by **+19%**. On sm120 stock sglang is *forced* onto the
+triton MoE fallback (the `flashinfer_*` MoE backends crash there), so triton isn't a weak
+baseline we chose — it's what sglang can run; the seam recovers the optimized backend's speed
+without forking. Fidelity is gated by a new **`cosine`** correctness mode (0.985 vs the fp32
+reference; element-wise tolerance is meaningless at fp4 per-element error). The meaningful next
+arena is **B200/sm100**, where sglang's FP4 MoE genuinely works and is heavily tuned.
+
 ### Calibration findings (from running on real hardware)
 
 1. **The KL threshold must be calibrated to the model's nondeterminism noise

@@ -49,10 +49,10 @@ def activate() -> None:
     (activation / layernorm). Each install no-ops until its module is present, so
     calling activate twice patches whatever is available each time.
     """
-    from optima.integrations import sglang_attention, sglang_norm, sglang_silu
+    from optima.integrations import sglang_attention, sglang_moe, sglang_norm, sglang_silu
     from optima.registry import REGISTRY
 
-    for install in (sglang_silu.install, sglang_norm.install, sglang_attention.install):
+    for install in (sglang_silu.install, sglang_norm.install, sglang_attention.install, sglang_moe.install):
         try:
             install(REGISTRY)
         except Exception:  # noqa: BLE001 - never break engine startup
@@ -76,6 +76,10 @@ def activate() -> None:
     try:
         _load_bundle_into_registry(bundle)
         REGISTRY.enable()
+        if _truthy(os.environ.get("OPTIMA_STRICT")):
+            # Surface kernel errors instead of silently falling back (debug/proof: a
+            # failing kernel crashes the engine rather than masquerading as baseline).
+            REGISTRY.set_strict(True)
         _bundle_loaded = True
         logger.info("optima: bundle %s active -> slots %s", bundle, REGISTRY.slots())
     except Exception:  # noqa: BLE001 - a bad bundle must not wedge the engine
@@ -100,11 +104,17 @@ def _load_bundle_into_registry(bundle: str) -> None:
             continue
         meta = json.loads((Path(bundle) / op.metadata).read_text()) if op.metadata else {}
         entry = load_entry(src, op.entry)
+        # (prepare, forward) slots: load the 2nd callable too, so the runtime dispatcher
+        # can run the miner's weight-layout transform once and feed `prepared` to forward.
+        # (Until now prepare was only exercised by CPU `verify`; the block seam needs it
+        # live.) None for forward-only slots.
+        prepare = load_entry(src, op.prepare) if getattr(op, "prepare", None) else None
         REGISTRY.register(
             KernelImpl(
                 slot=op.slot,
                 bundle_id=manifest.bundle_id,
                 entry=entry,
+                prepare=prepare,
                 eligibility=eligibility_from_metadata(meta, op.dtypes),
             )
         )

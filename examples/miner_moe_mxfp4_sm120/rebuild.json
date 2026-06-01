@@ -1,8 +1,0 @@
-{
-  "steps": [
-    {
-      "type": "bundle_python",
-      "path": "rebuild_sglang_sm120_mxfp4.py"
-    }
-  ]
-}

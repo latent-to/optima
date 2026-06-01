@@ -42,11 +42,19 @@ This repo is the **validator harness** (the referee), plus example miner bundles
   timing. A slot is a single **op** *or* a fused **block** (same cheat-resistant
   contract — validator allocates outputs, miner fills them, the kernel never reaches
   the sampler — just a wider boundary): `activation.silu_and_mul`, `norm.rmsnorm`
-  (ops), and `attention.sdpa` (a block: QK^T+softmax+·V; CPU op-correctness verified,
-  the GPU `RadixAttention.forward` seam wiring is the next integration step).
-- **Not done: any actual throughput improvement.** The example kernels are toy
-  demos and are *slower* than sglang's tuned kernels. We built the referee, not
-  optimizations.
+  (ops); `attention.sdpa`/`attention.decode` (blocks via the `RadixAttention.forward`
+  seam, `OPTIMA_ATTENTION_SEAM=1`); and `moe.fused_experts` / `moe.fused_experts_mxfp4`
+  (blocks via the `FusedMoE.forward` seam, `OPTIMA_MOE_SEAM=1`).
+- **First real throughput win — through SlotSpec, on real GPUs.** On 4× RTX PRO 6000
+  Blackwell (sm120), the `moe.fused_experts_mxfp4` bundle (MXFP4 cutlass fused-MoE,
+  autotuned) routes gpt-oss-120b's experts through the seam at **~912–922 tok/s, TP=4
+  batch 32 — matching the hand-forked `flashinfer_mxfp4` backend (~926) with NO fork**
+  (validator runs stock pinned sglang). Stock sglang is *forced* onto the triton MoE
+  fallback on sm120 (the `flashinfer_*` MoE backends crash there), so this both ties the
+  forked best and beats the stock-realizable path (+19%). Gated by a new `cosine`
+  correctness mode (fp4: element-wise tolerance is meaningless). The silu/rmsnorm/attention
+  demos are still toy/slow — they prove the contract; the MXFP4 MoE is the first speed win.
+  **Next arena: B200/sm100**, where sglang's FP4 MoE genuinely works and is heavily tuned.
 - **Open:** isolation for untrusted miners, chain integration, a real DB, bigger
   slots (attention/MLA, MoE), and **eval calibration** (KL threshold = k× the
   measured nondeterminism noise floor; run with `enable_deterministic_inference`;

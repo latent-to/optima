@@ -71,10 +71,20 @@ class Correctness:
       ULP level (attention reorders the softmax reduction; fp8 / weight-absorbed
       forms shift a few elements). Calibrate ``min_ratio`` to the stock-vs-stock
       noise floor — the same discipline as the KL gate.
+    * ``"cosine"`` — cosine similarity of the flattened output vs the HP reference
+      must be >= ``min_cosine``, with an optional relative-L2-norm guard
+      (``max_rel_norm_err``) to catch a kernel that gets the direction right but the
+      scale wrong. This is the correct fidelity metric for **low-bit** kernels
+      (MXFP4/MXFP8): element-wise tolerance is meaningless when every element carries
+      ~6-12% quantization error, but the *direction* (and energy) of the block output
+      is preserved — which is what actually drives the model's logits. Measured on
+      sm120 GPT-OSS MoE: ~0.999 vs a dequant reference, ~0.99 vs fp32 ground truth.
     """
 
-    mode: str = "allclose"  # "allclose" | "matched_ratio"
+    mode: str = "allclose"  # "allclose" | "matched_ratio" | "cosine"
     min_ratio: float = 1.0
+    min_cosine: float = 0.0  # cosine mode: min cosine similarity vs the HP reference
+    max_rel_norm_err: float = 0.0  # cosine mode: optional |‖a‖-‖e‖|/‖e‖ guard (0 = off)
 
 
 @dataclass(frozen=True)
@@ -94,6 +104,13 @@ class SlotSpec:
     # and passes it to `entry` each step as `prepared`. None -> a plain forward-only slot.
     prepare: Optional[str] = None
     invoke_prepare: Optional[Callable] = None  # (prepare_fn, inputs) -> prepared (None for forward-only)
+    # Live seam: build the args for the miner's prepare() from the actual sglang layer
+    # (validator-owned layer->contract mapping). The dispatcher calls
+    # prepare(*prepare_from_layer(layer)); invoke_prepare mirrors the SAME call shape for
+    # verify. This is how a slot carries more than two dense tensors (biases, the
+    # interleaving flag, quant scales) without widening the generic contract. None ->
+    # the dispatcher defaults to (layer.w13_weight.data, layer.w2_weight.data).
+    prepare_from_layer: Optional[Callable] = None
     correctness: Correctness = field(default_factory=Correctness)
     tolerances: dict[torch.dtype, Tolerance] = field(default_factory=dict)
 
@@ -373,6 +390,30 @@ def _moe_reference(x, w13, w2, topk_ids, topk_weights):
     return out
 
 
+def _moe_gptoss_reference(x, w13, w2, topk_ids, topk_weights, *, alpha=1.702, beta=1.0, limit=7.0):
+    # GPT-OSS expert MLP: a CLAMPED gated-SiLU (not plain silu(gate)*up). w13:(E,2I,H)
+    # rows [gate; up], w2:(E,H,I). act = clamp(gate)*sigmoid(alpha*clamp(gate))*(clamp(up)+beta).
+    # This is the high-precision reference the MXFP4 cutlass kernel is gated against.
+    M, H = x.shape
+    I = w13.shape[1] // 2
+    K = topk_ids.shape[1]
+    x32 = x.float()
+    out = torch.zeros(M, H, device=x.device, dtype=torch.float32)
+    lim = torch.tensor(float(limit), device=x.device)
+    for k in range(K):
+        e = topk_ids[:, k].long()
+        wk = topk_weights[:, k].float()
+        w13_e = w13[e].float()                         # (M,2I,H)
+        w2_e = w2[e].float()                           # (M,H,I)
+        fc1 = torch.einsum("mh,mih->mi", x32, w13_e)   # (M,2I)
+        gate, up = fc1[:, :I], fc1[:, I:]
+        gate_c = torch.minimum(gate, lim)
+        up_c = torch.clamp(up, -float(limit), float(limit))
+        act = gate_c * torch.sigmoid(gate_c * alpha) * (up_c + beta)  # (M,I)
+        out += wk[:, None] * torch.einsum("mi,mhi->mh", act, w2_e)
+    return out
+
+
 def _moe_inputs(*, num_tokens: int, num_experts: int, hidden: int, inter: int, topk: int,
                 dtype: torch.dtype, device: str, seed: int) -> dict:
     g = torch.Generator(device=device).manual_seed(seed)
@@ -406,6 +447,7 @@ MOE_FUSED_EXPERTS = SlotSpec(
     out_shapes=lambda i: [(i["x"].shape[0], i["x"].shape[1])],
     invoke_reference=lambda i: [_moe_reference(i["x"], i["w13"], i["w2"], i["topk_ids"], i["topk_weights"])],
     invoke_prepare=lambda prepare_fn, i: prepare_fn(i["w13"], i["w2"]),
+    prepare_from_layer=lambda layer: (layer.w13_weight.data, layer.w2_weight.data),
     invoke_entry=lambda entry, i, outs, prepared: entry(i["x"], i["topk_ids"], i["topk_weights"], prepared, outs[0]),
     shapes=(
         {"num_tokens": 4, "num_experts": 8, "hidden": 256, "inter": 128, "topk": 2},
@@ -426,17 +468,41 @@ MOE_FUSED_EXPERTS_MXFP4 = SlotSpec(
     prepare="prepare",
     summary=(
         "MXFP4 fused MoE experts — a (prepare, forward) PAIR for GPT-OSS/Blackwell-style "
-        "expert kernels.  prepare(...) owns weight/scale layout once at load;  "
-        "forward(x, topk_ids, topk_weights, prepared, out) owns the fused expert call."
+        "expert kernels.  prepare(w13, w2) owns weight/scale layout (repack [gate;up]->[up;gate], "
+        "pack MXFP4, interleave scales) once at load;  forward(x, topk_ids, topk_weights, prepared, "
+        "out) MXFP8-quantizes x and runs the fused CUTLASS call.  Gated against the GPT-OSS clamped "
+        "gated-SiLU reference; matched_ratio tolerance calibrated to MXFP4/MXFP8 quant error."
     ),
     kind="block",
     make_inputs=_moe_inputs,
     out_shapes=lambda i: [(i["x"].shape[0], i["x"].shape[1])],
-    invoke_reference=lambda i: [_moe_reference(i["x"], i["w13"], i["w2"], i["topk_ids"], i["topk_weights"])],
-    invoke_prepare=lambda prepare_fn, i: prepare_fn(i["w13"], i["w2"]),
+    invoke_reference=lambda i: [_moe_gptoss_reference(i["x"], i["w13"], i["w2"], i["topk_ids"], i["topk_weights"])],
+    # Verify: synthetic dense [gate; up] block weights, no biases (a clean kernel-vs-
+    # reference check). The dict shape matches the live prepare_from_layer call.
+    invoke_prepare=lambda prepare_fn, i: prepare_fn({"w13": i["w13"], "w2": i["w2"]}),
+    # Live seam (gpt-oss): hand prepare the dequantized bf16 experts + biases; rows are
+    # HF-interleaved [gate0, up0, ...] so prepare de-interleaves to CUTLASS [up; gate].
+    prepare_from_layer=lambda layer: (
+        {
+            "w13": layer.w13_weight.data,
+            "w2": layer.w2_weight.data,
+            "w13_bias": layer.w13_weight_bias.data,
+            "w2_bias": layer.w2_weight_bias.data,
+            "interleaved": True,
+        },
+    ),
     invoke_entry=lambda entry, i, outs, prepared: entry(i["x"], i["topk_ids"], i["topk_weights"], prepared, outs[0]),
-    shapes=MOE_FUSED_EXPERTS.shapes,
-    correctness=Correctness("matched_ratio", min_ratio=0.97),
+    # GPT-OSS-flavored, CUTLASS-MXFP4-valid dims (hidden 2880; intermediate a 32-block
+    # multiple). Small E so verify stays light. The fp4 kernel is NOT bit-exact, so the
+    # gate is matched_ratio vs the fp32 reference at a quant-calibrated tolerance.
+    shapes=(
+        {"num_tokens": 16, "num_experts": 8, "hidden": 2880, "inter": 736, "topk": 4},
+        {"num_tokens": 4, "num_experts": 4, "hidden": 2880, "inter": 736, "topk": 2},
+    ),
+    # Low-bit fidelity: cosine vs the fp32 reference (element-wise tolerance is
+    # meaningless at ~6-12% per-element fp4 error). min_cosine calibrated below; the
+    # rel-norm guard catches a kernel that gets direction right but energy wrong.
+    correctness=Correctness("cosine", min_cosine=0.97, max_rel_norm_err=0.0),
     tolerances=_BF16_TOL,
 )
 

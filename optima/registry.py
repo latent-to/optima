@@ -47,6 +47,11 @@ class KernelImpl:
     slot: str
     bundle_id: str
     entry: Callable[..., Any]  # called as entry(*inputs, out)
+    # Optional 2nd callable for (prepare, forward) slots (e.g. moe.fused_experts): the
+    # validator-owned dispatcher runs it ONCE on the layer's raw weights at the first
+    # call and memoizes the result, then passes that `prepared` to `entry` each step.
+    # None for plain forward-only slots (silu / rmsnorm / attention).
+    prepare: Optional[Callable[..., Any]] = None
     eligibility: Eligibility = field(default_factory=Eligibility)
 
 

@@ -54,6 +54,8 @@ This repo is the **validator harness** (the referee), plus example miner bundles
   forked best and beats the stock-realizable path (+19%). Gated by a new `cosine`
   correctness mode (fp4: element-wise tolerance is meaningless). The silu/rmsnorm/attention
   demos are still toy/slow — they prove the contract; the MXFP4 MoE is the first speed win.
+  Run **eager** with mem headroom for the first-forward `prepare` (eval uses `mem≈0.6`; or `0.85`
+  + `disable_piecewise_cuda_graph` + `OPTIMA_MOE_FREE_DENSE=1`, which frees the dense bf16 experts).
   **Next arena: B200/sm100**, where sglang's FP4 MoE genuinely works and is heavily tuned.
 - **Open:** isolation for untrusted miners, chain integration, a real DB, bigger
   slots (attention/MLA, MoE), and **eval calibration** (KL threshold = k× the

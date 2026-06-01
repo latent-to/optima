@@ -416,7 +416,30 @@ def _moe_prepared(self, impl, slot):
             args = (self.w13_weight.data, self.w2_weight.data)
         self._optima_moe_prepared = impl.prepare(*args)
         self._optima_moe_prepared_done = True
+        _maybe_free_dense_weights(self)
     return self._optima_moe_prepared
+
+
+def _maybe_free_dense_weights(self) -> None:
+    """OPT-IN (``OPTIMA_MOE_FREE_DENSE=1``): release this layer's dense bf16 expert
+    weights once the miner kernel holds its own (MXFP4) copies — the dequantized
+    originals are dead weight (~4x the size of the packed copies). This lowers
+    steady-state residency so the engine can run at a higher mem_fraction.
+
+    SAFETY: only valid in FULL eager (disable_cuda_graph AND disable_piecewise_cuda_graph)
+    where every forward routes to the kernel; a fallback after freeing would hit empty
+    weights (it fails loudly, never silently). Left OFF by default — the supported path
+    is to give ``prepare`` GPU headroom via mem_fraction (the eval uses ~0.6)."""
+    import os
+
+    if os.environ.get("OPTIMA_MOE_FREE_DENSE") != "1":
+        return
+    for attr in ("w13_weight", "w2_weight", "w13_weight_bias", "w2_weight_bias"):
+        p = getattr(self, attr, None)
+        data = getattr(p, "data", None)
+        if data is not None:
+            p.data = torch.empty(0, device=data.device, dtype=data.dtype)
+    torch.cuda.empty_cache()
 
 
 def _run_moe_kernel(self, x, routed, impl, slot):

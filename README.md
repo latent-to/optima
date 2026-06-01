@@ -87,8 +87,14 @@ and beats the stock-realizable path by **+19%**. On sm120 stock sglang is *force
 triton MoE fallback (the `flashinfer_*` MoE backends crash there), so triton isn't a weak
 baseline we chose — it's what sglang can run; the seam recovers the optimized backend's speed
 without forking. Fidelity is gated by a new **`cosine`** correctness mode (0.985 vs the fp32
-reference; element-wise tolerance is meaningless at fp4 per-element error). The meaningful next
-arena is **B200/sm100**, where sglang's FP4 MoE genuinely works and is heavily tuned.
+reference; element-wise tolerance is meaningless at fp4 per-element error).
+
+Run **eager** with GPU headroom for the first-forward `prepare` (which pads/quantizes the dense
+experts): the eval's `mem_fraction_static≈0.6` works as-is; at `0.85` set full-eager
+(`disable_piecewise_cuda_graph`) **and** `OPTIMA_MOE_FREE_DENSE=1` (reclaims the dense bf16 experts
+after prepare — the kernel owns its MXFP4 copies). The production-clean fix (any mem_fraction) is
+load-time weight conversion — tracked. The meaningful next arena is **B200/sm100**, where sglang's
+FP4 MoE genuinely works and is heavily tuned.
 
 ### Calibration findings (from running on real hardware)
 

@@ -197,8 +197,32 @@ it ran an untuned default tactic. Fix: tune once per problem shape under `autotu
 kernel, then hit the process-global `AutoTuner` cache. Also: `prepare` OOMs at `mem_fraction 0.85`
 (mxfp4 copies alongside the bf16 weights) — run ~0.65, `del` the padded scratch, `empty_cache()`.
 
+**Running it (matters — the win is config-sensitive):** the lazy first-forward `prepare`
+needs GPU headroom (it pads/quantizes dense bf16 experts while the model is resident). Two
+supported configs, both eager:
+- **eval default** `mem_fraction_static≈0.6` (what `EvalConfig` uses) — works as-is, 912–915 tok/s.
+- **high mem** (`0.85`): set full-eager (`disable_cuda_graph` **and** `disable_piecewise_cuda_graph`
+  — the piecewise-graph buffers otherwise eat the headroom) **and** `OPTIMA_MOE_FREE_DENSE=1`, which
+  reclaims the dense bf16 experts after prepare (the kernel owns its MXFP4 copies). Verified: 920
+  tok/s, no OOM. The production-clean fix (run at any mem) is load-time weight conversion — tracked.
+
+**Codex review of PR #9 — findings + resolutions:**
+1. *P1 live OOM during prepare* — was at `mem_fraction 0.85` **without** the memory settings (GPU
+   ~full → the 1.08 GiB padded-bf16 transient can't allocate). Fixed: `OPTIMA_MOE_FREE_DENSE=1` +
+   full-eager runs at 0.85 (920 tok/s); the eval's 0.6 works without freeing. Memory-lifecycle, not
+   architecture (codex agreed).
+2. *Docs overstated parity* — fair; phrasing now states the config (eager + mem headroom / free-dense)
+   and that parity is 912–920 vs 926.
+3. *Needs eager* — confirmed; `disable_piecewise_cuda_graph` is recommended (and required for
+   free-dense safety: a fallback after freeing would hit empty weights, loudly). Documented.
+4. *pytest missing in the pod venv* — true (uv venv, no pytest/pip); `py_compile`/`compat`/CUDA
+   `verify` all pass. Run the suite with `uv pip install pytest` (or a minimal shim): 63 pass.
+5. *rebuild.py remains an arbitrary-bundle-Python escape hatch* — out of scope here (removed it from
+   THIS bundle); tracked as a separate hardening item (drop `bundle_python` / require vetted
+   repo-local + content-pinned patchers).
+
 **Next:** B200/sm100 (where sglang's FP4 MoE genuinely works + is heavily tuned — the real arena);
-a CUDA-graph-capturable seam; free the bf16 originals after prepare to drop the mem requirement.
+load-time weight conversion (run at any mem_fraction); a CUDA-graph-capturable seam.
 
 ### 2026-06-01 — block slots + attention seam + cu13 / sglang-0.5.12 bring-up (Opus 4.8)
 

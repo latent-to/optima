@@ -24,13 +24,15 @@ This repo is the **validator harness** (the referee), plus example miner bundles
 1. `docs/HOW_OPTIMA_WORKS.md` — the full explainer: validator function, what
    miners submit, the pipeline, how a kernel gets into the spawned model process,
    and the complete threat model.
-2. `README.md` — current state of record (results, gates, run recipes). If it and
+2. `docs/SLOT_CONTRACT.md` — **the narrow waist: the four invariants a slot must
+   never break.** Read before touching `optima/slots.py` or adding a seam. Short.
+3. `README.md` — current state of record (results, gates, run recipes). If it and
    HOW_OPTIMA_WORKS disagree, **README wins** (it's kept current).
-3. `docs/SUBNET_BLUEPRINT.md` — how a real subnet (Affine) is built: chain
+4. `docs/SUBNET_BLUEPRINT.md` — how a real subnet (Affine) is built: chain
    plumbing, services, DB, copy detection, isolation. The production roadmap.
-4. `docs/DEV_ENVIRONMENT.md` — the GPU pods (lium), the `sn120` toolchain env, and
+5. `docs/DEV_ENVIRONMENT.md` — the GPU pods (lium), the `sn120` toolchain env, and
    how to push code + run evals on them.
-5. `docs/SGLANG_TRACKING.md` — how we stay current with sglang (it's both our
+6. `docs/SGLANG_TRACKING.md` — how we stay current with sglang (it's both our
    baseline and our runtime): a pinned version for consensus, the bump+re-baseline
    process, and the `optima compat` canary.
 
@@ -97,7 +99,9 @@ matters — sglang uses `mp spawn`).
   the reference — attention / fp8 / MLA weight-absorption — gated against
   high-precision ground truth, never the stock kernel) + a seam patch in
   `optima/integrations/` (installed from `seam.activate()`, module added to
-  `bootstrap._TARGETS`).
+  `bootstrap._TARGETS`). It **must** satisfy the four invariants in
+  `docs/SLOT_CONTRACT.md` (the waist); if it can't, it belongs in the fenced
+  escape hatch, not the core.
 - **The seam patches a pinned, unmodified sglang at runtime** — we never fork,
   commit, or reconfigure sglang, so the gitignored `sglang/` clone is a dev
   reference only. Runtime injection is how a miner changes a *backend* (e.g.

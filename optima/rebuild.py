@@ -1,15 +1,20 @@
-"""Trusted rebuild-plan helper for framework-mode bundles.
+"""Rebuild-plan helper for the framework-mode escape hatch.
 
 Framework mode lets a candidate open a larger backend surface than the narrow
-tensor-in/out dispatcher can express. The untrusted bundle still should not run an
-arbitrary shell script in the trusted driver. Instead, the bundle may include a
-small data-only ``rebuild.json`` plan, and this validator-owned helper applies the
-allowed source patch/rebuild steps inside the isolated candidate process before
-SGLang imports.
+tensor-in/out dispatcher can express (a backend swap, a source recompile). That is
+the *fenced escape hatch*, NOT the core slot contract — see docs/SLOT_CONTRACT.md.
 
-This is an early rebuild tier, not a general package manager. It is deliberately
-narrow: run a vetted repo-local Python patcher, then let the backend JIT/rebuild
-happen during candidate engine startup in the same no-egress namespace.
+The hard rule here: a ``rebuild.json`` step may reference **only a validator-shipped,
+reviewed patcher** that lives in this repo (``repo_python``). It must NOT execute
+bundle-supplied code — that would be arbitrary miner RCE in the candidate process,
+which no-egress isolation bounds but does not prevent (it can still touch the
+filesystem, the shared sglang install, secrets on the box). This mirrors how PyTorch
+gates backends: you submit a patch to core to add one; you do not ship arbitrary
+code into the dispatcher. A miner who needs a patcher gets it *reviewed and merged*
+into the repo first; then a bundle's ``rebuild.json`` may select it by relative path.
+
+(The earlier ``bundle_python`` step type — run an arbitrary script from the bundle —
+is deliberately removed; it is rejected with a clear error.)
 """
 
 from __future__ import annotations
@@ -52,11 +57,15 @@ def apply_rebuild_plan(bundle_path: str | Path) -> bool:
             raise RebuildError(f"rebuild step {i} must be an object")
         typ = step.get("type")
         if typ == "repo_python":
+            # ONLY validator-shipped, reviewed patchers (repo-local). Never bundle code.
             script = _safe_repo_path(repo_root, str(step.get("path", "")))
             _run_python_script(script)
         elif typ == "bundle_python":
-            script = _safe_bundle_path(bundle, str(step.get("path", "")))
-            _run_python_script(script)
+            raise RebuildError(
+                "rebuild step 'bundle_python' is not allowed: a bundle may not execute its "
+                "own code in the candidate process (arbitrary RCE). Use a validator-shipped, "
+                "reviewed 'repo_python' patcher instead. See docs/SLOT_CONTRACT.md."
+            )
         else:
             raise RebuildError(f"unsupported rebuild step type: {typ!r}")
     return True
@@ -70,17 +79,6 @@ def _safe_repo_path(repo_root: Path, rel: str) -> Path:
         raise RebuildError(f"repo script path escapes repo: {rel!r}")
     if not p.is_file():
         raise RebuildError(f"repo script not found: {rel!r}")
-    return p
-
-
-def _safe_bundle_path(bundle: Path, rel: str) -> Path:
-    if not rel or rel.startswith("/"):
-        raise RebuildError(f"bundle script path must be relative: {rel!r}")
-    p = (bundle / rel).resolve()
-    if bundle != p and bundle not in p.parents:
-        raise RebuildError(f"bundle script path escapes bundle: {rel!r}")
-    if not p.is_file():
-        raise RebuildError(f"bundle script not found: {rel!r}")
     return p
 
 

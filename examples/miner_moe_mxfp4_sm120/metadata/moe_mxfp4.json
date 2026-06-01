@@ -2,5 +2,5 @@
   "op": "moe.fused_experts_mxfp4",
   "dtypes": ["bfloat16", "float16", "float32"],
   "architectures": ["sm120"],
-  "notes": "Framework-mode GPT-OSS MXFP4 MoE backend swap for RTX PRO 6000 Blackwell. rebuild.json applies the SM120 FlashInfer/SGLang source patch; optima bench launches the candidate with flashinfer_mxfp4."
+  "notes": "GPT-OSS MXFP4 fused-MoE kernel for RTX PRO 6000 Blackwell (sm120), scored through the FusedMoE block seam (no sglang fork, no framework mode). prepare = CUTLASS [up;gate] MXFP4 repack + interleaved scales + biases; forward = MXFP8-act-quant + flashinfer cutlass_fused_moe (autotuned). Matches the hand-forked flashinfer_mxfp4 backend at TP=4."
 }

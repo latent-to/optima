@@ -15,3 +15,15 @@ WORKLOG.md
 experiments/
 scripts/gptoss_tp_bench.py
 scripts/moe_config_microbench.py
+
+# Local scratch / one-off experiment files (single-underscore prefix, repo root only).
+/_*.py
+/_*.sh
+/_*.json
+
+# Datagen workbench + its configs (local tooling, like the scripts/ entries above).
+/datagen_magpie.py
+/v4_engine_datagen.json
+
+# Per-session handoff log (local, like WORKLOG.md — references box specifics / tmp paths).
+/H200_SESSION.md

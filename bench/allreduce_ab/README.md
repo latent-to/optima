@@ -19,6 +19,11 @@ flag, so one pinned package, consensus preserved.
   With `NSYS=1`, profiles each and prints per-call latency via the parser.
 - `parse_allreduce_latency.py` — decode-only (graphId-split) per-call all-reduce latency from an
   nsys sqlite. `avg_us >> min_us` ⇒ latency-bound (the lever is latency/overlap, not bytes).
+- `decode_breakdown.py` — decode-only **category rollup** + top-N kernels from an nsys sqlite (the
+  full lever map: comm vs moe_gemm vs attention vs glue vs gemm …). Run it on the B200 default-backend
+  capture to get the B200 map — every hard number we have is H200. Validated on the H200 captures:
+  reproduces marlin decode = moe_gemm 41% / comm 35% / attention 5% / glue 0.6%, and flashinfer =
+  moe_gemm 43% / comm 35% / glue 2.4% (marlin fuses the glue; flashinfer does not).
 
 ## Backend matrix (all stock sglang flags)
 
@@ -59,6 +64,18 @@ docker run --rm --gpus all --privileged --ipc=host --shm-size 32g --network host
   bash -lc 'cd /opt/optima && NSYS=1 MOE_BACKEND=marlin bash bench/allreduce_ab/sweep.sh'
 ```
 (`TORCH_CUDA_ARCH_LIST`: 9.0 = H100/H200, 10.0 = B200.)
+
+### Get the B200 map (we're blind there — all hard numbers are H200)
+After a `NSYS=1` sweep, the `default`-backend capture is the B200 decode baseline:
+
+```bash
+python3 bench/allreduce_ab/decode_breakdown.py      bench/allreduce_ab/results/ar_01_default.sqlite
+python3 bench/allreduce_ab/parse_allreduce_latency.py bench/allreduce_ab/results/ar_01_default.sqlite
+```
+
+The rollup tells you how B200 decode actually splits (comm / moe_gemm / attention / glue / …) so we
+size every lever before building. On B200 native FP4 shrinks the MoE GEMM, so comm should be an even
+larger share than the ~35% measured on H200.
 
 ## How to read it (the decision rule)
 

@@ -75,6 +75,29 @@ def cmd_chain_compat(_: argparse.Namespace) -> int:
     return 0 if all(c.ok for c in checks) else 2
 
 
+def cmd_set_weights(args: argparse.Namespace) -> int:
+    from optima import chain
+    from optima.commit_reveal import Ledger
+
+    led = Ledger.load(args.ledger)
+    if not led.champion:
+        print(f"no champion in {args.ledger}; nothing to weight")
+        return 1
+    weights = {led.champion.hotkey: 1.0}  # winner-take-all baseline (matches settle)
+    subtensor = chain.connect(args.network)
+    if args.dry_run:
+        res = chain.set_weights(subtensor, None, args.netuid, weights, dry_run=True)
+        print(f"DRY RUN (network={args.network}, netuid={args.netuid}): "
+              f"would set uids={res['uids']} weights={res['weights']}")
+        return 0
+    import bittensor as bt
+
+    wallet = bt.Wallet(name=args.wallet, hotkey=args.hotkey)
+    res = chain.set_weights(subtensor, wallet, args.netuid, weights)
+    print(f"set_weights submitted={res.get('submitted')} uids={res.get('uids')}")
+    return 0 if res.get("submitted") else 1
+
+
 def cmd_scan(args: argparse.Namespace) -> int:
     m = load_manifest(args.bundle)
     print(f"bundle: {m.bundle_id}  abi: {m.abi_version}  ops: {len(m.ops)}")
@@ -404,6 +427,17 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("chain-compat",
                         help="check the installed bittensor SDK exposes the chain API we use")
     sp.set_defaults(func=cmd_chain_compat)
+
+    sp = sub.add_parser("set-weights",
+                        help="push the ledger champion's weights on-chain (king of the hill)")
+    sp.add_argument("--ledger", default="optima_ledger.json")
+    sp.add_argument("--netuid", type=int, required=True)
+    sp.add_argument("--network", default="finney", help="'test' for the public testnet")
+    sp.add_argument("--wallet", default="default")
+    sp.add_argument("--hotkey", default="default")
+    sp.add_argument("--dry-run", action="store_true",
+                    help="build + print the (uids, weights) payload, do NOT submit")
+    sp.set_defaults(func=cmd_set_weights)
 
     sp = sub.add_parser("scan", help="static policy scan of a bundle")
     sp.add_argument("bundle")

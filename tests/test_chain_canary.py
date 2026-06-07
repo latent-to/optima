@@ -35,15 +35,20 @@ def test_missing_bittensor_is_graceful(monkeypatch):
 def _fake_bittensor(methods: tuple[str, ...]) -> types.ModuleType:
     mod = types.ModuleType("bittensor")
     mod.__version__ = "9.9.9-fake"
-    mod.wallet = type("Wallet", (), {})
+    wcls = type("Wallet", (), {})
+    mod.Wallet = wcls
+    mod.wallet = wcls
     ns = {m: (lambda self, *a, **k: None) for m in methods}
-    mod.subtensor = type("Subtensor", (), ns)
+    cls = type("Subtensor", (), ns)
+    mod.Subtensor = cls
+    mod.subtensor = cls
     return mod
 
 
 def test_full_fake_sdk_passes(monkeypatch):
     fake = _fake_bittensor((
-        "set_weights", "metagraph", "is_hotkey_registered", "get_current_block",
+        "set_weights", "metagraph", "get_all_commitments", "set_commitment",
+        "is_hotkey_registered", "get_current_block", "get_block_hash",
         "commit", "reveal_commitment",
     ))
     monkeypatch.setitem(sys.modules, "bittensor", fake)

@@ -22,6 +22,26 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))
 import ingest          # noqa: E402
 import findings as fnd  # noqa: E402
+import compare as cmp   # noqa: E402
+
+
+# --------------------------------------------------------------------------- #
+# minimal dataset builder for compare.py tests (no dir / no trace parsing)
+# --------------------------------------------------------------------------- #
+def _mini(peak_tok, cats):
+    """cats: list of (cat, pct, count, bound, winnable)."""
+    return {
+        "display": {c[0]: c[0] for c in cats},
+        "meta": {"datadir": f"ds@{peak_tok}"},
+        "e2e": [{"config": "mtp_off", "conc": 64, "kind": "sweep", "agg_toks": peak_tok}],
+        "findings": {
+            "peak": {"tok_s": peak_tok, "conc": 64, "config": "mtp_off"},
+            "decode_canonical": {"label": "mtp_off", "rank": "TP0", "categories": [
+                {"cat": c, "display": c, "pct": p, "count": n, "us": p * 10,
+                 "bound_type": b, "winnable": w, "verdict": "", "ncu": None}
+                for (c, p, n, b, w) in cats]},
+        },
+    }
 
 
 # --------------------------------------------------------------------------- #
@@ -178,6 +198,37 @@ def test_trace_cache_roundtrips(tmp):
     assert a == b, "cached parse differs from fresh parse"
     # a no-cache parse must still match
     assert ingest.parse_torch_trace(trace, use_cache=False) == a
+
+
+def test_compare_win_with_fusion(tmp):
+    base = _mini(2800, [("fp4_moe_gemm", 39, 39, "memory", False), ("moe_finalize", 2.0, 40, "latency", True)])
+    patched = _mini(3000, [("fp4_moe_gemm", 41, 39, "memory", False), ("moe_finalize", 0.1, 2, "latency", True)])
+    c = cmp.compare(base, patched, noise_pct=2.0)
+    assert c["win"] is True, c["headline"]
+    assert c["fused"] and c["fused"][0]["cat"] == "moe_finalize", "fusion not detected"
+    assert "WIN" in c["headline"] and "corroborated" in c["headline"]
+
+
+def test_compare_inconclusive_within_noise(tmp):
+    base = _mini(2800, [("fp4_moe_gemm", 39, 39, "memory", False)])
+    patched = _mini(2830, [("fp4_moe_gemm", 39, 39, "memory", False)])  # +1.07% < 2% noise
+    c = cmp.compare(base, patched, noise_pct=2.0)
+    assert c["win"] is None and "INCONCLUSIVE" in c["headline"], c["headline"]
+
+
+def test_compare_regression(tmp):
+    base = _mini(2800, [("fp4_moe_gemm", 39, 39, "memory", False)])
+    patched = _mini(2600, [("fp4_moe_gemm", 39, 39, "memory", False)])
+    c = cmp.compare(base, patched, noise_pct=2.0)
+    assert c["win"] is False and "REGRESSION" in c["headline"], c["headline"]
+
+
+def test_compare_apparent_win_no_structure(tmp):
+    """e2e up but no glue category fused → flagged as possible clock noise, not a clean win."""
+    base = _mini(2800, [("fp4_moe_gemm", 39, 39, "memory", False), ("moe_finalize", 2.0, 40, "latency", True)])
+    patched = _mini(3050, [("fp4_moe_gemm", 39, 39, "memory", False), ("moe_finalize", 2.0, 40, "latency", True)])
+    c = cmp.compare(base, patched, noise_pct=2.0)
+    assert "APPARENT WIN" in c["headline"] and c["cautions"], c["headline"]
 
 
 def main():

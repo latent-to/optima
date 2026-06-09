@@ -126,16 +126,30 @@ maps onto the two reports:
   boundary), (2) its **decode share shrinks**, (3) **e2e tok/s rises**. If decode
   share didn't move or e2e didn't rise → it's a phantom win. Discard it.
 
+Don't eyeball two reports — run **`compare.py`**, which arbitrates in one line:
+
+```bash
+python3 tools/profiler/compare.py out_base/dataset.json out_patched/dataset.json \
+    --label-a base --label-b moe_fused -o compare.html
+```
+
+It prints the verdict + the e2e and decode-structure deltas. **E2E is the
+arbiter** (steady-state, directly comparable; kernel-time *share* is not — the
+denominator shifts when you fuse). **A launch-count drop is the fusion proof.**
+And a delta **within ±noise is NOT a win** (default ±2%, `--noise-pct` to change)
+— it says INCONCLUSIVE and tells you to re-run interleaved + clock-locked, so a
+clock/thermal wobble never reads as a win. The verdicts:
+- `WIN` — e2e up past noise **and** a glue category's launches collapsed.
+- `APPARENT WIN` — e2e up but no structural change → suspect clock noise, confirm.
+- `INCONCLUSIVE` — e2e within ±noise. Not a win.
+- `REGRESSION` — e2e down past noise.
+
 **On the nsys-only box (no ncu):** the tool still works — categories just read
 "unknown / PROFILE IT" instead of a bound-type. That's fine for *proving* a
 fusion: ncu is for *deciding where to fuse* (diagnose the bound-type once, on an
 ncu box); nsys + e2e + the kernel-launch-count drop is enough to *prove the
 fusion worked*. So: diagnose bound-types on an ncu box once per model, then
 iterate on patches against the nsys-only box using e2e + launch counts.
-
-> A dedicated `compare.py` (two `dataset.json` → side-by-side deltas: e2e peak,
-> per-category share, launch counts, bound-type changes) is the natural next
-> addition for scenario B — not built yet.
 
 ## Extending to a new model
 
@@ -149,6 +163,8 @@ detection: a label containing `prefill` → prefill regime; `b32`/`b1` → batch
 - `findings.py` — dataset → verdicts (CLI: `python3 findings.py dataset.json`).
 - `report.py` — dataset + findings → `report.html` (template in `templates/`).
 - `build.py` — the one-command pipeline.
+- `compare.py` — A/B two `dataset.json` → one win/no-win verdict + `compare.html`
+  (CLI: `python3 compare.py base/dataset.json patched/dataset.json -o compare.html`).
 - `tests/test_profiler.py` — synthetic fixtures encoding the guards above
   (`python3 tools/profiler/tests/test_profiler.py`, no pytest needed).
 

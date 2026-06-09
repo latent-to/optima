@@ -1,0 +1,8 @@
+# generated outputs — never commit these
+profiler_out/
+*.report.html
+dataset.json
+findings.json
+# parsed-trace cache (lives next to a dataset, but ignore if one lands here)
+.profiler_cache/
+__pycache__/

@@ -123,6 +123,11 @@ class SlotSpec:
     #     handing it the process group; it fills `out` with the REDUCED result.
     collective_partial: Optional[Callable] = None
     invoke_collective: Optional[Callable] = None
+    # Per-slot end-to-end KL gate, calibrated to THIS slot's intrinsic noise floor (the
+    # generic 5e-3 default is tuned for elementwise ops; attention sits ~6e-3 vs flash's
+    # reordered softmax, so a flat 5e-3 false-fails a faithful attention kernel — README
+    # calibration finding 6). None -> use the eval's generic threshold.
+    kl_threshold: Optional[float] = None
 
     def tolerance_for(self, dtype: torch.dtype) -> Tolerance:
         if dtype in self.tolerances:
@@ -294,6 +299,9 @@ ATTENTION_SDPA = SlotSpec(
     # fp32 reference, not all-close. 0.99 tolerates a thin tail of ULP-level diffs.
     correctness=Correctness("matched_ratio", min_ratio=0.99),
     tolerances=_BF16_TOL,
+    # Attention's intrinsic end-to-end KL floor (~6e-3 vs flash) is above the generic
+    # 5e-3 gate; calibrate to ~5x the floor so a faithful attention kernel isn't false-failed.
+    kl_threshold=3e-2,
 )
 
 
@@ -364,6 +372,7 @@ ATTENTION_DECODE = SlotSpec(
     ),
     correctness=Correctness("matched_ratio", min_ratio=0.99),
     tolerances=_BF16_TOL,
+    kl_threshold=3e-2,  # attention's higher intrinsic floor (see attention.sdpa)
 )
 
 

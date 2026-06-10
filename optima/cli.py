@@ -156,6 +156,7 @@ def cmd_verify(args: argparse.Namespace) -> int:
         result = call_in_subprocess(
             verify_entry_from_source, op.slot, str(src), op.entry,
             prepare_name=op.prepare, dtype_name=args.dtype, device=args.device, seed=args.seed,
+            jitter_seed=args.seed,  # count-dim jitter so shapes vary per run (anti shape-branch)
         )
         print(format_verify(result))
         if not result.passed:
@@ -189,6 +190,13 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
         print("no known slots in this bundle; nothing to evaluate")
         return 1
 
+    # Per-slot calibrated KL threshold (e.g. attention's higher floor) overrides the generic
+    # default unless KL is advisory; the user's explicit --kl-threshold still applies as the
+    # fallback for slots without a calibrated value.
+    from optima.slots import get_slot as _get_slot
+    _slot_kl = _get_slot(m.ops[0].slot).kl_threshold
+    _kl_threshold = None if args.kl_advisory else (_slot_kl if _slot_kl is not None else args.kl_threshold)
+
     cfg = EvalConfig(
         model_path=args.model,
         dtype=args.dtype,
@@ -202,7 +210,7 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
         prompt_seed=args.prompt_seed,
         top_logprobs_num=args.top_logprobs,
         ignore_eos=args.ignore_eos,
-        kl_threshold=None if args.kl_advisory else args.kl_threshold,
+        kl_threshold=_kl_threshold,
         argmax_disagree_rate_threshold=args.argmax_disagree_rate,
         p99_kl_threshold=args.p99_kl_threshold,
         deterministic=not args.no_deterministic,
@@ -210,6 +218,7 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
         disable_cuda_graph=args.disable_cuda_graph,
         mem_fraction_static=args.mem_fraction,
         tp_size=args.tp_size,
+        max_running_requests=args.max_running_requests,
         moe_runner_backend=args.moe_runner_backend,
         disable_custom_all_reduce=args.disable_custom_all_reduce,
         candidate_attention_backend=args.candidate_attention_backend,
@@ -218,6 +227,8 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
         extra_engine_kwargs=_json_obj(args.engine_kwargs_json),
         candidate_extra_engine_kwargs=_json_obj(args.candidate_engine_kwargs_json),
     )
+    if _slot_kl is not None and not args.kl_advisory:
+        print(f"  (using {m.ops[0].slot}'s calibrated KL threshold {_slot_kl:g})")
     print(f"\nrunning two launches of {args.model} (dtype={args.dtype}, "
           f"deterministic={cfg.deterministic}, cuda_graph={not cfg.disable_cuda_graph}, "
           f"attn_backend={cfg.attention_backend or 'auto'}, "
@@ -260,9 +271,10 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
         ch = content_hash(args.bundle)
         led = Ledger.load(args.ledger)
         led.record_score(args.hotkey, ch, args.round, report.score, report.kl.mean_kl,
-                         report.passed_quality, sglang_version=PINNED_SGLANG)
+                         report.passed_quality, sglang_version=PINNED_SGLANG, slot=m.ops[0].slot)
         led.save(args.ledger)
-        print(f"recorded -> {args.ledger} (hotkey={args.hotkey}, round={args.round}, sglang={PINNED_SGLANG})")
+        print(f"recorded -> {args.ledger} (hotkey={args.hotkey}, round={args.round}, "
+              f"slot={m.ops[0].slot}, sglang={PINNED_SGLANG})")
     return 0 if report.passed_quality else 3
 
 
@@ -288,6 +300,13 @@ def cmd_bench(args: argparse.Namespace) -> int:
         print("no known slots in this bundle; nothing to evaluate")
         return 1
 
+    from optima.slots import get_slot as _get_slot
+    _slot_kl = _get_slot(m.ops[0].slot).kl_threshold
+    _kl_threshold = None if args.kl_advisory else (_slot_kl if _slot_kl is not None else args.kl_threshold)
+    if args.samples < 100 and not args.kl_advisory:
+        print(f"  [note] --samples {args.samples} is small for the accuracy gate "
+              "(~12% std at n=12); KL is the primary gate, use ~100-200 for a real accuracy floor.")
+
     cfg = EvalConfig(
         model_path=args.model,
         dtype=args.dtype,
@@ -295,7 +314,7 @@ def cmd_bench(args: argparse.Namespace) -> int:
         prompt_seed=args.prompt_seed,
         top_logprobs_num=args.top_logprobs,
         ignore_eos=args.ignore_eos,
-        kl_threshold=None if args.kl_advisory else args.kl_threshold,
+        kl_threshold=_kl_threshold,
         argmax_disagree_rate_threshold=args.argmax_disagree_rate,
         p99_kl_threshold=args.p99_kl_threshold,
         framework_mode=args.framework_mode,
@@ -307,6 +326,7 @@ def cmd_bench(args: argparse.Namespace) -> int:
         disable_cuda_graph=args.disable_cuda_graph,
         mem_fraction_static=args.mem_fraction,
         tp_size=args.tp_size,
+        max_running_requests=args.max_running_requests,
         moe_runner_backend=args.moe_runner_backend,
         disable_custom_all_reduce=args.disable_custom_all_reduce,
         candidate_attention_backend=args.candidate_attention_backend,
@@ -367,9 +387,10 @@ def cmd_bench(args: argparse.Namespace) -> int:
         ch = content_hash(args.bundle)
         led = Ledger.load(args.ledger)
         led.record_score(args.hotkey, ch, args.round, report.score, report.kl.mean_kl,
-                         report.passed_quality, sglang_version=PINNED_SGLANG)
+                         report.passed_quality, sglang_version=PINNED_SGLANG, slot=m.ops[0].slot)
         led.save(args.ledger)
-        print(f"recorded -> {args.ledger} (hotkey={args.hotkey}, round={args.round}, sglang={PINNED_SGLANG})")
+        print(f"recorded -> {args.ledger} (hotkey={args.hotkey}, round={args.round}, "
+              f"slot={m.ops[0].slot}, sglang={PINNED_SGLANG})")
     return 0 if report.passed_quality else 3
 
 
@@ -398,13 +419,17 @@ def cmd_commit(args: argparse.Namespace) -> int:
 def cmd_reveal(args: argparse.Namespace) -> int:
     from optima.bundle_hash import content_hash
     from optima.commit_reveal import Ledger, RevealError
-    from optima.copy_fingerprint import bundle_fingerprint
+    from optima.copy_fingerprint import bundle_fingerprint, bundle_structural_fingerprint
 
     ch = content_hash(args.bundle)
-    fp = bundle_fingerprint(args.bundle)  # reformat-invariant near-copy signal
+    fp = bundle_fingerprint(args.bundle)  # reformat-invariant near-copy signal (auto-demotes)
+    sfp = bundle_structural_fingerprint(args.bundle)  # rename/constant-tweak skeleton (advisory)
     led = Ledger.load(args.ledger)
+    # Query advisory structural matches BEFORE recording this reveal (so we don't match self).
+    advisory = led.structural_near_copies(sfp, args.hotkey)
     try:
-        rev = led.reveal(args.hotkey, ch, args.salt, args.round, fingerprint=fp)
+        rev = led.reveal(args.hotkey, ch, args.salt, args.round, fingerprint=fp,
+                         structural_fingerprint=sfp)
     except RevealError as e:
         print(f"REJECTED: {e}")
         return 2
@@ -413,6 +438,9 @@ def cmd_reveal(args: argparse.Namespace) -> int:
     if not rev.original:
         print("  -> flagged as a COPY (an earlier commit to this exact content OR its "
               "reformatted-but-identical structure exists); earns 0")
+    elif advisory:
+        print(f"  ⚠ ADVISORY: structurally similar to earlier submission(s) by {', '.join(advisory)} "
+              "(possible rename/constant-tweak copy) — flagged for review, not auto-demoted")
     return 0
 
 
@@ -435,6 +463,18 @@ def cmd_settle(args: argparse.Namespace) -> int:
     from optima.compat import PINNED_SGLANG
 
     led = Ledger.load(args.ledger)
+    if getattr(args, "per_slot", False):
+        res = led.settle_per_slot(args.round, margin=args.margin, current_sglang_version=PINNED_SGLANG)
+        led.save(args.ledger)
+        print("per-slot championships (emission split across slots):")
+        for slot, champ in sorted(res.champions.items()):
+            changed = " (NEW)" if res.title_changes.get(slot) else ""
+            stale = "  ⚠ STALE pin — re-baseline" if slot in res.stale_slots else ""
+            print(f"  {slot or '(unlabeled)':32s} {champ.hotkey} score={champ.score:.3f}{changed}{stale}")
+        if res.rejected_copies:
+            print(f"rejected copies: {', '.join(res.rejected_copies)}")
+        print(f"weights: {res.weights}")
+        return 0
     res = led.settle(args.round, margin=args.margin, current_sglang_version=PINNED_SGLANG)
     led.save(args.ledger)
     print(f"title_changed={res.title_changed} challenger_score={res.challenger_score:.3f}")
@@ -513,6 +553,8 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--disable-cuda-graph", action="store_true",
                     help="eager mode for quick debugging; DEGRADES the baseline — never score with this")
     sp.add_argument("--tp-size", type=int, default=None, help="tensor-parallel size (multi-GPU)")
+    sp.add_argument("--max-running-requests", type=int, default=None,
+                    help="cap concurrent running requests = score at a serving-realistic batch (report M2)")
     sp.add_argument("--moe-runner-backend", default=None,
                     help="sglang MoE backend (e.g. 'triton')")
     sp.add_argument("--candidate-moe-runner-backend", default=None,
@@ -573,6 +615,8 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--disable-cuda-graph", action="store_true",
                     help="eager mode for quick debugging; DEGRADES the baseline — never score with this")
     sp.add_argument("--tp-size", type=int, default=None, help="tensor-parallel size (multi-GPU)")
+    sp.add_argument("--max-running-requests", type=int, default=None,
+                    help="cap concurrent running requests = score at a serving-realistic batch (report M2)")
     sp.add_argument("--moe-runner-backend", default=None,
                     help="sglang MoE backend (e.g. 'triton')")
     sp.add_argument("--candidate-moe-runner-backend", default=None,
@@ -627,6 +671,9 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--round", type=int, default=0)
     sp.add_argument("--margin", type=float, default=0.02)
     sp.add_argument("--ledger", default="optima_ledger.json")
+    sp.add_argument("--per-slot", action="store_true",
+                    help="per-slot championships (one champion per slot, emission split) — pays "
+                         "specialists, vs the winner-take-all default")
     sp.set_defaults(func=cmd_settle)
 
     return p

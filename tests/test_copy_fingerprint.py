@@ -8,7 +8,22 @@ copy revealed in a LATER round than the original is no longer mislabeled origina
 from pathlib import Path
 
 from optima.commit_reveal import Ledger, make_commitment
-from optima.copy_fingerprint import bundle_fingerprint, normalized_source, source_fingerprint
+from optima.copy_fingerprint import (
+    bundle_fingerprint,
+    normalized_source,
+    source_fingerprint,
+    structural_fingerprint,
+)
+
+# A rename-everything + constant-tweak copy of ORIG: same structure, vars renamed
+# (x->inp, out->dst, d->half), the // 2 constant changed to // 3. No statements added.
+RENAMED_TWEAKED = '''\
+import torch
+
+def silu_and_mul(inp, dst):
+    half = inp.shape[-1] // 3
+    dst.copy_(torch.nn.functional.silu(inp[..., :half]) * inp[..., half:])
+'''
 
 ORIG = '''\
 """A kernel docstring."""
@@ -99,3 +114,30 @@ def test_independent_distinct_kernels_both_original():
     a = _commit_reveal(led, "alice", "HASH_A", "s", 0, "fpA")
     b = _commit_reveal(led, "bob", "HASH_B", "s", 0, "fpB")
     assert a.original and b.original
+
+
+# ---- structural (advisory) fingerprint: catches rename + constant-tweak ----
+
+
+def test_structural_fingerprint_survives_rename_and_constant_tweak():
+    # The normalized fingerprint differs (names/constants changed), but the structural
+    # skeleton is identical -> advisory near-copy signal the normalized form misses.
+    assert source_fingerprint(ORIG) != source_fingerprint(RENAMED_TWEAKED)
+    assert structural_fingerprint(ORIG) == structural_fingerprint(RENAMED_TWEAKED)
+
+
+def test_structural_fingerprint_distinguishes_different_ops():
+    # silu vs a plain multiply (DIFFERENT) must NOT collide structurally.
+    assert structural_fingerprint(ORIG) != structural_fingerprint(DIFFERENT)
+
+
+def test_structural_advisory_is_not_auto_demote():
+    led = Ledger()
+    led.commit("alice", make_commitment("H_A", "alice", "s"), 0)
+    led.reveal("alice", "H_A", "s", 0, fingerprint="fpA", structural_fingerprint="SKEL")
+    # bob: different exact + normalized fp, but SAME structural skeleton.
+    matches = led.structural_near_copies("SKEL", "bob")
+    led.commit("bob", make_commitment("H_B", "bob", "s"), 1)
+    bob = led.reveal("bob", "H_B", "s", 1, fingerprint="fpB", structural_fingerprint="SKEL")
+    assert matches == ["alice"]      # surfaced for review
+    assert bob.original is True      # but NOT demoted (advisory only)

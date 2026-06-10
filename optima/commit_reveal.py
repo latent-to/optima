@@ -97,7 +97,8 @@ class Reveal:
     round_id: int
     commit_seq: int
     original: bool = True
-    fingerprint: str = ""  # reformat-invariant near-copy fingerprint (optima.copy_fingerprint)
+    fingerprint: str = ""  # reformat-invariant near-copy fingerprint (auto-demotes a match)
+    structural_fingerprint: str = ""  # rename/constant-tweak skeleton — ADVISORY only (review)
 
 
 @dataclass
@@ -109,6 +110,7 @@ class Score:
     kl_mean: float
     passed: bool
     sglang_version: str = ""  # the pin this speedup was measured against (re-baseline key)
+    slot: str = ""  # the slot this submission competes in (for per-slot championships)
 
 
 @dataclass
@@ -150,6 +152,18 @@ class SettleResult:
     champion_stale: bool = False  # champion was crowned under a different sglang pin -> re-baseline
 
 
+@dataclass
+class PerSlotSettleResult:
+    """Result of a per-slot championship: one champion PER slot, emission split across
+    slots. Pays specialists for the slot they actually own — the fix for winner-take-all
+    starving everyone but the single best end-to-end bundle (report misalignment M4)."""
+    champions: dict[str, Champion]  # slot -> champion
+    weights: dict[str, float]  # hotkey -> emission share (sums to ~1 across slots with a champion)
+    title_changes: dict[str, bool]  # slot -> did the title change this round
+    stale_slots: list[str] = field(default_factory=list)  # slots whose champion is on an old pin
+    rejected_copies: list[str] = field(default_factory=list)
+
+
 class RevealError(ValueError):
     pass
 
@@ -160,7 +174,8 @@ class Ledger:
         self.reveals: list[Reveal] = []
         self.scores: list[Score] = []
         self.evals: dict[str, EvalRecord] = {}
-        self.champion: Optional[Champion] = None
+        self.champion: Optional[Champion] = None  # winner-take-all baseline (single best)
+        self.champions: dict[str, Champion] = {}  # per-slot championships (settle_per_slot)
         self._seq = 0
 
     # ---- persistence ----
@@ -190,6 +205,10 @@ class Ledger:
         led.evals = {k: EvalRecord(**_only_fields(EvalRecord, v)) for k, v in data.get("evals", {}).items()}
         champ = data.get("champion")
         led.champion = Champion(**_only_fields(Champion, champ)) if champ else None
+        led.champions = {
+            slot: Champion(**_only_fields(Champion, c))
+            for slot, c in (data.get("champions") or {}).items() if c
+        }
         led._seq = data.get("seq", len(led.commitments))
         return led
 
@@ -201,6 +220,7 @@ class Ledger:
             "scores": [asdict(s) for s in self.scores],
             "evals": {k: asdict(v) for k, v in self.evals.items()},
             "champion": asdict(self.champion) if self.champion else None,
+            "champions": {slot: asdict(c) for slot, c in self.champions.items()},
             "seq": self._seq,
         }
         _atomic_write_json(Path(path), data)
@@ -216,7 +236,7 @@ class Ledger:
     # ---- reveal phase ----
 
     def reveal(self, hotkey: str, content_hash: str, salt: str, round_id: int,
-               fingerprint: str = "") -> Reveal:
+               fingerprint: str = "", structural_fingerprint: str = "") -> Reveal:
         """Verify a reveal against this hotkey's prior commitments; record it.
 
         Raises RevealError if no commitment by this hotkey matches. The commitment
@@ -257,15 +277,29 @@ class Ledger:
             for r in prior:
                 r.original = False
 
-        rev = Reveal(hotkey, content_hash, salt, round_id, match.seq, original, fingerprint)
+        rev = Reveal(hotkey, content_hash, salt, round_id, match.seq, original,
+                     fingerprint, structural_fingerprint)
         self.reveals.append(rev)
         return rev
+
+    def structural_near_copies(self, structural_fingerprint: str, hotkey: str) -> list[str]:
+        """ADVISORY: prior reveals by OTHER hotkeys whose structural skeleton matches
+        (rename/constant-tweak similarity). Returned for review/flagging — NOT used to
+        demote, since the skeleton can collide on genuinely-distinct simple kernels."""
+        if not structural_fingerprint:
+            return []
+        return sorted({
+            r.hotkey for r in self.reveals
+            if r.hotkey != hotkey and r.structural_fingerprint == structural_fingerprint
+        })
 
     # ---- scoring ----
 
     def record_score(self, hotkey: str, content_hash: str, round_id: int,
-                     score: float, kl_mean: float, passed: bool, sglang_version: str = "") -> None:
-        self.scores.append(Score(hotkey, content_hash, round_id, score, kl_mean, passed, sglang_version))
+                     score: float, kl_mean: float, passed: bool, sglang_version: str = "",
+                     slot: str = "") -> None:
+        self.scores.append(Score(hotkey, content_hash, round_id, score, kl_mean, passed,
+                                 sglang_version, slot))
 
     # ---- full eval records (audit trail + dedup; the rich superset of a Score) ----
 
@@ -353,4 +387,58 @@ class Ledger:
             challenger_score=challenger_score,
             rejected_copies=sorted(set(rejected_copies)),
             champion_stale=champion_stale,
+        )
+
+    def settle_per_slot(self, round_id: int, margin: float = 0.02,
+                        current_sglang_version: str = "") -> PerSlotSettleResult:
+        """Per-slot king-of-the-hill: a champion PER slot, emission split equally across
+        the slots that have a champion. This pays a specialist who owns ONE slot, instead
+        of giving 100% to the single best end-to-end bundle (winner-take-all starves
+        everyone else — report misalignment M4). Same noise-confirmed crownable scores,
+        same copy exclusion, same stale-on-pin-bump handling as ``settle`` — applied
+        within each slot's bracket. Updates ``self.champions`` (the per-slot map).
+        """
+        rejected_copies: list[str] = []
+        by_slot: dict[str, list[Score]] = {}
+        for s in self.scores:
+            if s.round_id != round_id or not s.passed:
+                continue
+            if not self._is_original(s.hotkey, s.content_hash, round_id):
+                rejected_copies.append(s.hotkey)
+                continue
+            by_slot.setdefault(s.slot, []).append(s)
+
+        title_changes: dict[str, bool] = {}
+        stale_slots: list[str] = []
+        for slot, cands in by_slot.items():
+            challenger = max(cands, key=lambda s: s.score, default=None)
+            if challenger is None:
+                continue
+            champ = self.champions.get(slot)
+            stale = bool(champ and current_sglang_version and champ.sglang_version
+                         and champ.sglang_version != current_sglang_version)
+            threshold = (champ.score * (1.0 + margin)) if (champ and not stale) else (1.0 + margin)
+            if challenger.score >= threshold:
+                self.champions[slot] = Champion(
+                    content_hash=challenger.content_hash, hotkey=challenger.hotkey,
+                    score=challenger.score, round_id=round_id,
+                    sglang_version=current_sglang_version or challenger.sglang_version,
+                )
+                title_changes[slot] = True
+            elif stale:
+                stale_slots.append(slot)
+
+        # Split emission equally across slots that currently have a champion.
+        live = {slot: c for slot, c in self.champions.items() if c}
+        weights: dict[str, float] = {}
+        if live:
+            share = 1.0 / len(live)
+            for c in live.values():
+                weights[c.hotkey] = weights.get(c.hotkey, 0.0) + share
+        return PerSlotSettleResult(
+            champions=dict(self.champions),
+            weights=weights,
+            title_changes=title_changes,
+            stale_slots=sorted(set(stale_slots)),
+            rejected_copies=sorted(set(rejected_copies)),
         )

@@ -57,6 +57,55 @@ def source_fingerprint(source: str) -> str:
     return hashlib.sha256(normalized_source(source).encode("utf-8")).hexdigest()
 
 
+class _Skeletonize(ast.NodeTransformer):
+    """Blank identifier NAMES and constant VALUES, keeping call/attribute structure.
+
+    So a copy that renames every variable and tweaks a constant (block size 64->128)
+    skeletonizes IDENTICALLY to its source — the residue the reformat-invariant
+    ``normalized_source`` misses. Attribute names are KEPT (``.silu`` vs ``.relu`` stays
+    distinct), so two genuinely different kernels keep different skeletons. Higher
+    false-positive risk than the normalized form (two simple kernels can share a
+    skeleton), so this is an ADVISORY review signal, never an auto-demote."""
+
+    def visit_Name(self, node):  # noqa: N802
+        return ast.copy_location(ast.Name(id="_v", ctx=node.ctx), node)
+
+    def visit_arg(self, node):  # noqa: N802
+        node.arg = "_a"
+        node.annotation = None
+        return node
+
+    def visit_Constant(self, node):  # noqa: N802
+        return ast.copy_location(ast.Constant(value=type(node.value).__name__), node)
+
+
+def structural_source(source: str) -> str:
+    tree = ast.parse(source)
+    _strip_docstrings(tree)
+    tree = _Skeletonize().visit(tree)
+    return ast.unparse(ast.fix_missing_locations(tree))
+
+
+def structural_fingerprint(source: str) -> str:
+    """Advisory near-copy signal robust to variable renames AND constant tweaks."""
+    return hashlib.sha256(structural_source(source).encode("utf-8")).hexdigest()
+
+
+def bundle_structural_fingerprint(bundle_root: str | Path) -> str:
+    """Advisory structural fingerprint over a bundle's kernels + slot wiring (see
+    ``structural_fingerprint``). "" if any source can't be parsed."""
+    root = Path(bundle_root)
+    manifest = load_manifest(root)
+    parts: list[str] = []
+    try:
+        for op in sorted(manifest.ops, key=lambda o: o.slot):
+            src = resolve_source(root, op)
+            parts.append(op.slot + "\x00" + structural_fingerprint(src.read_text(encoding="utf-8")))
+    except SyntaxError:
+        return ""
+    return hashlib.sha256("\x1e".join(parts).encode("utf-8")).hexdigest()
+
+
 def bundle_fingerprint(bundle_root: str | Path) -> str:
     """A reformat-invariant fingerprint over a bundle's kernels + slot wiring.
 

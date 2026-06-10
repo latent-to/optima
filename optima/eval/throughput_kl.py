@@ -109,6 +109,13 @@ class EvalConfig:
     disable_cuda_graph: bool = False
     mem_fraction_static: float = 0.6
     log_level: str = "warning"
+    # Serving regime: cap the concurrently-running requests so throughput is measured at a
+    # production-like batch, not just whatever a single generate() call packs. The right
+    # kernel is regime-dependent (low-batch=dispatch-bound, high-batch=memory-bound), so a
+    # win must be measured at the serving operating point. None -> sglang default. PARTIAL
+    # fix for the eval-vs-serving-distribution gap (report M2/#12): the knob exists; a full
+    # per-epoch multi-regime sweep + worst-regime gate is still future work.
+    max_running_requests: Optional[int] = None
     # multi-GPU knobs (TP size, MoE backend, custom-allreduce toggle for tensor-parallel
     # runs; see docs/DEV_ENVIRONMENT.md). Left unset by default so single-GPU runs are
     # byte-for-byte unchanged.

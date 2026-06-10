@@ -172,8 +172,10 @@ NCU_TARGETS = {
 
 
 COMM_NOTE = (
-    "Do not put collectives in kernel-replay NCU by default. Use e2e A/B plus "
-    "nsys timeline for all-reduce; try NCU only as an explicit risky experiment."
+    "NCU supports multi-process/multi-GPU profiling, but communication kernels need "
+    "the right mode: target all ranks/processes, use a communicator/lockstep launch "
+    "when kernels must run concurrently, and prefer NVTX/range/application replay over "
+    "naive single-rank kernel replay. Pair the counters with e2e A/B and nsys timeline."
 )
 
 
@@ -233,6 +235,7 @@ def plan(dataset: dict, min_pct: float = 0.8, include_known_wins: bool = True) -
                 "flags": [
                     "baseline: default/custom all-reduce",
                     "ablation: --disable-custom-all-reduce",
+                    "ncu comm pass: --target-processes all plus --communicator shmem/tcp and --lockstep-kernel-launch for mandatory-concurrent kernels",
                     "topology-gated: --enable-symm-mem / --enable-nccl-nvls only if supported",
                 ],
             })

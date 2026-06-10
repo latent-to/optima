@@ -93,9 +93,11 @@ capture on pod  →  pull to Mac  →  build.py <dir>  →  open report.html
 ### The profile pack, not a profiling loop
 
 There is no single profiler invocation that gives every answer. `nsys` gives the
-timeline and attribution, `ncu` gives per-kernel counters but uses replay and can
-break on collectives/cluster kernels, and e2e serving is the only truth for
-throughput. Treat one **profile pack** as the unit:
+timeline and attribution, `ncu` gives per-kernel counters and supports
+multi-process/multi-GPU profiling, but replay mode must match the workload
+(kernel/range/application replay, communicator/lockstep for mandatory-concurrent
+communication kernels). e2e serving is the only truth for throughput. Treat one
+**profile pack** as the unit:
 
 1. **Serving truth**: e2e sweep at the target concurrencies, plus a short torch
    steady-decode trace from the same server config.
@@ -103,8 +105,14 @@ throughput. Treat one **profile pack** as the unit:
    and the long-context point you care about; always export `cuda_gpu_kern_sum`
    and `cuda_gpu_trace` on the GPU box.
 3. **Counters**: `ncu` only the categories from the report/plan at serving batch
-   plus bs1 where useful. Do not chase collectives with kernel replay by default.
-4. **Small backend matrix**: run only pre-declared flag A/Bs that the logs or
+   plus bs1 where useful. TP=1 is a convenience for isolated non-collective
+   kernels when the model fits; TP>1 is valid and required for communication or
+   sharded-kernel truth.
+4. **Communication counters**: for NCCL/NVSHMEM/all-reduce-style work, use
+   `--target-processes all`, the appropriate `--communicator` mode, lockstep
+   launch, and NVTX/range/application replay rather than pretending a TP=1
+   capture answers the question.
+5. **Small backend matrix**: run only pre-declared flag A/Bs that the logs or
    model code justify, e.g. `--linear-attn-decode-backend flashinfer` vs
    `--linear-attn-decode-backend triton` for Qwen GDN.
 

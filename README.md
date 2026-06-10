@@ -25,12 +25,26 @@ slot** (a slot can be one op, a region behind one typed tensor boundary, or a co
 handed the process group), the seam that swaps an untrusted kernel into a spawned model
 process, op-correctness, two-launch throughput measurement, the KL gate, a real-task
 capability gate (GSM8K + MMLU), commit-reveal + king-of-the-hill scoring, and
-tamper-resistant timing. **Six slots:** `activation.silu_and_mul`, `norm.rmsnorm` (ops);
+tamper-resistant timing. **Seven slots:** `activation.silu_and_mul`, `norm.rmsnorm` (ops);
 `attention.sdpa` / `attention.decode`, `moe.fused_experts` (blocks); `collective.all_reduce`
-(collective, verified distributed). The **attention-decode swap is proven end-to-end on a
-live Qwen** (the validator extracts the running model's paged KV and routes decode to the
-miner kernel; a broken kernel is caught ~20×), and scoring runs with **CUDA graphs ON + the
-hardware's best attention backend**, never a graphs-off/triton weak baseline.
+and `moe.fused_experts_reduce` (collectives, verified distributed). The last is the **block
+that owns its trailing TP all-reduce** — the only contract that can express the compute-comm
+**overlap** win (~75% of decode at scale), where a plain MoE slot can't (the validator there
+replays a separate stock reduce). The **attention-decode swap is proven end-to-end on a live
+Qwen** (the validator extracts the running model's paged KV and routes decode to the miner
+kernel; a broken kernel is caught ~20×).
+
+**Scoring is CUDA-graphs-ON** (graphs-off cripples the baseline ~4.5–6.5×, so it's never used
+to score). The op seams (silu/rmsnorm) are graph-captured directly; the **block/collective
+seams now run a kernel the miner DECLARES graph-capturable** (`graph_safe` in metadata) *inside*
+the graph — so a real MoE/comms/overlap win is scorable in the only regime that matters. An
+undeclared kernel stays eager-only (falls back to the trusted baseline in-graph, so it can't
+wedge capture); the attention gather-MVP is still eager (a paged-direct, graph-safe contract is
+the next rung). **Noise-robust scoring** (we can't lock clocks on rented pods): each candidate is
+**bracketed by a baseline before AND after** (B,C,B'), the speedup is paired against their mean,
+the bar is `1 + max(2%, k·measured-noise)` not a hand-picked 2%, and a round whose baselines
+disagree past a tolerance is **NO-DECISION** (never crowns). `ignore_eos` is on for scoring so
+both sides emit identical token counts.
 
 **No kernel has beaten sglang — the optimization side is unproven.** This validates the
 *referee*, not any optimization. Every example kernel is a correctness demo: faithful ones
@@ -121,7 +135,10 @@ caught a *subtle* real drift a per-op check missed.
 
 ```
 optima/
-  slots.py                  # the slot ABI: SlotSpec catalog (6 slots; kind = op|block|collective)
+  slots.py                  # the slot ABI: SlotSpec catalog (7 slots; kind = op|block|collective)
+  seams.py                  # single source of truth for the seam adapters (bootstrap/activate/compat derive from it)
+  eval/scoring.py           # noise-robust speedup verdict (bookended A/B, noise-derived margin, no-decision)
+  copy_fingerprint.py       # reformat-invariant near-copy fingerprint (AST-normalized)
   manifest.py               # bundle manifest parse + path-safety
   sandbox.py                # static policy scan + isolated load (defense-in-depth)
   registry.py               # kernel registry + eligibility + active toggle
@@ -162,8 +179,11 @@ install the seam in **every** venv interpreter via a `.pth` file
 moment its module loads — including in the spawned scheduler. Five chokepoints today:
 `SiluAndMul` / `RMSNorm` (ops), `RadixAttention.forward` / `FusedMoE.forward` (blocks),
 and `GroupCoordinator.all_reduce` (collective). The pinned sglang (0.5.12.post1, see
-`optima/compat.py`) has no stable plugin framework, so this `.pth` path is primary; the
-entry-point plugin is kept for builds that do.
+`optima/compat.py`) **does** ship a hook/plugin framework (`srt/plugins/hook_registry.py`,
+added by PR #21388 — present at the pin), so migrating the seam to a sanctioned
+`sglang.srt.plugins` entry-point hook is a tracked option (`integrations/sglang_plugin.py`
+is the shim); the `.pth` path is kept primary today because it is version-independent and
+known spawn-safe.
 
 The validator does **two launches** of the same model (identical weights/seed):
 baseline (`OPTIMA_ACTIVE=0`, stock kernels) and candidate (`OPTIMA_ACTIVE=1`,
@@ -227,8 +247,10 @@ fallback, and does the registration. Adding a slot is a validator action in
 handed the process group, verified distributed). Correctness is `allclose` for bit-faithful
 ops, `matched_ratio` (≥ρ of elements within tol vs high-precision ground truth) for kernels
 that legitimately differ (attention/fp8/absorbed), or `cosine` (vs the HP reference) for
-low-bit kernels where element-wise tolerance is meaningless (FP4/FP8). **Six slots
-today:**
+low-bit kernels where element-wise tolerance is meaningless (FP4/FP8). A kernel that
+targets a block/collective slot also declares `graph_safe` in its metadata to be run
+(and scored) under CUDA graphs; undeclared kernels stay eager-only and fall back in-graph.
+**Seven slots today:**
 
 - `activation.silu_and_mul` — `entry(x, out)` — Qwen/Llama-class MLP (op).
 - `norm.rmsnorm` — `entry(x, weight, out, eps)` — universal; fires on gpt-oss (op).
@@ -240,6 +262,11 @@ today:**
 - `moe.fused_experts` — `(prepare, forward)` pair — SwiGLU fused experts; `prepare` owns
   the weight layout once at load, `forward(x, topk_ids, topk_weights, prepared, out)` runs
   per step (block; a quantized kernel carries its FP4/FP8 weight layout in `prepare`).
+- `moe.fused_experts_reduce` — `(prepare, forward)`; `forward(x, topk_ids, topk_weights,
+  prepared, out, group)` — the experts block that **owns its trailing TP all-reduce** (the
+  compute-comm overlap lever). The kernel is handed the process group and fills `out` with
+  the reduced output; the validator does NOT replay a reduce. Verified distributed vs the
+  fp32 cross-rank sum of the per-rank expert outputs.
 - `collective.all_reduce` — `entry(x, out, group)` — TP all-reduce (the comms waist); the
   validator owns the buffer + the process group; verified distributed vs the fp32
   cross-rank sum (`optima.verify_collective`).
@@ -260,14 +287,32 @@ optima settle  --round 0 --margin 0.02 --ledger l.json
   prior commitment by that hotkey, so you can't reveal a bundle you didn't commit
   to (copying at reveal time is impossible). In production this is Bittensor's
   native commit-reveal (we keep only the off-chain scoring half).
-- **copy detection**: earliest commit of a content hash is original; later ones
-  earn 0. *(Next: a behavioral/functional fingerprint to catch reformatted
-  near-copies — exact hashes miss those; see SUBNET_BLUEPRINT.)*
-- **king of the hill**: a champion holds the emission; a challenger takes the title
-  only by beating it by a margin. A copy ties → earns nothing.
+- **copy detection** (`optima/copy_fingerprint.py`): cumulative **across rounds** (a copy
+  in a later round is caught, not just same-round), on the exact content hash OR a
+  **reformat-invariant fingerprint** (AST-normalized — a reflowed/recommented/renamed-
+  whitespace copy with a fresh hash is still demoted). A **structural** fingerprint (names
+  and constants blanked) additionally flags rename + constant-tweak near-copies as an
+  **advisory** at reveal (surfaced for review, never auto-demoted — skeletons can collide).
+- **king of the hill**: a champion holds the emission; a challenger takes the title only by
+  beating it by a margin. A copy ties → earns nothing. `optima settle --per-slot` runs a
+  **champion per slot** and splits emission across slots, so a specialist who owns one slot
+  is paid (vs winner-take-all giving 100% to the single best end-to-end bundle).
 
-Robust scoring: median-of-K timed passes with spread, per-epoch seeded prompts
-(anti-overfit), and a speedup margin gate.
+Robust scoring (see `optima/eval/scoring.py`), built for a validator that **can't lock GPU
+clocks**: each launch does median-of-K timed passes; the candidate is **bracketed by a
+baseline before and after** (B,C,B'); the speedup is paired against the baseline mean; the
+bar is **derived from the measured baseline noise** (`1 + max(margin, k·noise)`) not a
+hand-picked constant; a round whose bracketing baselines disagree past a tolerance is
+**NO-DECISION** and cannot crown. The ledger records a crownable speedup or 0.0. Fidelity
+gating beyond mean-KL: a **coverage (tail-mass) guard** catches a flattened distribution
+whose visible head matches (top-k KL is blind to it), the argmax-rate catches sparse flips,
+**per-slot KL thresholds** calibrate to each slot's floor (attention's ~6e-3 vs silu's), and
+`aligned_kl` now counts early-stop as dropped positions. Plus per-epoch seeded prompts
+(anti-overfit), **shape jitter** on the per-op verify (count dims vary per run, so a kernel
+can't hard-code the verify shapes), `ignore_eos` so both sides emit identical token counts
+and the throughput numerator is a driver-known fixed budget (not a scheduler-reported
+count), a `max_running_requests` knob to score at a serving-realistic batch, and a
+**stale-champion** flag at settle when the `PINNED_SGLANG` differs (re-baseline on a bump).
 
 ## Security model
 
@@ -295,11 +340,13 @@ cross-validator consensus catches a rogue validator.
 
 | Concern | Now | Production |
 |---|---|---|
-| Slots | 6: silu/rmsnorm, attention.sdpa/decode, MoE, all-reduce | + MLA, GEMM, comms-overlap blocks |
+| Slots | 7: silu/rmsnorm, attention.sdpa/decode, MoE, all-reduce, MoE+reduce (overlap) | + MLA, FP8/FP4 GEMM, graph-safe paged attention |
 | Throughput gain | **none — no submitted kernel beats sglang yet** | a kernel that beats sglang at equal fidelity |
 | Model | up to gpt-oss-120b (1 GPU) | DSV4-scale (multi-GPU, TP/PD/EP) |
-| Quality gate | KL + GSM8K/MMLU on real prompts, **uncalibrated** | noise-floor KL + large-n benchmarks + det mode |
-| Isolation | scan + in-proc load | namespaces + no-egress + per-eval ctx + watchdog |
+| Quality gate | mean-KL + coverage/argmax/per-slot-threshold + GSM8K/MMLU, det-mode default | full-vocab KL at a reference seam + large-n (100–200) benchmarks |
+| Scoring noise | noise-derived margin + bookended A/B + no-decision (no clock-lock needed) | + interleaved per-iter A/B + locked clocks where available |
+| Isolation | scan (hardened) + **out-of-process** verify | namespaces + no-egress + per-eval ctx + watchdog (needs Linux/root) |
+| Champion | per-round, pin-staleness flagged | head-to-head re-eval vs a content-addressed bundle store |
 | Chain | local JSON ledger | on-chain commit-reveal + set_weights |
 | State | JSON | a real DB, single-writer weights |
 
@@ -309,8 +356,10 @@ cross-validator consensus catches a rogue validator.
    `invoke_entry`, `out_shapes`, a `Correctness` mode, tolerances). It must satisfy the
    four invariants in [docs/SLOT_CONTRACT.md](docs/SLOT_CONTRACT.md); if it can't, it
    belongs in the fenced escape hatch (`rebuild.py`), not the core.
-2. Add a seam patch under `optima/integrations/` that routes the real sglang chokepoint
-   through a dispatcher built with `make_*_dispatcher`, install it from `seam.activate()`,
-   and add the module to `bootstrap._TARGETS`; add a canary line in `optima/compat.py`.
+2. If the slot needs a new chokepoint, add a seam patch under `optima/integrations/` (a
+   dispatcher built with `make_*_dispatcher`) and a **single `SeamAdapter` entry in
+   `optima/seams.py`** — the bootstrap watch-list, `seam.activate()`, and the `optima compat`
+   canary all derive from that one table (no parallel list to edit).
 3. Miners target the new slot by name in their manifest. (A `collective` slot is verified
-   with `optima.verify_collective`, not `verify_entry` — see the contract doc.)
+   with `optima.verify_collective`, not `verify_entry` — see the contract doc. A
+   block/collective kernel declares `graph_safe` in metadata to be scored under CUDA graphs.)

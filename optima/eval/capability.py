@@ -30,6 +30,7 @@ import torch
 from optima.eval._launch import call_in_subprocess, launched_engine
 from optima.eval.benchmarks import Problem, get_benchmark
 from optima.eval.kl import KLReport, aligned_kl, extract_per_prompt, kl_gate_ok, token_match_rate
+from optima.eval.scoring import score_speedup
 from optima.eval.throughput_kl import EvalConfig
 
 
@@ -60,11 +61,15 @@ class CapabilityReport:
     candidate_tok_s: float
     speedup: float
     passed_quality: bool
-    passed_speedup: bool
-    score: float
+    passed_speedup: bool  # NOISE-AWARE (see optima/eval/scoring.py)
+    score: float  # crownable speedup or 0.0 — what the ledger records
     kl: KLReport
     token_match: float = 1.0
     regressions: list[str] = field(default_factory=list)
+    noise: float = 0.0
+    required_speedup: float = 1.0
+    confident: bool = True
+    baseline2_tok_s: float = 0.0
 
 
 def _sampling_params(cfg: EvalConfig, *, max_new_tokens: int) -> dict:
@@ -97,7 +102,12 @@ def _generate_and_time(engine, prompts: list[str], *, max_new_tokens: int, timed
         elapsed = time.perf_counter() - t0
         if isinstance(outs, dict):
             outs = [outs]
-        tokens = sum(int(o.get("meta_info", {}).get("completion_tokens", 0)) for o in outs)
+        # Numerator: under ignore_eos the driver knows the count a priori (fixed budget),
+        # so don't trust the scheduler-reported completion_tokens (#11).
+        if getattr(cfg, "ignore_eos", False):
+            tokens = len(prompts) * int(max_new_tokens)
+        else:
+            tokens = sum(int(o.get("meta_info", {}).get("completion_tokens", 0)) for o in outs)
         if elapsed > 0:
             samples.append(tokens / elapsed)
         outputs = outs  # keep last for answer-checking + KL
@@ -151,12 +161,18 @@ def evaluate_capability(
     if max_new_tokens is not None:
         max_new = int(max_new_tokens)
 
-    # Each launch runs in its own fresh process so the baseline's deterministic /
-    # CUDA global state can't corrupt the candidate (see _launch.call_in_subprocess).
+    # Bookended A/B (clocks unlockable on rented pods): stock BEFORE and AFTER the
+    # candidate brackets it and bounds the drift across it. Each launch runs in its
+    # own fresh process so the baseline's deterministic/CUDA global state can't corrupt
+    # the candidate (see _launch.call_in_subprocess + optima/eval/scoring.py).
     base_tok_s, base_texts, base_pp = call_in_subprocess(
         _run_launch, cfg, flat, bundle_path="", active=False, max_new_tokens=max_new)
     cand_tok_s, cand_texts, cand_pp = call_in_subprocess(
         _run_launch, cfg, flat, bundle_path=bundle_path, active=True, max_new_tokens=max_new)
+    base2_tok_s = 0.0
+    if getattr(cfg, "bookend_baseline", True):
+        base2_tok_s, _b2_texts, _b2_pp = call_in_subprocess(
+            _run_launch, cfg, flat, bundle_path="", active=False, max_new_tokens=max_new)
 
     base_correct = _accuracy_by_benchmark(flat, base_texts)
     cand_correct = _accuracy_by_benchmark(flat, cand_texts)
@@ -186,26 +202,36 @@ def evaluate_capability(
         kl_threshold=cfg.kl_threshold,
         p99_kl_threshold=cfg.p99_kl_threshold,
         argmax_disagree_rate_threshold=cfg.argmax_disagree_rate_threshold,
+        coverage_dev_threshold=getattr(cfg, "coverage_dev_threshold", None),
     )
 
-    speedup = (cand_tok_s / base_tok_s) if base_tok_s > 0 else 0.0
+    baseline_reads = [base_tok_s] + ([base2_tok_s] if base2_tok_s > 0 else [])
+    verdict = score_speedup(
+        baseline_reads, cand_tok_s,
+        min_margin=cfg.speedup_margin, k=getattr(cfg, "score_k", 2.0),
+        max_noise=getattr(cfg, "max_noise", 0.10),
+    )
     if getattr(cfg, "framework_mode", False):
         fidelity_ok = total > 0 and token_match >= cfg.token_match_threshold
     else:
         fidelity_ok = kl_ok
     passed_quality = len(regressions) == 0 and fidelity_ok
-    passed_speedup = speedup >= (1.0 + cfg.speedup_margin)
-    score = speedup if (passed_quality and passed_speedup) else (0.0 if not passed_quality else speedup)
+    crownable = passed_quality and verdict.passed_speedup
+    score = verdict.speedup if crownable else 0.0
 
     return CapabilityReport(
         benchmarks=scores,
         baseline_tok_s=base_tok_s,
         candidate_tok_s=cand_tok_s,
-        speedup=speedup,
+        speedup=verdict.speedup,
         passed_quality=passed_quality,
-        passed_speedup=passed_speedup,
+        passed_speedup=verdict.passed_speedup,
         score=score,
         kl=kl,
         token_match=token_match,
         regressions=regressions,
+        noise=verdict.noise,
+        required_speedup=verdict.required,
+        confident=verdict.confident,
+        baseline2_tok_s=base2_tok_s,
     )

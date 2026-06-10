@@ -45,30 +45,23 @@ _bundle_loaded = False
 def activate() -> None:
     """Install all seams; load + enable the bundle iff this process is active.
 
-    Called by the bootstrap post-import hook after EITHER seamed module loads
-    (activation / layernorm). Each install no-ops until its module is present, so
-    calling activate twice patches whatever is available each time.
+    Called by the bootstrap post-import hook after ANY seamed module loads. Each
+    install no-ops until its module is present, so calling activate repeatedly patches
+    whatever is available each time. The adapter list comes from the single seam table
+    (optima/seams.py) — the same table the bootstrap watch-list and the compat canary
+    use, so there is no parallel list to keep in sync.
     """
-    from optima.integrations import (
-        sglang_allreduce,
-        sglang_attention,
-        sglang_moe,
-        sglang_norm,
-        sglang_silu,
-    )
-    from optima.registry import REGISTRY
+    import importlib
 
-    for install in (
-        sglang_silu.install,
-        sglang_norm.install,
-        sglang_attention.install,
-        sglang_moe.install,
-        sglang_allreduce.install,
-    ):
+    from optima.registry import REGISTRY
+    from optima.seams import SEAM_ADAPTERS
+
+    for adapter in SEAM_ADAPTERS:
         try:
-            install(REGISTRY)
+            mod = importlib.import_module(f"optima.integrations.{adapter.integration}")
+            mod.install(REGISTRY)
         except Exception:  # noqa: BLE001 - never break engine startup
-            logger.exception("optima: failed to install a seam")
+            logger.exception("optima: failed to install seam %s", adapter.name)
 
     if _IS_DRIVER:
         # Timing process: seams installed (pass-through) but we never load the

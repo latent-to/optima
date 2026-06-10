@@ -19,20 +19,11 @@ from __future__ import annotations
 import importlib.abc
 import sys
 
-# Modules whose import should trigger seam installation. activation -> SiluAndMul,
-# layernorm -> RMSNorm, radix_attention -> RadixAttention (attention BLOCK chokepoint),
-# fused_moe_triton.layer -> FusedMoE (MoE BLOCK chokepoint), parallel_state ->
-# GroupCoordinator.all_reduce (the COLLECTIVE / TP-comms chokepoint). All
-# backend-agnostic; seam.activate() installs whatever is loaded.
-_TARGETS = frozenset(
-    {
-        "sglang.srt.layers.activation",
-        "sglang.srt.layers.layernorm",
-        "sglang.srt.layers.radix_attention",
-        "sglang.srt.layers.moe.fused_moe_triton.layer",
-        "sglang.srt.distributed.parallel_state",
-    }
-)
+# Modules whose import should trigger seam installation — derived from the single seam
+# table (optima/seams.py), so adding a seam there is the only edit. seams.py is stdlib-only
+# (no torch/sglang), safe to import at interpreter startup. seam.activate() installs
+# whatever is loaded.
+from optima.seams import TARGET_MODULES as _TARGETS
 
 
 def _run_activate() -> None:

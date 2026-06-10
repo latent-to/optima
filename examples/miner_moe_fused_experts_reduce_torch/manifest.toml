@@ -1,0 +1,18 @@
+# CPU/GPU dry-run bundle for the moe.fused_experts_reduce slot — the block that OWNS
+# its trailing TP all-reduce (the compute-comm OVERLAP lever, ~75% of decode at scale).
+# prepare lays out the expert weights; fused_experts_reduce computes the local experts
+# AND the cross-rank reduce, given the process group. Verified DISTRIBUTED vs the fp32
+# cross-rank sum. Pure torch here (a correctness demo); a real submission overlaps the
+# expert GEMM with the reduce. metadata sets graph_safe=false (this Python-loop demo is
+# eager-only); a real graph-capturable kernel sets graph_safe=true to be scored graphs-on.
+
+bundle_id = "example-moe-fused-experts-reduce-torch"
+abi_version = "optima-op-abi-v0"
+
+[[ops]]
+slot = "moe.fused_experts_reduce"
+source = "kernels/moe_reduce.py"
+entry = "fused_experts_reduce"
+prepare = "prepare"
+dtypes = ["float32", "bfloat16", "float16"]
+metadata = "metadata/moe_reduce.json"

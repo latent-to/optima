@@ -46,19 +46,42 @@ This repo is the **validator harness** (the referee), plus example miner bundles
   kernel never reaches the sampler — just a wider boundary): `activation.silu_and_mul`,
   `norm.rmsnorm` (ops); `attention.sdpa`/`attention.decode` (blocks via the
   `RadixAttention.forward` seam, `OPTIMA_ATTENTION_SEAM=1`); `moe.fused_experts` (block
-  via the `FusedMoE.forward` seam, `OPTIMA_MOE_SEAM=1`); and `collective.all_reduce`
+  via the `FusedMoE.forward` seam, `OPTIMA_MOE_SEAM=1`); `collective.all_reduce`
   (the TP comms waist, via the `GroupCoordinator.all_reduce` seam,
-  `OPTIMA_COLLECTIVE_SEAM=1` — verified distributed by `optima.verify_collective`).
+  `OPTIMA_COLLECTIVE_SEAM=1`); and **`moe.fused_experts_reduce`** — the experts block that
+  **owns its trailing all-reduce** (the compute-comm OVERLAP lever, ~75% of decode), so the
+  kernel fuses experts + reduce and the validator does NOT replay a stock reduce. Both
+  collectives are verified distributed by `optima.verify_collective`. The 5 seam adapters
+  live in ONE table, `optima/seams.py` (the bootstrap watch-list, `seam.activate`, and the
+  `compat` canary all derive from it — no parallel list).
+- **Graphs-ON is the only regime that counts.** Scoring runs CUDA graphs ON (graphs-off
+  cripples the baseline ~4.5–6.5×). Op seams capture directly; a block/collective kernel must
+  declare `graph_safe: true` in metadata to run under capture, else it falls back in-graph.
+  Beating sglang/vLLM/TensorRT graphs-on is the whole point.
+- **Scoring is noise-robust without clock-locking** (`optima/eval/scoring.py`): the candidate is
+  bracketed by a baseline before AND after (B,C,B'), paired against the mean, with the bar
+  derived from measured baseline noise (`1 + max(margin, k·noise)`) and a NO-DECISION verdict
+  when the bracketing baselines disagree. `ignore_eos` on → identical token budgets AND a
+  driver-known throughput numerator (not a scheduler-reported count). Fidelity gating beyond
+  mean-KL: a coverage/tail-mass guard (catches a flattened head-matching distribution top-k KL
+  misses), argmax-rate (sparse flips), early-stop dropped-position accounting, and **per-slot
+  KL thresholds** (`SlotSpec.kl_threshold`; attention 3e-2 vs the 5e-3 default). Per-op verify
+  **jitters count dims** per run (anti shape-branching). Anti-copy (`optima/copy_fingerprint.py`):
+  cumulative-across-rounds detection on exact hash OR a reformat-invariant fingerprint
+  (auto-demote), plus a structural skeleton fingerprint (advisory, flags rename/constant-tweak).
+  `optima settle --per-slot` = a champion per slot, emission split (pays specialists); a champion
+  on a different `PINNED_SGLANG` is flagged stale (re-baseline). `optima verify` loads + runs the
+  kernel **out-of-process** so the CLI never imports miner code (full netns isolation is still TODO).
 - **No kernel has beaten sglang.** The mechanism is validated to fire correctly on real
   models (a faithful kernel reproduces the model; a broken one is caught by the gate), but
   every example kernel is a correctness demo — the faithful ones are *slower* than sglang's
   own tuned kernels. The optimization side is unproven: nothing submitted moves throughput.
-- **Open — the actual goal:** a submitted kernel that genuinely beats sglang at equal
-  fidelity (none does yet). Plus isolation for untrusted miners, chain integration, a real
-  DB, bigger slots (MLA/weight-absorbed attention, FP8/FP4 GEMM, comms-overlap blocks that
-  own their trailing reduce), and **eval calibration** (KL threshold = k× the measured
-  nondeterminism noise floor; run with `enable_deterministic_inference`; benchmark accuracy
-  needs large n).
+- **Open — the actual goal:** a submitted graph-safe kernel that genuinely beats sglang at
+  equal fidelity (none does yet) — the `moe.fused_experts_reduce` overlap is the highest-value
+  target. Plus isolation for untrusted miners, chain integration, a real DB, more slots
+  (MLA/weight-absorbed attention, FP8/FP4 GEMM, graph-safe paged attention), and **eval
+  calibration** (KL threshold = k× the measured nondeterminism noise floor; run with
+  `enable_deterministic_inference`; benchmark accuracy needs large n).
 
 ## How to run
 
@@ -86,14 +109,16 @@ matters — sglang uses `mp spawn`).
 - gpt-oss-120b fits a single H100 in the validated Hopper path. Multi-GPU (TP) runs on
   other boxes select the MoE backend via `--moe-runner-backend`; see
   `docs/DEV_ENVIRONMENT.md`.
-- Adding a slot = a `SlotSpec` in `optima/slots.py` (set `kind="op"` or `"block"`;
+- Adding a slot = a `SlotSpec` in `optima/slots.py` (set `kind="op"`/`"block"`/`"collective"`;
   use `Correctness("matched_ratio", ...)` for kernels that legitimately differ from
   the reference — attention / fp8 / MLA weight-absorption — gated against
-  high-precision ground truth, never the stock kernel) + a seam patch in
-  `optima/integrations/` (installed from `seam.activate()`, module added to
-  `bootstrap._TARGETS`). It **must** satisfy the four invariants in
-  `docs/SLOT_CONTRACT.md` (the waist); if it can't, it belongs in the fenced
-  escape hatch, not the core.
+  high-precision ground truth, never the stock kernel). If it needs a NEW sglang
+  chokepoint, add a seam patch in `optima/integrations/` and a **single entry in
+  `optima/seams.py`** (the one table the bootstrap watch-list, `seam.activate`, and the
+  `compat` canary all derive from — do NOT re-add a parallel list to `bootstrap`/`compat`).
+  It **must** satisfy the four invariants in `docs/SLOT_CONTRACT.md` (the waist); a
+  block/collective kernel also declares `graph_safe` to be scored under CUDA graphs. If it
+  can't satisfy the invariants, it belongs in the fenced escape hatch, not the core.
 - **The seam patches a pinned, unmodified sglang at runtime** — we never fork,
   commit, or reconfigure sglang, so the gitignored `sglang/` clone is a dev
   reference only. Runtime injection is how a miner changes a *backend* (e.g.

@@ -49,6 +49,25 @@ def run_checks() -> list[Check]:
         f"found {ver}" + ("" if ver == PINNED_SGLANG else "  <-- DIFFERS from pin"),
     )
 
+    # Table-driven baseline: every adapter in the single seam table (optima/seams.py)
+    # must have its target module import and its Class.method chokepoint present. Adding
+    # a seam to that table auto-adds this canary (no separate edit here). The bespoke
+    # signature checks below enrich these for the known seams.
+    import importlib
+
+    from optima.seams import SEAM_ADAPTERS
+
+    for adapter in SEAM_ADAPTERS:
+        cls_name, _, meth = adapter.chokepoint.partition(".")
+        try:
+            mod = importlib.import_module(adapter.target_module)
+            cls = getattr(mod, cls_name, None)
+            ok = cls is not None and hasattr(cls, meth)
+            add(f"seam table: {adapter.name} ({adapter.chokepoint})", ok,
+                "" if ok else f"missing {adapter.chokepoint} in {adapter.target_module}")
+        except Exception as exc:  # noqa: BLE001
+            add(f"seam table: {adapter.name} ({adapter.chokepoint})", False, repr(exc))
+
     try:
         from sglang.srt.layers.utils.multi_platform import MultiPlatformOp
         mpo = MultiPlatformOp

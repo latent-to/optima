@@ -31,6 +31,15 @@ class Eligibility:
     dtypes: frozenset[str] = frozenset()
     architectures: frozenset[str] = frozenset()
     max_last_dim: Optional[int] = None  # cap on x.shape[-1]
+    # The miner DECLARES the kernel is CUDA-graph-capturable: static shapes, no host
+    # syncs (.item()/.cpu()), no data-dependent Python control flow, writes only to the
+    # validator-allocated buffer. Required to run the block/collective seams under the
+    # scoring config (graphs ON) — that is the ONLY regime a real MoE/comms win is worth
+    # anything in (graphs-off cripples the baseline ~4.5-6.5x). Default False: an
+    # undeclared kernel stays eager-only (so it can't wedge graph capture); the seam
+    # falls back to the trusted baseline in-graph. A kernel that lies (declares graph_safe
+    # but isn't) either errors at capture -> fallback, or is caught by the fidelity gate.
+    graph_safe: bool = False
 
     def accepts(self, *, dtype_name: str, last_dim: int, arch: Optional[str]) -> bool:
         if self.dtypes and dtype_name not in self.dtypes:
@@ -126,4 +135,5 @@ def eligibility_from_metadata(meta: dict | None, manifest_dtypes: tuple[str, ...
         dtypes=frozenset(dtypes),
         architectures=frozenset(archs),
         max_last_dim=int(max_last) if max_last is not None else None,
+        graph_safe=bool(meta.get("graph_safe", False)),
     )

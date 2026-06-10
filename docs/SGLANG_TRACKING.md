@@ -145,10 +145,10 @@ surfaces closed − re-baseline churn.
 
 | sglang change | canary catches it as | fix in |
 |---|---|---|
-| seam class renamed/moved (`SiluAndMul`, `RMSNorm`, `MultiPlatformOp`) | `seam: …` FAIL | the import in `integrations/*` + `bootstrap._TARGETS` |
+| seam class renamed/moved (`SiluAndMul`, `RMSNorm`, `MultiPlatformOp`) | `seam: …` FAIL | the one seam table `optima/seams.py` (bootstrap watch-list, `seam.activate`, and the canary all derive from it) |
 | `forward_cuda` signature change (e.g. residual handling) | `seam: …` detail shows new params | `dispatch.py` dispatcher |
 | Engine / `ServerArgs` API change | `Engine.generate …` / `ServerArgs …` FAIL | `eval/_launch.py`, `EvalConfig` |
-| a real plugin framework lands (bleeding-edge sglang has one) | (canary still green) | optionally swap the `.pth` for the entry-point plugin — `integrations/sglang_plugin.py` already exists for that |
+| the plugin/hook framework (`srt/plugins/hook_registry.py`, present since 0.5.12.post1 / PR #21388) is adopted | (canary still green) | optionally swap the `.pth` for the sanctioned `sglang.srt.plugins` entry-point hook — `integrations/sglang_plugin.py` is the shim |
 | compile/graph path imports the swapped kernel by name (0.5.12+ piecewise CUDA graph / torch.compile) | (canary green; the *candidate* launch crashes `ModuleNotFoundError: optima_kernel_*`) | `sandbox.load_entry` registers the kernel module in `sys.modules` before exec |
 | seam install races a partially-initialized sglang module on import | (canary green; a caught `optima: failed to install a seam` traceback on every `import sglang`) | `integrations/*` install() guards on the class attribute, not the raising import |
 

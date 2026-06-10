@@ -56,7 +56,26 @@ two things **mandatory, not optional**:
 
 Overlap wins (hide the reduce behind the producer GEMM) are *not* a reduce-only slot — they need
 a **block that owns both** (the MoE block owning its trailing reduce; a row-parallel `linear+reduce`
-block). Same contract, wider boundary.
+block). Same contract, wider boundary. This is now realized as **`moe.fused_experts_reduce`**: a
+(prepare, forward) block handed the process group whose `forward(x, topk_ids, topk_weights,
+prepared, out, group)` fills `out` with the *already-reduced* expert output — the validator does
+NOT replay a stock all-reduce after it, so the kernel can fuse/overlap the expert GEMM with the
+reduce. Verified distributed vs the fp32 cross-rank sum of the per-rank expert outputs
+(`optima.verify_collective`, driven by the slot's `collective_partial` / `invoke_collective` hooks).
+This lifts the structural ceiling — the plain `moe.fused_experts` slot can't express the overlap
+because the reduce is severed onto a separate stock call.
+
+## Graph-safety is part of the contract (you only win with graphs ON)
+
+Scoring runs with **CUDA graphs ON** — graphs-off cripples the baseline ~4.5–6.5×, so a graphs-off
+"win" is meaningless and beating sglang/vLLM/TensorRT graphs-on is the entire point. The op seams
+(silu/rmsnorm) are graph-captured directly. A **block/collective** kernel must DECLARE
+`graph_safe: true` in its metadata to be run inside the graph; otherwise the seam falls back to the
+trusted baseline under capture (an un-capturable kernel can't wedge the graph). `graph_safe` means:
+static shapes, no host syncs (`.item()`/`.cpu()`), no data-dependent Python control flow, writes only
+the validator-allocated buffer. A kernel that lies either errors at capture (→ fallback) or is caught
+by the fidelity gate. The attention `decode` gather-MVP is the one seam that is structurally eager (a
+per-step `max_len` host-sync); its graph-safe form is a paged-direct contract (the next rung).
 
 ## Evolution rules
 

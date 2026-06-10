@@ -77,12 +77,29 @@ _DESERIALIZE_BASES = frozenset(
 )
 
 # Bare builtins that are almost always a code-execution smell in a kernel.
-_BANNED_BUILTINS = frozenset({"eval", "exec", "compile", "__import__", "open", "input", "breakpoint"})
-
-# Dunder attribute names used in classic sandbox-escape chains.
-_BANNED_DUNDERS = frozenset(
-    {"__globals__", "__builtins__", "__subclasses__", "__bases__", "__mro__", "__code__", "__loader__", "__dict__"}
+# Includes namespace-exposers (globals/vars/locals) used to reach a sandbox escape.
+_BANNED_BUILTINS = frozenset(
+    {"eval", "exec", "compile", "__import__", "open", "input", "breakpoint", "globals", "vars", "locals"}
 )
+
+# Dynamic attribute access — the classic literal-AST-scan bypass
+# (``getattr(os, 'sys'+'tem')``). Flagged ONLY when the attribute NAME is not a string
+# literal; a literal ``getattr(self, 'forward')`` is fine and common in kernels.
+_DYNAMIC_ATTR_FNS = frozenset({"getattr", "setattr", "delattr"})
+
+# Dunder attribute names used in classic sandbox-escape chains. ``__class__`` is the
+# entry hop of ``().__class__.__bases__[0].__subclasses__()`` and was previously missed.
+_BANNED_DUNDERS = frozenset(
+    {"__globals__", "__builtins__", "__subclasses__", "__bases__", "__mro__", "__code__",
+     "__loader__", "__dict__", "__class__", "__subclasshook__", "__getattribute__", "__base__"}
+)
+
+# Names whose SUBSCRIPT is an escape (``__builtins__['eval']``), not just attribute access.
+_BANNED_SUBSCRIPT_NAMES = frozenset({"__builtins__", "__globals__", "__dict__"})
+
+
+def _is_string_literal(node) -> bool:
+    return isinstance(node, ast.Constant) and isinstance(node.value, str)
 
 
 @dataclass(frozen=True)
@@ -110,10 +127,18 @@ def scan_source(source: str, *, filename: str = "<kernel>") -> ScanResult:
             root = (node.module or "").split(".", 1)[0]
             if root in _BANNED_IMPORT_ROOTS:
                 out.append(f"{filename}:{node.lineno}: banned import-from {node.module!r}")
-        # eval(...) / exec(...) / open(...) used as a bare name
+        # eval(...) / exec(...) / open(...) / globals(...) used as a bare name
         elif isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
             if node.func.id in _BANNED_BUILTINS:
                 out.append(f"{filename}:{node.lineno}: banned builtin call {node.func.id!r}")
+            # getattr/setattr/delattr with a NON-literal attribute name = dynamic-attr escape.
+            elif node.func.id in _DYNAMIC_ATTR_FNS and len(node.args) >= 2 and not _is_string_literal(node.args[1]):
+                out.append(f"{filename}:{node.lineno}: dynamic {node.func.id}() with a "
+                           "non-literal attribute name (sandbox-escape pattern)")
+        # __builtins__['eval'] / __globals__[...] subscript escape
+        elif isinstance(node, ast.Subscript) and isinstance(node.value, ast.Name) \
+                and node.value.id in _BANNED_SUBSCRIPT_NAMES:
+            out.append(f"{filename}:{node.lineno}: banned subscript on {node.value.id!r}")
         # os.system(...) / subprocess.Popen(...) / ctypes.CDLL(...)
         elif isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
             attr = node.func.attr

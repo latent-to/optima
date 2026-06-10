@@ -149,6 +149,8 @@ def engine_kwargs(cfg, *, active: bool = False) -> dict[str, Any]:
         kwargs["enable_deterministic_inference"] = True
     if getattr(cfg, "tp_size", None):
         kwargs["tp_size"] = int(cfg.tp_size)
+    if getattr(cfg, "max_running_requests", None):
+        kwargs["max_running_requests"] = int(cfg.max_running_requests)
     moe_runner_backend = getattr(cfg, "moe_runner_backend", None)
     if active and getattr(cfg, "candidate_moe_runner_backend", None):
         moe_runner_backend = cfg.candidate_moe_runner_backend

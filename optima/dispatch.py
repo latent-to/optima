@@ -227,7 +227,7 @@ def make_moe_dispatcher(
     baseline_forward: Callable[..., object],
     *,
     registry: KernelRegistry = REGISTRY,
-    slots: tuple[str, ...] = ("moe.fused_experts",),
+    slots: tuple[str, ...] = ("moe.fused_experts_reduce", "moe.fused_experts"),
 ) -> Callable[..., object]:
     """Build a replacement for ``FusedMoE.forward`` — the single chokepoint every MoE
     layer funnels through (``sglang.srt.layers.moe.fused_moe_triton.layer``), so the
@@ -261,7 +261,8 @@ def make_moe_dispatcher(
         _maybe_inspect_moe(self, hidden_states, topk_output)
         if _moe_seam_active():
             try:
-                if _moe_supported(self) and hidden_states.dim() == 2 and not _in_cuda_graph():
+                if _moe_supported(self) and hidden_states.dim() == 2:
+                    in_graph = _in_cuda_graph()
                     routed = _standard_topk(topk_output)
                     if routed is not None:
                         x = hidden_states
@@ -272,10 +273,16 @@ def make_moe_dispatcher(
                             )
                             # (prepare, forward) slot: a registered kernel MUST carry
                             # prepare, else we can't honor the contract -> skip it.
-                            if impl is not None and impl.prepare is not None:
-                                out = _run_moe_kernel(self, x, routed, impl, slot)
-                                _log_once_active(slot)
-                                return out
+                            if impl is None or impl.prepare is None:
+                                continue
+                            # Under CUDA graphs (the scoring config) only run a kernel the
+                            # miner DECLARED graph-capturable; otherwise trust the baseline
+                            # in-graph so an un-capturable kernel can't wedge graph capture.
+                            if in_graph and not impl.eligibility.graph_safe:
+                                continue
+                            out = _run_moe_kernel(self, x, routed, impl, slot)
+                            _log_once_active(slot)
+                            return out
             except Exception as exc:  # noqa: BLE001
                 if registry.strict:
                     raise
@@ -442,12 +449,29 @@ def _maybe_free_dense_weights(self) -> None:
 
 
 def _run_moe_kernel(self, x, routed, impl, slot):
-    """Allocate the output (validator-owned), run the miner's fused-experts kernel, then
-    replay FusedMoE.forward_impl's tensor-parallel all-reduce. EP is excluded upstream."""
+    """Allocate the output (validator-owned) and run the miner's fused-experts kernel.
+
+    Two contracts share this path:
+      * ``moe.fused_experts`` — miner fills the LOCAL expert output; the validator then
+        replays FusedMoE.forward_impl's tensor-parallel all-reduce (the reduce is stock).
+      * ``moe.fused_experts_reduce`` — the miner kernel OWNS the trailing all-reduce (it is
+        handed the TP process group), so it can overlap the expert GEMM with the reduce; the
+        validator does NOT replay it. This is the only contract that can express the
+        compute-comm overlap win. EP is excluded upstream for both.
+    """
     topk_ids, topk_weights = routed
     prepared = _moe_prepared(self, impl, slot)
     M, H = x.shape[0], x.shape[-1]
     out = torch.empty((M, H), dtype=x.dtype, device=x.device)
+
+    if slot.endswith(".fused_experts_reduce"):
+        # The kernel does experts AND the cross-rank reduce. Hand it the TP group; do not
+        # replay a second reduce. If there's no real TP group (single rank), the kernel's
+        # reduce is a no-op and the local output is already the answer.
+        group = _tp_device_group()
+        impl.entry(x, topk_ids, topk_weights, prepared, out, group)  # miner fills the REDUCED out
+        return out
+
     impl.entry(x, topk_ids, topk_weights, prepared, out)  # miner fills `out` (local experts)
     if getattr(self, "reduce_results", False) and getattr(self, "moe_tp_size", 1) > 1:
         # Sum this rank's partial expert output across the TP group (raises if the
@@ -456,6 +480,19 @@ def _run_moe_kernel(self, x, routed, impl, slot):
 
         out = tensor_model_parallel_all_reduce(out)
     return out
+
+
+def _tp_device_group():
+    """The tensor-parallel process group to hand a reduce-owning MoE kernel.
+
+    Returns the live TP ``device_group`` (NCCL/gloo) or None if TP isn't initialized
+    (single-rank dev/CPU runs), in which case the miner kernel's reduce is a no-op."""
+    try:
+        from sglang.srt.distributed.parallel_state import get_tp_group
+
+        return getattr(get_tp_group(), "device_group", None)
+    except Exception:  # noqa: BLE001 - no TP group available -> single-rank semantics
+        return None
 
 
 _COLLECTIVE_LOGGED_ACTIVE = False
@@ -489,14 +526,16 @@ def make_allreduce_dispatcher(
         if _collective_seam_active() and not args and not kwargs:
             try:
                 if (torch.is_tensor(input_) and input_.dim() == 2
-                        and getattr(self, "world_size", 1) > 1 and not _in_cuda_graph()):
+                        and getattr(self, "world_size", 1) > 1):
                     impl = registry.lookup(
                         slot,
                         dtype_name=_dtype_name(input_.dtype),
                         last_dim=input_.shape[-1],
                         arch=_arch_tag(input_.device.index or 0) if input_.is_cuda else None,
                     )
-                    if impl is not None:
+                    # Under CUDA graphs (the scoring config) only run a kernel the miner
+                    # DECLARED graph-capturable; else trust the stock reduce in-graph.
+                    if impl is not None and not (_in_cuda_graph() and not impl.eligibility.graph_safe):
                         out = torch.empty_like(input_)
                         group = getattr(self, "device_group", None)
                         impl.entry(input_, out, group)  # miner fills out with sum-over-ranks

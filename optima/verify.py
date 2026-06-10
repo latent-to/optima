@@ -16,8 +16,12 @@ declared output shape and the miner fills them.
 
 This is the per-op analogue of a unit test: necessary but NOT sufficient — small
 per-op errors that pass here can compound into large end-to-end KL, which is why the
-pipeline still runs the end-to-end gate. The seeds/shapes are re-randomizable per
-epoch by the caller so a kernel cannot special-case the fixed verification inputs.
+pipeline still runs the end-to-end gate. To stop a kernel from special-casing the fixed
+verification inputs, the input VALUES vary with ``seed`` and, when ``jitter_seed`` is
+set (the CLI path does this per run), the COUNT dimensions (num_tokens / batch / ctx)
+are perturbed too — so a kernel can't hard-code the exact verify shapes. Feature dims
+(hidden / head_dim) are left intact since kernels legitimately specialize on them; the
+end-to-end gate on fresh prompts is the backstop against shape-branching there.
 """
 
 from __future__ import annotations
@@ -104,6 +108,28 @@ def _compare(
     return passed, float(abs_err.max()), float(rel_err.max()), ratio, detail, "ratio"
 
 
+# Count-like shape keys safe to jitter (varying these doesn't break a kernel that
+# legitimately specializes on the feature dims like hidden / head_dim / inter).
+_JITTER_KEYS = ("num_tokens", "batch", "ctx")
+
+
+def _jitter_shapes(shapes: list[dict], seed: int) -> list[dict]:
+    """Perturb the count dimensions of each shape deterministically from ``seed`` so the
+    verify shapes vary per run — a kernel can't hard-code the exact verification token
+    counts. Feature dims are untouched; counts stay >= 1."""
+    import random
+
+    rng = random.Random(seed)
+    out: list[dict] = []
+    for sh in shapes:
+        s = dict(sh)
+        for k in _JITTER_KEYS:
+            if k in s and isinstance(s[k], int):
+                s[k] = max(1, s[k] + rng.randint(-1, 3) + (s[k] // 3) * rng.randint(0, 1))
+        out.append(s)
+    return out
+
+
 def verify_entry(
     slot: SlotSpec,
     entry: Callable[..., None],
@@ -113,6 +139,7 @@ def verify_entry(
     device: Optional[str] = None,
     seed: int = 0,
     shapes: Optional[list[dict]] = None,
+    jitter_seed: Optional[int] = None,
 ) -> VerifyResult:
     """Verify a miner ``entry`` against the slot's reference.
 
@@ -130,6 +157,8 @@ def verify_entry(
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     tol = slot.tolerance_for(dtype)
     test_shapes = shapes if shapes is not None else list(slot.shapes)
+    if jitter_seed is not None:
+        test_shapes = _jitter_shapes(test_shapes, jitter_seed)
 
     results: list[ShapeResult] = []
     for i, shape in enumerate(test_shapes):
@@ -180,6 +209,34 @@ def verify_entry(
         passed=all(r.passed for r in results) and len(results) > 0,
         shape_results=results,
     )
+
+
+def verify_entry_from_source(
+    slot_name: str,
+    source_path: str,
+    entry_name: str,
+    *,
+    prepare_name: Optional[str] = None,
+    dtype_name: str = "bfloat16",
+    device: Optional[str] = None,
+    seed: int = 0,
+    shapes: Optional[list[dict]] = None,
+    jitter_seed: Optional[int] = None,
+) -> VerifyResult:
+    """Load the miner module and verify it — module-level + picklable so the CLI can run
+    it via ``call_in_subprocess`` in a FRESH process. This keeps the trusted validator/CLI
+    process from ever importing miner code (import-time payloads + the kernel run only in the
+    throwaway child). It is NOT a security boundary by itself — production still needs the
+    child namespaced/no-egress — but it removes the in-process-RCE-in-the-CLI sink (#6)."""
+    from optima.sandbox import load_entry
+    from optima.slots import get_slot
+
+    slot = get_slot(slot_name)
+    dtype = getattr(torch, dtype_name)
+    entry = load_entry(source_path, entry_name)  # runs the miner module body — in THIS child
+    prepare = load_entry(source_path, prepare_name) if prepare_name else None
+    return verify_entry(slot, entry, prepare=prepare, dtype=dtype, device=device, seed=seed,
+                        shapes=shapes, jitter_seed=jitter_seed)
 
 
 def _name(dtype: torch.dtype) -> str:

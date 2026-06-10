@@ -1,0 +1,6 @@
+{
+  "op": "moe.fused_experts_reduce",
+  "dtypes": ["float32", "bfloat16", "float16"],
+  "graph_safe": false,
+  "notes": "Correctness demo: local SwiGLU experts + an owned torch all-reduce. A real submission overlaps the expert GEMM with the reduce (reduce-scatter the down-proj as produced) and sets graph_safe=true so it is scored under CUDA graphs."
+}

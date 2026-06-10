@@ -26,9 +26,14 @@ _DTYPES = {"float32": "float32", "bfloat16": "bfloat16", "float16": "float16"}
 
 
 def _rank_worker(rank, world_size, backend, init_method, slot_name, source_path, entry_name,
-                 shape, dtype_name, device, seed, result_dir):
+                 shape, dtype_name, device, seed, result_dir, prepare_name=None):
     """One rank: init the group, run the miner collective into a validator-owned buffer,
-    compare to the trusted fp32 cross-rank reduce. Writes its verdict to ``result_dir``."""
+    compare to the trusted fp32 cross-rank reduce. Writes its verdict to ``result_dir``.
+
+    Slot-driven via the slot's ``collective_partial`` (the fp32 tensor whose cross-rank
+    SUM is the reference) and ``invoke_collective`` (how to call the kernel with the group),
+    so this handles a bare all-reduce AND a block that owns its trailing reduce
+    (moe.fused_experts_reduce) without hard-coding either contract."""
     import torch
     import torch.distributed as dist
 
@@ -48,14 +53,23 @@ def _rank_worker(rank, world_size, backend, init_method, slot_name, source_path,
         dtype = getattr(torch, dtype_name)
         dev = f"cuda:{rank}" if device == "cuda" else "cpu"
         inputs = slot.make_inputs(dtype=dtype, device=dev, seed=seed, rank=rank, world_size=world_size, **shape)
-        x = inputs["x"]
-        out = torch.empty_like(x)  # validator-owned output buffer
+
+        # (prepare, forward) collective blocks (e.g. moe.fused_experts_reduce): run the
+        # miner's weight-prep once on THIS rank's shard before the timed forward.
+        prepared = None
+        if prepare_name and slot.invoke_prepare is not None:
+            prepared = slot.invoke_prepare(load_entry(source_path, prepare_name), inputs)
+
+        out_shape = slot.out_shapes(inputs)[0]
+        out = torch.empty(out_shape, dtype=dtype, device=dev)  # validator-owned output buffer
 
         entry = load_entry(source_path, entry_name)
-        entry(x, out, dist.group.WORLD)  # miner fills `out` with sum-over-ranks
+        invoke = slot.invoke_collective or (lambda e, i, o, g, p: e(i["x"], o, g))
+        invoke(entry, inputs, out, dist.group.WORLD, prepared)  # miner fills `out` with sum-over-ranks
 
-        # Trusted high-precision reference: the fp32 cross-rank sum.
-        ref = x.detach().float().clone()
+        # Trusted high-precision reference: the fp32 cross-rank SUM of each rank's partial.
+        partial = slot.collective_partial(inputs, prepared) if slot.collective_partial else inputs["x"].float()
+        ref = partial.detach().float().clone()
         dist.all_reduce(ref, op=dist.ReduceOp.SUM)
 
         tol = slot.tolerance_for(dtype)
@@ -87,6 +101,7 @@ def verify_collective(
     source_path: str,
     entry_name: str,
     *,
+    prepare_name: str | None = None,
     world_size: int = 2,
     backend: str | None = None,
     device: str | None = None,
@@ -113,7 +128,7 @@ def verify_collective(
         with tempfile.TemporaryDirectory(prefix="optima_collective_") as rd:
             init_method = f"file://{os.path.join(rd, 'pg_store')}"
             args = (world_size, backend, init_method, slot.name, source_path, entry_name,
-                    shape, dtype_name, device, seed + i, rd)
+                    shape, dtype_name, device, seed + i, rd, prepare_name)
             spawn_err = None
             try:
                 mp.spawn(_rank_worker, args=args, nprocs=world_size, join=True)

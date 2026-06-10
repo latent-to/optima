@@ -14,9 +14,11 @@ This is the long-form explainer. By the end you should understand, with no gaps:
 It points at every file. Paths are relative to this doc (`docs/`), so
 `../optima/slots.py` is the harness module `optima/slots.py`.
 
-> **Current scope (kept in sync):** six slots — `activation.silu_and_mul`,
+> **Current scope (kept in sync):** seven slots — `activation.silu_and_mul`,
 > `norm.rmsnorm` (ops); `attention.sdpa` / `attention.decode`, `moe.fused_experts`
-> (blocks); `collective.all_reduce` (collective) — two quality gates (per-token **KL**
+> (blocks); `collective.all_reduce` and `moe.fused_experts_reduce` (collectives — the
+> latter the block that owns its trailing reduce, the compute-comm overlap lever) — two
+> quality gates (per-token **KL**
 > *and* real **benchmark accuracy** — Part 6), validated up to **gpt-oss-120b**.
 > `README.md` is the live state-of-record (results + calibration); if it disagrees with
 > this doc, README wins. **No submitted kernel has beaten sglang** — this validates the
@@ -156,8 +158,9 @@ targets and *where* the kernel source lives. It does not run anything yet.
 
 The set of operations a miner is allowed to replace is the **slot catalog**,
 owned by the validator in [../optima/slots.py](../optima/slots.py). Today there are
-six slots across three `kind`s — `op` (`activation.silu_and_mul`, `norm.rmsnorm`),
+seven slots across three `kind`s — `op` (`activation.silu_and_mul`, `norm.rmsnorm`),
 `block` (`attention.sdpa`, `attention.decode`, `moe.fused_experts`), and `collective`
+(`collective.all_reduce`, and `moe.fused_experts_reduce` — the block that owns its reduce)
 (`collective.all_reduce`). A slot
 (`SlotSpec`) declares everything the validator needs to *use* and *verify* a kernel
 without trusting it:
@@ -293,10 +296,13 @@ interpreter — it re-imports sglang from scratch. So if you patch a class in th
 parent process, the child never sees it. The model runs in the child; your patch
 is in the parent. Naive monkeypatching silently does nothing.
 
-(We also learned the pinned sglang has **no** stable plugin framework — it only
-exists on bleeding-edge main — so the "register a plugin entry point" approach is
-dead on the version that actually installs from PyPI. `PINNED_SGLANG` is
-`0.5.12.post1`, in [../optima/compat.py](../optima/compat.py).)
+(Correction to an earlier note: the pinned sglang **does** ship a hook/plugin
+framework — `srt/plugins/hook_registry.py` (BEFORE/AFTER/AROUND/REPLACE hooks via
+`sglang.srt.plugins` entry points), added by PR #21388 and present at the pin
+`0.5.12.post1`. So an entry-point hook IS available; we keep the `.pth` path primary
+because it is version-independent and known spawn-safe, and track migrating to the
+sanctioned hook as future work. `PINNED_SGLANG` is in
+[../optima/compat.py](../optima/compat.py).)
 
 ### 5.2 The solution: a `.pth` + a post-import hook
 
@@ -713,7 +719,7 @@ Validated on a real H100 (sglang 0.5.12.post1 / CUDA 13, torch 2.11+cu130), Qwen
 up to gpt-oss-120b:
 
 - **The seam works on real models, including a 120B MoE.** Confirmed because the
-  *broken* kernel changes the output. Six slots across op / block / collective kinds;
+  *broken* kernel changes the output. Seven slots across op / block / collective kinds;
   e.g. `norm.rmsnorm` fires on gpt-oss (whose activation is fused into the MoE kernel so
   silu is inert), and the `FusedMoE.forward` block seam routes gpt-oss's experts to the
   miner kernel.
@@ -747,9 +753,9 @@ In rough priority:
 1. **Isolation** (8.4): per-eval process + namespaces + no network egress + GPU
    context isolation + watchdog. *Required before untrusted miners.* Today the VM
    is the trust boundary.
-2. **A kernel that actually beats sglang** — the whole point, still unproven. Six slots
-   exist (silu/rmsnorm ops; attention.sdpa/decode, MoE blocks; all-reduce collective), but
-   they're correctness demos, not speedups. The prizes are MLA/weight-absorbed attention,
+2. **A kernel that actually beats sglang** — the whole point, still unproven. Seven slots
+   exist (silu/rmsnorm ops; attention.sdpa/decode, MoE blocks; all-reduce + MoE-with-owned-reduce
+   collectives), but they're correctness demos, not speedups. The prizes are MLA/weight-absorbed attention,
    dense FP8/FP4 GEMM, and *comms-overlap* blocks (a block that owns its trailing reduce) —
    plus the multi-GPU surface (TP / PD-disaggregation / EP). Each new slot is a `SlotSpec` +
    a seam patch; the hard part is a kernel that wins, not the wiring.
@@ -769,7 +775,7 @@ The harness package, [../optima/](../optima):
 
 | File | Role |
 |---|---|
-| [slots.py](../optima/slots.py) | The slot ABI. `SlotSpec` (`invoke_reference`/`invoke_entry` for non-uniform signatures, `kind` = op/block/collective, a `Correctness` mode, `prepare`/`prepare_from_layer` for quant-layout slots), the **6 slots** (silu, rmsnorm, attention.sdpa/decode, moe.fused_experts, collective.all_reduce), references, input generators, tolerances. Adding a slot = editing here. |
+| [slots.py](../optima/slots.py) | The slot ABI. `SlotSpec` (`invoke_reference`/`invoke_entry` for non-uniform signatures, `kind` = op/block/collective, a `Correctness` mode, `prepare`/`prepare_from_layer` for quant-layout slots), the **7 slots** (silu, rmsnorm, attention.sdpa/decode, moe.fused_experts, moe.fused_experts_reduce, collective.all_reduce), references, input generators, tolerances. Adding a slot = editing here. |
 | [manifest.py](../optima/manifest.py) | Parse + validate `manifest.toml`. Schema + ABI check + **path-safety** (`_safe_relpath`). Pure-Python. |
 | [sandbox.py](../optima/sandbox.py) | `scan_source` (AST policy tripwire), `load_entry` (import the kernel — isolate in prod), `probe_in_subprocess`. |
 | [registry.py](../optima/registry.py) | `KernelRegistry` (process-global `REGISTRY`), `KernelImpl`, `Eligibility`. The dispatcher's lookup table + active toggle. |

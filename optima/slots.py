@@ -112,6 +112,22 @@ class SlotSpec:
     prepare_from_layer: Optional[Callable] = None
     correctness: Correctness = field(default_factory=Correctness)
     tolerances: dict[torch.dtype, Tolerance] = field(default_factory=dict)
+    # Collective slots (kind="collective") are verified DISTRIBUTED, so the single-process
+    # invoke_reference/invoke_entry don't apply. These two hooks let optima.verify_collective
+    # drive ANY collective slot (a bare all-reduce, OR a block that OWNS its trailing reduce
+    # like moe.fused_experts_reduce) without hard-coding one contract:
+    #   * collective_partial(inputs, prepared) -> the fp32 per-rank tensor whose cross-rank
+    #     SUM is the trusted reference (x for all-reduce; the local experts' fp32 output for
+    #     the MoE-overlap block).
+    #   * invoke_collective(entry, inputs, out, group, prepared) -> call the miner kernel,
+    #     handing it the process group; it fills `out` with the REDUCED result.
+    collective_partial: Optional[Callable] = None
+    invoke_collective: Optional[Callable] = None
+    # Per-slot end-to-end KL gate, calibrated to THIS slot's intrinsic noise floor (the
+    # generic 5e-3 default is tuned for elementwise ops; attention sits ~6e-3 vs flash's
+    # reordered softmax, so a flat 5e-3 false-fails a faithful attention kernel — README
+    # calibration finding 6). None -> use the eval's generic threshold.
+    kl_threshold: Optional[float] = None
 
     def tolerance_for(self, dtype: torch.dtype) -> Tolerance:
         if dtype in self.tolerances:
@@ -283,6 +299,9 @@ ATTENTION_SDPA = SlotSpec(
     # fp32 reference, not all-close. 0.99 tolerates a thin tail of ULP-level diffs.
     correctness=Correctness("matched_ratio", min_ratio=0.99),
     tolerances=_BF16_TOL,
+    # Attention's intrinsic end-to-end KL floor (~6e-3 vs flash) is above the generic
+    # 5e-3 gate; calibrate to ~5x the floor so a faithful attention kernel isn't false-failed.
+    kl_threshold=3e-2,
 )
 
 
@@ -353,6 +372,7 @@ ATTENTION_DECODE = SlotSpec(
     ),
     correctness=Correctness("matched_ratio", min_ratio=0.99),
     tolerances=_BF16_TOL,
+    kl_threshold=3e-2,  # attention's higher intrinsic floor (see attention.sdpa)
 )
 
 
@@ -483,6 +503,9 @@ COLLECTIVE_ALL_REDUCE = SlotSpec(
     # drives the real verification.
     invoke_reference=lambda i: [i["x"]],
     invoke_entry=lambda entry, i, outs, prepared: entry(i["x"], outs[0], i.get("__group__")),
+    # Distributed-verify hooks: the reference is the fp32 SUM of each rank's x.
+    collective_partial=lambda i, prepared: i["x"].float(),
+    invoke_collective=lambda entry, i, out, group, prepared: entry(i["x"], out, group),
     shapes=(
         {"num_tokens": 1, "hidden": 4096},
         {"num_tokens": 8, "hidden": 4096},
@@ -495,12 +518,82 @@ COLLECTIVE_ALL_REDUCE = SlotSpec(
 )
 
 
+# ---------------------------------------------------------------------------
+# Slot (COLLECTIVE block — owns its trailing reduce): moe.fused_experts_reduce
+#   prepare(w13, w2) -> prepared                                  (once at load)
+#   forward(x, topk_ids, topk_weights, prepared, out, group)      (per step)
+#   x:(M,H) per rank -> out:(M,H) = SUM_over_ranks( local_experts(x) )
+#
+# This is the fix for the structural ceiling: the decode win is the OVERLAP of the
+# expert GEMM with the trailing TP all-reduce (~75% of decode at TP/EP scale), and a
+# plain moe.fused_experts slot can't express it because the validator replays a SEPARATE
+# stock all-reduce after the kernel — the two ops are severed. Here ONE kernel owns BOTH
+# the experts AND the reduce (it is handed the process group), so it can fuse/overlap them.
+# The validator does NOT replay the reduce. Wider capability -> verified DISTRIBUTED vs the
+# fp32 cross-rank sum of the per-rank expert outputs, and the end-to-end gate is mandatory.
+# Still inside the four invariants: validator owns out + the group + the call site; the
+# reduced output feeds the residual stream upstream of the sampler (nothing to substitute).
+# ---------------------------------------------------------------------------
+
+
+def _moe_reduce_inputs(*, num_tokens: int, num_experts: int, hidden: int, inter: int, topk: int,
+                       dtype: torch.dtype, device: str, seed: int, rank: int = 0, world_size: int = 1) -> dict:
+    # Tokens + routing are REPLICATED across ranks (seeded without rank), so every rank
+    # runs the same tokens; the expert WEIGHTS are SHARDED (seeded WITH rank), so each
+    # rank computes a different partial and the cross-rank reduce does real work.
+    gx = torch.Generator(device=device).manual_seed(seed)
+    x = (torch.randn(num_tokens, hidden, generator=gx, device=device, dtype=torch.float32) * 0.1).to(dtype)
+    ids = torch.randint(0, num_experts, (num_tokens, topk), generator=gx, device=device).to(torch.int32)
+    scores = torch.rand(num_tokens, topk, generator=gx, device=device)
+    weights = (scores / scores.sum(dim=1, keepdim=True)).to(torch.float32)
+    gw = torch.Generator(device=device).manual_seed(seed + 1_000_003 * rank)
+    w13 = (torch.randn(num_experts, 2 * inter, hidden, generator=gw, device=device, dtype=torch.float32) * 0.05).to(dtype)
+    w2 = (torch.randn(num_experts, hidden, inter, generator=gw, device=device, dtype=torch.float32) * 0.05).to(dtype)
+    return {"x": x, "w13": w13, "w2": w2, "topk_ids": ids, "topk_weights": weights}
+
+
+MOE_FUSED_EXPERTS_REDUCE = SlotSpec(
+    name="moe.fused_experts_reduce",
+    entry="fused_experts_reduce",
+    prepare="prepare",
+    summary=(
+        "fused MoE experts that OWN the trailing TP all-reduce (the compute-comm overlap "
+        "lever).  prepare(w13, w2) -> prepared;  "
+        "forward(x, topk_ids, topk_weights, prepared, out, group) fills out with the "
+        "SUM-over-ranks of the local expert output.  x:(M,H) -> out:(M,H);  verified DISTRIBUTED."
+    ),
+    kind="collective",
+    make_inputs=_moe_reduce_inputs,
+    out_shapes=lambda i: [(i["x"].shape[0], i["x"].shape[1])],
+    # Single-process invoke_reference/entry are unused for kind="collective"; the real
+    # reference is the cross-rank fp32 sum (collective_partial), driven by verify_collective.
+    invoke_reference=lambda i: [_moe_reference(i["x"], i["w13"], i["w2"], i["topk_ids"], i["topk_weights"])],
+    invoke_entry=lambda entry, i, outs, prepared: None,
+    invoke_prepare=lambda prepare_fn, i: prepare_fn(i["w13"], i["w2"]),
+    prepare_from_layer=lambda layer: (layer.w13_weight.data, layer.w2_weight.data),
+    # Reference partial = this rank's fp32 expert output (HP, from the RAW weights, NOT the
+    # miner's `prepared`); the trusted cross-rank SUM is the full MoE output.
+    collective_partial=lambda i, prepared: _moe_reference(
+        i["x"], i["w13"], i["w2"], i["topk_ids"], i["topk_weights"]).float(),
+    invoke_collective=lambda entry, i, out, group, prepared: entry(
+        i["x"], i["topk_ids"], i["topk_weights"], prepared, out, group),
+    shapes=(
+        {"num_tokens": 4, "num_experts": 8, "hidden": 256, "inter": 128, "topk": 2},
+        {"num_tokens": 16, "num_experts": 32, "hidden": 512, "inter": 256, "topk": 4},
+        {"num_tokens": 8, "num_experts": 4, "hidden": 384, "inter": 192, "topk": 1},
+    ),
+    correctness=Correctness("matched_ratio", min_ratio=0.97),
+    tolerances=_BF16_TOL,
+)
+
+
 SLOTS: dict[str, SlotSpec] = {
     SILU_AND_MUL.name: SILU_AND_MUL,
     RMSNORM.name: RMSNORM,
     ATTENTION_SDPA.name: ATTENTION_SDPA,
     ATTENTION_DECODE.name: ATTENTION_DECODE,
     MOE_FUSED_EXPERTS.name: MOE_FUSED_EXPERTS,
+    MOE_FUSED_EXPERTS_REDUCE.name: MOE_FUSED_EXPERTS_REDUCE,
     COLLECTIVE_ALL_REDUCE.name: COLLECTIVE_ALL_REDUCE,
 }
 

@@ -287,21 +287,32 @@ optima settle  --round 0 --margin 0.02 --ledger l.json
   prior commitment by that hotkey, so you can't reveal a bundle you didn't commit
   to (copying at reveal time is impossible). In production this is Bittensor's
   native commit-reveal (we keep only the off-chain scoring half).
-- **copy detection**: earliest commit of a content hash is original; later ones
-  earn 0. *(Next: a behavioral/functional fingerprint to catch reformatted
-  near-copies — exact hashes miss those; see SUBNET_BLUEPRINT.)*
-- **king of the hill**: a champion holds the emission; a challenger takes the title
-  only by beating it by a margin. A copy ties → earns nothing.
+- **copy detection** (`optima/copy_fingerprint.py`): cumulative **across rounds** (a copy
+  in a later round is caught, not just same-round), on the exact content hash OR a
+  **reformat-invariant fingerprint** (AST-normalized — a reflowed/recommented/renamed-
+  whitespace copy with a fresh hash is still demoted). A **structural** fingerprint (names
+  and constants blanked) additionally flags rename + constant-tweak near-copies as an
+  **advisory** at reveal (surfaced for review, never auto-demoted — skeletons can collide).
+- **king of the hill**: a champion holds the emission; a challenger takes the title only by
+  beating it by a margin. A copy ties → earns nothing. `optima settle --per-slot` runs a
+  **champion per slot** and splits emission across slots, so a specialist who owns one slot
+  is paid (vs winner-take-all giving 100% to the single best end-to-end bundle).
 
-Robust scoring (see `optima/eval/scoring.py`): each launch does median-of-K timed
-passes; the candidate is **bracketed by a baseline before and after** (B,C,B'); the
-speedup is paired against the baseline mean; the bar is **derived from the measured
-baseline noise** (`1 + max(margin, k·noise)`) not a hand-picked constant; a round whose
-bracketing baselines disagree past a tolerance is **NO-DECISION** and cannot crown. Plus
-per-epoch seeded prompts (anti-overfit), `ignore_eos` for identical token budgets, and a
-near-copy fingerprint (`optima/copy_fingerprint.py`) so reformatted copies are caught like
-exact ones. A champion crowned under a different `PINNED_SGLANG` is flagged **stale** at
-settle so its frozen speedup can't gate the round (re-baseline on a pin bump).
+Robust scoring (see `optima/eval/scoring.py`), built for a validator that **can't lock GPU
+clocks**: each launch does median-of-K timed passes; the candidate is **bracketed by a
+baseline before and after** (B,C,B'); the speedup is paired against the baseline mean; the
+bar is **derived from the measured baseline noise** (`1 + max(margin, k·noise)`) not a
+hand-picked constant; a round whose bracketing baselines disagree past a tolerance is
+**NO-DECISION** and cannot crown. The ledger records a crownable speedup or 0.0. Fidelity
+gating beyond mean-KL: a **coverage (tail-mass) guard** catches a flattened distribution
+whose visible head matches (top-k KL is blind to it), the argmax-rate catches sparse flips,
+**per-slot KL thresholds** calibrate to each slot's floor (attention's ~6e-3 vs silu's), and
+`aligned_kl` now counts early-stop as dropped positions. Plus per-epoch seeded prompts
+(anti-overfit), **shape jitter** on the per-op verify (count dims vary per run, so a kernel
+can't hard-code the verify shapes), `ignore_eos` so both sides emit identical token counts
+and the throughput numerator is a driver-known fixed budget (not a scheduler-reported
+count), a `max_running_requests` knob to score at a serving-realistic batch, and a
+**stale-champion** flag at settle when the `PINNED_SGLANG` differs (re-baseline on a bump).
 
 ## Security model
 
@@ -332,8 +343,10 @@ cross-validator consensus catches a rogue validator.
 | Slots | 7: silu/rmsnorm, attention.sdpa/decode, MoE, all-reduce, MoE+reduce (overlap) | + MLA, FP8/FP4 GEMM, graph-safe paged attention |
 | Throughput gain | **none — no submitted kernel beats sglang yet** | a kernel that beats sglang at equal fidelity |
 | Model | up to gpt-oss-120b (1 GPU) | DSV4-scale (multi-GPU, TP/PD/EP) |
-| Quality gate | KL + GSM8K/MMLU on real prompts, **uncalibrated** | noise-floor KL + large-n benchmarks + det mode |
-| Isolation | scan + in-proc load | namespaces + no-egress + per-eval ctx + watchdog |
+| Quality gate | mean-KL + coverage/argmax/per-slot-threshold + GSM8K/MMLU, det-mode default | full-vocab KL at a reference seam + large-n (100–200) benchmarks |
+| Scoring noise | noise-derived margin + bookended A/B + no-decision (no clock-lock needed) | + interleaved per-iter A/B + locked clocks where available |
+| Isolation | scan (hardened) + **out-of-process** verify | namespaces + no-egress + per-eval ctx + watchdog (needs Linux/root) |
+| Champion | per-round, pin-staleness flagged | head-to-head re-eval vs a content-addressed bundle store |
 | Chain | local JSON ledger | on-chain commit-reveal + set_weights |
 | State | JSON | a real DB, single-writer weights |
 

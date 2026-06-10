@@ -61,10 +61,17 @@ This repo is the **validator harness** (the referee), plus example miner bundles
 - **Scoring is noise-robust without clock-locking** (`optima/eval/scoring.py`): the candidate is
   bracketed by a baseline before AND after (B,C,B'), paired against the mean, with the bar
   derived from measured baseline noise (`1 + max(margin, k·noise)`) and a NO-DECISION verdict
-  when the bracketing baselines disagree. `ignore_eos` on for identical token budgets. A
-  reformat-invariant copy fingerprint (`optima/copy_fingerprint.py`) catches near-copies; copy
-  detection is cumulative across rounds; a champion crowned under a different `PINNED_SGLANG`
-  is flagged stale at settle.
+  when the bracketing baselines disagree. `ignore_eos` on → identical token budgets AND a
+  driver-known throughput numerator (not a scheduler-reported count). Fidelity gating beyond
+  mean-KL: a coverage/tail-mass guard (catches a flattened head-matching distribution top-k KL
+  misses), argmax-rate (sparse flips), early-stop dropped-position accounting, and **per-slot
+  KL thresholds** (`SlotSpec.kl_threshold`; attention 3e-2 vs the 5e-3 default). Per-op verify
+  **jitters count dims** per run (anti shape-branching). Anti-copy (`optima/copy_fingerprint.py`):
+  cumulative-across-rounds detection on exact hash OR a reformat-invariant fingerprint
+  (auto-demote), plus a structural skeleton fingerprint (advisory, flags rename/constant-tweak).
+  `optima settle --per-slot` = a champion per slot, emission split (pays specialists); a champion
+  on a different `PINNED_SGLANG` is flagged stale (re-baseline). `optima verify` loads + runs the
+  kernel **out-of-process** so the CLI never imports miner code (full netns isolation is still TODO).
 - **No kernel has beaten sglang.** The mechanism is validated to fire correctly on real
   models (a faithful kernel reproduces the model; a broken one is caught by the gate), but
   every example kernel is a correctness demo — the faithful ones are *slower* than sglang's

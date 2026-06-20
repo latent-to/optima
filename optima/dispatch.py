@@ -263,6 +263,7 @@ def make_moe_dispatcher(
             try:
                 if _moe_supported(self) and hidden_states.dim() == 2:
                     in_graph = _in_cuda_graph()
+                    quant_fmt = _moe_quant_format(self)
                     routed = _standard_topk(topk_output)
                     if routed is not None:
                         x = hidden_states
@@ -279,6 +280,11 @@ def make_moe_dispatcher(
                             # miner DECLARED graph-capturable; otherwise trust the baseline
                             # in-graph so an un-capturable kernel can't wedge graph capture.
                             if in_graph and not impl.eligibility.graph_safe:
+                                continue
+                            # Pair kernel<->layer by quant format: a dense kernel never runs
+                            # a quantized layer (it would mis-read packed bytes + scales), and
+                            # a quant kernel never runs a dense layer. Mismatch -> baseline.
+                            if not _quant_ok(impl.eligibility.quant, quant_fmt):
                                 continue
                             out = _run_moe_kernel(self, x, routed, impl, slot)
                             _log_once_active(slot)
@@ -370,16 +376,42 @@ def _moe_supported(self) -> bool:
     # all-reduce in _run_moe_kernel.)
     if getattr(self, "moe_ep_size", 1) != 1:
         return False
-    # Need the dense expert-weight params the (w13, w2) contract hands to prepare().
+    # Need the expert-weight params prepare_from_layer maps to the kernel's weight view.
     if not (hasattr(self, "w13_weight") and hasattr(self, "w2_weight")):
         return False
-    # Dense (unquantized) experts only for now: a quantized layer exposes packed FP4/FP8
-    # bytes plus separate *_scale params, which the dense contract would mis-read. A
-    # quantized expert kernel needs the richer weight view (the explicit next rung), so
-    # fall back until that lands rather than feed prepare() raw packed bytes.
-    if hasattr(self, "w13_weight_scale") or hasattr(self, "w2_weight_scale"):
-        return False
+    # Quantized layers (FP4/FP8 — they expose *_weight_scale) ARE admitted here and
+    # paired to a kernel BY FORMAT in the dispatch loop (_quant_ok): a quantized layer
+    # only runs a kernel that DECLARES its exact format (and gets the quant-aware
+    # prepare_from_layer); a dense layer still runs only a dense kernel. The format gate
+    # is per-impl, so it lives in the loop — _moe_supported runs before the impl is known.
     return True
+
+
+def _moe_quant_format(self) -> Optional[str]:
+    """The layer's expert-weight quant format: ``None`` (dense), ``"fp8"``, or ``"nvfp4"``.
+
+    A quantized FusedMoE exposes ``*_weight_scale`` params; the format is read off the
+    packed weight dtype (float8 -> ``"fp8"``; sub-byte packed -> ``"nvfp4"``). The
+    dispatcher pairs this to a kernel's declared ``Eligibility.quant`` (see ``_quant_ok``).
+    The EXACT NVFP4 scale-param layout a kernel's prepare consumes is pinned against the
+    live layer via ``OPTIMA_MOE_INSPECT`` (the dump hook above) — this only classifies."""
+    if not (hasattr(self, "w13_weight_scale") or hasattr(self, "w2_weight_scale")):
+        return None
+    w = getattr(getattr(self, "w13_weight", None), "data", None)
+    dt = getattr(w, "dtype", None)
+    if dt in (getattr(torch, "float8_e4m3fn", None), getattr(torch, "float8_e5m2", None)):
+        return "fp8"
+    return "nvfp4"
+
+
+def _quant_ok(declared: frozenset[str], fmt: Optional[str]) -> bool:
+    """Pair a kernel's declared quant formats to the layer's format. Conservative: a DENSE
+    layer (``fmt is None``) runs only a dense kernel (no declared formats); a QUANTIZED
+    layer runs only a kernel that declares its exact format. Never cross — a mismatch falls
+    back to the trusted baseline rather than mis-read the weights."""
+    if fmt is None:
+        return not declared
+    return fmt in declared
 
 
 def _in_cuda_graph() -> bool:

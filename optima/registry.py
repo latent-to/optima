@@ -40,6 +40,14 @@ class Eligibility:
     # falls back to the trusted baseline in-graph. A kernel that lies (declares graph_safe
     # but isn't) either errors at capture -> fallback, or is caught by the fidelity gate.
     graph_safe: bool = False
+    # The quantization formats this kernel's (prepare, forward) handle, e.g.
+    # ``{"nvfp4"}`` or ``{"fp8"}``. EMPTY (default) means the kernel takes DENSE
+    # (unquantized) expert weights only. The MoE dispatcher pairs a kernel to a layer
+    # by format: a dense layer runs only an empty-``quant`` kernel; a quantized layer
+    # runs only a kernel that declares its exact format (else fall back to the trusted
+    # baseline). This is the gate that lets an NVFP4 expert kernel reach the seam without
+    # feeding a dense kernel packed FP4 bytes + separate scales it would mis-read.
+    quant: frozenset[str] = frozenset()
 
     def accepts(self, *, dtype_name: str, last_dim: int, arch: Optional[str]) -> bool:
         if self.dtypes and dtype_name not in self.dtypes:
@@ -136,4 +144,5 @@ def eligibility_from_metadata(meta: dict | None, manifest_dtypes: tuple[str, ...
         architectures=frozenset(archs),
         max_last_dim=int(max_last) if max_last is not None else None,
         graph_safe=bool(meta.get("graph_safe", False)),
+        quant=frozenset(str(q) for q in meta.get("quant", ())),
     )

@@ -317,18 +317,24 @@ count), a `max_running_requests` knob to score at a serving-realistic batch, and
 
 ## Arenas: trying a new model
 
-Different models ship in different sglang images/versions (gpt-oss on the pin, DeepSeek-V4
-on `…:deepseek-v4-blackwell`, a launch-window model on a nightly). An **arena**
-(`optima/arenas.py`) captures everything model-specific — `{model_path, sglang_version,
-docker_image, seam-adapter subset, per-model KL floors, engine kwargs}` — so **"try a new
-model" is a config row, not a manual sglang checkout + a hand-edited constant**:
+Different models need different runtimes (gpt-oss on the pin, DeepSeek-V4 on a Blackwell
+sglang, a launch-window model on a nightly). An **arena** (`optima/arenas.py`) captures
+everything model-specific — `{model_path, sglang_version, docker_image, seam-adapter
+subset, per-model KL floors, engine kwargs}` — so **"try a new model" is a config row, not
+a manual sglang checkout + a hand-edited constant**:
 
 ```python
 MINIMAX_M3 = Arena(name="minimax-m3", model_path="MiniMaxAI/MiniMax-M3",
-                   sglang_version="0.5.13", docker_image="lmsysorg/sglang:<m3-tag>",
+                   sglang_version="0.5.13", docker_image="ghcr.io/optima/validator:minimax-m3",
                    seam_adapters=("attention", "moe", "collective"),
                    kl_floors={"attention.decode": 0.04}, engine_kwargs={"tp_size": 4})
 ```
+
+`docker_image` is an **Optima-owned validator image** (sglang + CUDA/PyTorch + the Optima
+seam + the calibrated gates baked in), **not** a vendor `lmsysorg/sglang` container —
+consensus needs a byte-identical runtime across validators, and a stock image carries
+neither the seam nor the gates. Miners may develop in any container; the validator runs
+the Optima image.
 
 Then `optima compat --arena minimax-m3` (checks that arena's pin + seam subset) and
 `optima {evaluate,bench,settle} --arena minimax-m3`. The KL gate resolves **arena floor >

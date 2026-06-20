@@ -1,11 +1,19 @@
 """Arenas — the per-model mapping of {sglang version, image, seam subset, KL floors}.
 
 The validator's job is to score a kernel inside a SPECIFIC model's sglang. Different
-models ship in different sglang images/versions (gpt-oss/Qwen on the pinned build,
-DeepSeek-V4 on ``lmsysorg/sglang:deepseek-v4-blackwell``, a launch-window model on a
-nightly). An *arena* captures everything that is model-specific so that "try a new
-model" is a CONFIG ROW here, not a manual sglang checkout + a hand-edited constant +
-a worklog note.
+models need different runtimes (gpt-oss/Qwen on the pinned build, DeepSeek-V4 on a
+Blackwell sglang, a launch-window model on a nightly). An *arena* captures everything
+that is model-specific so that "try a new model" is a CONFIG ROW here, not a manual
+sglang checkout + a hand-edited constant + a worklog note.
+
+``docker_image`` is an **Optima-OWNED validator image**, not a vendor sglang container.
+Consensus requires every validator to measure on a BYTE-IDENTICAL runtime, and a stock
+``lmsysorg/sglang`` image has neither the Optima seam (the ``.pth`` bootstrap + the
+package) nor the calibrated gates — two validators on the "same" vendor image would
+still score differently. So the arena pins the *whole* scoring stack — sglang +
+CUDA/PyTorch + the Optima seam + the model kwargs + the calibrated floors — built into
+one image (e.g. ``ghcr.io/optima/validator:<arena>``). A miner may develop inside a
+vendor container (we enforce nothing on miners); the *validator* runs the Optima image.
 
 Two facts this reconciles (they look opposed but aren't):
 
@@ -37,8 +45,8 @@ Adding a model = one row. Example (fill in from the model's image):
     MINIMAX_M3 = Arena(
         name="minimax-m3",
         model_path="MiniMaxAI/MiniMax-M3",        # the HF id you serve
-        sglang_version="0.5.13",                  # whatever the M3 image ships
-        docker_image="lmsysorg/sglang:<m3-tag>",
+        sglang_version="0.5.13",                  # the sglang baked into the image below
+        docker_image="ghcr.io/optima/validator:minimax-m3",  # Optima-owned (sglang+seam+gates)
         seam_adapters=("attention", "moe", "collective"),  # the seams that apply to M3
         kl_floors={"attention.decode": 0.04},     # calibrate on the first clean run
         engine_kwargs={"tp_size": 4, "moe_runner_backend": "triton"},
@@ -58,7 +66,10 @@ class Arena:
     name: str  # short id, used as --arena <name> and stamped on scores
     model_path: str  # the model served/scored in this arena ("" = generic/any)
     sglang_version: str  # the pinned sglang for THIS model (the per-arena consensus version)
-    docker_image: str = ""  # the image shipping that sglang + the model's deps (doc/ops)
+    # Optima-OWNED validator image pinning the WHOLE scoring runtime (sglang + CUDA/torch +
+    # the Optima seam + the calibrated gates), not a vendor sglang container — consensus
+    # needs a byte-identical runtime across validators. "" = the host venv (default arena).
+    docker_image: str = ""
     # NAME subset of seams.SEAM_ADAPTERS that apply to this model; () = all of them.
     seam_adapters: tuple[str, ...] = ()
     # slot name -> calibrated mean-KL floor for THIS model (overrides SlotSpec.kl_threshold).

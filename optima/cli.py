@@ -36,6 +36,20 @@ def _json_obj(raw: str | None) -> dict:
     return out
 
 
+def _resolve_scoring_arena(args: argparse.Namespace):
+    from optima.arenas import get_arena
+
+    arena = get_arena(getattr(args, "arena", None))
+    if not arena.competable():
+        raise ValueError(f"arena {arena.name!r} has no sglang_version; it cannot be scored")
+    model = getattr(args, "model", None)
+    if arena.model_path and model and model != arena.model_path:
+        raise ValueError(
+            f"arena {arena.name!r} is for model {arena.model_path!r}, but --model is {model!r}"
+        )
+    return arena
+
+
 def _dtype(name: str):
     import torch
 
@@ -94,13 +108,19 @@ def cmd_chain_compat(_: argparse.Namespace) -> int:
 
 def cmd_set_weights(args: argparse.Namespace) -> int:
     from optima import chain
+    from optima.arenas import get_arena
     from optima.commit_reveal import Ledger
 
+    # Emit the ACTIVE arena's champion (only one arena competes at a time). Read the
+    # authoritative per-arena map, not the legacy `champion` view (which is just the
+    # last-settled arena and would emit the wrong champion in a multi-arena ledger).
+    arena = get_arena(getattr(args, "arena", None))
     led = Ledger.load(args.ledger)
-    if not led.champion:
-        print(f"no champion in {args.ledger}; nothing to weight")
+    champ = led.arena_champions.get(arena.name)
+    if not champ:
+        print(f"no champion for arena {arena.name!r} in {args.ledger}; nothing to weight")
         return 1
-    weights = {led.champion.hotkey: 1.0}  # winner-take-all baseline (matches settle)
+    weights = {champ.hotkey: 1.0}  # winner-take-all baseline (matches settle)
     subtensor = chain.connect(args.network)
     if args.dry_run:
         res = chain.set_weights(subtensor, None, args.netuid, weights, dry_run=True)
@@ -210,9 +230,12 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
     # KL gate resolution (most-specific wins, unless --kl-advisory): the ARENA's per-model
     # calibrated floor > the slot's model-agnostic default (SlotSpec.kl_threshold) > the
     # CLI --kl-threshold. The arena also supplies the model's base engine kwargs.
-    from optima.arenas import get_arena
     from optima.slots import get_slot as _get_slot
-    _arena = get_arena(getattr(args, "arena", None))
+    try:
+        _arena = _resolve_scoring_arena(args)
+    except ValueError as exc:
+        print(f"arena error: {exc}")
+        return 2
     _slot_name = m.ops[0].slot
     _arena_kl = _arena.kl_floor_for(_slot_name)
     _slot_kl = _get_slot(_slot_name).kl_threshold
@@ -248,7 +271,8 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
         candidate_attention_backend=args.candidate_attention_backend,
         candidate_moe_runner_backend=args.candidate_moe_runner_backend,
         candidate_disable_custom_all_reduce=args.candidate_disable_custom_all_reduce,
-        extra_engine_kwargs={**_arena.engine_kwargs, **_json_obj(args.engine_kwargs_json)},
+        base_engine_kwargs=dict(_arena.engine_kwargs),
+        extra_engine_kwargs=_json_obj(args.engine_kwargs_json),
         candidate_extra_engine_kwargs=_json_obj(args.candidate_engine_kwargs_json),
     )
     if _arena.name != "default":
@@ -327,9 +351,12 @@ def cmd_bench(args: argparse.Namespace) -> int:
         print("no known slots in this bundle; nothing to evaluate")
         return 1
 
-    from optima.arenas import get_arena
     from optima.slots import get_slot as _get_slot
-    _arena = get_arena(getattr(args, "arena", None))
+    try:
+        _arena = _resolve_scoring_arena(args)
+    except ValueError as exc:
+        print(f"arena error: {exc}")
+        return 2
     _slot_name = m.ops[0].slot
     _arena_kl = _arena.kl_floor_for(_slot_name)
     _slot_kl = _get_slot(_slot_name).kl_threshold
@@ -368,7 +395,8 @@ def cmd_bench(args: argparse.Namespace) -> int:
         candidate_attention_backend=args.candidate_attention_backend,
         candidate_moe_runner_backend=args.candidate_moe_runner_backend,
         candidate_disable_custom_all_reduce=args.candidate_disable_custom_all_reduce,
-        extra_engine_kwargs={**_arena.engine_kwargs, **_json_obj(args.engine_kwargs_json)},
+        base_engine_kwargs=dict(_arena.engine_kwargs),
+        extra_engine_kwargs=_json_obj(args.engine_kwargs_json),
         candidate_extra_engine_kwargs=_json_obj(args.candidate_engine_kwargs_json),
     )
     names = [b.strip() for b in args.benchmarks.split(",") if b.strip()]
@@ -405,7 +433,7 @@ def cmd_bench(args: argparse.Namespace) -> int:
     elif kl.num_positions == 0:
         kl_note = "n/a (no logprobs)"
     else:
-        kl_note = f"<= {args.kl_threshold:.1e}"
+        kl_note = f"<= {_kl_threshold:.1e}"
     rate_note = "" if args.kl_advisory else f" (<= {args.argmax_disagree_rate:.1%})"
     print(f"quality    no-accuracy-regression + KL mean_kl={kl.mean_kl:.3e} ({kl_note}), "
           f"argmax_disagree={kl.argmax_disagreements}/{kl.num_positions} "
@@ -484,10 +512,11 @@ def cmd_ledger(args: argparse.Namespace) -> int:
 
     led = Ledger.load(args.ledger)
     print(f"commitments={len(led.commitments)} reveals={len(led.reveals)} scores={len(led.scores)}")
-    if led.champion:
-        c = led.champion
-        print(f"champion: hotkey={c.hotkey} score={c.score:.3f} round={c.round_id} "
-              f"content={c.content_hash[:16]}...")
+    if led.arena_champions:
+        for arena in sorted(led.arena_champions):
+            c = led.arena_champions[arena]
+            print(f"champion[{arena}]: hotkey={c.hotkey} score={c.score:.3f} round={c.round_id} "
+                  f"content={c.content_hash[:16]}...")
     else:
         print("champion: (none yet)")
     return 0
@@ -500,8 +529,8 @@ def cmd_settle(args: argparse.Namespace) -> int:
     # --arena scopes the settle to one arena's scores (cross-model speedups aren't
     # comparable) and supplies the current pin for the stale-champion check. Omit it to
     # settle all scores against the default pin (pre-arena behavior).
-    arena_name = getattr(args, "arena", None)
-    arena = get_arena(arena_name)
+    arena = get_arena(getattr(args, "arena", None))
+    arena_name = arena.name
     cur_ver = arena.sglang_version
     led = Ledger.load(args.ledger)
     if getattr(args, "per_slot", False):
@@ -554,6 +583,9 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("set-weights",
                         help="push the ledger champion's weights on-chain (king of the hill)")
     sp.add_argument("--ledger", default="optima_ledger.json")
+    sp.add_argument("--arena", default=None,
+                    help="emit this arena's champion (default = the default arena). Only one "
+                         "arena competes at a time, so this picks the active one")
     sp.add_argument("--netuid", type=int, required=True)
     sp.add_argument("--network", default="finney", help="'test' for the public testnet")
     sp.add_argument("--wallet", default="default")
@@ -730,7 +762,7 @@ def build_parser() -> argparse.ArgumentParser:
                          "specialists, vs the winner-take-all default")
     sp.add_argument("--arena", default=None,
                     help="settle only this arena's scores against its pin (cross-model scores aren't "
-                         "comparable). Default = all scores vs the default pin (pre-arena behavior)")
+                         "comparable). Default = the default arena")
     sp.set_defaults(func=cmd_settle)
 
     return p

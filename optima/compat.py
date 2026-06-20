@@ -69,8 +69,11 @@ def run_checks(arena: Optional[Arena] = None) -> list[Check]:
 
     from optima.seams import SEAM_ADAPTERS
 
+    def wants(adapter_name: str) -> bool:
+        return arena.applies_seam(adapter_name)
+
     for adapter in SEAM_ADAPTERS:
-        if not arena.applies_seam(adapter.name):
+        if not wants(adapter.name):
             continue  # this seam is out of scope for this arena's model
         cls_name, _, meth = adapter.chokepoint.partition(".")
         try:
@@ -82,66 +85,72 @@ def run_checks(arena: Optional[Arena] = None) -> list[Check]:
         except Exception as exc:  # noqa: BLE001
             add(f"seam table: {adapter.name} ({adapter.chokepoint})", False, repr(exc))
 
-    try:
-        from sglang.srt.layers.utils.multi_platform import MultiPlatformOp
-        mpo = MultiPlatformOp
-        add("MultiPlatformOp base present", True)
-    except Exception as exc:  # noqa: BLE001
-        mpo = None
-        add("MultiPlatformOp base present", False, repr(exc))
+    mpo = None
+    if wants("activation") or wants("layernorm"):
+        try:
+            from sglang.srt.layers.utils.multi_platform import MultiPlatformOp
+            mpo = MultiPlatformOp
+            add("MultiPlatformOp base present", True)
+        except Exception as exc:  # noqa: BLE001
+            add("MultiPlatformOp base present", False, repr(exc))
 
     # activation seam (SiluAndMul slot)
-    try:
-        from sglang.srt.layers.activation import SiluAndMul
+    if wants("activation"):
+        try:
+            from sglang.srt.layers.activation import SiluAndMul
 
-        ok = hasattr(SiluAndMul, "forward_cuda") and hasattr(SiluAndMul, "forward_native")
-        if mpo is not None:
-            ok = ok and issubclass(SiluAndMul, mpo)
-        add("seam: SiluAndMul (activation)", ok, "needs forward_cuda/native on a MultiPlatformOp")
-    except Exception as exc:  # noqa: BLE001
-        add("seam: SiluAndMul (activation)", False, repr(exc))
+            ok = hasattr(SiluAndMul, "forward_cuda") and hasattr(SiluAndMul, "forward_native")
+            if mpo is not None:
+                ok = ok and issubclass(SiluAndMul, mpo)
+            add("seam: SiluAndMul (activation)", ok, "needs forward_cuda/native on a MultiPlatformOp")
+        except Exception as exc:  # noqa: BLE001
+            add("seam: SiluAndMul (activation)", False, repr(exc))
 
     # norm seam (RMSNorm slot)
-    try:
-        from sglang.srt.layers.layernorm import RMSNorm
+    if wants("layernorm"):
+        try:
+            from sglang.srt.layers.layernorm import RMSNorm
 
-        params = list(inspect.signature(RMSNorm.forward_cuda).parameters)
-        ok = hasattr(RMSNorm, "forward_cuda") and "residual" in params
-        if mpo is not None:
-            ok = ok and issubclass(RMSNorm, mpo)
-        add("seam: RMSNorm (layernorm)", ok, f"forward_cuda params={tuple(params)}")
-    except Exception as exc:  # noqa: BLE001
-        add("seam: RMSNorm (layernorm)", False, repr(exc))
+            params = list(inspect.signature(RMSNorm.forward_cuda).parameters)
+            ok = hasattr(RMSNorm, "forward_cuda") and "residual" in params
+            if mpo is not None:
+                ok = ok and issubclass(RMSNorm, mpo)
+            add("seam: RMSNorm (layernorm)", ok, f"forward_cuda params={tuple(params)}")
+        except Exception as exc:  # noqa: BLE001
+            add("seam: RMSNorm (layernorm)", False, repr(exc))
 
     # attention seam (the attention BLOCK slot chokepoint: RadixAttention.forward)
-    try:
-        from sglang.srt.layers.radix_attention import RadixAttention
+    if wants("attention"):
+        try:
+            from sglang.srt.layers.radix_attention import RadixAttention
 
-        params = set(inspect.signature(RadixAttention.forward).parameters)
-        ok = hasattr(RadixAttention, "forward") and {"q", "k", "v", "forward_batch"} <= params
-        add("seam: RadixAttention (attention)", ok, f"forward params={tuple(sorted(params))}")
-    except Exception as exc:  # noqa: BLE001
-        add("seam: RadixAttention (attention)", False, repr(exc))
+            params = set(inspect.signature(RadixAttention.forward).parameters)
+            ok = hasattr(RadixAttention, "forward") and {"q", "k", "v", "forward_batch"} <= params
+            add("seam: RadixAttention (attention)", ok, f"forward params={tuple(sorted(params))}")
+        except Exception as exc:  # noqa: BLE001
+            add("seam: RadixAttention (attention)", False, repr(exc))
 
     # MoE seam (the MoE BLOCK slot chokepoint: FusedMoE.forward(hidden_states, topk_output))
-    try:
-        from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+    if wants("moe"):
+        try:
+            from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 
-        params = set(inspect.signature(FusedMoE.forward).parameters)
-        ok = hasattr(FusedMoE, "forward") and {"hidden_states", "topk_output"} <= params
-        add("seam: FusedMoE (moe.fused_experts)", ok, f"forward params={tuple(sorted(params))}")
-    except Exception as exc:  # noqa: BLE001
-        add("seam: FusedMoE (moe.fused_experts)", False, repr(exc))
+            params = set(inspect.signature(FusedMoE.forward).parameters)
+            ok = hasattr(FusedMoE, "forward") and {"hidden_states", "topk_output"} <= params
+            add("seam: FusedMoE (moe.fused_experts)", ok, f"forward params={tuple(sorted(params))}")
+        except Exception as exc:  # noqa: BLE001
+            add("seam: FusedMoE (moe.fused_experts)", False, repr(exc))
 
     # collective seam (the TP-comms chokepoint: GroupCoordinator.all_reduce)
-    try:
-        from sglang.srt.distributed.parallel_state import GroupCoordinator
+    if wants("collective"):
+        try:
+            from sglang.srt.distributed.parallel_state import GroupCoordinator
 
-        params = set(inspect.signature(GroupCoordinator.all_reduce).parameters)
-        ok = hasattr(GroupCoordinator, "all_reduce") and "input_" in params
-        add("seam: GroupCoordinator.all_reduce (collective)", ok, f"all_reduce params={tuple(sorted(params))}")
-    except Exception as exc:  # noqa: BLE001
-        add("seam: GroupCoordinator.all_reduce (collective)", False, repr(exc))
+            params = set(inspect.signature(GroupCoordinator.all_reduce).parameters)
+            ok = hasattr(GroupCoordinator, "all_reduce") and "input_" in params
+            add("seam: GroupCoordinator.all_reduce (collective)", ok, f"all_reduce params={tuple(sorted(params))}")
+        except Exception as exc:  # noqa: BLE001
+            add("seam: GroupCoordinator.all_reduce (collective)", False, repr(exc))
 
     # Engine logprob API (we read top-k logprobs for KL)
     try:

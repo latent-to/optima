@@ -43,6 +43,7 @@ logger = logging.getLogger("optima.ledger")
 
 # Bump when the on-disk ledger format changes in a way older code cannot read.
 SCHEMA_VERSION = 1
+DEFAULT_ARENA = "default"
 
 
 def make_commitment(content_hash: str, hotkey: str, salt: str) -> str:
@@ -111,7 +112,7 @@ class Score:
     passed: bool
     sglang_version: str = ""  # the pin this speedup was measured against (re-baseline key)
     slot: str = ""  # the slot this submission competes in (for per-slot championships)
-    arena: str = ""  # the model/arena this was scored in — speedups only compare within an arena
+    arena: str = DEFAULT_ARENA  # the model/arena this was scored in — speedups only compare within an arena
 
 
 @dataclass
@@ -121,6 +122,7 @@ class Champion:
     score: float
     round_id: int
     sglang_version: str = ""  # the pin the title was won under; a different current pin = stale
+    arena: str = DEFAULT_ARENA
 
 
 @dataclass(frozen=True)
@@ -175,8 +177,12 @@ class Ledger:
         self.reveals: list[Reveal] = []
         self.scores: list[Score] = []
         self.evals: dict[str, EvalRecord] = {}
-        self.champion: Optional[Champion] = None  # winner-take-all baseline (single best)
-        self.champions: dict[str, Champion] = {}  # per-slot championships (settle_per_slot)
+        # Legacy convenience views: the last-settled winner-take-all champion and the
+        # default arena's per-slot champions. The arena maps below are authoritative.
+        self.champion: Optional[Champion] = None
+        self.champions: dict[str, Champion] = {}
+        self.arena_champions: dict[str, Champion] = {}
+        self.arena_slot_champions: dict[str, dict[str, Champion]] = {}
         self._seq = 0
 
     # ---- persistence ----
@@ -210,6 +216,29 @@ class Ledger:
             slot: Champion(**_only_fields(Champion, c))
             for slot, c in (data.get("champions") or {}).items() if c
         }
+        led.arena_champions = {
+            _arena_key(arena): Champion(**_only_fields(Champion, c))
+            for arena, c in (data.get("arena_champions") or {}).items() if c
+        }
+        led.arena_slot_champions = {
+            _arena_key(arena): {
+                slot: Champion(**_only_fields(Champion, c))
+                for slot, c in (slot_map or {}).items() if c
+            }
+            for arena, slot_map in (data.get("arena_slot_champions") or {}).items()
+        }
+        # The arena maps are authoritative; the bare ``champion``/``champions`` are legacy
+        # views. Reconcile them by ALIASING each legacy view to the matching arena entry
+        # (and seeding that entry from a pre-arena ledger that only had the legacy field),
+        # so the two serialized blobs can never drift apart in a later save().
+        if led.champion:
+            champion_arena = _arena_key(getattr(led.champion, "arena", DEFAULT_ARENA))
+            led.champion.arena = champion_arena
+            led.champion = led.arena_champions.setdefault(champion_arena, led.champion)
+        if DEFAULT_ARENA in led.arena_slot_champions:
+            led.champions = led.arena_slot_champions[DEFAULT_ARENA]
+        elif led.champions:
+            led.arena_slot_champions[DEFAULT_ARENA] = led.champions
         led._seq = data.get("seq", len(led.commitments))
         return led
 
@@ -222,6 +251,11 @@ class Ledger:
             "evals": {k: asdict(v) for k, v in self.evals.items()},
             "champion": asdict(self.champion) if self.champion else None,
             "champions": {slot: asdict(c) for slot, c in self.champions.items()},
+            "arena_champions": {arena: asdict(c) for arena, c in self.arena_champions.items()},
+            "arena_slot_champions": {
+                arena: {slot: asdict(c) for slot, c in slot_map.items()}
+                for arena, slot_map in self.arena_slot_champions.items()
+            },
             "seq": self._seq,
         }
         _atomic_write_json(Path(path), data)
@@ -298,9 +332,9 @@ class Ledger:
 
     def record_score(self, hotkey: str, content_hash: str, round_id: int,
                      score: float, kl_mean: float, passed: bool, sglang_version: str = "",
-                     slot: str = "", arena: str = "") -> None:
+                     slot: str = "", arena: str = DEFAULT_ARENA) -> None:
         self.scores.append(Score(hotkey, content_hash, round_id, score, kl_mean, passed,
-                                 sglang_version, slot, arena))
+                                 sglang_version, slot, _arena_key(arena)))
 
     # ---- full eval records (audit trail + dedup; the rich superset of a Score) ----
 
@@ -327,7 +361,7 @@ class Ledger:
         return False
 
     def settle(self, round_id: int, margin: float = 0.02,
-               current_sglang_version: str = "", arena: Optional[str] = None) -> SettleResult:
+               current_sglang_version: str = "", arena: str = DEFAULT_ARENA) -> SettleResult:
         """Apply king-of-the-hill: a challenger takes the title only if it beats the
         champion by ``margin``. Emission goes to the champion (winner-take-all baseline).
         Copies and non-improvers earn nothing.
@@ -344,12 +378,13 @@ class Ledger:
         re-establishes the title by clearing the floor margin over *current* stock, and
         ``champion_stale`` is flagged so the operator re-baselines the old champion.
         """
+        arena_key = _arena_key(arena)
         rejected_copies: list[str] = []
         candidates: list[Score] = []
         for s in self.scores:
             if s.round_id != round_id or not s.passed:
                 continue
-            if arena is not None and s.arena != arena:
+            if _arena_key(s.arena) != arena_key:
                 continue  # only compare within the same arena (cross-model scores aren't comparable)
             if not self._is_original(s.hotkey, s.content_hash, round_id):
                 rejected_copies.append(s.hotkey)
@@ -359,32 +394,37 @@ class Ledger:
         challenger = max(candidates, key=lambda s: s.score, default=None)
         challenger_score = challenger.score if challenger else 0.0
 
+        champion = self.arena_champions.get(arena_key)
         champion_stale = bool(
-            self.champion and current_sglang_version and self.champion.sglang_version
-            and self.champion.sglang_version != current_sglang_version
+            champion and current_sglang_version and champion.sglang_version
+            and champion.sglang_version != current_sglang_version
         )
         # A stale champion's frozen ratio isn't comparable to the current pin's baseline,
         # so don't gate on it — require a real win over current fresh stock instead.
-        if self.champion and not champion_stale:
-            threshold = self.champion.score * (1.0 + margin)
+        if champion and not champion_stale:
+            threshold = champion.score * (1.0 + margin)
         else:
             threshold = 1.0 + margin
 
         title_changed = False
         if challenger is not None and challenger_score >= threshold:
-            self.champion = Champion(
+            champion = Champion(
                 content_hash=challenger.content_hash,
                 hotkey=challenger.hotkey,
                 score=challenger.score,
                 round_id=round_id,
                 sglang_version=current_sglang_version or challenger.sglang_version,
+                arena=arena_key,
             )
+            self.arena_champions[arena_key] = champion
             title_changed = True
             champion_stale = False  # freshly (re-)crowned under the current pin
 
-        weights = {self.champion.hotkey: 1.0} if self.champion else {}
+        if champion is not None:
+            self.champion = champion  # legacy view: last-settled arena champion
+        weights = {champion.hotkey: 1.0} if champion else {}
         return SettleResult(
-            champion=self.champion,
+            champion=champion,
             weights=weights,
             title_changed=title_changed,
             challenger_score=challenger_score,
@@ -393,7 +433,7 @@ class Ledger:
         )
 
     def settle_per_slot(self, round_id: int, margin: float = 0.02,
-                        current_sglang_version: str = "", arena: Optional[str] = None) -> PerSlotSettleResult:
+                        current_sglang_version: str = "", arena: str = DEFAULT_ARENA) -> PerSlotSettleResult:
         """Per-slot king-of-the-hill: a champion PER slot, emission split equally across
         the slots that have a champion. This pays a specialist who owns ONE slot, instead
         of giving 100% to the single best end-to-end bundle (winner-take-all starves
@@ -401,12 +441,13 @@ class Ledger:
         same copy exclusion, same stale-on-pin-bump handling as ``settle`` — applied
         within each slot's bracket. Updates ``self.champions`` (the per-slot map).
         """
+        arena_key = _arena_key(arena)
         rejected_copies: list[str] = []
         by_slot: dict[str, list[Score]] = {}
         for s in self.scores:
             if s.round_id != round_id or not s.passed:
                 continue
-            if arena is not None and s.arena != arena:
+            if _arena_key(s.arena) != arena_key:
                 continue  # only compare within the same arena
             if not self._is_original(s.hotkey, s.content_hash, round_id):
                 rejected_copies.append(s.hotkey)
@@ -415,35 +456,44 @@ class Ledger:
 
         title_changes: dict[str, bool] = {}
         stale_slots: list[str] = []
+        slot_champions = self.arena_slot_champions.setdefault(arena_key, {})
         for slot, cands in by_slot.items():
             challenger = max(cands, key=lambda s: s.score, default=None)
             if challenger is None:
                 continue
-            champ = self.champions.get(slot)
+            champ = slot_champions.get(slot)
             stale = bool(champ and current_sglang_version and champ.sglang_version
                          and champ.sglang_version != current_sglang_version)
             threshold = (champ.score * (1.0 + margin)) if (champ and not stale) else (1.0 + margin)
             if challenger.score >= threshold:
-                self.champions[slot] = Champion(
+                slot_champions[slot] = Champion(
                     content_hash=challenger.content_hash, hotkey=challenger.hotkey,
                     score=challenger.score, round_id=round_id,
                     sglang_version=current_sglang_version or challenger.sglang_version,
+                    arena=arena_key,
                 )
                 title_changes[slot] = True
             elif stale:
                 stale_slots.append(slot)
 
-        # Split emission equally across slots that currently have a champion.
-        live = {slot: c for slot, c in self.champions.items() if c}
+        if arena_key == DEFAULT_ARENA:
+            self.champions = slot_champions  # legacy view for old commands/tests
+
+        # Split emission equally across slots that currently have a champion in this arena.
+        live = {slot: c for slot, c in slot_champions.items() if c}
         weights: dict[str, float] = {}
         if live:
             share = 1.0 / len(live)
             for c in live.values():
                 weights[c.hotkey] = weights.get(c.hotkey, 0.0) + share
         return PerSlotSettleResult(
-            champions=dict(self.champions),
+            champions=dict(slot_champions),
             weights=weights,
             title_changes=title_changes,
             stale_slots=sorted(set(stale_slots)),
             rejected_copies=sorted(set(rejected_copies)),
         )
+
+
+def _arena_key(arena: Optional[str]) -> str:
+    return arena or DEFAULT_ARENA

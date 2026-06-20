@@ -6,7 +6,11 @@ arena equals pre-arena behavior; a non-default arena's KL floor overrides the sl
 default; and scores from different arenas don't share a championship bracket.
 """
 
-from optima.arenas import DEFAULT_ARENA, Arena, arena_for_model, get_arena, list_arenas
+import argparse
+
+import pytest
+
+from optima.arenas import ARENAS, DEFAULT_ARENA, Arena, arena_for_model, get_arena, list_arenas
 from optima.commit_reveal import Ledger, make_commitment
 
 
@@ -19,7 +23,6 @@ def test_default_arena_equals_pre_arena_pin():
 
 
 def test_unknown_arena_raises_with_known_list():
-    import pytest
     with pytest.raises(KeyError, match="unknown arena"):
         get_arena("does-not-exist")
 
@@ -73,12 +76,36 @@ def test_settle_arena_filter_isolates_brackets():
     assert res_a.challenger_score == 1.10
 
 
-def test_settle_no_arena_filter_is_backward_compatible():
+def test_settle_default_arena_does_not_mix_non_default_scores():
     led = Ledger()
     _score(led, "alice", "H_A", "moe.fused_experts", 1.30, "default")
-    res = led.settle(0, margin=0.02)  # arena=None -> all scores, pre-arena behavior
+    _score(led, "bob", "H_B", "moe.fused_experts", 1.90, "minimax-m3")
+    res = led.settle(0, margin=0.02)  # omitted arena -> default arena only
     assert res.champion.hotkey == "alice"
     assert res.weights == {"alice": 1.0}
+
+
+def test_arena_champions_remain_isolated_after_settling_other_arena():
+    led = Ledger()
+    _score(led, "alice", "H_A", "moe.fused_experts", 1.10, "gpt-oss")
+    _score(led, "bob", "H_B", "moe.fused_experts", 1.90, "minimax-m3")
+    assert led.settle(0, margin=0.02, arena="gpt-oss").champion.hotkey == "alice"
+    assert led.settle(0, margin=0.02, arena="minimax-m3").champion.hotkey == "bob"
+
+    # A later empty gpt-oss round must keep paying the gpt-oss champion, not the
+    # last-settled minimax champion.
+    res = led.settle(1, margin=0.02, arena="gpt-oss")
+    assert res.champion.hotkey == "alice"
+    assert res.weights == {"alice": 1.0}
+
+
+def test_per_slot_champions_are_arena_scoped():
+    led = Ledger()
+    _score(led, "alice", "H_A", "moe.fused_experts", 1.10, "gpt-oss")
+    _score(led, "bob", "H_B", "moe.fused_experts", 1.90, "minimax-m3")
+    assert led.settle_per_slot(0, margin=0.02, arena="gpt-oss").weights == {"alice": 1.0}
+    assert led.settle_per_slot(0, margin=0.02, arena="minimax-m3").weights == {"bob": 1.0}
+    assert led.settle_per_slot(1, margin=0.02, arena="gpt-oss").weights == {"alice": 1.0}
 
 
 def test_arena_score_persists(tmp_path):
@@ -90,6 +117,107 @@ def test_arena_score_persists(tmp_path):
     assert led2.scores[0].arena == "minimax-m3"
 
 
+def test_arena_champion_persists_by_arena(tmp_path):
+    led = Ledger()
+    _score(led, "alice", "H_A", "moe.fused_experts", 1.10, "gpt-oss")
+    _score(led, "bob", "H_B", "moe.fused_experts", 1.90, "minimax-m3")
+    led.settle(0, margin=0.02, arena="gpt-oss")
+    led.settle(0, margin=0.02, arena="minimax-m3")
+    p = tmp_path / "l.json"
+    led.save(p)
+
+    led2 = Ledger.load(p)
+    assert led2.arena_champions["gpt-oss"].hotkey == "alice"
+    assert led2.arena_champions["minimax-m3"].hotkey == "bob"
+
+
 def test_arena_for_model_resolves_then_defaults():
     assert arena_for_model("no-such-model") is DEFAULT_ARENA
     assert "default" in list_arenas()
+
+
+def test_cli_rejects_model_that_does_not_match_arena():
+    from optima.cli import _resolve_scoring_arena
+
+    ARENAS["tmp-m3"] = Arena(name="tmp-m3", model_path="MiniMax/M3", sglang_version="0.5.13")
+    try:
+        with pytest.raises(ValueError, match="--model"):
+            _resolve_scoring_arena(argparse.Namespace(arena="tmp-m3", model="Qwen/Qwen2.5"))
+    finally:
+        ARENAS.pop("tmp-m3", None)
+
+
+def test_engine_kwargs_precedence_arena_then_typed_then_json():
+    from optima.eval._launch import engine_kwargs
+    from optima.eval.throughput_kl import EvalConfig
+
+    cfg = EvalConfig(
+        model_path="model",
+        base_engine_kwargs={"tp_size": 4, "custom": "arena"},
+        tp_size=2,
+        extra_engine_kwargs={"custom": "json"},
+    )
+    kw = engine_kwargs(cfg)
+    assert kw["tp_size"] == 2
+    assert kw["custom"] == "json"
+
+
+def test_engine_kwargs_drops_harness_owned_base_keys():
+    # A harness-owned key in arena base_engine_kwargs is dropped (the typed cfg wins),
+    # but a non-reserved base kwarg with no typed field passes straight through.
+    from optima.eval._launch import engine_kwargs
+    from optima.eval.throughput_kl import EvalConfig
+
+    cfg = EvalConfig(
+        model_path="model",
+        mem_fraction_static=0.6,
+        base_engine_kwargs={"mem_fraction_static": 0.99, "schedule_policy": "fcfs"},
+    )
+    kw = engine_kwargs(cfg)
+    assert kw["mem_fraction_static"] == 0.6  # reserved: arena's 0.99 dropped, not honored
+    assert kw["schedule_policy"] == "fcfs"  # non-reserved: survives
+
+
+def test_set_weights_reads_authoritative_arena_champion_not_legacy_view():
+    # The bug this guards: set-weights must emit the ACTIVE arena's champion, not the
+    # last-settled one. arena_champions is per-arena correct; the legacy `champion` is not.
+    led = Ledger()
+    _score(led, "alice", "H_A", "moe.fused_experts", 1.10, "gpt-oss")
+    _score(led, "bob", "H_B", "moe.fused_experts", 1.90, "minimax-m3")
+    led.settle(0, margin=0.02, arena="gpt-oss")
+    led.settle(0, margin=0.02, arena="minimax-m3")  # settled last
+    assert led.arena_champions["gpt-oss"].hotkey == "alice"
+    assert led.arena_champions["minimax-m3"].hotkey == "bob"
+    assert led.champion.hotkey == "bob"  # legacy view = last-settled -> wrong for gpt-oss
+
+
+def test_legacy_views_alias_authoritative_maps_after_load(tmp_path):
+    # The legacy champion/champions views must be the SAME objects as their arena entries
+    # after load, so the two serialized blobs can never drift apart.
+    led = Ledger()
+    _score(led, "alice", "H_A", "moe.fused_experts", 1.10, "gpt-oss")
+    _score(led, "bob", "H_B", "moe.fused_experts", 1.90, "minimax-m3")
+    led.settle(0, margin=0.02, arena="gpt-oss")
+    led.settle(0, margin=0.02, arena="minimax-m3")
+    led.settle_per_slot(0, margin=0.02, arena="default")  # seed the default slot map too
+    p = tmp_path / "l.json"
+    led.save(p)
+
+    led2 = Ledger.load(p)
+    assert led2.champion is led2.arena_champions[led2.champion.arena]
+    assert led2.champions is led2.arena_slot_champions["default"]
+
+
+def test_pre_arena_ledger_migrates_champion_into_default(tmp_path):
+    import json
+
+    # A ledger written by pre-arena code has only `champion` (no arena maps). Load must
+    # migrate it into the default arena and alias the legacy view to it.
+    p = tmp_path / "old.json"
+    p.write_text(json.dumps({
+        "schema_version": 1,
+        "champion": {"content_hash": "H", "hotkey": "alice", "score": 1.5, "round_id": 0},
+    }))
+    led = Ledger.load(p)
+    assert led.arena_champions["default"].hotkey == "alice"
+    assert led.champion is led.arena_champions["default"]

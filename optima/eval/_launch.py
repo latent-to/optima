@@ -14,6 +14,10 @@ from typing import Any
 
 logger = logging.getLogger("optima.eval")
 
+# Engine kwargs the harness sets unconditionally from the typed EvalConfig; an arena's
+# base_engine_kwargs cannot override these (it would be silently dropped — see engine_kwargs).
+_RESERVED_ENGINE_KWARGS = ("model_path", "dtype", "mem_fraction_static", "random_seed", "log_level")
+
 
 class IsolationError(RuntimeError):
     """Raised when candidate isolation was requested but could not be proven."""
@@ -128,7 +132,22 @@ def engine_kwargs(cfg, *, active: bool = False) -> dict[str, Any]:
     / ``disable_custom_all_reduce``) and deterministic mode apply identically. New
     fields are read with ``getattr`` so an older/duck-typed cfg still works.
     """
-    kwargs: dict[str, Any] = dict(
+    # Arena/model defaults are applied first. Typed CLI/config fields below override
+    # them, and --engine-kwargs-json remains the final explicit escape hatch.
+    base: dict[str, Any] = dict(getattr(cfg, "base_engine_kwargs", {}) or {})
+    # These are owned by the harness (set unconditionally below from the typed cfg), so a
+    # value for them in arena base_engine_kwargs would be silently overridden. Drop + warn
+    # rather than let an arena author think it took effect — use the typed CLI flag instead.
+    reserved = [k for k in _RESERVED_ENGINE_KWARGS if k in base]
+    if reserved:
+        logger.warning(
+            "optima: arena base_engine_kwargs %s are harness-owned and ignored; "
+            "set them via the typed CLI flag (e.g. --mem-fraction), not the arena", reserved,
+        )
+        for k in reserved:
+            base.pop(k, None)
+    kwargs: dict[str, Any] = base
+    kwargs.update(
         model_path=cfg.model_path,
         dtype=cfg.dtype,
         mem_fraction_static=cfg.mem_fraction_static,

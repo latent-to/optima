@@ -125,6 +125,10 @@ class EvalConfig:
     candidate_attention_backend: Optional[str] = None
     candidate_moe_runner_backend: Optional[str] = None
     candidate_disable_custom_all_reduce: Optional[bool] = None
+    # Arena/model engine defaults (lowest precedence). Harness-owned keys (model_path,
+    # dtype, mem_fraction_static, random_seed, log_level) are dropped with a warning —
+    # set those via the typed fields. Use this for model kwargs without a typed field.
+    base_engine_kwargs: dict[str, Any] = field(default_factory=dict)
     extra_engine_kwargs: dict[str, Any] = field(default_factory=dict)
     candidate_extra_engine_kwargs: dict[str, Any] = field(default_factory=dict)
 

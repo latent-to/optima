@@ -20,7 +20,14 @@ from dataclasses import dataclass
 
 # The sglang version scored against. Bump DELIBERATELY and in a coordinated way —
 # see docs/SGLANG_TRACKING.md. All validators must run the same version (consensus).
-PINNED_SGLANG = "0.5.12.post1"
+#
+# 0.5.13.post1 (CUDA 13). VALIDATION STATE — read before treating as authoritative:
+#   * static seam canary: GREEN — all chokepoints intact on 0.5.13.post1 (sglang-canary CI,
+#     2026-06-22: FusedMoE/RadixAttention/SiluAndMul/RMSNorm/all_reduce + logprob API + ServerArgs).
+#   * GPU end-to-end re-validation (broken-bundle gate FAILs, faithful kernels PASS) + champion
+#     RE-BASELINE: **PENDING** — run on a pod before this pin is authoritative for scoring.
+#     0.5.12.post1 was the last fully H100-validated pin.
+PINNED_SGLANG = "0.5.13.post1"
 
 
 @dataclass

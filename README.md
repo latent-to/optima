@@ -146,7 +146,7 @@ optima/
   verify.py                 # op/block correctness vs HP reference (allclose|matched_ratio|cosine)
   verify_collective.py      # DISTRIBUTED verify for collective slots (mp-spawn N ranks)
   rebuild.py                # fenced escape hatch: validator-shipped repo patchers only (no bundle code)
-  compat.py                 # PINNED_SGLANG (0.5.12.post1) + the seam canary (`optima compat`)
+  compat.py                 # PINNED_SGLANG (0.5.13.post1; re-baseline pending) + the seam canary (`optima compat`)
   seam.py / bootstrap.py    # install the seam in every venv interpreter via a .pth
   integrations/
     sglang_silu.py / sglang_norm.py        # ops: SiluAndMul, RMSNorm
@@ -178,7 +178,7 @@ install the seam in **every** venv interpreter via a `.pth` file
 (`import optima.bootstrap`) + a post-import hook that patches the target chokepoint the
 moment its module loads — including in the spawned scheduler. Five chokepoints today:
 `SiluAndMul` / `RMSNorm` (ops), `RadixAttention.forward` / `FusedMoE.forward` (blocks),
-and `GroupCoordinator.all_reduce` (collective). The pinned sglang (0.5.12.post1, see
+and `GroupCoordinator.all_reduce` (collective). The pinned sglang (0.5.13.post1, see
 `optima/compat.py`) **does** ship a hook/plugin framework (`srt/plugins/hook_registry.py`,
 added by PR #21388 — present at the pin), so migrating the seam to a sanctioned
 `sglang.srt.plugins` entry-point hook is a tracked option (`integrations/sglang_plugin.py`

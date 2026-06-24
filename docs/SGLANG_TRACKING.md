@@ -28,8 +28,11 @@ it isn't a fairness nicety, it's consensus.
 The sglang version is therefore a **coordinated, pinned subnet parameter**, bumped
 deliberately per "season," not "latest on each box." The single source of truth is
 `PINNED_SGLANG` in [../optima/compat.py](../optima/compat.py) (currently
-`0.5.12.post1`, CUDA 13 — validated end-to-end on an H100: all seams intact, the
-broken-bundle gate FAILs, faithful kernels PASS).
+`0.5.13.post1`, CUDA 13). Validation state of this pin: the **static seam canary is GREEN**
+(all chokepoints intact on 0.5.13.post1, sglang-canary CI 2026-06-22), but the **GPU
+end-to-end re-validation** (broken-bundle gate FAILs, faithful kernels PASS) **and champion
+re-baseline are PENDING** — run them on a pod before treating 0.5.13.post1 as authoritative
+for scoring. `0.5.12.post1` was the last fully H100-validated pin.
 
 ## What's actually coupled: the score, not the kernel
 

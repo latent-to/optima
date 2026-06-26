@@ -113,8 +113,22 @@ def cmd_scan(args: argparse.Namespace) -> int:
     return rc
 
 
+def _verify_model_key(args: argparse.Namespace, op, bundle: str):
+    """The served-model key for the per-model profile: the explicit --model, else the op's
+    metadata-declared 'model' (a DEV convenience — production passes the served-model key)."""
+    if getattr(args, "model", None):
+        return args.model
+    if op.metadata:
+        try:
+            meta = json.loads((Path(bundle) / op.metadata).read_text())
+            return meta.get("model")
+        except Exception:  # noqa: BLE001
+            return None
+    return None
+
+
 def cmd_verify(args: argparse.Namespace) -> int:
-    from optima.slots import SLOTS, get_slot
+    from optima.slots import SLOTS, slot_for_model
     from optima.verify import format_verify, verify_entry
 
     m = load_manifest(args.bundle)
@@ -123,7 +137,11 @@ def cmd_verify(args: argparse.Namespace) -> int:
         if op.slot not in SLOTS:
             print(f"  [SKIP] {op.slot}: not a known slot on this validator")
             continue
-        slot = get_slot(op.slot)
+        model_key = _verify_model_key(args, op, args.bundle)
+        slot = slot_for_model(op.slot, model_key)
+        if model_key:
+            print(f"  [profile] {op.slot}: model={model_key} "
+                  f"(correctness={slot.correctness.mode})")
         src = resolve_source(args.bundle, op)
 
         scan = scan_path(src)
@@ -155,7 +173,8 @@ def cmd_verify(args: argparse.Namespace) -> int:
 
         result = call_in_subprocess(
             verify_entry_from_source, op.slot, str(src), op.entry,
-            prepare_name=op.prepare, dtype_name=args.dtype, device=args.device, seed=args.seed,
+            prepare_name=op.prepare, model_key=model_key, override_point=op.override_point,
+            dtype_name=args.dtype, device=args.device, seed=args.seed,
             jitter_seed=args.seed,  # count-dim jitter so shapes vary per run (anti shape-branch)
         )
         print(format_verify(result))
@@ -523,6 +542,10 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--dtype", default="bfloat16", choices=["bfloat16", "float16", "float32"])
     sp.add_argument("--device", default=None, help="cuda|cpu (default: auto)")
     sp.add_argument("--seed", type=int, default=0)
+    sp.add_argument("--model", default=None,
+                    help="served-model key for the per-model profile (e.g. MiniMax-M3); "
+                         "default: read the op's metadata 'model' (a DEV convenience — "
+                         "production uses the validator's served-model key, never metadata)")
     sp.set_defaults(func=cmd_verify)
 
     sp = sub.add_parser("evaluate", help="end-to-end throughput + KL on a model")

@@ -217,6 +217,8 @@ def verify_entry_from_source(
     entry_name: str,
     *,
     prepare_name: Optional[str] = None,
+    model_key: Optional[str] = None,
+    override_point: Optional[str] = None,
     dtype_name: str = "bfloat16",
     device: Optional[str] = None,
     seed: int = 0,
@@ -227,14 +229,29 @@ def verify_entry_from_source(
     it via ``call_in_subprocess`` in a FRESH process. This keeps the trusted validator/CLI
     process from ever importing miner code (import-time payloads + the kernel run only in the
     throwaway child). It is NOT a security boundary by itself — production still needs the
-    child namespaced/no-egress — but it removes the in-process-RCE-in-the-CLI sink (#6)."""
-    from optima.sandbox import load_entry
-    from optima.slots import get_slot
+    child namespaced/no-egress — but it removes the in-process-RCE-in-the-CLI sink (#6).
 
-    slot = get_slot(slot_name)
+    ``model_key`` specializes the slot to the served model (the swigluoai/cosine profile);
+    None -> the generic slot. ``override_point`` (an override submission) composes the miner's
+    epilogue into the validator-owned base kernel instead of loading a whole-kernel ``entry``."""
+    from optima.sandbox import load_entry
+    from optima.slots import slot_for_model
+
+    slot = slot_for_model(slot_name, model_key)
     dtype = getattr(torch, dtype_name)
-    entry = load_entry(source_path, entry_name)  # runs the miner module body — in THIS child
-    prepare = load_entry(source_path, prepare_name) if prepare_name else None
+    if override_point is not None:
+        from optima_kernels.override import build_override
+
+        def _loader(name):
+            try:
+                return load_entry(source_path, name)
+            except Exception:  # noqa: BLE001 - absent symbol (e.g. GPU-only device fn) -> None
+                return None
+
+        entry, prepare = build_override(slot_name, override_point, entry_name, _loader)
+    else:
+        entry = load_entry(source_path, entry_name)  # runs the miner module body — in THIS child
+        prepare = load_entry(source_path, prepare_name) if prepare_name else None
     return verify_entry(slot, entry, prepare=prepare, dtype=dtype, device=device, seed=seed,
                         shapes=shapes, jitter_seed=jitter_seed)
 

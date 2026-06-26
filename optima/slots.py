@@ -87,6 +87,35 @@ class Correctness:
 
 
 @dataclass(frozen=True)
+class Activation:
+    """A model's gated-MLP activation — a validator-owned MODEL FACT, never a miner choice.
+
+    Applied to the GEMM1 ``(gate, up)`` subtiles inside the MoE block. The generic slot
+    reference is SiLU; a model whose MoE uses a different activation (M3's clamped
+    ``swigluoai``) carries it in ``MODEL_PROFILES`` so the op-correctness reference matches
+    the real model and a faithful kernel isn't false-failed. The swiglu ``alpha`` (the
+    sigmoid gain, 1.702 for M3) is DISTINCT from the per-expert NVFP4 dequant scale — the
+    two-alpha trap; they never mix.
+    """
+
+    kind: str  # "silu" | "swigluoai"
+    alpha: float = 0.0  # swiglu sigmoid gain (1.702 for M3); unused for "silu"
+    limit: float = 0.0  # symmetric clamp (7.0 for M3); 0 = no clamp
+
+    def __call__(self, gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
+        if self.kind == "silu":
+            return F.silu(gate) * up
+        if self.kind == "swigluoai":
+            g = gate.clamp(max=self.limit) if self.limit else gate
+            u = up.clamp(min=-self.limit, max=self.limit) if self.limit else up
+            return g * torch.sigmoid(self.alpha * g) * (u + 1.0)
+        raise ValueError(f"unknown activation kind {self.kind!r}")
+
+
+_SILU = Activation("silu")
+
+
+@dataclass(frozen=True)
 class SlotSpec:
     name: str  # dotted slot id, e.g. "activation.silu_and_mul"
     entry: str  # required callable name the miner module must expose
@@ -389,8 +418,10 @@ ATTENTION_DECODE = SlotSpec(
 # ---------------------------------------------------------------------------
 
 
-def _moe_reference(x, w13, w2, topk_ids, topk_weights):
+def _moe_reference(x, w13, w2, topk_ids, topk_weights, activation: Optional["Activation"] = None):
     # x:(M,H) w13:(E,2I,H)[gate;up] w2:(E,H,I) topk_ids:(M,K) topk_weights:(M,K) -> (M,H)
+    # `activation` is the model's gated-MLP activation (validator-owned); None -> SiLU (generic).
+    act_fn = activation or _SILU
     M, H = x.shape
     I = w13.shape[1] // 2
     K = topk_ids.shape[1]
@@ -403,8 +434,8 @@ def _moe_reference(x, w13, w2, topk_ids, topk_weights):
         w2_e = w2[e].float()                            # (M,H,I)
         fc1 = torch.einsum("mh,mih->mi", x32, w13_e)    # (M,2I)
         gate, up = fc1[:, :I], fc1[:, I:]
-        act = F.silu(gate) * up                         # (M,I)
-        out += wk[:, None] * torch.einsum("mi,mhi->mh", act, w2_e)
+        activated = act_fn(gate, up)                    # (M,I)
+        out += wk[:, None] * torch.einsum("mi,mhi->mh", activated, w2_e)
     return out
 
 
@@ -608,3 +639,64 @@ def get_slot(name: str) -> SlotSpec:
 
 def list_slots() -> list[str]:
     return sorted(SLOTS)
+
+
+# ---------------------------------------------------------------------------
+# Per-model facts (validator-owned). A miner only NAMES the model; the activation,
+# the fidelity floor, etc. are the validator's. The generic slot is SiLU + matched_ratio;
+# a model whose MoE differs (M3's clamped swigluoai + NVFP4 -> cosine) carries a profile so
+# op-correctness gates against the REAL model and a faithful low-bit kernel isn't false-failed.
+# (Precursor to the per-model arena registry; the numbers live here, never in bundle metadata.)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class SlotProfile:
+    activation: Optional[Activation] = None  # overrides the slot's reference activation
+    correctness: Optional[Correctness] = None  # overrides the slot's fidelity gate
+
+
+MODEL_PROFILES: dict[str, dict[str, SlotProfile]] = {
+    "MiniMax-M3": {
+        "moe.fused_experts": SlotProfile(
+            activation=Activation("swigluoai", alpha=1.702, limit=7.0),
+            # FP4's 6-12% per-element error trips matched_ratio even when correct; gate on
+            # cosine vs the fp32 HP reference. 0.985 = the measured NVFP4 floor (0.9958) minus
+            # margin; the plain-SiLU donor scores 0.449 here and is correctly rejected.
+            correctness=Correctness("cosine", min_cosine=0.985),
+        ),
+    },
+}
+MODEL_PROFILES["MiniMax-M3-NVFP4"] = MODEL_PROFILES["MiniMax-M3"]  # checkpoint-name alias
+
+_MOE_SLOTS = ("moe.fused_experts", "moe.fused_experts_reduce")
+
+
+def slot_for_model(name: str, model_key: Optional[str] = None) -> SlotSpec:
+    """The slot spec specialized to a served model. ``model_key=None`` (or no profile for
+    this model/slot) returns the generic ``get_slot(name)`` unchanged — so every existing
+    bundle and test is untouched. With a profile, rebind the activation into the slot's
+    high-precision reference(s) and swap the fidelity gate. The miner never sees these."""
+    import dataclasses
+
+    spec = get_slot(name)
+    if not model_key:
+        return spec
+    profile = MODEL_PROFILES.get(model_key, {}).get(name)
+    if profile is None:
+        return spec
+
+    changes: dict = {}
+    if profile.activation is not None and name in _MOE_SLOTS:
+        act = profile.activation
+        changes["invoke_reference"] = (
+            lambda i: [_moe_reference(i["x"], i["w13"], i["w2"], i["topk_ids"], i["topk_weights"], act)]
+        )
+        if spec.collective_partial is not None:  # the reduce variant's per-rank reference
+            changes["collective_partial"] = (
+                lambda i, prepared: _moe_reference(
+                    i["x"], i["w13"], i["w2"], i["topk_ids"], i["topk_weights"], act).float()
+            )
+    if profile.correctness is not None:
+        changes["correctness"] = profile.correctness
+    return dataclasses.replace(spec, **changes) if changes else spec

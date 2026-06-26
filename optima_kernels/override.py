@@ -112,3 +112,31 @@ def compose(
 
     fused_experts.__optima_override__ = point.key  # provenance (attribution)
     return fused_experts
+
+
+def default_prepare(w13, w2):
+    """Validator-owned ``prepare`` for an override submission (the miner ships none).
+
+    CPU/dense form; the GPU NVFP4-layout prepare is part of the base megakernel (M1.2). The
+    validator owns the weight layout for a base kernel — the miner only fills the epilogue."""
+    return {"fmt": "dense", "w13": w13.contiguous(), "w2": w2.contiguous(), "inter": w13.shape[1] // 2}
+
+
+def build_override(slot: str, override_point: str, entry_name: str, loader: Callable):
+    """Build ``(entry, prepare)`` for an override submission, shared by the live seam and
+    ``verify``. ``loader(name) -> callable | None`` loads a function from the (scanned)
+    bundle source, returning None if the symbol is absent.
+
+    Convention: ``entry_name`` is the **device** epilogue (``@cute.jit``, GPU-only — absent
+    on a CPU box behind a cutlass guard); ``entry_name + "_ref"`` is its **torch reference**
+    (always present, the EFC PyTorchEvaluation phase = the fidelity oracle + the CPU path).
+    """
+    epilogue_torch = loader(entry_name + "_ref")
+    if epilogue_torch is None:
+        raise ValueError(
+            f"override {entry_name!r} must ship a torch reference {entry_name + '_ref'!r} "
+            "(the EFC PyTorchEvaluation phase / fidelity oracle)"
+        )
+    epilogue_device = loader(entry_name)  # GPU-only; may be None on CPU
+    entry = compose(slot, override_point, epilogue_torch=epilogue_torch, epilogue_device=epilogue_device)
+    return entry, default_prepare

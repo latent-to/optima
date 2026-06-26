@@ -108,12 +108,25 @@ def _load_bundle_into_registry(bundle: str) -> None:
             logger.warning("optima: skip %s, failed scan: %s", op.slot, scan.violations)
             continue
         meta = json.loads((Path(bundle) / op.metadata).read_text()) if op.metadata else {}
-        entry = load_entry(src, op.entry)
-        # (prepare, forward) slots: load the 2nd callable too, so the runtime dispatcher
-        # can run the miner's weight-layout transform once and feed `prepared` to forward.
-        # (Until now prepare was only exercised by CPU `verify`; the block seam needs it
-        # live.) None for forward-only slots.
-        prepare = load_entry(src, op.prepare) if getattr(op, "prepare", None) else None
+        if getattr(op, "override_point", None):
+            # Override submission: compose the miner's epilogue into the validator-owned base
+            # kernel -> a standard (entry, prepare) that flows through the normal dispatcher.
+            from optima_kernels.override import build_override
+
+            def _loader(name, _src=src):
+                try:
+                    return load_entry(_src, name)
+                except Exception:  # noqa: BLE001 - absent symbol (GPU-only device fn) -> None
+                    return None
+
+            entry, prepare = build_override(op.slot, op.override_point, op.entry, _loader)
+        else:
+            entry = load_entry(src, op.entry)
+            # (prepare, forward) slots: load the 2nd callable too, so the runtime dispatcher
+            # can run the miner's weight-layout transform once and feed `prepared` to forward.
+            # (Until now prepare was only exercised by CPU `verify`; the block seam needs it
+            # live.) None for forward-only slots.
+            prepare = load_entry(src, op.prepare) if getattr(op, "prepare", None) else None
         REGISTRY.register(
             KernelImpl(
                 slot=op.slot,

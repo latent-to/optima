@@ -26,7 +26,7 @@ _DTYPES = {"float32": "float32", "bfloat16": "bfloat16", "float16": "float16"}
 
 
 def _rank_worker(rank, world_size, backend, init_method, slot_name, source_path, entry_name,
-                 shape, dtype_name, device, seed, result_dir, prepare_name=None):
+                 shape, dtype_name, device, seed, result_dir, prepare_name=None, model_key=None):
     """One rank: init the group, run the miner collective into a validator-owned buffer,
     compare to the trusted fp32 cross-rank reduce. Writes its verdict to ``result_dir``.
 
@@ -42,14 +42,14 @@ def _rank_worker(rank, world_size, backend, init_method, slot_name, source_path,
     initialized = False
     try:
         from optima.sandbox import load_entry
-        from optima.slots import get_slot
+        from optima.slots import slot_for_model
 
         if device == "cuda":
             torch.cuda.set_device(rank)
         dist.init_process_group(backend=backend, init_method=init_method, rank=rank, world_size=world_size)
         initialized = True
 
-        slot = get_slot(slot_name)
+        slot = slot_for_model(slot_name, model_key)
         dtype = getattr(torch, dtype_name)
         dev = f"cuda:{rank}" if device == "cuda" else "cpu"
         inputs = slot.make_inputs(dtype=dtype, device=dev, seed=seed, rank=rank, world_size=world_size, **shape)
@@ -107,11 +107,13 @@ def verify_collective(
     device: str | None = None,
     seed: int = 0,
     shapes: list[dict] | None = None,
+    model_key: str | None = None,
 ) -> VerifyResult:
     """Verify a collective slot's kernel across ``world_size`` spawned ranks.
 
     Defaults: ``device`` = cuda iff enough GPUs, else cpu; ``backend`` = nccl on cuda,
-    gloo on cpu. gloo has no bf16, so the CPU path is forced to fp32.
+    gloo on cpu. gloo has no bf16, so the CPU path is forced to fp32. ``model_key`` selects
+    the validator per-model slot profile (activation reference + metric); None -> generic.
     """
     import torch
     import torch.multiprocessing as mp
@@ -128,7 +130,7 @@ def verify_collective(
         with tempfile.TemporaryDirectory(prefix="optima_collective_") as rd:
             init_method = f"file://{os.path.join(rd, 'pg_store')}"
             args = (world_size, backend, init_method, slot.name, source_path, entry_name,
-                    shape, dtype_name, device, seed + i, rd, prepare_name)
+                    shape, dtype_name, device, seed + i, rd, prepare_name, model_key)
             spawn_err = None
             try:
                 mp.spawn(_rank_worker, args=args, nprocs=world_size, join=True)

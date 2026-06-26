@@ -6,6 +6,11 @@
 > a slot or extending `SlotSpec`, check a submission against the four rules. If it can't satisfy
 > all four, it is not a core slot** — it goes in the fenced escape hatch (bottom), or not at all.
 
+> **Miners:** you don't need this page to compete — see [MINER_GUIDE.md](MINER_GUIDE.md).
+> The one rule that shapes how you write a kernel: you only ever *fill an output tensor the
+> validator allocated*, strictly upstream of the sampler (rules 1–2). That's why you never
+> return tensors and never see the final tokens. The rest is the validator's side.
+
 ## Why a "waist"
 
 Long-lived extensible systems are hourglasses: a *thin, stable, minimal* waist, with a

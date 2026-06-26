@@ -262,11 +262,16 @@ def make_moe_dispatcher(
         _maybe_inspect_moe(self, hidden_states, topk_output)
         if _moe_seam_active():
             try:
-                if _moe_supported(self) and hidden_states.dim() == 2:
+                if not (_moe_supported(self) and hidden_states.dim() == 2):
+                    _moe_debug(lambda: f"SKIP not-supported (ep={getattr(self,'moe_ep_size',1)} "
+                                       f"dim={hidden_states.dim()})")
+                else:
                     in_graph = _in_cuda_graph()
                     quant_fmt = _moe_quant_format(self)
                     routed = _standard_topk(topk_output)
-                    if routed is not None:
+                    if routed is None:
+                        _moe_debug(lambda: f"SKIP non-standard topk_output={type(topk_output).__name__}")
+                    else:
                         x = hidden_states
                         arch = _arch_tag(x.device.index or 0) if x.is_cuda else None
                         for slot in slots:
@@ -276,24 +281,30 @@ def make_moe_dispatcher(
                             # (prepare, forward) slot: a registered kernel MUST carry
                             # prepare, else we can't honor the contract -> skip it.
                             if impl is None or impl.prepare is None:
+                                _moe_debug(lambda s=slot: f"SKIP {s}: no impl/prepare (lookup miss)")
                                 continue
                             # Under CUDA graphs (the scoring config) only run a kernel the
                             # miner DECLARED graph-capturable; otherwise trust the baseline
                             # in-graph so an un-capturable kernel can't wedge graph capture.
                             if in_graph and not impl.eligibility.graph_safe:
+                                _moe_debug(lambda s=slot: f"SKIP {s}: in_graph & not graph_safe")
                                 continue
                             # Pair kernel<->layer by quant format: a dense kernel never runs
                             # a quantized layer (it would mis-read packed bytes + scales), and
                             # a quant kernel never runs a dense layer. Mismatch -> baseline.
                             if not _quant_ok(impl.eligibility.quant, quant_fmt):
+                                _moe_debug(lambda s=slot: f"SKIP {s}: quant mismatch "
+                                                          f"(kernel={set(impl.eligibility.quant)} layer={quant_fmt})")
                                 continue
                             out = _run_moe_kernel(self, x, routed, impl, slot)
                             _log_once_active(slot)
+                            _moe_debug(lambda s=slot, m=x.shape[0]: f"FIRED slot={s} M={m} quant={quant_fmt}")
                             return out
             except Exception as exc:  # noqa: BLE001
                 if registry.strict:
                     raise
                 _log_once_fallback(exc)
+                _moe_debug(lambda e=exc: f"FELL BACK after kernel error: {e!r}")
                 # any mismatch with this sglang's internals -> trust the baseline
         return baseline_forward(self, hidden_states, topk_output)
 
@@ -346,6 +357,30 @@ def _maybe_inspect_moe(self, hidden_states, topk_output) -> None:
             fh.write("\n".join(lines) + "\n")
     except Exception:  # noqa: BLE001
         pass
+
+
+_MOE_DEBUG_SEEN: set = set()
+
+
+def _moe_debug(msg) -> None:
+    """Print a one-time-per-message MoE-seam decision to stderr when OPTIMA_MOE_DEBUG=1.
+
+    A definitive observability hook for the spawned scheduler child, where the optima logger's
+    records don't always reach the captured stream. ``msg`` is a thunk so the (cheap) f-string
+    only runs when debugging is on. Inert otherwise."""
+    import os
+    import sys
+
+    if os.environ.get("OPTIMA_MOE_DEBUG") != "1":
+        return
+    try:
+        m = msg() if callable(msg) else str(msg)
+    except Exception:  # noqa: BLE001
+        return
+    if m in _MOE_DEBUG_SEEN:
+        return
+    _MOE_DEBUG_SEEN.add(m)
+    print(f"[optima.moe] {m}", file=sys.stderr, flush=True)
 
 
 def _log_once_active(slot: str) -> None:

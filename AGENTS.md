@@ -17,6 +17,11 @@ This repo is the **validator harness** (the referee), plus example miner bundles
 
 ## Read these (in order)
 
+> Writing or testing a competing kernel (the miner side)? Start with
+> `docs/MINER_GUIDE.md` — the plain-language on-ramp (slots, scoring gates, the
+> bundle format, local→GPU testing, how to find a real win). The docs below are the
+> deeper validator/agent references.
+
 0. `WORKLOG.md` (**local & gitignored — not in a fresh clone; on the dev machine
    only**). The candid working log: full experiment history, live GPU-pod access,
    the prioritized roadmap, and "how to resume". If it exists, read it first — it's

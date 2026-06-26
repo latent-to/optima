@@ -229,13 +229,13 @@ def verify_entry_from_source(
     entry_name: str,
     *,
     prepare_name: Optional[str] = None,
-    model_key: Optional[str] = None,
-    override_point: Optional[str] = None,
     dtype_name: str = "bfloat16",
     device: Optional[str] = None,
     seed: int = 0,
     shapes: Optional[list[dict]] = None,
     jitter_seed: Optional[int] = None,
+    model_key: Optional[str] = None,
+    override_point: Optional[str] = None,
 ) -> VerifyResult:
     """Load the miner module and verify it — module-level + picklable so the CLI can run
     it via ``call_in_subprocess`` in a FRESH process. This keeps the trusted validator/CLI
@@ -243,9 +243,10 @@ def verify_entry_from_source(
     throwaway child). It is NOT a security boundary by itself — production still needs the
     child namespaced/no-egress — but it removes the in-process-RCE-in-the-CLI sink (#6).
 
-    ``model_key`` specializes the slot to the served model (the swigluoai/cosine profile);
-    None -> the generic slot. ``override_point`` (an override submission) composes the miner's
-    epilogue into the validator-owned base kernel instead of loading a whole-kernel ``entry``."""
+    ``model_key`` (a validator/model fact, e.g. ``"MiniMax-M3"``) selects the per-model slot
+    specialization (right activation reference + low-bit metric). None -> the generic slot.
+    ``override_point`` (an override submission) composes the miner's epilogue into the
+    validator-owned base kernel instead of loading a whole-kernel ``entry``."""
     from optima.sandbox import load_entry
     from optima.slots import slot_for_model
 

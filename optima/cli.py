@@ -22,7 +22,6 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from pathlib import Path
 
 from optima.manifest import load_manifest, resolve_source
 from optima.sandbox import scan_path
@@ -126,8 +125,9 @@ def cmd_scan(args: argparse.Namespace) -> int:
 
 
 def _recursive_scan_ok(bundle: str) -> bool:
-    """Fail-closed vendored-tree guard for the eval paths: scan every bundle .py, not just
-    the declared entries. Prints violations; returns False if any."""
+    """Fail-closed vendored-tree guard for the eval paths: scan every bundle .py, not just the
+    declared entries (a vendored library .py using open/importlib/subprocess must not slip in
+    unscanned). Prints violations; returns False if any."""
     from optima.sandbox import scan_tree
 
     tree = scan_tree(bundle)
@@ -138,37 +138,41 @@ def _recursive_scan_ok(bundle: str) -> bool:
     return tree.ok
 
 
-def _verify_model_key(args: argparse.Namespace, op, bundle: str):
-    """The served-model key for the per-model profile: the explicit --model, else the op's
-    metadata-declared 'model' (a DEV convenience — production passes the served-model key)."""
-    if getattr(args, "model", None):
-        return args.model
-    if op.metadata:
-        try:
-            meta = json.loads((Path(bundle) / op.metadata).read_text())
-        except (OSError, ValueError):  # missing/malformed metadata -> no profile (not a hard error)
-            return None
-        return meta.get("model")
-    return None
+def _declared_model(bundle: str, op) -> str | None:
+    """Dev convenience: read the model an op's metadata JSON declares, to pick the
+    validator's per-model slot profile when --model isn't given. Never reads thresholds
+    from metadata (those are validator-owned in slots.MODEL_PROFILES) — only the model id,
+    which selects WHICH validator profile applies. Best-effort; returns None on any issue."""
+    if not getattr(op, "metadata", None):
+        return None
+    try:
+        import json
+        from pathlib import Path
+
+        meta = json.loads((Path(bundle) / op.metadata).read_text())
+        return meta.get("model") or meta.get("model_profile")
+    except Exception:
+        return None
 
 
 def cmd_verify(args: argparse.Namespace) -> int:
-    from optima.slots import SLOTS, slot_for_model
+    from optima.slots import SLOTS, get_slot, model_profile, slot_for_model
     from optima.verify import format_verify, verify_entry
 
     m = load_manifest(args.bundle)
-    if not _recursive_scan_ok(args.bundle):
+    if not _recursive_scan_ok(args.bundle):  # vendored-tree guard (every .py, not just entries)
         return 2
     rc = 0
     for op in m.ops:
         if op.slot not in SLOTS:
             print(f"  [SKIP] {op.slot}: not a known slot on this validator")
             continue
-        model_key = _verify_model_key(args, op, args.bundle)
+        model_key = args.model or _declared_model(args.bundle, op)
+        if model_profile(model_key, op.slot) is not None:
+            via = "via --model" if args.model else "declared in metadata"
+            print(f"  [profile] {op.slot}: model {model_key!r} ({via}) -> validator slot profile "
+                  "(activation + low-bit metric)")
         slot = slot_for_model(op.slot, model_key)
-        if model_key:
-            print(f"  [profile] {op.slot}: model={model_key} "
-                  f"(correctness={slot.correctness.mode})")
         src = resolve_source(args.bundle, op)
 
         scan = scan_path(src)
@@ -186,7 +190,8 @@ def cmd_verify(args: argparse.Namespace) -> int:
 
             ws = getattr(args, "world_size", None) or 2
             result = verify_collective(slot, str(src), op.entry, prepare_name=op.prepare,
-                                       world_size=ws, device=args.device, seed=args.seed)
+                                       world_size=ws, device=args.device, seed=args.seed,
+                                       model_key=model_key)
             print(format_verify(result))
             if not result.passed:
                 rc = 2
@@ -200,9 +205,10 @@ def cmd_verify(args: argparse.Namespace) -> int:
 
         result = call_in_subprocess(
             verify_entry_from_source, op.slot, str(src), op.entry,
-            prepare_name=op.prepare, model_key=model_key, override_point=op.override_point,
-            dtype_name=args.dtype, device=args.device, seed=args.seed,
+            prepare_name=op.prepare, dtype_name=args.dtype, device=args.device, seed=args.seed,
             jitter_seed=args.seed,  # count-dim jitter so shapes vary per run (anti shape-branch)
+            model_key=model_key,  # validator per-model slot profile (activation + metric)
+            override_point=op.override_point,  # compose a miner epilogue into the base kernel
         )
         print(format_verify(result))
         if not result.passed:
@@ -217,7 +223,7 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
     # Trusted parent: validate + scan only. It never imports miner code — the
     # kernel is loaded inside the (to-be-isolated) model process by the plugin.
     m = load_manifest(args.bundle)
-    if not _recursive_scan_ok(args.bundle):
+    if not _recursive_scan_ok(args.bundle):  # vendored-tree guard (every .py, not just entries)
         return 2
     known = 0
     for op in m.ops:
@@ -572,9 +578,9 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--device", default=None, help="cuda|cpu (default: auto)")
     sp.add_argument("--seed", type=int, default=0)
     sp.add_argument("--model", default=None,
-                    help="served-model key for the per-model profile (e.g. MiniMax-M3); "
-                         "default: read the op's metadata 'model' (a DEV convenience — "
-                         "production uses the validator's served-model key, never metadata)")
+                    help="validator model key for the per-model slot profile (activation + "
+                         "low-bit metric), e.g. MiniMax-M3. Default: the model declared in the "
+                         "op's metadata (dev convenience); production uses the served-model key.")
     sp.set_defaults(func=cmd_verify)
 
     sp = sub.add_parser("evaluate", help="end-to-end throughput + KL on a model")

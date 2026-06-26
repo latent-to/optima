@@ -100,6 +100,27 @@ def test_manifest_rejects_foreign_abi():
         assert "abi_version" in str(e)
 
 
+def test_manifest_override_point_fields():
+    payload = {**_GOOD, "ops": [dict(
+        _GOOD["ops"][0], base_kernel="nvfp4_moe_megakernel", override_point="gemm1_epilogue")]}
+    m = _with_loader(payload, lambda: M.load_manifest(TRITON_BUNDLE))
+    op = m.op_for("activation.silu_and_mul")
+    assert op.base_kernel == "nvfp4_moe_megakernel"
+    assert op.override_point == "gemm1_epilogue"
+    assert op.is_override
+    # base_kernel/override_point are first-class, not swept into extra.
+    assert "base_kernel" not in op.extra and "override_point" not in op.extra
+
+
+def test_manifest_override_point_requires_base_kernel():
+    bad = {**_GOOD, "ops": [dict(_GOOD["ops"][0], override_point="gemm1_epilogue")]}
+    try:
+        _with_loader(bad, lambda: M.load_manifest(TRITON_BUNDLE))
+        raise AssertionError("expected ManifestError")
+    except M.ManifestError as e:
+        assert "requires 'base_kernel'" in str(e)
+
+
 # ---- eligibility ------------------------------------------------------------
 
 

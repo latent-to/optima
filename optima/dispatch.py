@@ -229,10 +229,11 @@ def make_moe_dispatcher(
     registry: KernelRegistry = REGISTRY,
     slots: tuple[str, ...] = ("moe.fused_experts_reduce", "moe.fused_experts"),
 ) -> Callable[..., object]:
-    """Build a replacement for ``FusedMoE.forward`` — the single chokepoint every MoE
-    layer funnels through (``sglang.srt.layers.moe.fused_moe_triton.layer``), so the
-    seam is backend-agnostic (the triton / cutlass / marlin MoE backends all sit
-    *below* it).
+    """Build a replacement for ``FusedMoE.forward_impl`` — the single chokepoint every MoE
+    layer funnels through (``sglang.srt.layers.moe.fused_moe_triton.layer``; ``.forward`` is
+    a router that bypasses to ``forward_impl`` under piecewise capture, so ``forward_impl`` is
+    the waist — see optima/integrations/sglang_moe.py), so the seam is backend-agnostic (the
+    triton / cutlass / marlin MoE backends all sit *below* it).
 
     MoE experts are a *block*, and a (prepare, forward) one: the validator owns routing
     (``topk_output`` is computed upstream and handed in), owns the expert weights, and

@@ -1,11 +1,14 @@
 """CPU tests for the FusedMoE block seam (optima.dispatch.make_moe_dispatcher).
 
-The seam replaces ``FusedMoE.forward(self, hidden_states, topk_output)``. These tests
-drive that dispatcher directly with a *fake* layer + a fake standard ``topk_output`` —
-no GPU, no sglang — so the routing extraction, the (prepare, forward) wiring, the
-validator-owned output allocation, and the conservative fallbacks are all exercised on
-the laptop. The faithful kernel is the real example bundle; correctness is checked
-against the slot's own fp32 reference.
+The seam replaces ``FusedMoE.forward_impl(self, hidden_states, topk_output)`` — the
+waist every path (eager, in-piecewise, the two piecewise custom ops) converges on; a
+patch on ``.forward`` is bypassed under piecewise capture. These tests drive that
+dispatcher directly with a *fake* layer + a fake standard ``topk_output`` — no GPU, no
+sglang — so the routing extraction, the (prepare, forward) wiring, the validator-owned
+output allocation, and the conservative fallbacks are all exercised on the laptop. The
+faithful kernel is the real example bundle; correctness is checked against the slot's
+own fp32 reference. The install path (which method gets patched) is covered by
+``test_install_patches_forward_impl`` below.
 """
 
 from __future__ import annotations
@@ -227,3 +230,64 @@ def test_raising_kernel_falls_back_unless_strict(monkeypatch):
     reg.set_strict(True)
     with pytest.raises(RuntimeError, match="boom"):
         dispatched(_fake_layer(inputs), inputs["x"], _standard_topk_output(inputs))
+
+
+# ---- M0: the install path patches forward_impl (the piecewise waist), not forward ----
+
+def test_install_patches_forward_impl(monkeypatch):
+    """``.forward`` is bypassed under piecewise capture (it routes to custom ops that call
+    ``forward_impl`` directly), so the seam MUST patch ``forward_impl``."""
+    import sys
+    from types import ModuleType
+
+    from optima.integrations import sglang_moe
+
+    def forward(self, hidden_states, topk_output):          # the router — must stay untouched
+        return ("forward", hidden_states)
+
+    def forward_impl(self, hidden_states, topk_output):     # the waist — must be patched
+        return ("impl", hidden_states)
+
+    class FakeFusedMoE:
+        pass
+
+    FakeFusedMoE.forward = forward
+    FakeFusedMoE.forward_impl = forward_impl
+    mod = ModuleType(sglang_moe._MODULE)
+    mod.FusedMoE = FakeFusedMoE
+    monkeypatch.setitem(sys.modules, sglang_moe._MODULE, mod)
+
+    orig_forward, orig_impl = FakeFusedMoE.forward, FakeFusedMoE.forward_impl
+    try:
+        sglang_moe.install()
+        assert sglang_moe.is_installed()
+        assert FakeFusedMoE.forward_impl is not orig_impl          # patched
+        assert FakeFusedMoE.forward is orig_forward                # router untouched
+        assert FakeFusedMoE._optima_orig_forward_impl is orig_impl  # captured for fallback/uninstall
+        sglang_moe.install()  # idempotent
+        assert FakeFusedMoE._optima_orig_forward_impl is orig_impl
+    finally:
+        sglang_moe.uninstall()
+    assert FakeFusedMoE.forward_impl is orig_impl
+    assert not sglang_moe.is_installed()
+
+
+def test_install_noop_without_forward_impl(monkeypatch):
+    """An older sglang lacking ``forward_impl`` -> the seam stays inert (the compat canary
+    flags the missing chokepoint rather than the seam silently patching the wrong method)."""
+    import sys
+    from types import ModuleType
+
+    from optima.integrations import sglang_moe
+
+    class OldFusedMoE:
+        def forward(self, hidden_states, topk_output):
+            return ("forward", hidden_states)
+
+    mod = ModuleType(sglang_moe._MODULE)
+    mod.FusedMoE = OldFusedMoE
+    monkeypatch.setitem(sys.modules, sglang_moe._MODULE, mod)
+
+    sglang_moe.install()
+    assert not sglang_moe.is_installed()
+    assert not hasattr(OldFusedMoE, "_optima_orig_forward_impl")

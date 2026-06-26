@@ -1,0 +1,19 @@
+{
+  "slot": "moe.fused_experts",
+  "model": "MiniMax-M3-NVFP4",
+  "arch": "sm_100",
+  "graph_safe": true,
+  "quant": ["nvfp4"],
+  "correctness": {"metric": "cosine", "min_cosine": 0.985,
+    "_note": "validator-owned via MODEL_PROFILES['MiniMax-M3']; declared here for documentation. FP4's per-element error trips matched_ratio; gate on cosine vs an fp32 swigluoai reference (floor 0.9958 - margin). Plain SiLU scores 0.449 and is rejected."},
+  "kl_threshold": 5e-3,
+  "swiglu": {"kind": "swigluoai", "alpha": 1.702, "limit": 7.0,
+    "_formula": "g=min(gate,7); u=clamp(up,-7,7); out=g*sigmoid(1.702*g)*(u+1)"},
+  "win_measured": {
+    "regime": "8xB200 TP4 graphs-ON decode, equal fidelity (GSM8K ~0.94-0.96 vs cutlass 0.98)",
+    "vs": "flashinfer_cutlass fused MoE (served single-node-TP baseline)",
+    "conc256_in2048": {"ratio": 1.12, "drift": "drift-canceled concurrent A/B"},
+    "conc16_in131072": {"ratio": 1.15},
+    "_note": "measured on the pre-override shape (runtime flashinfer patch + sglang cutedsl path). The override here is the SAME epilogue; the GPU number is reproduced once optima_kernels nvfp4_moe_megakernel is built (M1.2) and re-measured through the seam."
+  }
+}

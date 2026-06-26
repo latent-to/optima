@@ -163,6 +163,29 @@ def scan_path(path: str | Path) -> ScanResult:
     return scan_source(p.read_text(encoding="utf-8"), filename=p.name)
 
 
+def scan_tree(root: str | Path) -> ScanResult:
+    """Recursively scan EVERY ``.py`` under a bundle root — the vendored-tree guard.
+
+    ``scan_path`` only covers the single declared entry module; a bundle can carry a whole
+    vendored library, and a vendored module using ``open``/``importlib``/``subprocess`` must
+    not slip in unscanned (the hole the single-file scan left). Aggregates violations across
+    all files (skips ``__pycache__``). Still defense-in-depth, not a sandbox — but it closes
+    the "ship the dangerous code in a file nobody scans" gap.
+    """
+    root = Path(root)
+    out: list[str] = []
+    for p in sorted(root.rglob("*.py")):
+        if "__pycache__" in p.parts:
+            continue
+        try:
+            text = p.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:  # noqa: PERF203
+            out.append(f"{p.relative_to(root)}: unreadable: {exc}")
+            continue
+        out.extend(scan_source(text, filename=str(p.relative_to(root))).violations)
+    return ScanResult(ok=not out, violations=tuple(out))
+
+
 def load_entry(source_path: str | Path, entry: str) -> Callable:
     """Import ``source_path`` in-process and return its ``entry`` callable.
 

@@ -69,7 +69,19 @@ class OpEntry:
     metadata: str | None
     prepare: str | None = None  # optional 2nd callable (weight-prep) for (prepare, forward) slots
     setup: str | None = None  # optional callable run ONCE at engine init (framework mode)
+    # Override-point submission (the swigluoai class): the bundle does NOT ship a whole kernel —
+    # it fills a typed hole in a validator-owned base kernel from optima_kernels. ``entry`` then
+    # names the override device fn (e.g. a CuTe-DSL epilogue), ``base_kernel`` names the base
+    # (e.g. "nvfp4_moe_megakernel"), ``override_point`` the hole (e.g. "gemm1_epilogue"). The
+    # validator JIT-composes base+override at load (see optima_kernels.override). ``prepare`` is
+    # omitted: the validator owns the weight-prep for the base kernel.
+    base_kernel: str | None = None
+    override_point: str | None = None
     extra: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def is_override(self) -> bool:
+        return self.override_point is not None
 
 
 @dataclass(frozen=True)
@@ -175,7 +187,23 @@ def load_manifest(bundle_root: str | Path) -> Manifest:
         dtypes = tuple(str(d) for d in op.get("dtypes", ()))
         archs = tuple(str(a) for a in op.get("architectures", ()))
 
-        known = {"slot", "source", "entry", "prepare", "setup", "dtypes", "architectures", "metadata"}
+        # Override-point fields (optional). override_point requires base_kernel; the names
+        # are resolved against optima_kernels at load (here we only check structure).
+        base_kernel = op.get("base_kernel")
+        if base_kernel is not None:
+            base_kernel = str(base_kernel).strip()
+            _require(bool(base_kernel), f"ops[{i}] ({slot}) 'base_kernel' must be non-empty when set")
+        override_point = op.get("override_point")
+        if override_point is not None:
+            override_point = str(override_point).strip()
+            _require(bool(override_point), f"ops[{i}] ({slot}) 'override_point' must be non-empty when set")
+        _require(
+            override_point is None or base_kernel is not None,
+            f"ops[{i}] ({slot}) 'override_point' requires 'base_kernel'",
+        )
+
+        known = {"slot", "source", "entry", "prepare", "setup", "dtypes", "architectures",
+                 "metadata", "base_kernel", "override_point"}
         extra = {k: v for k, v in op.items() if k not in known}
 
         ops.append(
@@ -188,6 +216,8 @@ def load_manifest(bundle_root: str | Path) -> Manifest:
                 metadata=metadata,
                 prepare=prepare,
                 setup=setup,
+                base_kernel=base_kernel,
+                override_point=override_point,
                 extra=extra,
             )
         )

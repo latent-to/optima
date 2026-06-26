@@ -116,15 +116,17 @@ def run_checks() -> list[Check]:
     except Exception as exc:  # noqa: BLE001
         add("seam: RadixAttention (attention)", False, repr(exc))
 
-    # MoE seam (the MoE BLOCK slot chokepoint: FusedMoE.forward(hidden_states, topk_output))
+    # MoE seam (the MoE BLOCK slot chokepoint: FusedMoE.forward_impl(hidden_states,
+    # topk_output) — the waist all paths converge on; .forward is bypassed under
+    # piecewise capture, so we patch forward_impl, see optima/integrations/sglang_moe.py)
     try:
         from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 
-        params = set(inspect.signature(FusedMoE.forward).parameters)
-        ok = hasattr(FusedMoE, "forward") and {"hidden_states", "topk_output"} <= params
-        add("seam: FusedMoE (moe.fused_experts)", ok, f"forward params={tuple(sorted(params))}")
+        params = set(inspect.signature(FusedMoE.forward_impl).parameters)
+        ok = hasattr(FusedMoE, "forward_impl") and {"hidden_states", "topk_output"} <= params
+        add("seam: FusedMoE.forward_impl (moe.fused_experts)", ok, f"forward_impl params={tuple(sorted(params))}")
     except Exception as exc:  # noqa: BLE001
-        add("seam: FusedMoE (moe.fused_experts)", False, repr(exc))
+        add("seam: FusedMoE.forward_impl (moe.fused_experts)", False, repr(exc))
 
     # collective seam (the TP-comms chokepoint: GroupCoordinator.all_reduce)
     try:
@@ -156,6 +158,18 @@ def run_checks() -> list[Check]:
         add("ServerArgs accepts our kwargs", need <= fields, f"missing: {sorted(need - fields) or 'none'}")
     except Exception as exc:  # noqa: BLE001
         add("ServerArgs accepts our kwargs", False, repr(exc))
+
+    # Blessed base — the kernel-library surface a miner kernel / a composed override runs on.
+    # Consensus-critical: a flashinfer/cutlass/triton skew JITs different kernels -> different
+    # throughput AND numerics -> divergent weights -> Yuma penalty (the same reason sglang is
+    # pinned). Record-only until the arena pins exact versions; the canary reports the surface.
+    try:
+        from optima.blessed_base import check_blessed_base
+
+        for name, ok, detail in check_blessed_base():
+            add(f"blessed-base: {name}", ok, detail)
+    except Exception as exc:  # noqa: BLE001
+        add("blessed-base", False, repr(exc))
 
     return checks
 

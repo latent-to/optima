@@ -44,7 +44,7 @@ SEAM_ADAPTERS: tuple[SeamAdapter, ...] = (
     SeamAdapter("attention", "sglang.srt.layers.radix_attention",
                 "sglang_attention", "RadixAttention.forward", ("attention.decode", "attention.sdpa")),
     SeamAdapter("moe", "sglang.srt.layers.moe.fused_moe_triton.layer",
-                "sglang_moe", "FusedMoE.forward", ("moe.fused_experts", "moe.fused_experts_reduce")),
+                "sglang_moe", "FusedMoE.forward_impl", ("moe.fused_experts", "moe.fused_experts_reduce")),
     SeamAdapter("collective", "sglang.srt.distributed.parallel_state",
                 "sglang_allreduce", "GroupCoordinator.all_reduce", ("collective.all_reduce",)),
 )

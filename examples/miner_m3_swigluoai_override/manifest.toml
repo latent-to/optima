@@ -1,0 +1,23 @@
+# MiniMax-M3 NVFP4 MoE — the swigluoai win as an OVERRIDE submission.
+#
+# The whole bundle is one epilogue. The fused NVFP4 MoE megakernel (gather -> GEMM1 ->
+# {epilogue} -> NVFP4 requant -> GEMM2 -> fused finalize) is the validator-owned base
+# (optima_kernels nvfp4_moe_megakernel); the miner ships ONLY the GEMM1 epilogue — M3's
+# clamped swigluoai, ~14 lines of CuTe-DSL + its torch reference. No vendored kernel, no
+# sglang import, no open()-patch: the override-point composes it into the base at load.
+#
+# Contrast experiments/minimax_m3/bundle/miner_m3_moe_swigluoai_nvfp4/ (the old shape): a
+# 155-line bundle that imported sglang for the layout and installed the win by open()-patching
+# site-packages flashinfer (sandbox-banned). This is the clean replacement.
+
+bundle_id = "m3-swigluoai-override-v1"
+abi_version = "optima-op-abi-v0"
+
+[[ops]]
+slot = "moe.fused_experts"
+source = "kernels/swigluoai.py"
+entry = "gemm1_epilogue"            # the device epilogue (entry+"_ref" = its torch reference)
+base_kernel = "nvfp4_moe_megakernel"
+override_point = "gemm1_epilogue"
+dtypes = ["bfloat16", "float16"]
+metadata = "metadata/moe.json"

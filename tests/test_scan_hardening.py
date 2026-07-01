@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from optima.sandbox import scan_source
+from optima.sandbox import scan_source, scan_tree
 
 EXAMPLES = Path(__file__).resolve().parent.parent / "examples"
 
@@ -20,9 +20,28 @@ EXAMPLES = Path(__file__).resolve().parent.parent / "examples"
     "v = vars()\n",
     "y = ().__class__.__bases__[0]\n",                            # __class__ escape hop
     "import os\nsetattr(os, 'x'+'y', 1)\n",                       # dynamic setattr
+    "import os\nf = os.system\nf('id')\n",                        # banned-callable ALIAS (no Call at the access)
+    "import os\ncmds = [os.system]\ncmds[0]('id')\n",             # alias via a container
+    "import dill\nl = dill.loads\nl(b'')\n",                      # deserializer alias
 ])
 def test_known_bypasses_are_flagged(src):
     assert not scan_source(src).ok, f"should have flagged: {src!r}"
+
+
+def test_scan_tree_flags_symlinks_fail_closed(tmp_path):
+    # rglob does not follow directory symlinks, so a symlinked dir of .py files would
+    # be invisible to the scan while staying perfectly importable at runtime. Any
+    # symlink in a bundle is now a violation in itself.
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "evil.py").write_text("import os\nos.system('id')\n")
+    bundle = tmp_path / "bundle"
+    (bundle / "kernels").mkdir(parents=True)
+    (bundle / "kernels" / "k.py").write_text("import torch\n")
+    (bundle / "kernels" / "vendored").symlink_to(outside, target_is_directory=True)
+    res = scan_tree(bundle)
+    assert not res.ok
+    assert any("symlink" in v for v in res.violations)
 
 
 @pytest.mark.parametrize("src", [

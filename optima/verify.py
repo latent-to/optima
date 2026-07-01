@@ -247,24 +247,25 @@ def verify_entry_from_source(
     specialization (right activation reference + low-bit metric). None -> the generic slot.
     ``override_point`` (an override submission) composes the miner's epilogue into the
     validator-owned base kernel instead of loading a whole-kernel ``entry``."""
-    from optima.sandbox import load_entry
+    from optima.sandbox import callable_from, load_module
     from optima.slots import slot_for_model
 
     slot = slot_for_model(slot_name, model_key)
     dtype = getattr(torch, dtype_name)
+    # ONE module instance: entry/prepare (or an override's device fns) must share a
+    # namespace — separate load_entry calls re-execute the body per callable.
+    module = load_module(source_path)  # runs the miner module body — in THIS child
     if override_point is not None:
         from optima_kernels.override import build_override
 
-        def _loader(name):
-            try:
-                return load_entry(source_path, name)
-            except Exception:  # noqa: BLE001 - absent symbol (e.g. GPU-only device fn) -> None
-                return None
+        def _loader(name, _mod=module):
+            fn = getattr(_mod, name, None)
+            return fn if callable(fn) else None  # absent symbol (GPU-only device fn) -> None
 
         entry, prepare = build_override(slot_name, override_point, entry_name, _loader)
     else:
-        entry = load_entry(source_path, entry_name)  # runs the miner module body — in THIS child
-        prepare = load_entry(source_path, prepare_name) if prepare_name else None
+        entry = callable_from(module, entry_name)
+        prepare = callable_from(module, prepare_name) if prepare_name else None
     return verify_entry(slot, entry, prepare=prepare, dtype=dtype, device=device, seed=seed,
                         shapes=shapes, jitter_seed=jitter_seed)
 

@@ -62,3 +62,18 @@ def test_per_slot_persists_across_load(tmp_path):
     led.save(p)
     led2 = Ledger.load(p)
     assert led2.champions["moe.fused_experts"].hotkey == "alice"
+
+
+def test_stale_champion_flagged_even_when_its_slot_gets_no_submissions():
+    # A pin bump makes alice's frozen score incomparable; her slot receives no
+    # challengers this round (only ANOTHER slot does), but she still holds emission —
+    # the slot must be flagged stale for re-baseline anyway.
+    led = Ledger()
+    _score(led, "alice", "H_A", "moe.fused_experts", 1.20, pin="0.5.11")
+    led.settle_per_slot(0, current_sglang_version="0.5.11")
+    _score(led, "bob", "H_B", "norm.rmsnorm", 1.10, rnd=1, pin="0.5.12")
+    res = led.settle_per_slot(1, current_sglang_version="0.5.12")
+    assert "moe.fused_experts" in res.stale_slots
+    # And with NO submissions anywhere the flag still raises.
+    res2 = led.settle_per_slot(2, current_sglang_version="0.5.12")
+    assert "moe.fused_experts" in res2.stale_slots

@@ -71,9 +71,12 @@ This repo is the **validator harness** (the referee), plus example miner bundles
   mean-KL: a coverage/tail-mass guard (catches a flattened head-matching distribution top-k KL
   misses), argmax-rate (sparse flips), early-stop dropped-position accounting, and **per-slot
   KL thresholds** (`SlotSpec.kl_threshold`; attention 3e-2 vs the 5e-3 default). Per-op verify
-  **jitters count dims** per run (anti shape-branching). Anti-copy (`optima/copy_fingerprint.py`):
-  cumulative-across-rounds detection on exact hash OR a reformat-invariant fingerprint
-  (auto-demote), plus a structural skeleton fingerprint (advisory, flags rename/constant-tweak).
+  **jitters count dims** per run (anti shape-branching; collective verify too). Anti-copy
+  (`optima/copy_fingerprint.py`): cumulative-across-rounds detection on exact hash OR a
+  reformat-invariant fingerprint — computed **per slot over each op's transitive bundle-local
+  import closure**, with a per-FILE containment compare so neither padding the bundle with an
+  extra op nor relocating a stolen body into an imported module evades auto-demote — plus a
+  structural skeleton fingerprint (advisory, flags rename/constant-tweak).
   `optima settle --per-slot` = a champion per slot, emission split (pays specialists); a champion
   on a different `PINNED_SGLANG` is flagged stale (re-baseline). `optima verify` loads + runs the
   kernel **out-of-process** so the CLI never imports miner code (full netns isolation is still TODO).

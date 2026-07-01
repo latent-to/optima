@@ -82,8 +82,11 @@ def _sampling_params(cfg: EvalConfig, *, max_new_tokens: int) -> dict:
 def _generate_and_time(engine, prompts: list[str], *, max_new_tokens: int, timed_iters: int,
                        cfg: EvalConfig, top_logprobs_num: int = 0):
     sp = _sampling_params(cfg, max_new_tokens=max_new_tokens)
-    # warmup (JIT/compile off the clock)
-    engine.generate(prompt=prompts, sampling_params=sp)
+    # warmup (JIT/compile AND the clock ramp off the clock): cfg.warmup_iters full
+    # rounds, >=2 — a single round leaves the documented ±17-32% ramp inside the
+    # timing window (see EvalConfig.warmup_iters).
+    for _ in range(max(1, getattr(cfg, "warmup_iters", 1))):
+        engine.generate(prompt=prompts, sampling_params=sp)
 
     samples: list[float] = []
     outputs = None

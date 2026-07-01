@@ -151,9 +151,20 @@ def scan_source(source: str, *, filename: str = "<kernel>") -> ScanResult:
                         f"{filename}:{node.lineno}: banned deserialization "
                         f"{node.func.value.id}.{attr}()"
                     )
-        # attribute access to escape dunders
-        elif isinstance(node, ast.Attribute) and node.attr in _BANNED_DUNDERS:
-            out.append(f"{filename}:{node.lineno}: banned attribute {node.attr!r}")
+        # attribute access to escape dunders — or to ALIAS a banned callable without
+        # an ast.Call at the access site (``f = os.system; f("id")``). Flagging the
+        # bare access double-reports a direct ``os.system(...)`` (once via the Call
+        # branch, once here); harmless for a reject-on-any-violation scan.
+        elif isinstance(node, ast.Attribute):
+            if node.attr in _BANNED_DUNDERS:
+                out.append(f"{filename}:{node.lineno}: banned attribute {node.attr!r}")
+            elif node.attr in _BANNED_ATTR_CALLS:
+                out.append(f"{filename}:{node.lineno}: banned attribute {node.attr!r} "
+                           "(aliasable escape callable)")
+            elif (node.attr in _DESERIALIZE_ATTRS and isinstance(node.value, ast.Name)
+                    and node.value.id in _DESERIALIZE_BASES):
+                out.append(f"{filename}:{node.lineno}: banned deserialization alias "
+                           f"{node.value.id}.{node.attr}")
 
     return ScanResult(ok=not out, violations=tuple(out))
 
@@ -174,8 +185,17 @@ def scan_tree(root: str | Path) -> ScanResult:
     """
     root = Path(root)
     out: list[str] = []
-    for p in sorted(root.rglob("*.py")):
+    for p in sorted(root.rglob("*")):
         if "__pycache__" in p.parts:
+            continue
+        # Fail-closed on ANY symlink: rglob does not follow directory symlinks, so a
+        # symlinked dir full of .py would otherwise be silently invisible to this scan
+        # (while still perfectly importable at runtime). A bundle has no business
+        # containing symlinks at all.
+        if p.is_symlink():
+            out.append(f"{p.relative_to(root)}: symlink (not allowed in a bundle)")
+            continue
+        if p.suffix != ".py" or not p.is_file():
             continue
         try:
             text = p.read_text(encoding="utf-8")
@@ -186,13 +206,19 @@ def scan_tree(root: str | Path) -> ScanResult:
     return ScanResult(ok=not out, violations=tuple(out))
 
 
-def load_entry(source_path: str | Path, entry: str) -> Callable:
-    """Import ``source_path`` in-process and return its ``entry`` callable.
+def load_module(source_path: str | Path):
+    """Import ``source_path`` in-process and return the MODULE object.
 
     SECURITY: this executes the module body. Call it only from inside an isolated
     worker (separate process/namespace, no network, per-eval GPU context), never
     from the trusted validator process. The scan is enforced here as a tripwire,
     but it is not the boundary.
+
+    Every call EXECUTES THE BODY AGAIN in a fresh module instance (and repoints
+    ``sys.modules``) — so a caller that needs several callables from one op
+    (entry + prepare + setup, or an override's device fns) must call this ONCE and
+    ``getattr`` them all, or the callables end up in different module namespaces
+    (module-global state shared between prepare and entry would silently vanish).
     """
     p = Path(source_path).resolve()
     scan = scan_path(p)
@@ -213,11 +239,23 @@ def load_entry(source_path: str | Path, entry: str) -> Callable:
     # ModuleNotFoundError ("No module named 'optima_kernel_<stem>'") during capture.
     sys.modules[mod_name] = module
     spec.loader.exec_module(module)  # runs the miner module body
+    return module
 
-    fn = getattr(module, entry, None)
+
+def callable_from(module, name: str) -> Callable:
+    """Pull a named callable off an already-loaded kernel module (see ``load_module``)."""
+    fn = getattr(module, name, None)
     if not callable(fn):
-        raise AttributeError(f"kernel module {p.name} has no callable {entry!r}")
+        raise AttributeError(
+            f"kernel module {getattr(module, '__name__', '?')} has no callable {name!r}")
     return fn
+
+
+def load_entry(source_path: str | Path, entry: str) -> Callable:
+    """``load_module`` + pull one callable. For SEVERAL callables from the same op use
+    ``load_module`` once + ``callable_from`` — repeated ``load_entry`` calls re-execute
+    the module body into separate instances (see ``load_module``)."""
+    return callable_from(load_module(source_path), entry)
 
 
 def probe_in_subprocess(source_path: str | Path, entry: str, *, cpu_seconds: int = 20, mem_mb: int = 4096) -> tuple[bool, str]:

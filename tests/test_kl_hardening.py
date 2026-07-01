@@ -28,8 +28,9 @@ def test_tail_flattening_with_matching_head_is_caught_by_coverage():
     rpt = kl_over_positions(ref, cand)
     assert rpt.argmax_disagreements == 0           # head ranking preserved
     assert rpt.mean_coverage_dev > 0.4             # but the tail moved
-    # Passes a mean-only gate, FAILS once the coverage guard is on.
-    assert kl_gate_ok(rpt, kl_threshold=5e-3, coverage_dev_threshold=None) or True
+    # Passes a lenient mean-only gate (the head-KL of this flattening is ~0.9, so it
+    # clears a 1.0 mean threshold with no coverage guard), FAILS once the guard is on.
+    assert kl_gate_ok(rpt, kl_threshold=1.0, coverage_dev_threshold=None)
     assert not kl_gate_ok(rpt, kl_threshold=1.0, coverage_dev_threshold=0.25)
 
 

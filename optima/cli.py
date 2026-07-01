@@ -113,9 +113,11 @@ def cmd_scan(args: argparse.Namespace) -> int:
             print(f"      {v}")
             rc = 2
     # Recursive guard: catch a vendored/extra .py the per-op (entry-only) scan misses.
+    # Exact file match, not startswith: a prefix filter would also drop violations in
+    # e.g. "kernels/silu.py_evil.py" because it string-prefixes "kernels/silu.py".
     op_sources = {op.source for op in m.ops}
     extra = [v for v in scan_tree(args.bundle).violations
-             if not any(v.startswith(s) for s in op_sources)]
+             if v.split(":", 1)[0] not in op_sources]
     if extra:
         print("  [VIOLATIONS] vendored/extra .py (recursive scan):")
         for v in extra:
@@ -191,6 +193,7 @@ def cmd_verify(args: argparse.Namespace) -> int:
             ws = getattr(args, "world_size", None) or 2
             result = verify_collective(slot, str(src), op.entry, prepare_name=op.prepare,
                                        world_size=ws, device=args.device, seed=args.seed,
+                                       jitter_seed=args.seed,  # anti shape-branch, like per-op
                                        model_key=model_key)
             print(format_verify(result))
             if not result.passed:
@@ -338,6 +341,8 @@ def cmd_bench(args: argparse.Namespace) -> int:
     from optima.eval.throughput_kl import EvalConfig
 
     m = load_manifest(args.bundle)
+    if not _recursive_scan_ok(args.bundle):  # vendored-tree guard (every .py, not just entries)
+        return 2
     known = 0
     for op in m.ops:
         if op.slot not in SLOTS:
@@ -473,25 +478,34 @@ def cmd_commit(args: argparse.Namespace) -> int:
 def cmd_reveal(args: argparse.Namespace) -> int:
     from optima.bundle_hash import content_hash
     from optima.commit_reveal import Ledger, RevealError
-    from optima.copy_fingerprint import bundle_fingerprint, bundle_structural_fingerprint
+    from optima.copy_fingerprint import (
+        bundle_fingerprint,
+        bundle_slot_file_fingerprints,
+        bundle_slot_fingerprints,
+        bundle_structural_fingerprint,
+    )
 
     ch = content_hash(args.bundle)
     fp = bundle_fingerprint(args.bundle)  # reformat-invariant near-copy signal (auto-demotes)
+    slot_fps = bundle_slot_fingerprints(args.bundle)  # per-slot: a padded bundle can't hide a stolen slot
+    file_fps = bundle_slot_file_fingerprints(args.bundle)  # per-file: nor a RELOCATED stolen body
     sfp = bundle_structural_fingerprint(args.bundle)  # rename/constant-tweak skeleton (advisory)
     led = Ledger.load(args.ledger)
     # Query advisory structural matches BEFORE recording this reveal (so we don't match self).
     advisory = led.structural_near_copies(sfp, args.hotkey)
     try:
         rev = led.reveal(args.hotkey, ch, args.salt, args.round, fingerprint=fp,
-                         structural_fingerprint=sfp)
+                         structural_fingerprint=sfp, slot_fingerprints=slot_fps,
+                         slot_file_fingerprints=file_fps)
     except RevealError as e:
         print(f"REJECTED: {e}")
         return 2
     led.save(args.ledger)
     print(f"revealed hotkey={args.hotkey} content={ch[:16]}... original={rev.original}")
     if not rev.original:
-        print("  -> flagged as a COPY (an earlier commit to this exact content OR its "
-              "reformatted-but-identical structure exists); earns 0")
+        print("  -> flagged as a COPY (an earlier commit to this exact content, its "
+              "reformatted-but-identical structure, or a bundle whose kernel source "
+              "this one contains exists); earns 0")
     elif advisory:
         print(f"  ⚠ ADVISORY: structurally similar to earlier submission(s) by {', '.join(advisory)} "
               "(possible rename/constant-tweak copy) — flagged for review, not auto-demoted")

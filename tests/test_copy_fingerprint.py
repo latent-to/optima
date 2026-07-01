@@ -10,6 +10,8 @@ from pathlib import Path
 from optima.commit_reveal import Ledger, make_commitment
 from optima.copy_fingerprint import (
     bundle_fingerprint,
+    bundle_slot_file_fingerprints,
+    bundle_slot_fingerprints,
     normalized_source,
     source_fingerprint,
     structural_fingerprint,
@@ -141,3 +143,92 @@ def test_structural_advisory_is_not_auto_demote():
     bob = led.reveal("bob", "H_B", "s", 1, fingerprint="fpB", structural_fingerprint="SKEL")
     assert matches == ["alice"]      # surfaced for review
     assert bob.original is True      # but NOT demoted (advisory only)
+
+
+# ---- relocation / padding evasion (per-slot + per-file compares) ----
+
+
+def _write_bundle(root: Path, ops: list[tuple[str, str, str]], files: dict[str, str]) -> Path:
+    """Materialize a minimal bundle: ``ops`` = (slot, source, entry) rows; ``files`` =
+    relpath -> python source."""
+    root.mkdir(parents=True, exist_ok=True)
+    lines = ['bundle_id = "t"', 'abi_version = "optima-op-abi-v0"', ""]
+    for slot, source, entry in ops:
+        lines += ["[[ops]]", f'slot = "{slot}"', f'source = "{source}"', f'entry = "{entry}"', ""]
+    (root / "manifest.toml").write_text("\n".join(lines))
+    for rel, src in files.items():
+        p = root / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(src)
+    return root
+
+
+def _reveal_bundle(led: Ledger, hotkey: str, ch: str, rnd: int, bundle: Path):
+    led.commit(hotkey, make_commitment(ch, hotkey, "s"), rnd)
+    return led.reveal(
+        hotkey, ch, "s", rnd,
+        fingerprint=bundle_fingerprint(bundle),
+        slot_fingerprints=bundle_slot_fingerprints(bundle),
+        slot_file_fingerprints=bundle_slot_file_fingerprints(bundle),
+    )
+
+
+def test_relocated_body_behind_a_reexport_is_still_flagged(tmp_path):
+    # alice: the body lives in the DECLARED entry module.
+    a = _write_bundle(tmp_path / "a", [("activation.silu_and_mul", "kernels/silu.py", "silu_and_mul")],
+                      {"kernels/silu.py": ORIG})
+    # bob: entry is a one-line re-export; alice's body (reflowed) hides in an imported
+    # module at a DIFFERENT path — the exact-hash, whole-bundle AND per-slot closure
+    # fingerprints all differ, so only the per-file containment compare can catch it.
+    b = _write_bundle(tmp_path / "b", [("activation.silu_and_mul", "kernels/silu.py", "silu_and_mul")],
+                      {"kernels/silu.py": "from ._impl import silu_and_mul\n",
+                       "kernels/_impl.py": REFORMATTED})
+    led = Ledger()
+    ra = _reveal_bundle(led, "alice", "H_A", 0, a)
+    rb = _reveal_bundle(led, "bob", "H_B", 1, b)
+    assert ra.original is True
+    assert rb.original is False
+
+
+def test_padding_an_extra_op_does_not_evade_demotion(tmp_path):
+    a = _write_bundle(tmp_path / "a", [("activation.silu_and_mul", "kernels/silu.py", "silu_and_mul")],
+                      {"kernels/silu.py": ORIG})
+    # bob pads the stolen (reflowed, relocated) slot with a second unrelated op so the
+    # whole-bundle fingerprint can never match alice's single-op bundle.
+    pad = "import torch\n\ndef rmsnorm(x, w, out, eps):\n    v = (x * x).mean(-1, keepdim=True)\n    out.copy_(x * torch.rsqrt(v + eps) * w)\n"
+    b = _write_bundle(tmp_path / "b",
+                      [("activation.silu_and_mul", "kernels/main.py", "silu_and_mul"),
+                       ("norm.rmsnorm", "kernels/rms.py", "rmsnorm")],
+                      {"kernels/main.py": REFORMATTED, "kernels/rms.py": pad})
+    led = Ledger()
+    ra = _reveal_bundle(led, "alice", "H_A", 0, a)
+    rb = _reveal_bundle(led, "bob", "H_B", 1, b)
+    assert ra.original is True
+    assert rb.original is False
+
+
+def test_shared_vendored_utility_alone_is_not_a_copy(tmp_path):
+    # Both miners vendor the SAME public helper next to genuinely different kernels:
+    # file-set INTERSECTION is non-empty but neither set CONTAINS the other -> no demote.
+    util = ("import torch\n\ndef ceil_div(a, b):\n    return (a + b - 1) // b\n\n"
+            "def pad_to(x, m):\n    r = x.shape[-1] % m\n    return x if r == 0 else "
+            "torch.nn.functional.pad(x, (0, m - r))\n")
+    a = _write_bundle(tmp_path / "a", [("activation.silu_and_mul", "kernels/k.py", "silu_and_mul")],
+                      {"kernels/k.py": "from .util import ceil_div\n" + ORIG, "kernels/util.py": util})
+    b = _write_bundle(tmp_path / "b", [("activation.silu_and_mul", "kernels/k.py", "silu_and_mul")],
+                      {"kernels/k.py": "from .util import ceil_div\n" + DIFFERENT, "kernels/util.py": util})
+    led = Ledger()
+    ra = _reveal_bundle(led, "alice", "H_A", 0, a)
+    rb = _reveal_bundle(led, "bob", "H_B", 1, b)
+    assert ra.original is True
+    assert rb.original is True
+
+
+def test_file_fingerprints_skip_boilerplate_and_follow_imports(tmp_path):
+    b = _write_bundle(tmp_path / "b", [("activation.silu_and_mul", "kernels/silu.py", "silu_and_mul")],
+                      {"kernels/silu.py": "from ._impl import silu_and_mul\n",
+                       "kernels/_impl.py": ORIG})
+    file_fps = bundle_slot_file_fingerprints(b)["activation.silu_and_mul"]
+    # the one-line re-export shim is boilerplate (below the substantial floor); the
+    # imported body is followed and fingerprinted path-independently.
+    assert file_fps == [source_fingerprint(ORIG)]

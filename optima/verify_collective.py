@@ -41,7 +41,7 @@ def _rank_worker(rank, world_size, backend, init_method, slot_name, source_path,
                "detail": "", "metric": "ratio", "err": None}
     initialized = False
     try:
-        from optima.sandbox import load_entry
+        from optima.sandbox import callable_from, load_module
         from optima.slots import slot_for_model
 
         if device == "cuda":
@@ -54,16 +54,20 @@ def _rank_worker(rank, world_size, backend, init_method, slot_name, source_path,
         dev = f"cuda:{rank}" if device == "cuda" else "cpu"
         inputs = slot.make_inputs(dtype=dtype, device=dev, seed=seed, rank=rank, world_size=world_size, **shape)
 
+        # ONE module instance for prepare+entry (separate loads would re-execute the
+        # body and split them across namespaces — see optima.sandbox.load_module).
+        module = load_module(source_path)
+
         # (prepare, forward) collective blocks (e.g. moe.fused_experts_reduce): run the
         # miner's weight-prep once on THIS rank's shard before the timed forward.
         prepared = None
         if prepare_name and slot.invoke_prepare is not None:
-            prepared = slot.invoke_prepare(load_entry(source_path, prepare_name), inputs)
+            prepared = slot.invoke_prepare(callable_from(module, prepare_name), inputs)
 
         out_shape = slot.out_shapes(inputs)[0]
         out = torch.empty(out_shape, dtype=dtype, device=dev)  # validator-owned output buffer
 
-        entry = load_entry(source_path, entry_name)
+        entry = callable_from(module, entry_name)
         invoke = slot.invoke_collective or (lambda e, i, o, g, p: e(i["x"], o, g))
         invoke(entry, inputs, out, dist.group.WORLD, prepared)  # miner fills `out` with sum-over-ranks
 
@@ -108,15 +112,21 @@ def verify_collective(
     seed: int = 0,
     shapes: list[dict] | None = None,
     model_key: str | None = None,
+    jitter_seed: int | None = None,
 ) -> VerifyResult:
     """Verify a collective slot's kernel across ``world_size`` spawned ranks.
 
     Defaults: ``device`` = cuda iff enough GPUs, else cpu; ``backend`` = nccl on cuda,
     gloo on cpu. gloo has no bf16, so the CPU path is forced to fp32. ``model_key`` selects
     the validator per-model slot profile (activation reference + metric); None -> generic.
+    ``jitter_seed`` perturbs the count dims per run (same anti-shape-branching guard as
+    the per-op verify — without it a collective kernel could hard-code the fixed verify
+    shapes); jittered in the parent so every rank builds identical shapes.
     """
     import torch
     import torch.multiprocessing as mp
+
+    from optima.verify import _jitter_shapes
 
     if device is None:
         device = "cuda" if (torch.cuda.is_available() and torch.cuda.device_count() >= world_size) else "cpu"
@@ -124,6 +134,8 @@ def verify_collective(
         backend = "nccl" if device == "cuda" else "gloo"
     dtype_name = "float32" if backend == "gloo" else "bfloat16"  # gloo: no bf16
     test_shapes = shapes if shapes is not None else list(slot.shapes)
+    if jitter_seed is not None:
+        test_shapes = _jitter_shapes(test_shapes, jitter_seed)
 
     results: list[ShapeResult] = []
     for i, shape in enumerate(test_shapes):

@@ -297,9 +297,14 @@ optima settle  --round 0 --margin 0.02 --ledger l.json
 - **copy detection** (`optima/copy_fingerprint.py`): cumulative **across rounds** (a copy
   in a later round is caught, not just same-round), on the exact content hash OR a
   **reformat-invariant fingerprint** (AST-normalized — a reflowed/recommented/renamed-
-  whitespace copy with a fresh hash is still demoted). A **structural** fingerprint (names
-  and constants blanked) additionally flags rename + constant-tweak near-copies as an
-  **advisory** at reveal (surfaced for review, never auto-demoted — skeletons can collide).
+  whitespace copy with a fresh hash is still demoted). Fingerprints are computed **per slot**
+  over each op's transitive bundle-local **import closure**, and the ledger also compares
+  per-FILE fingerprint sets by **containment** — so padding the bundle with an extra op, or
+  relocating a stolen body into an imported `_impl.py` behind a re-export shim, still demotes
+  (while two miners merely vendoring the same public utility never match). A **structural**
+  fingerprint (names and constants blanked) additionally flags rename + constant-tweak
+  near-copies as an **advisory** at reveal (surfaced for review, never auto-demoted —
+  skeletons can collide).
 - **king of the hill**: a champion holds the emission; a challenger takes the title only by
   beating it by a margin. A copy ties → earns nothing. `optima settle --per-slot` runs a
   **champion per slot** and splits emission across slots, so a specialist who owns one slot

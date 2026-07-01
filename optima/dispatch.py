@@ -87,8 +87,13 @@ def make_rmsnorm_dispatcher(
     """
 
     def dispatched(self, x, residual=None, post_residual_addition=None):
-        # Rare / fp32 paths -> trusted baseline (keeps the contract simple & safe).
-        if post_residual_addition is not None or getattr(self, "fp32_residual", False):
+        # Rare / semantic-override paths -> trusted baseline (keeps the contract simple
+        # & safe): fp32 residual, a variance computed over a prefix subset of the hidden
+        # dim (variance_size_override), or HF cast-before-multiply semantics
+        # (cast_x_before_out_mul) are all NOT the pure rmsnorm the slot contract states.
+        if (post_residual_addition is not None or getattr(self, "fp32_residual", False)
+                or getattr(self, "variance_size_override", None) is not None
+                or getattr(self, "cast_x_before_out_mul", False)):
             return baseline_forward(self, x, residual, post_residual_addition)
 
         impl = registry.lookup(
@@ -178,8 +183,11 @@ def _attention_seam_active() -> bool:
 
 def _decode_supported(self, k, v, kwargs) -> bool:
     # The gather MVP supports standard MHA decode only: real k/v, uniform head dim,
-    # no MLA-rope-split / cross-attention / sliding window. Anything else -> baseline.
-    if k is None or v is None or "k_rope" in kwargs:
+    # no MLA-rope-split / cross-attention / sliding window. ANY extra kwarg means a
+    # contract the dense-gather kernel doesn't model (k_rope = MLA rope split,
+    # sinks = gpt-oss attention sinks, ...) — running the kernel anyway would
+    # silently drop that piece of the computation. Anything unknown -> baseline.
+    if k is None or v is None or kwargs:
         return False
     if getattr(self, "is_cross_attention", False):
         return False
@@ -288,6 +296,17 @@ def make_moe_dispatcher(
                             # in-graph so an un-capturable kernel can't wedge graph capture.
                             if in_graph and not impl.eligibility.graph_safe:
                                 _moe_debug(lambda s=slot: f"SKIP {s}: in_graph & not graph_safe")
+                                continue
+                            # The reduce-owning contract only fits a layer that actually
+                            # reduces here: under TP>1 with reduce_results=False the model
+                            # defers the reduce downstream (e.g. fuses it after a shared-
+                            # expert add), so a kernel that reduces anyway would insert an
+                            # EXTRA all-reduce and diverge from stock.
+                            if (slot.endswith(".fused_experts_reduce")
+                                    and getattr(self, "moe_tp_size", 1) > 1
+                                    and not getattr(self, "reduce_results", False)):
+                                _moe_debug(lambda s=slot: f"SKIP {s}: layer does not reduce here "
+                                                          "(reduce_results=False under TP)")
                                 continue
                             # Pair kernel<->layer by quant format: a dense kernel never runs
                             # a quantized layer (it would mis-read packed bytes + scales), and

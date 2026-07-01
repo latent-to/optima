@@ -216,3 +216,30 @@ def test_gate_num_positions_zero_defers():
     from optima.eval.kl import kl_gate_ok
 
     assert kl_gate_ok(_report(0, mean_kl=0.0), kl_threshold=5e-3) is True  # no logprobs -> defer
+
+
+# ---- LongMath answer checking: FINAL lines are authoritative; no raw substring ----
+
+
+def _lm_problem(answer="42"):
+    from optima.eval.benchmarks import Problem
+
+    return Problem(id="t", prompt="p", answer=answer)
+
+
+def test_long_math_final_lines_checked():
+    lm = get_benchmark("long_math")
+    assert lm.check(_lm_problem(), "FINAL_FIRST: 42\n...consistency...\nFINAL_LAST: 42")
+    # a wrong FINAL answer is wrong even if the gold digits appear in the reasoning
+    assert not lm.check(_lm_problem(), "FINAL_FIRST: 41\nwe considered 42 but rejected it\nFINAL_LAST: 41")
+
+
+def test_long_math_substring_of_another_number_is_not_correct():
+    lm = get_benchmark("long_math")
+    # no FINAL lines: "42" inside "142"/"3.42"/"-42" must NOT pass (the old raw
+    # substring check made the gate near-vacuous for short gold answers)
+    assert not lm.check(_lm_problem(), "the running total is 142 here")
+    assert not lm.check(_lm_problem(), "we get 3.42 as an intermediate")
+    assert not lm.check(_lm_problem(), "the delta is -42 overall")
+    # but a clean standalone mention still counts as a fallback
+    assert lm.check(_lm_problem(), "so the result is 42.")

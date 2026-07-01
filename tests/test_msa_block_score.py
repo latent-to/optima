@@ -92,3 +92,13 @@ def test_msa_monotone_perturbation_verifies():
 def test_msa_wrong_selection_fails():
     res = verify_entry(SLOT, _wrong_selection, dtype=torch.float32, device="cpu", seed=0)
     assert not res.passed
+
+
+def test_msa_gate_is_never_vacuous():
+    # n_blocks must exceed top_k on EVERY verify shape (top-k of exactly k blocks
+    # selects everything -> any output scores overlap 1.0), including when count-dim
+    # jitter drives ctx down (the make_inputs floor).
+    for sh in list(SLOT.shapes) + [dict(SLOT.shapes[0], ctx=1024), dict(SLOT.shapes[0], ctx=256)]:
+        i = SLOT.make_inputs(**sh, dtype=torch.float32, device="cpu", seed=0)
+        n_blocks = i["index_k"].shape[1] // i["block_size"]
+        assert n_blocks > SLOT.correctness.top_k, f"vacuous shape: {sh} -> {n_blocks} blocks"

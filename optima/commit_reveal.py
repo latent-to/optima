@@ -99,6 +99,16 @@ class Reveal:
     original: bool = True
     fingerprint: str = ""  # reformat-invariant near-copy fingerprint (auto-demotes a match)
     structural_fingerprint: str = ""  # rename/constant-tweak skeleton — ADVISORY only (review)
+    # Per-slot reformat-invariant fingerprints (slot -> hash). The LOAD-BEARING copy
+    # compare: matching ANY single slot demotes, so padding a stolen bundle with an
+    # extra unrelated op cannot perturb the whole-bundle ``fingerprint`` into freshness.
+    slot_fingerprints: dict[str, str] = field(default_factory=dict)
+    # Per-slot PATH-INDEPENDENT fingerprints of each substantial closure file
+    # (slot -> sorted hashes). Catches relocation/padding WITHIN a slot: the ledger
+    # demotes on set CONTAINMENT (all of a prior reveal's files appear here), which a
+    # stolen body moved into an imported module cannot evade and a merely-shared
+    # vendored utility cannot trigger.
+    slot_file_fingerprints: dict[str, list[str]] = field(default_factory=dict)
 
 
 @dataclass
@@ -236,16 +246,28 @@ class Ledger:
     # ---- reveal phase ----
 
     def reveal(self, hotkey: str, content_hash: str, salt: str, round_id: int,
-               fingerprint: str = "", structural_fingerprint: str = "") -> Reveal:
+               fingerprint: str = "", structural_fingerprint: str = "",
+               slot_fingerprints: Optional[dict[str, str]] = None,
+               slot_file_fingerprints: Optional[dict[str, list[str]]] = None) -> Reveal:
         """Verify a reveal against this hotkey's prior commitments; record it.
 
         Raises RevealError if no commitment by this hotkey matches. The commitment
         match is per-round (you commit and reveal within a round). Copy detection is
-        **cumulative across ALL rounds** and matches on either the exact
-        ``content_hash`` OR the reformat-invariant ``fingerprint``
-        (``optima.copy_fingerprint`` — catches a champion's source reflowed/renamed
-        into a new hash). Earliest commit (lowest seq) by a DIFFERENT hotkey is the
-        original; this reveal is a copy if such an earlier one exists.
+        **cumulative across ALL rounds** and matches on any of:
+
+        * the exact ``content_hash``;
+        * the whole-bundle reformat-invariant ``fingerprint``;
+        * any single slot of ``slot_fingerprints`` (a stolen slot inside a bundle
+          PADDED with an extra op);
+        * per-slot file-set CONTAINMENT via ``slot_file_fingerprints`` — every
+          substantial closure file of one reveal appearing in the other (a stolen
+          body RELOCATED into an imported module, or a slot padded with extra
+          files). Containment, not intersection, so two honest miners vendoring
+          the same public utility next to their own distinct kernels never match.
+
+        (All from ``optima.copy_fingerprint``.) Earliest commit (lowest seq) by a
+        DIFFERENT hotkey is the original; this reveal is a copy if such an earlier
+        one exists.
         """
         target = make_commitment(content_hash, hotkey, salt)
         match = min(
@@ -263,12 +285,29 @@ class Ledger:
         # (exact hash) OR the same normalized structure (near-copy fingerprint), in
         # ANY round, makes the later commit the copy. Same-hotkey re-reveals of one's
         # own work are never copies. Earliest commit_seq wins.
+        slot_fps = {s: fp for s, fp in (slot_fingerprints or {}).items() if fp}
+        file_fps = {s: sorted(v) for s, v in (slot_file_fingerprints or {}).items() if v}
+
         def _same(r: Reveal) -> bool:
             if r.hotkey == hotkey:
                 return False
             if r.content_hash == content_hash:
                 return True
-            return bool(fingerprint) and r.fingerprint == fingerprint
+            if fingerprint and r.fingerprint == fingerprint:
+                return True
+            # Per-slot compare: one stolen slot demotes, however the rest of the
+            # bundle was padded/perturbed.
+            if any(r.slot_fingerprints.get(s) == fp for s, fp in slot_fps.items()):
+                return True
+            # Per-slot file-set CONTAINMENT (either direction — commit order decides
+            # who is original): all of one bundle's substantial files for a slot
+            # appearing inside the other's = the same work, wherever the copier
+            # relocated it and whatever they padded around it.
+            for s, mine in file_fps.items():
+                theirs = set(r.slot_file_fingerprints.get(s, ()))
+                if theirs and (theirs <= set(mine) or set(mine) <= theirs):
+                    return True
+            return False
 
         prior = [r for r in self.reveals if _same(r)]
         original = all(match.seq < r.commit_seq for r in prior) if prior else True
@@ -278,7 +317,7 @@ class Ledger:
                 r.original = False
 
         rev = Reveal(hotkey, content_hash, salt, round_id, match.seq, original,
-                     fingerprint, structural_fingerprint)
+                     fingerprint, structural_fingerprint, slot_fps, file_fps)
         self.reveals.append(rev)
         return rev
 
@@ -426,6 +465,17 @@ class Ledger:
                 )
                 title_changes[slot] = True
             elif stale:
+                stale_slots.append(slot)
+
+        # A slot with NO submissions this round still has a standing champion earning
+        # emission; if that champion was crowned under a different pin it must be
+        # flagged for re-baseline too — staleness is a property of the champion, not
+        # of this round's challenger traffic.
+        for slot, champ in self.champions.items():
+            if slot in by_slot or not champ:
+                continue
+            if (current_sglang_version and champ.sglang_version
+                    and champ.sglang_version != current_sglang_version):
                 stale_slots.append(slot)
 
         # Split emission equally across slots that currently have a champion.

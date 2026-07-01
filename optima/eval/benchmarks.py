@@ -315,7 +315,14 @@ class LongMath:
 
     def check(self, problem: Problem, output_text: str) -> bool:
         answers = [match.group(1) for match in _FINAL_RE.finditer(output_text)]
-        return problem.answer in answers or problem.answer in output_text
+        if answers:
+            return problem.answer in answers
+        # No FINAL_* line at all: fall back to a digit-boundary search. Never a raw
+        # substring check — with a short gold answer ("5") a substring matches nearly
+        # any long decode (any "15", "52", ...), making the accuracy gate vacuous.
+        # Boundaries: no digit after; no digit/decimal-point/sign before (so "142",
+        # "3.42" and "-42" can never satisfy answer "42").
+        return re.search(rf"(?<![\d.-]){re.escape(problem.answer)}(?!\d)", output_text) is not None
 
 
 # ---------------------------------------------------------------------------

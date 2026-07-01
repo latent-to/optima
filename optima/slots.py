@@ -697,9 +697,11 @@ def _msa_inputs(*, batch: int, num_q_heads: int, head_dim: int, ctx: int, block_
     def rnd(*shape: int) -> torch.Tensor:
         return torch.randn(*shape, generator=g, device=device, dtype=torch.float32).to(dtype)
 
-    # Keep ctx a clean multiple of block_size with >= _MSA_TOPK blocks, robust to count-dim
-    # jitter (so top-k never exceeds n_blocks and the block view always divides).
-    nblk = max(_MSA_TOPK, ctx // block_size)
+    # Keep ctx a clean multiple of block_size with n_blocks comfortably ABOVE _MSA_TOPK,
+    # robust to count-dim jitter. n_blocks == top_k would make the gate vacuous (top-k of
+    # k blocks selects everything — any output, even all-zeros, scores overlap 1.0), so
+    # the floor keeps at least 4 distractor blocks the selection can get wrong.
+    nblk = max(_MSA_TOPK + 4, ctx // block_size)
     ctx = nblk * block_size
     seq_lens = torch.randint(_MSA_TOPK * block_size, ctx + 1, (batch,), generator=g, device=device).to(torch.int32)
     seq_lens[0] = ctx  # one full-length request
@@ -727,7 +729,9 @@ ATTENTION_MSA_BLOCK_SCORE = SlotSpec(
     invoke_entry=lambda entry, i, outs, prepared: entry(
         i["q"], i["index_k"], i["seq_lens"], i["block_size"], outs[0]),
     shapes=(
-        {"batch": 4, "num_q_heads": 4, "head_dim": 128, "ctx": 1024, "block_size": 128},   # 8 blocks
+        # Every shape keeps n_blocks > _MSA_TOPK (=8): at n_blocks == top_k the overlap
+        # gate is vacuous (any selection of 8-of-8 blocks scores 1.0).
+        {"batch": 4, "num_q_heads": 4, "head_dim": 128, "ctx": 1536, "block_size": 128},   # 12 blocks
         {"batch": 2, "num_q_heads": 4, "head_dim": 128, "ctx": 2048, "block_size": 128},   # 16 blocks
         {"batch": 8, "num_q_heads": 8, "head_dim": 64, "ctx": 1536, "block_size": 128},    # 12 blocks
         {"batch": 3, "num_q_heads": 4, "head_dim": 128, "ctx": 4096, "block_size": 128},   # 32 blocks
@@ -816,17 +820,25 @@ def specialize_slot(slot: SlotSpec, profile: SlotProfile) -> SlotSpec:
     return replace(slot, **repl) if repl else slot
 
 
+_M3_MOE_PROFILE = SlotProfile(
+    activation=Activation("swigluoai", alpha=1.702, limit=7.0),
+    # Low-bit (NVFP4) experts: gate on cosine vs the same-function fp32 reference.
+    # min_cosine = the measured NVFP4 representational floor (0.9958 at M3 shape,
+    # m3_swigluoai_gate.py) with headroom; plain-SiLU scores 0.45 and is rejected.
+    # No norm guard yet (max_rel_norm_err uncalibrated — TODO measure the floor).
+    correctness=Correctness("cosine", min_cosine=0.985),
+)
+
 # model key (as a miner may declare it / as the validator keys its served model) -> {slot: profile}
 MODEL_PROFILES: dict[str, dict[str, SlotProfile]] = {
     "MiniMax-M3": {
-        "moe.fused_experts": SlotProfile(
-            activation=Activation("swigluoai", alpha=1.702, limit=7.0),
-            # Low-bit (NVFP4) experts: gate on cosine vs the same-function fp32 reference.
-            # min_cosine = the measured NVFP4 representational floor (0.9958 at M3 shape,
-            # m3_swigluoai_gate.py) with headroom; plain-SiLU scores 0.45 and is rejected.
-            # No norm guard yet (max_rel_norm_err uncalibrated — TODO measure the floor).
-            correctness=Correctness("cosine", min_cosine=0.985),
-        ),
+        # BOTH experts slots run the same swigluoai experts on M3 — the reduce-owning
+        # block (the overlap target) just also owns the trailing all-reduce, and
+        # specialize_slot retargets its distributed reference (collective_partial) too.
+        # Registering only the plain slot would verify an M3 reduce kernel against a
+        # SiLU reference and false-fail every honest submission.
+        "moe.fused_experts": _M3_MOE_PROFILE,
+        "moe.fused_experts_reduce": _M3_MOE_PROFILE,
     },
 }
 # NVFP4 builds carry a "-NVFP4" suffix in their declared model id; alias them.

@@ -20,15 +20,33 @@ tooling, not the automatic demote path.
 
 Pure-Python (no torch), so it runs in the trusted intake path next to the manifest
 parse, exactly like ``content_hash``.
+
+Layers, and what covers what:
+  * Python kernels get all three: exact hash, AST-normalized (reformat-invariant),
+    and AST-skeleton (rename/constant-tweak, advisory).
+  * Declared ``cuda_sources`` (the sanctioned CUDA-source tier, see
+    ``optima/manifest.py``) get only TWO of the three: an exact sha256 of the raw
+    bytes, plus a regex-based reformat-invariant normalization (strip ``//`` and
+    ``/* */`` comments, collapse whitespace) — folded into the SAME per-file set
+    ``bundle_slot_file_fingerprints`` returns, so the relocation-proof containment
+    compare covers ``.cu``/``.cuh`` bodies too. There is deliberately NO CUDA parser
+    here and therefore no structural-skeleton layer for CUDA: a rename-every-identifier
+    + tweak-a-constant copy of a ``.cu`` file is NOT caught by anything in this module.
+    That gap is accepted for now (CUDA sources are validator-reviewed via
+    ``optima/rebuild.py`` before compilation, which is a stronger check than an advisory
+    skeleton fingerprint would be); revisit if the CUDA-source tier grows before a real
+    C-family parser is worth building.
 """
 
 from __future__ import annotations
 
 import ast
 import hashlib
+import re
 from pathlib import Path
 
-from optima.manifest import load_manifest, resolve_source
+from optima.manifest import (load_manifest, resolve_cuda_sources, resolve_dep_patches,
+                             resolve_source)
 
 
 def _strip_docstrings(tree: ast.AST) -> None:
@@ -89,6 +107,61 @@ def structural_source(source: str) -> str:
 def structural_fingerprint(source: str) -> str:
     """Advisory near-copy signal robust to variable renames AND constant tweaks."""
     return hashlib.sha256(structural_source(source).encode("utf-8")).hexdigest()
+
+
+# ---------------------------------------------------------------------------
+# CUDA source normalization (the sanctioned cuda_sources tier — see manifest.py).
+#
+# Deliberately NOT a CUDA/C++ parser: no AST, no identifier/constant skeletonization,
+# so rename+constant-tweak evasion is NOT caught for .cu/.cuh (documented at the top
+# of this module). This is regex-based reformat-invariance only: strip // line
+# comments and /* */ block comments, then collapse all whitespace runs to a single
+# space. That is enough to make a reflowed/recommented copy of a .cu file fingerprint
+# identically, which is the same bar the .py normalized_source() clears.
+# ---------------------------------------------------------------------------
+
+_CUDA_LINE_COMMENT_RE = re.compile(r"//[^\n]*")
+_CUDA_BLOCK_COMMENT_RE = re.compile(r"/\*.*?\*/", re.DOTALL)
+_WHITESPACE_RE = re.compile(r"\s+")
+
+
+def normalized_cuda_source(source: str) -> str:
+    """Reformat-invariant normalization of CUDA source: strip comments, collapse whitespace.
+
+    No parsing — a best-effort textual normalization, not a semantic one. String/char
+    literals containing ``//`` or ``/*`` are not specially protected (a rare false
+    positive here just under-normalizes, it never over-matches unrelated kernels).
+    """
+    no_comments = _CUDA_BLOCK_COMMENT_RE.sub(" ", source)
+    no_comments = _CUDA_LINE_COMMENT_RE.sub("", no_comments)
+    return _WHITESPACE_RE.sub(" ", no_comments).strip()
+
+
+def cuda_source_fingerprint(source: str) -> str:
+    return hashlib.sha256(normalized_cuda_source(source).encode("utf-8")).hexdigest()
+
+
+def normalized_dep_patch(source: str) -> str:
+    """Reformat-invariant normalization of a unified diff (the dep_patches tier).
+
+    What a patch DOES is its +/- lines and the files it touches; everything else is
+    presentation an evader can regenerate freely — hunk headers move with -U context
+    width, context lines multiply with it, git headers come and go. Keep only the
+    file headers and the +/- payload, whitespace-collapsed. A patch re-emitted with
+    different context width / offsets / comments-in-context fingerprints identically;
+    changing what it actually changes does not.
+    """
+    keep: list[str] = []
+    for ln in source.splitlines():
+        if ln.startswith(("--- ", "+++ ")):
+            keep.append(_WHITESPACE_RE.sub(" ", ln.strip()))
+        elif ln.startswith(("+", "-")):
+            keep.append(_WHITESPACE_RE.sub(" ", ln[1:].strip()))
+    return "\n".join(keep)
+
+
+def dep_patch_fingerprint(source: str) -> str:
+    return hashlib.sha256(normalized_dep_patch(source).encode("utf-8")).hexdigest()
 
 
 # ---------------------------------------------------------------------------
@@ -253,15 +326,37 @@ def bundle_slot_file_fingerprints(bundle_root: str | Path) -> dict[str, list[str
 
     Skips closure files that don't parse/decode (they cannot execute at runtime
     either); ``{}`` only if an op's ENTRY can't be parsed, matching the other maps.
+
+    Also folds in the op's declared ``cuda_sources`` (see ``optima/manifest.py``): each
+    contributes TWO entries to the set — the exact sha256 of its raw bytes (catches a
+    byte-identical relocated copy) and ``cuda_source_fingerprint`` (the reformat-invariant
+    normalization, catches a copy that's just been reflowed/recommented). This is what
+    closes the "ship a stolen binary/.cu behind a trivially different .py shim" gap: a
+    declared cuda_source used to be invisible to copy_fingerprint's import-closure walk
+    entirely (it isn't Python, isn't imported, and previously wasn't even scanned).
     """
     root = Path(bundle_root)
     manifest = load_manifest(root)
     out: dict[str, list[str]] = {}
+    # Declared dep patches are BUNDLE-level (they modify the engine's dependency tree
+    # for every slot the bundle claims), so their fingerprints fold into EVERY slot's
+    # file set: a stolen deep-seam patch re-shipped behind a different kernel shim is
+    # still "all of their work inside yours" for the containment compare. Two entries
+    # each, mirroring cuda_sources: exact raw sha256 + the reformat-invariant
+    # normalized-diff fingerprint (context width / hunk offsets / git headers free).
+    patch_fps: set[str] = set()
+    for dp in resolve_dep_patches(root, manifest):
+        try:
+            raw = dp.read_bytes()
+        except OSError:
+            continue
+        patch_fps.add(hashlib.sha256(raw).hexdigest())
+        patch_fps.add(dep_patch_fingerprint(raw.decode("utf-8", errors="replace")))
     try:
         for op in manifest.ops:
             entry = resolve_source(root, op)
             entry_key = entry.resolve()
-            fps: set[str] = set()
+            fps: set[str] = set(patch_fps)
             for f in _closure_files(root, entry):
                 try:
                     norm = normalized_source(f.read_text(encoding="utf-8"))
@@ -271,6 +366,13 @@ def bundle_slot_file_fingerprints(bundle_root: str | Path) -> dict[str, list[str
                     continue
                 if len(norm) >= _SUBSTANTIAL_NORM_LEN:
                     fps.add(hashlib.sha256(norm.encode("utf-8")).hexdigest())
+            for cs in resolve_cuda_sources(root, op):
+                try:
+                    raw = cs.read_bytes()
+                except OSError:
+                    continue
+                fps.add(hashlib.sha256(raw).hexdigest())
+                fps.add(cuda_source_fingerprint(raw.decode("utf-8", errors="replace")))
             out[op.slot] = sorted(fps)
     except SyntaxError:
         return {}

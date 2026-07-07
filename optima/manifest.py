@@ -15,6 +15,9 @@ Bundle layout::
       manifest.toml
       kernels/
         silu_and_mul.py        # exposes the slot's `entry` callable
+        silu_and_mul.cu        # optional: declared via ops.cuda_sources (sanctioned
+                                # inspectable CUDA source; compiled only by a
+                                # validator-reviewed patcher, see optima/rebuild.py)
       metadata/
         silu_and_mul.json      # optional eligibility (dtypes, arch, max dims)
 """
@@ -77,6 +80,12 @@ class OpEntry:
     # omitted: the validator owns the weight-prep for the base kernel.
     base_kernel: str | None = None
     override_point: str | None = None
+    # Sanctioned "CUDA source" tier: bundle-relative paths to inspectable ``.cu``/``.cuh``
+    # sources declared for this op. Compiled only by a validator-reviewed patcher
+    # (rebuild.json — a different track); this module only validates the declaration is
+    # well-formed and safe to point at. Declaring a path here is what lets scan_tree (see
+    # optima/sandbox.py) treat the file as sanctioned instead of an unscanned stray binary.
+    cuda_sources: tuple[str, ...] = ()
     extra: dict[str, Any] = field(default_factory=dict)
 
     @property
@@ -85,10 +94,26 @@ class OpEntry:
 
 
 @dataclass(frozen=True)
+class DepPatchEntry:
+    """One bundle-declared dependency patch (the ``dep_patches`` tier).
+
+    ``target`` names a PINNED dependency (e.g. "flashinfer") — whether that target is
+    patchable at all, and WHERE inside it a patch may land, is arena policy enforced by
+    the one reviewed applier (optima/patchers/apply_dep_patch.py), never bundle content.
+    ``path`` is a bundle-relative TEXT unified diff, structurally validated at load
+    (optima/deppatch.py): modifications + new files only, no binary/rename/delete.
+    """
+
+    target: str
+    path: str
+
+
+@dataclass(frozen=True)
 class Manifest:
     bundle_id: str
     abi_version: str
     ops: tuple[OpEntry, ...]
+    dep_patches: tuple[DepPatchEntry, ...] = ()
     raw: dict[str, Any] = field(default_factory=dict)
 
     def op_for(self, slot: str) -> OpEntry | None:
@@ -119,6 +144,79 @@ def _safe_relpath(root: Path, rel: str, *, kind: str) -> Path:
     )
     _require(p.exists(), f"{kind} not found: {rel!r}")
     _require(p.is_file(), f"{kind} must be a file: {rel!r}")
+    return p
+
+
+_CUDA_SOURCE_SUFFIXES = (".cu", ".cuh")
+
+
+def _validate_cuda_source(root: Path, rel: str, *, slot: str) -> Path:
+    """Validate one declared ``cuda_sources`` entry: exists, resolves inside the bundle,
+    is a regular non-symlink file, and has a ``.cu``/``.cuh`` suffix.
+
+    Mirrors ``_safe_relpath``'s containment check but additionally refuses symlinks
+    (a bundle-relative symlink could point a "reviewed" .cu path at file contents
+    outside the reviewed tree even while resolving inside the bundle boundary) and
+    restricts the suffix so this declaration can't be used to sneak an arbitrary file
+    past scan_tree's binary-suffix rejection under the "sanctioned CUDA source" cover.
+    """
+    kind = "cuda_sources"
+    _require(isinstance(rel, str) and rel != "", f"ops ({slot}) {kind} path must be a non-empty string")
+    _require(not rel.startswith("/"), f"ops ({slot}) {kind} path must be relative: {rel!r}")
+    unresolved = root / rel
+    _require(not unresolved.is_symlink(), f"ops ({slot}) {kind} must not be a symlink: {rel!r}")
+    p = unresolved.resolve()
+    root_resolved = root.resolve()
+    _require(
+        p == root_resolved or root_resolved in p.parents,
+        f"ops ({slot}) {kind} path escapes bundle root: {rel!r}",
+    )
+    _require(p.exists(), f"ops ({slot}) {kind} not found: {rel!r}")
+    _require(not p.is_symlink(), f"ops ({slot}) {kind} must not be a symlink: {rel!r}")
+    _require(p.is_file(), f"ops ({slot}) {kind} must be a regular file: {rel!r}")
+    _require(
+        p.suffix in _CUDA_SOURCE_SUFFIXES,
+        f"ops ({slot}) {kind} must be .cu or .cuh: {rel!r}",
+    )
+    return p
+
+
+_DEP_PATCH_SUFFIXES = (".patch", ".diff")
+
+
+def _validate_dep_patch(root: Path, rel: str, *, target: str) -> Path:
+    """Validate one declared ``dep_patches`` entry: same containment/symlink posture as
+    ``_validate_cuda_source`` (suffix-restricted so the declaration can't sanction an
+    arbitrary file), PLUS a structural parse of the diff itself — a bundle carrying a
+    binary/rename/delete "patch" fails at intake, not at apply time."""
+    kind = "dep_patches"
+    _require(isinstance(rel, str) and rel != "", f"{kind} ({target}) path must be a non-empty string")
+    _require(not rel.startswith("/"), f"{kind} ({target}) path must be relative: {rel!r}")
+    unresolved = root / rel
+    _require(not unresolved.is_symlink(), f"{kind} ({target}) must not be a symlink: {rel!r}")
+    p = unresolved.resolve()
+    root_resolved = root.resolve()
+    _require(
+        p == root_resolved or root_resolved in p.parents,
+        f"{kind} ({target}) path escapes bundle root: {rel!r}",
+    )
+    _require(p.exists(), f"{kind} ({target}) not found: {rel!r}")
+    _require(not p.is_symlink(), f"{kind} ({target}) must not be a symlink: {rel!r}")
+    _require(p.is_file(), f"{kind} ({target}) must be a regular file: {rel!r}")
+    _require(
+        p.suffix in _DEP_PATCH_SUFFIXES,
+        f"{kind} ({target}) must be .patch or .diff: {rel!r}",
+    )
+    from optima.deppatch import DepPatchError, parse_patch_text
+
+    try:
+        text = p.read_text(encoding="utf-8")
+    except UnicodeDecodeError as exc:
+        raise ManifestError(f"{kind} ({target}) {rel!r} is not UTF-8 text: {exc}") from exc
+    try:
+        parse_patch_text(text)
+    except DepPatchError as exc:
+        raise ManifestError(f"{kind} ({target}) {rel!r} rejected: {exc}") from exc
     return p
 
 
@@ -202,8 +300,17 @@ def load_manifest(bundle_root: str | Path) -> Manifest:
             f"ops[{i}] ({slot}) 'override_point' requires 'base_kernel'",
         )
 
+        cuda_sources_raw = op.get("cuda_sources", ())
+        _require(
+            isinstance(cuda_sources_raw, (list, tuple)),
+            f"ops[{i}] ({slot}) 'cuda_sources' must be a list of paths",
+        )
+        for cs in cuda_sources_raw:
+            _validate_cuda_source(root, cs, slot=slot)
+        cuda_sources = tuple(str(cs) for cs in cuda_sources_raw)
+
         known = {"slot", "source", "entry", "prepare", "setup", "dtypes", "architectures",
-                 "metadata", "base_kernel", "override_point"}
+                 "metadata", "base_kernel", "override_point", "cuda_sources"}
         extra = {k: v for k, v in op.items() if k not in known}
 
         ops.append(
@@ -218,13 +325,72 @@ def load_manifest(bundle_root: str | Path) -> Manifest:
                 setup=setup,
                 base_kernel=base_kernel,
                 override_point=override_point,
+                cuda_sources=cuda_sources,
                 extra=extra,
             )
         )
 
-    return Manifest(bundle_id=bundle_id, abi_version=abi, ops=tuple(ops), raw=data)
+    dep_raw = data.get("dep_patches", ())
+    _require(
+        isinstance(dep_raw, (list, tuple)),
+        "top-level 'dep_patches' must be a list of {target, path} tables",
+    )
+    dep_patches: list[DepPatchEntry] = []
+    seen_dep: set[tuple[str, str]] = set()
+    for i, dp in enumerate(dep_raw):
+        _require(isinstance(dp, dict), f"dep_patches[{i}] must be a table")
+        target = str(dp.get("target", "")).strip()
+        _require(bool(target) and bool(_ID_RE.match(target)),
+                 f"dep_patches[{i}] 'target' must be a simple identifier: {target!r}")
+        rel = str(dp.get("path", "")).strip()
+        _validate_dep_patch(root, rel, target=target)
+        key = (target, rel)
+        _require(key not in seen_dep, f"duplicate dep_patches entry: {key!r}")
+        seen_dep.add(key)
+        unknown = set(dp) - {"target", "path"}
+        _require(not unknown, f"dep_patches[{i}] has unknown keys: {sorted(unknown)}")
+        dep_patches.append(DepPatchEntry(target=target, path=rel))
+
+    return Manifest(bundle_id=bundle_id, abi_version=abi, ops=tuple(ops),
+                    dep_patches=tuple(dep_patches), raw=data)
 
 
 def resolve_source(bundle_root: str | Path, op: OpEntry) -> Path:
     """Return the absolute, containment-checked path to an op's source file."""
     return _safe_relpath(Path(bundle_root), op.source, kind="source")
+
+
+def resolve_cuda_sources(bundle_root: str | Path, op: OpEntry) -> tuple[Path, ...]:
+    """Return the absolute, containment-checked paths to an op's declared ``cuda_sources``.
+
+    Re-validates (cheap; these are small source files) rather than trusting the
+    manifest was loaded from this exact ``bundle_root`` — same posture as
+    ``resolve_source``.
+    """
+    root = Path(bundle_root)
+    return tuple(_validate_cuda_source(root, cs, slot=op.slot) for cs in op.cuda_sources)
+
+
+def all_declared_cuda_sources(bundle_root: str | Path, manifest: Manifest) -> frozenset[Path]:
+    """Resolved, deduped set of every ``cuda_sources`` path declared across all ops.
+
+    The shape ``optima.sandbox.scan_tree`` wants for its declared-allowlist parameter:
+    a flat set of resolved paths, independent of which op declared them.
+    """
+    root = Path(bundle_root)
+    out: set[Path] = set()
+    for op in manifest.ops:
+        out.update(resolve_cuda_sources(root, op))
+    return frozenset(out)
+
+
+def resolve_dep_patches(bundle_root: str | Path, manifest: Manifest) -> tuple[Path, ...]:
+    """Absolute, containment-checked (re-validated) paths of all declared dep patches."""
+    root = Path(bundle_root)
+    return tuple(_validate_dep_patch(root, dp.path, target=dp.target)
+                 for dp in manifest.dep_patches)
+
+
+def all_declared_dep_patches(bundle_root: str | Path, manifest: Manifest) -> frozenset[Path]:
+    """``scan_tree``-shaped allowlist of every declared dep patch (see cuda variant)."""
+    return frozenset(resolve_dep_patches(bundle_root, manifest))

@@ -87,8 +87,22 @@ def activate() -> None:
             REGISTRY.set_strict(True)
         _bundle_loaded = True
         logger.info("optima: bundle %s active -> slots %s", bundle, REGISTRY.slots())
+        from optima import receipts
+
+        if REGISTRY.slots():
+            # Positive evidence for the eval driver (anti phantom-pass): this rank
+            # loaded the bundle and enabled the registry. See optima/receipts.py.
+            receipts.write("active", {"bundle": bundle, "slots": REGISTRY.slots()})
+        else:
+            # Loaded without exception but registered nothing (scan-tree reject, no
+            # known slots, every op skipped): for the eval this is exactly as
+            # stock-vs-stock as a failed load — say so, don't stay silent.
+            receipts.write("load_failed", {"bundle": bundle, "reason": "no slots registered"})
     except Exception:  # noqa: BLE001 - a bad bundle must not wedge the engine
         logger.exception("optima: bundle load failed for %s; running baseline", bundle)
+        from optima import receipts
+
+        receipts.write("load_failed", {"bundle": bundle, "reason": "exception during load"})
         REGISTRY.clear()
 
 
@@ -101,10 +115,31 @@ def _load_bundle_into_registry(bundle: str) -> None:
     manifest = load_manifest(bundle)
     # Recursive vendored-tree guard: a bundle can carry a whole vendored library; every .py
     # must clear the policy scan, not just the declared entries. Fail closed (load nothing).
-    tree = scan_tree(bundle)
+    # Pass the manifest's declared cuda_sources + dep_patches so the runtime load
+    # enforces the SAME strict allowlist as the CLI scan (undeclared non-.py files
+    # reject here too).
+    from optima.manifest import all_declared_cuda_sources, all_declared_dep_patches
+
+    tree = scan_tree(bundle,
+                     declared_cuda_sources=all_declared_cuda_sources(bundle, manifest),
+                     declared_dep_patches=all_declared_dep_patches(bundle, manifest))
     if not tree.ok:
         logger.warning("optima: skip bundle %s, recursive scan failed: %s", bundle, tree.violations)
         return
+    # The reviewed patchers' artifacts (compiled CUDA exts, dep overlays) must exist in
+    # THIS process: sglang runs the model in spawned scheduler ranks, and the driver's
+    # sys.modules preloads do not survive the spawn. Cache-hit fast after the driver's
+    # prepare_candidate_environment built once. (2026-07-07: without this the engine
+    # silently scored the shim's reference fallback — a phantom-kernel run.) A patcher
+    # failure raises out to activate() -> load_failed receipt -> the eval refuses.
+    from optima.rebuild import apply_rebuild_plan
+
+    apply_rebuild_plan(bundle)
+    # ONE module instance per SOURCE FILE, shared across ops: two slots declared on
+    # the same source (e.g. the shallow + deep fused-epilogue entries sharing one IPC
+    # workspace in module globals) must not get two module instances — each would
+    # re-init its own comm state and the second barrier could interleave across ranks.
+    loaded_by_src: dict[Path, object] = {}
     for op in manifest.ops:
         if op.slot not in SLOTS:
             continue
@@ -114,12 +149,15 @@ def _load_bundle_into_registry(bundle: str) -> None:
             logger.warning("optima: skip %s, failed scan: %s", op.slot, scan.violations)
             continue
         meta = json.loads((Path(bundle) / op.metadata).read_text()) if op.metadata else {}
-        # ONE module instance per op: pulling entry/prepare/setup via separate
+        # ONE module instance per op source: pulling entry/prepare/setup via separate
         # load_entry calls would re-execute the module body per callable and split
         # them across different module namespaces (module-global state shared between
         # prepare and entry would vanish; sys.modules would point at the last copy
         # while entry closed over an earlier one — torch.compile re-imports by name).
-        module = load_module(src)
+        src_key = Path(src).resolve()
+        module = loaded_by_src.get(src_key)
+        if module is None:
+            module = loaded_by_src[src_key] = load_module(src)
         if getattr(op, "override_point", None):
             # Override submission: compose the miner's epilogue into the validator-owned base
             # kernel -> a standard (entry, prepare) that flows through the normal dispatcher.

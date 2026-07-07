@@ -37,6 +37,24 @@ class Check:
     detail: str = ""
 
 
+def _chokepoint_present(mod, chokepoint: str) -> bool:
+    """True iff the adapter's chokepoint exists on ``mod``.
+
+    ``"Class.method"`` asserts a method on a class; a bare ``"function_name"`` (no dot)
+    asserts a callable MODULE-LEVEL attribute — the rebind-style seams (e.g. arfusion's
+    ``flashinfer_allreduce_residual_rmsnorm``) patch a module function, not a class.
+    ``"attr:Name"`` asserts a module attribute that need not be callable (rebind
+    targets like flashinfer's ``JitSpec`` / env constants).
+    """
+    if chokepoint.startswith("attr:"):
+        return hasattr(mod, chokepoint[len("attr:"):])
+    cls_name, dot, meth = chokepoint.partition(".")
+    if not dot:
+        return callable(getattr(mod, cls_name, None))
+    cls = getattr(mod, cls_name, None)
+    return cls is not None and hasattr(cls, meth)
+
+
 def run_checks() -> list[Check]:
     checks: list[Check] = []
 
@@ -61,15 +79,21 @@ def run_checks() -> list[Check]:
     # a seam to that table auto-adds this canary (no separate edit here). The bespoke
     # signature checks below enrich these for the known seams.
     import importlib
+    import importlib.util
 
     from optima.seams import SEAM_ADAPTERS
 
     for adapter in SEAM_ADAPTERS:
-        cls_name, _, meth = adapter.chokepoint.partition(".")
+        if adapter.requires is not None and importlib.util.find_spec(adapter.requires) is None:
+            # Row not assessable here (e.g. flashinfer only exists on engine boxes).
+            # SKIP-as-ok so dev/intake boxes stay green; the pinned engine env — the
+            # place a chokepoint break actually matters — always has the package.
+            add(f"seam table: {adapter.name} ({adapter.chokepoint})", True,
+                f"SKIP: {adapter.requires} not installed on this box")
+            continue
         try:
             mod = importlib.import_module(adapter.target_module)
-            cls = getattr(mod, cls_name, None)
-            ok = cls is not None and hasattr(cls, meth)
+            ok = _chokepoint_present(mod, adapter.chokepoint)
             add(f"seam table: {adapter.name} ({adapter.chokepoint})", ok,
                 "" if ok else f"missing {adapter.chokepoint} in {adapter.target_module}")
         except Exception as exc:  # noqa: BLE001

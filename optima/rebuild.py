@@ -86,7 +86,7 @@ def apply_rebuild_plan(bundle_path: str | Path) -> bool:
             # ONLY validator-shipped, reviewed patchers under optima/patchers/. Never
             # bundle code, and never an arbitrary repo module.
             script = _safe_patcher_path(repo_root, str(step.get("path", "")))
-            _run_python_script(script)
+            _run_python_script(script, bundle=bundle)
         elif typ == "bundle_python":
             raise RebuildError(
                 "rebuild step 'bundle_python' is not allowed: a bundle may not execute its "
@@ -124,10 +124,24 @@ def _safe_patcher_path(repo_root: Path, rel: str) -> Path:
     return p
 
 
-def _run_python_script(script: Path) -> None:
+def _run_python_script(script: Path, *, bundle: Path) -> None:
+    """Run a reviewed patcher with the triggering bundle's path in the environment.
+
+    ``OPTIMA_BUNDLE_PATH`` is the patcher contract: every caller of
+    ``apply_rebuild_plan`` (engine launch, distributed-verify ranks, CLI smoke) hands
+    the bundle path as an argument, so the plan must not depend on who set what env —
+    the earlier env-only convention silently no-op'd patchers in verify ranks (the
+    build skipped, the shim fell back to its reference path, and the "verify"
+    validated nothing)."""
     old_argv = sys.argv
+    old_bundle = os.environ.get("OPTIMA_BUNDLE_PATH")
     sys.argv = [str(script)]
+    os.environ["OPTIMA_BUNDLE_PATH"] = str(bundle)
     try:
         runpy.run_path(str(script), run_name="__main__")
     finally:
         sys.argv = old_argv
+        if old_bundle is None:
+            os.environ.pop("OPTIMA_BUNDLE_PATH", None)
+        else:
+            os.environ["OPTIMA_BUNDLE_PATH"] = old_bundle

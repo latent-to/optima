@@ -20,6 +20,8 @@ from typing import Callable, Optional
 
 import torch
 
+from optima import audit as _audit
+from optima import moe_export as _moe_export
 from optima.registry import REGISTRY, KernelRegistry
 
 logger = logging.getLogger("optima.dispatch")
@@ -47,6 +49,8 @@ def make_silu_and_mul_dispatcher(
     """
 
     def dispatched(self: object, x: torch.Tensor) -> torch.Tensor:
+        if _dynamo_compiling():  # traced region bakes pure stock (see _dynamo_compiling)
+            return baseline_forward(self, x)
         last_dim = x.shape[-1]
         impl = registry.lookup(
             slot,
@@ -59,6 +63,8 @@ def make_silu_and_mul_dispatcher(
 
         d = last_dim // 2
         out = torch.empty((*x.shape[:-1], d), dtype=x.dtype, device=x.device)
+        aud = _audit.sampled()
+        a_x = x.clone() if aud else None  # pre-call clone: the kernel may scribble on x
         try:
             impl.entry(x, out)
         except Exception:
@@ -66,6 +72,8 @@ def make_silu_and_mul_dispatcher(
                 raise
             # Quality/throughput already protect us; a crashing kernel just loses.
             return baseline_forward(self, x)
+        if aud:
+            _audit.run(slot, (out,), lambda: baseline_forward(self, a_x))
         return out
 
     return dispatched
@@ -87,6 +95,8 @@ def make_rmsnorm_dispatcher(
     """
 
     def dispatched(self, x, residual=None, post_residual_addition=None):
+        if _dynamo_compiling():  # traced region bakes pure stock (see _dynamo_compiling)
+            return baseline_forward(self, x, residual, post_residual_addition)
         # Rare / semantic-override paths -> trusted baseline (keeps the contract simple
         # & safe): fp32 residual, a variance computed over a prefix subset of the hidden
         # dim (variance_size_override), or HF cast-before-multiply semantics
@@ -107,14 +117,22 @@ def make_rmsnorm_dispatcher(
 
         eps = float(self.variance_epsilon)
         weight = self.weight.data
+        aud = _audit.sampled()
         try:
             if residual is None:
+                a_x = x.clone() if aud else None
                 out = torch.empty_like(x)
                 impl.entry(x, weight, out, eps)
+                if aud:
+                    _audit.run(slot, (out,), lambda: baseline_forward(self, a_x, None, None))
                 return out
+            a_x, a_res = (x.clone(), residual.clone()) if aud else (None, None)
             new_residual = x + residual  # validator owns the add
             out = torch.empty_like(new_residual)
             impl.entry(new_residual, weight, out, eps)
+            if aud:
+                _audit.run(slot, (out, new_residual),
+                           lambda: baseline_forward(self, a_x, a_res, None))
             return out, new_residual
         except Exception:
             if registry.strict:
@@ -150,9 +168,17 @@ def make_attention_dispatcher(
     pool buffers, graph-safe). Prefill / MLA / cross-attention / windowed paths fall
     back to the trusted backend. Conservative by construction: when in doubt, trust
     the baseline.
+
+    NO IN-ENGINE AUDIT here (optima.audit): re-running ``baseline_forward`` would
+    re-drive the backend's KV-cache write path (``save_kv_cache``) — stateful, and
+    idempotence is backend-specific, so a double-write could corrupt the run being
+    scored. Until a save-free audit call exists, attention fidelity rides verify
+    (matched_ratio vs fp32 ground truth) + the benchmark gate.
     """
 
     def dispatched(self, q, k, v, forward_batch, save_kv_cache: bool = True, **kwargs):
+        if _dynamo_compiling():  # traced region bakes pure stock (see _dynamo_compiling)
+            return baseline_forward(self, q, k, v, forward_batch, save_kv_cache, **kwargs)
         if _attention_seam_active():
             try:
                 if forward_batch.forward_mode.is_decode() and _decode_supported(self, k, v, kwargs):
@@ -267,6 +293,8 @@ def make_moe_dispatcher(
     """
 
     def dispatched(self, hidden_states, topk_output):
+        if _dynamo_compiling():  # traced region bakes pure stock (see _dynamo_compiling)
+            return baseline_forward(self, hidden_states, topk_output)
         _maybe_inspect_moe(self, hidden_states, topk_output)
         if _moe_seam_active():
             try:
@@ -315,7 +343,16 @@ def make_moe_dispatcher(
                                 _moe_debug(lambda s=slot: f"SKIP {s}: quant mismatch "
                                                           f"(kernel={set(impl.eligibility.quant)} layer={quant_fmt})")
                                 continue
+                            # Audit: baseline forward_impl on a pre-call clone (its TP
+                            # reduce is collective — rank-seeded sampling keeps lockstep).
+                            # Both sides are post-reduce here (the kernel path replays the
+                            # validator reduce for plain fused_experts), so comparable.
+                            aud = not in_graph and _audit.sampled()
+                            a_x = x.clone() if aud else None
                             out = _run_moe_kernel(self, x, routed, impl, slot)
+                            if aud:
+                                _audit.run(slot, (out,) if torch.is_tensor(out) else tuple(out),
+                                           lambda: baseline_forward(self, a_x, topk_output))
                             _log_once_active(slot)
                             _moe_debug(lambda s=slot, m=x.shape[0]: f"FIRED slot={s} M={m} quant={quant_fmt}")
                             return out
@@ -469,6 +506,25 @@ def _quant_ok(declared: frozenset[str], fmt: Optional[str]) -> bool:
     return fmt in declared
 
 
+def _dynamo_compiling() -> bool:
+    """True while torch.compile (Dynamo) is TRACING the caller.
+
+    Newer sglang compiles some seam call sites piecewise (observed 2026-07-07: the
+    prefill fusion path traces ``flashinfer_allreduce_residual_rmsnorm`` — i.e. our
+    rebound dispatcher — under Dynamo, which hard-errors on the dispatcher's
+    function-body imports/registry machinery). A traced region must bake PURE STOCK:
+    Dynamo constant-folds ``torch.compiler.is_compiling()`` to True during trace, so
+    an early ``return baseline_fn(...)`` erases the dispatcher from the compiled graph
+    entirely. Eager execution and classic CUDA-graph capture — the validated decode
+    win regime — see False and route normally. A slot that wants to live INSIDE a
+    compiled region needs the custom-op wrapper design (ledger, not built yet).
+    """
+    try:
+        return bool(torch.compiler.is_compiling())
+    except Exception:  # noqa: BLE001 - older torch without torch.compiler
+        return False
+
+
 def _in_cuda_graph() -> bool:
     # Eager-only MVP: a kernel captured into a piecewise CUDA graph isn't validated yet.
     # If we can't tell (helper missing), assume NOT in a graph (CPU tests / older sglang);
@@ -602,14 +658,18 @@ def make_allreduce_dispatcher(
     reduce is mid-network (upstream of the sampler) → no output to substitute.
 
     SCOPE (MVP, mirrors the other seams): only the multi-rank (``world_size > 1``)
-    default SUM all-reduce of a 2D tensor, eager-only, opt-in via ``OPTIMA_COLLECTIVE_SEAM=1``.
-    Extra args/kwargs, single-rank, or graph capture → trusted baseline. The miner gets
+    default SUM all-reduce of a 2D tensor, opt-in via ``OPTIMA_COLLECTIVE_SEAM=1``.
+    Extra args/kwargs or single-rank → trusted baseline. Under CUDA-graph capture
+    (the scoring config) a kernel runs only if it DECLARED ``graph_safe``; an
+    undeclared kernel stays eager-only and the stock reduce runs in-graph. The miner gets
     the process group (``self.device_group``) — a wider capability than op/block slots —
     so this slot is verified DISTRIBUTED (optima.verify_collective) and the end-to-end
     gate is mandatory (docs/SLOT_CONTRACT.md).
     """
 
     def dispatched(self, input_, *args, **kwargs):
+        if _dynamo_compiling():  # traced region bakes pure stock (see _dynamo_compiling)
+            return baseline_all_reduce(self, input_, *args, **kwargs)
         if _collective_seam_active() and not args and not kwargs:
             try:
                 if (torch.is_tensor(input_) and input_.dim() == 2
@@ -623,9 +683,15 @@ def make_allreduce_dispatcher(
                     # Under CUDA graphs (the scoring config) only run a kernel the miner
                     # DECLARED graph-capturable; else trust the stock reduce in-graph.
                     if impl is not None and not (_in_cuda_graph() and not impl.eligibility.graph_safe):
+                        # Audited baseline is COLLECTIVE (see arfusion note): rank-seeded
+                        # sampling + lockstep dispatch make the extra reduce safe.
+                        aud = not _in_cuda_graph() and _audit.sampled()
+                        a_in = input_.clone() if aud else None
                         out = torch.empty_like(input_)
                         group = getattr(self, "device_group", None)
                         impl.entry(input_, out, group)  # miner fills out with sum-over-ranks
+                        if aud:
+                            _audit.run(slot, (out,), lambda: baseline_all_reduce(self, a_in))
                         _log_collective_active()
                         return out
             except Exception as exc:  # noqa: BLE001
@@ -655,6 +721,229 @@ def _log_collective_fallback(exc: Exception) -> None:
     if not _COLLECTIVE_LOGGED_FALLBACK:
         _COLLECTIVE_LOGGED_FALLBACK = True
         logger.warning("optima: collective.all_reduce seam FELL BACK to baseline after kernel error: %r", exc)
+
+
+# ---------------------------------------------------------------------------
+# collective.ar_residual_rmsnorm — the fused AR+residual+RMSNorm epilogue waist
+# ---------------------------------------------------------------------------
+
+_ARFUSION_LOGGED_ACTIVE = False
+_ARFUSION_LOGGED_FALLBACK = False
+
+
+def make_arfusion_dispatcher(
+    baseline_fn: Callable[..., object],
+    *,
+    registry: KernelRegistry = REGISTRY,
+    slot: str = "collective.ar_residual_rmsnorm",
+) -> Callable[..., object]:
+    """Build a replacement for the MODULE-LEVEL function
+    ``sglang.srt.layers.flashinfer_comm_fusion.flashinfer_allreduce_residual_rmsnorm``
+    — sglang's own fused-epilogue waist. With ``--enable-flashinfer-allreduce-fusion``
+    (an arena server flag) every participating layer epilogue funnels through this one
+    function: the layer defers its TP all-reduce, and the next norm call performs
+    AR + residual-add + RMSNorm fused. The call site resolves the symbol per call via a
+    function-local import, so rebinding the module attribute reroutes every caller
+    (the mechanism the 2026-07-02 M3 fused-epilogue campaign validated in production).
+
+    The validator owns the call site, BOTH output buffers (norm_out, new_residual), and
+    the process group; the miner owns the reduce transport + the fused add/norm math.
+    Mid-network, upstream of the sampler — nothing to substitute. Stock signature and
+    the ``Tuple[Tensor, Tensor]`` return are preserved exactly; any deviation from the
+    plain path (extra semantics via kwargs, missing residual, non-2D input) falls back.
+
+    SCOPE: 2D input with a residual, multi-rank group, opt-in via
+    ``OPTIMA_ARFUSION_SEAM=1``. Token-count dispatch windows (a kernel measured to win
+    only at decode-sized T) are declared via eligibility ``max_num_tokens`` — oversized
+    calls (prefill) route to the trusted baseline rather than trusting the kernel to
+    decline. Under CUDA-graph capture a kernel runs only if it declared ``graph_safe``.
+    """
+
+    def dispatched(input_tensor, residual, weight, eps=1e-6, max_token_num=2048,
+                   use_oneshot=None, trigger_completion_at_end=False, fp32_acc=False,
+                   use_attn_tp_group=True):
+        # FIRST, before any Python machinery: inside a Dynamo trace this constant-folds
+        # to True and the compiled piece bakes pure stock (see _dynamo_compiling — the
+        # piecewise-prefill trace of this exact call site hard-errored otherwise).
+        if _dynamo_compiling():
+            return baseline_fn(input_tensor, residual, weight, eps, max_token_num,
+                               use_oneshot, trigger_completion_at_end, fp32_acc,
+                               use_attn_tp_group)
+        if _arfusion_seam_active():
+            # DEEP consume first: if this call's input is a moe output whose in-op
+            # finalize was skipped (ptr-keyed pend from the export seam), the tensor
+            # is UNFINALIZED — it must never reach the shallow kernel or the stock
+            # baseline directly. _deep_consume always returns a finalized result
+            # (miner deep kernel, or trusted fp32 reconstruct + stock fusion).
+            if _moe_export.has_pends():
+                exp = _moe_export.consume(input_tensor)
+                if exp is not None:
+                    return _deep_consume(
+                        exp, input_tensor, residual, weight, eps, max_token_num,
+                        use_oneshot, trigger_completion_at_end, fp32_acc,
+                        use_attn_tp_group, registry=registry, baseline_fn=baseline_fn)
+            try:
+                # Contiguity guard = STOCK PARITY: the stock function refuses
+                # non-contiguous input/residual/weight (real call sites pass views —
+                # upstream guards for it, flashinfer_comm_fusion.py). A raw-pointer
+                # kernel fed a strided view reads the wrong layout silently; verify
+                # can't see it (it always builds contiguous tensors), only the
+                # engine's own call mix does.
+                if (torch.is_tensor(input_tensor) and input_tensor.dim() == 2
+                        and torch.is_tensor(residual)
+                        and input_tensor.is_contiguous() and residual.is_contiguous()
+                        and (not torch.is_tensor(weight) or weight.is_contiguous())):
+                    impl = registry.lookup(
+                        slot,
+                        dtype_name=_dtype_name(input_tensor.dtype),
+                        last_dim=input_tensor.shape[-1],
+                        arch=_arch_tag(input_tensor.device.index or 0) if input_tensor.is_cuda else None,
+                        num_tokens=input_tensor.shape[0],
+                    )
+                    # Under CUDA graphs (the scoring config) only run a kernel the miner
+                    # DECLARED graph-capturable; else trust the stock path in-graph.
+                    if impl is not None and not (_in_cuda_graph() and not impl.eligibility.graph_safe):
+                        group = _arfusion_group(use_attn_tp_group)
+                        if group is not None and group.size() > 1:
+                            # The audited baseline is COLLECTIVE: safe only because the
+                            # sampling RNG is rank-identically seeded (audit.py) and all
+                            # ranks reach this dispatcher in lockstep; never under capture.
+                            aud = not _in_cuda_graph() and _audit.sampled()
+                            if aud:
+                                a_x, a_res = input_tensor.clone(), residual.clone()
+                            out_norm = torch.empty_like(input_tensor)
+                            out_residual = torch.empty_like(residual)
+                            impl.entry(input_tensor, residual, weight, float(eps),
+                                       out_norm, out_residual, group)
+                            if aud:
+                                _audit.run(slot, (out_norm, out_residual),
+                                           lambda: baseline_fn(a_x, a_res, weight, eps,
+                                                               max_token_num, use_oneshot,
+                                                               trigger_completion_at_end,
+                                                               fp32_acc, use_attn_tp_group))
+                            _log_arfusion_active()
+                            return out_norm, out_residual
+            except Exception as exc:  # noqa: BLE001
+                if registry.strict:
+                    raise
+                _log_arfusion_fallback(exc)
+        return baseline_fn(input_tensor, residual, weight, eps, max_token_num, use_oneshot,
+                           trigger_completion_at_end, fp32_acc, use_attn_tp_group)
+
+    return dispatched
+
+
+def _arfusion_seam_active() -> bool:
+    import os
+
+    return os.environ.get("OPTIMA_ARFUSION_SEAM") == "1"
+
+
+_DEEP_SLOT = "collective.moe_finalize_ar_rmsnorm"
+
+
+def _deep_consume(exp, input_tensor, residual, weight, eps, max_token_num,
+                  use_oneshot, trigger_completion_at_end, fp32_acc,
+                  use_attn_tp_group, *, registry, baseline_fn):
+    """Serve a skipped-finalize moe export: run the deep kernel when eligible, else
+    reconstruct with the validator-trusted fp32 finalize and hand the FINALIZED
+    tensor to the stock fusion call. Correctness invariant: every path out of here
+    has performed the finalize — the unfinalized input never leaks downstream.
+
+    The consume call may HEAD-TRIM CUDA-graph batch padding (same data_ptr,
+    T <= exp["T"]); more rows than were exported means the pointer pairing is
+    broken and nothing recoverable exists — that one raises."""
+    t = input_tensor.shape[0] if input_tensor.dim() == 2 else -1
+    if t < 0 or t > exp["T"]:
+        raise RuntimeError(
+            f"optima deep seam: consume T={t} exceeds export T={exp['T']} — "
+            "pointer pairing broken, refusing to serve an unfinalized output")
+    try:
+        impl = registry.lookup(
+            _DEEP_SLOT,
+            dtype_name=_dtype_name(input_tensor.dtype),
+            last_dim=input_tensor.shape[-1],
+            arch=_arch_tag(input_tensor.device.index or 0) if input_tensor.is_cuda else None,
+            num_tokens=t,
+        )
+        if impl is not None and not (_in_cuda_graph() and not impl.eligibility.graph_safe):
+            group = _arfusion_group(use_attn_tp_group)
+            if group is not None and group.size() > 1:
+                gemm_out, row_map, scales = _moe_export.export_views(
+                    exp, input_tensor.device)
+                # Collective audit: rank-identical sampling (audit.py) keeps the
+                # reference all-reduce in lockstep; never under capture. The deep
+                # slot has no runnable stock function (the stock finalize was
+                # skipped), so 'expected' is the slot's own trusted fp32 math —
+                # the SAME reference verify gates against.
+                aud = not _in_cuda_graph() and _audit.sampled()
+                if aud:
+                    a_inputs = {"gemm_out": gemm_out.clone(), "row_map": row_map.clone(),
+                                "scales": scales.clone(), "residual": residual.clone(),
+                                "weight": weight, "eps": eps}
+                out_norm = torch.empty_like(input_tensor)
+                out_residual = torch.empty_like(residual)
+                impl.entry(gemm_out, row_map, scales, residual, weight, float(eps),
+                           out_norm, out_residual, group)
+                if aud:
+                    def _reference():
+                        import torch.distributed as dist
+
+                        from optima.slots import (_ar_norm_reference_from_sum,
+                                                  _moe_fin_local_finalize)
+
+                        part = _moe_fin_local_finalize(a_inputs)
+                        dist.all_reduce(part, group=group)
+                        return _ar_norm_reference_from_sum(a_inputs, part, None)
+
+                    _audit.run(_DEEP_SLOT, (out_norm, out_residual), _reference)
+                _log_arfusion_active()
+                return out_norm, out_residual
+    except Exception as exc:  # noqa: BLE001
+        if registry.strict:
+            raise
+        _log_arfusion_fallback(exc)
+    # Trusted recovery: fp32 finalize from the exported views (head-trimmed to this
+    # call's T), then the stock fusion path on the now-FINALIZED tensor. Correct but
+    # slow — receipted as an orphan so a nonzero count is visible seam-health data.
+    finalized = _moe_export.trusted_finalize(exp, input_tensor)
+    _moe_export.orphaned(exp)
+    return baseline_fn(finalized, residual, weight, eps, max_token_num, use_oneshot,
+                       trigger_completion_at_end, fp32_acc, use_attn_tp_group)
+
+
+# (The 2026-07-07 one-off "stockcheck" diagnostic that lived here was productized
+# into optima/audit.py — the in-engine audit is the same mechanism, generic across
+# dispatchers, receipted, and gated by the eval driver.)
+
+
+def _arfusion_group(use_attn_tp_group: bool):
+    """The torch ProcessGroup the stock call would reduce over. ``use_attn_tp_group``
+    mirrors the stock argument (attention-TP vs full-TP chain); under plain TP the two
+    coincide. Resolution failure -> None -> baseline (never guess a group)."""
+    from sglang.srt.distributed import parallel_state as ps
+
+    try:
+        coord = ps.get_attention_tp_group() if use_attn_tp_group else ps.get_tp_group()
+    except (AttributeError, AssertionError):
+        coord = ps.get_tp_group()
+    return getattr(coord, "device_group", None)
+
+
+def _log_arfusion_active() -> None:
+    global _ARFUSION_LOGGED_ACTIVE
+    if not _ARFUSION_LOGGED_ACTIVE:
+        _ARFUSION_LOGGED_ACTIVE = True
+        logger.warning(
+            "optima: collective.ar_residual_rmsnorm seam ACTIVE — fused AR+norm epilogue routed through miner kernel")
+
+
+def _log_arfusion_fallback(exc: Exception) -> None:
+    global _ARFUSION_LOGGED_FALLBACK
+    if not _ARFUSION_LOGGED_FALLBACK:
+        _ARFUSION_LOGGED_FALLBACK = True
+        logger.warning(
+            "optima: collective.ar_residual_rmsnorm seam FELL BACK to baseline after kernel error: %r", exc)
 
 
 def _dtype_name(dtype: torch.dtype) -> str:

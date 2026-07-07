@@ -48,13 +48,33 @@ class Eligibility:
     # baseline). This is the gate that lets an NVFP4 expert kernel reach the seam without
     # feeding a dense kernel packed FP4 bytes + separate scales it would mis-read.
     quant: frozenset[str] = frozenset()
+    # Cap on the token/row count (x.shape[0]) the kernel claims. A kernel with a
+    # MEASURED dispatch window (e.g. the fused AR+norm epilogue wins at decode
+    # T<=1024 and must fall through for prefill-sized T) declares it here, so the
+    # seam routes oversized calls to the trusted baseline instead of trusting the
+    # kernel to decline. None -> no cap.
+    max_num_tokens: Optional[int] = None
+    # Floor on the token/row count. The measured counterpart of max_num_tokens for
+    # kernels that LOSE at tiny T (the deep fused epilogue wins at decode T>=48 but
+    # loses at long-ctx T=4 — the vendor tuner's finalize-fused tactics win there);
+    # below the floor the seam serves the stock path (or a sibling shallow kernel).
+    # For the deep slot the EXPORT side applies the same gate, so an ineligible T
+    # never has its finalize skipped in the first place. None -> no floor.
+    min_num_tokens: Optional[int] = None
 
-    def accepts(self, *, dtype_name: str, last_dim: int, arch: Optional[str]) -> bool:
+    def accepts(self, *, dtype_name: str, last_dim: int, arch: Optional[str],
+                num_tokens: Optional[int] = None) -> bool:
         if self.dtypes and dtype_name not in self.dtypes:
             return False
         if self.architectures and arch is not None and arch not in self.architectures:
             return False
         if self.max_last_dim is not None and last_dim > self.max_last_dim:
+            return False
+        if (self.max_num_tokens is not None and num_tokens is not None
+                and num_tokens > self.max_num_tokens):
+            return False
+        if (self.min_num_tokens is not None and num_tokens is not None
+                and num_tokens < self.min_num_tokens):
             return False
         return True
 
@@ -70,6 +90,11 @@ class KernelImpl:
     # None for plain forward-only slots (silu / rmsnorm / attention).
     prepare: Optional[Callable[..., Any]] = None
     eligibility: Eligibility = field(default_factory=Eligibility)
+
+
+# Slots whose miner impl was actually SELECTED at least once in this process —
+# guards the one-time "fired" receipt write in lookup() (see optima/receipts.py).
+_FIRED_SLOTS: set[str] = set()
 
 
 class KernelRegistry:
@@ -114,14 +139,42 @@ class KernelRegistry:
     # ---- lookup (dispatcher-side, hot path) ----
 
     def lookup(
-        self, slot: str, *, dtype_name: str, last_dim: int, arch: Optional[str]
+        self, slot: str, *, dtype_name: str, last_dim: int, arch: Optional[str],
+        num_tokens: Optional[int] = None
     ) -> Optional[KernelImpl]:
         if not self._active:
             return None
         impl = self._by_slot.get(slot)
         if impl is None:
             return None
-        if not impl.eligibility.accepts(dtype_name=dtype_name, last_dim=last_dim, arch=arch):
+        if not impl.eligibility.accepts(dtype_name=dtype_name, last_dim=last_dim, arch=arch,
+                                        num_tokens=num_tokens):
+            return None
+        if slot not in _FIRED_SLOTS:
+            # First time this process actually SELECTS the miner impl for this slot —
+            # positive routed-evidence for the eval driver (anti phantom-pass; see
+            # optima/receipts.py). Once per slot per process, so it stays off the hot
+            # path; under CUDA-graph replay this host code doesn't run at all.
+            _FIRED_SLOTS.add(slot)
+            from optima import receipts
+
+            receipts.write("fired", {"slot": slot}, tag=slot)
+        return impl
+
+    def peek(
+        self, slot: str, *, dtype_name: str, last_dim: int, arch: Optional[str],
+        num_tokens: Optional[int] = None
+    ) -> Optional[KernelImpl]:
+        """Eligibility probe WITHOUT the 'fired' receipt. For pre-flight gates (the
+        deep export seam asks "would the consume kernel run?" before arming
+        skip-finalize) — 'fired' must keep meaning "the miner entry was actually
+        selected at a call site", so probes must not write it."""
+        if not self._active:
+            return None
+        impl = self._by_slot.get(slot)
+        if impl is None or not impl.eligibility.accepts(
+                dtype_name=dtype_name, last_dim=last_dim, arch=arch,
+                num_tokens=num_tokens):
             return None
         return impl
 
@@ -145,4 +198,8 @@ def eligibility_from_metadata(meta: dict | None, manifest_dtypes: tuple[str, ...
         max_last_dim=int(max_last) if max_last is not None else None,
         graph_safe=bool(meta.get("graph_safe", False)),
         quant=frozenset(str(q) for q in meta.get("quant", ())),
+        max_num_tokens=(int(meta["max_num_tokens"])
+                        if meta.get("max_num_tokens") is not None else None),
+        min_num_tokens=(int(meta["min_num_tokens"])
+                        if meta.get("min_num_tokens") is not None else None),
     )

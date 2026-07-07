@@ -11,8 +11,10 @@ Contents:
   * ``override`` — the EFC-style epilogue override-point: a miner ships a small device
                    epilogue + a torch reference; the validator composes it into a base kernel.
   * ``moe``      — base kernels (the vendored-once, epilogue-hooked NVFP4 MoE megakernel; GPU).
+  * ``collective`` — fused cross-GPU epilogues; first entry = the M3 fused
+                   AR+residual+RMSNorm decode-epilogue win (portable launcher + .cu).
 """
 
 from __future__ import annotations
 
-__all__ = ["codec", "override", "moe"]
+__all__ = ["codec", "override", "moe", "collective"]

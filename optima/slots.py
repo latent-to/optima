@@ -156,6 +156,13 @@ class SlotSpec:
     #     handing it the process group; it fills `out` with the REDUCED result.
     collective_partial: Optional[Callable] = None
     invoke_collective: Optional[Callable] = None
+    # Optional post-reduce transform for distributed verify: some collective slots do
+    # trusted local math AFTER the cross-rank sum (e.g. residual-add + RMSNorm in
+    # collective.ar_residual_rmsnorm). ``collective_finish(inputs, summed, prepared)``
+    # maps the fp32 cross-rank SUM of ``collective_partial`` to the list of expected
+    # outputs, one per ``out_shapes`` entry. None -> the reference is the sum itself and
+    # the slot has exactly one output (the pre-existing all-reduce contract).
+    collective_finish: Optional[Callable] = None
     # Per-slot end-to-end KL gate, calibrated to THIS slot's intrinsic noise floor (the
     # generic 5e-3 default is tuned for elementwise ops; attention sits ~6e-3 vs flash's
     # reordered softmax, so a flat 5e-3 false-fails a faithful attention kernel — README
@@ -591,6 +598,193 @@ COLLECTIVE_ALL_REDUCE = SlotSpec(
 
 
 # ---------------------------------------------------------------------------
+# Slot (COLLECTIVE): collective.ar_residual_rmsnorm   (the decode-epilogue waist)
+#   Per rank: x:(M,H) is that rank's LOCAL partial (e.g. the un-reduced MoE/MLP output);
+#   residual:(M,H) and weight:(H,) are REPLICATED (identical on every rank). The kernel
+#   owns the whole fused epilogue:
+#     new_residual = sum_over_ranks(x) + residual
+#     norm_out     = rmsnorm(new_residual, weight, eps)
+#   contract: entry(x, residual, weight, eps, out_norm, out_residual, group)
+#
+# This is sglang's OWN fusion waist: with --enable-flashinfer-allreduce-fusion the
+# layer epilogues funnel through ONE module-level function
+# (sglang.srt.layers.flashinfer_comm_fusion.flashinfer_allreduce_residual_rmsnorm,
+# resolved per-call via a function-local import), so the seam is a module-attribute
+# rebind of a real single call site — the validator owns the call site, both output
+# buffers, and the process group; the miner owns the reduce algorithm + the fused
+# residual/norm math. Mid-network, upstream of the sampler: nothing to substitute.
+# The measured lever here is the fused AR+add+norm epilogue (two-shot Lamport beats
+# flashinfer's own fused kernel at decode T on B300 — the 2026-07-02 campaign), and
+# the future compute-comm overlap consumes pre-reduce exports at this same boundary.
+# Wider capability than "fill a tensor" -> verified DISTRIBUTED (the fp32 cross-rank
+# sum then trusted local add+norm via collective_finish), end-to-end gate mandatory.
+# ---------------------------------------------------------------------------
+
+
+def _ar_norm_inputs(*, num_tokens: int, hidden: int, dtype: torch.dtype, device: str,
+                    seed: int, rank: int = 0, world_size: int = 1) -> dict:
+    # x differs per rank (it is the local partial the reduce sums); residual + norm
+    # weight are the SAME on every rank (replicated model state), so they are seeded
+    # WITHOUT rank. Getting this split wrong is exactly the shared-expert/replication
+    # bug class the M3 campaign flagged — keep it explicit.
+    gx = torch.Generator(device=device).manual_seed(seed + 1_000_003 * rank)
+    gs = torch.Generator(device=device).manual_seed(seed)
+    x = (torch.randn(num_tokens, hidden, generator=gx, device=device, dtype=torch.float32) * 0.1).to(dtype)
+    residual = (torch.randn(num_tokens, hidden, generator=gs, device=device, dtype=torch.float32) * 0.1).to(dtype)
+    weight = (torch.rand(hidden, generator=gs, device=device, dtype=torch.float32) * 0.5 + 0.75).to(dtype)
+    return {"x": x, "residual": residual, "weight": weight, "eps": 1e-6}
+
+
+def _ar_norm_reference_from_sum(inputs: dict, summed: "torch.Tensor", prepared) -> list:
+    # Trusted fp32 math applied AFTER the cross-rank sum: residual add, then RMSNorm.
+    new_residual = summed + inputs["residual"].float()
+    var = new_residual.pow(2).mean(dim=-1, keepdim=True)
+    norm_out = new_residual * torch.rsqrt(var + float(inputs["eps"])) * inputs["weight"].float()
+    return [norm_out, new_residual]
+
+
+COLLECTIVE_AR_RESIDUAL_RMSNORM = SlotSpec(
+    name="collective.ar_residual_rmsnorm",
+    entry="ar_residual_rmsnorm",
+    summary=(
+        "fused all-reduce + residual-add + RMSNorm (the decode-epilogue waist behind "
+        "sglang's --enable-flashinfer-allreduce-fusion): x:(M,H) per-rank partial, "
+        "residual/weight replicated -> out_residual = sum_over_ranks(x) + residual, "
+        "out_norm = rmsnorm(out_residual, weight, eps).  "
+        "entry(x, residual, weight, eps, out_norm, out_residual, group).  Validator owns "
+        "both outputs + the group; verified DISTRIBUTED (fp32 cross-rank sum, then the "
+        "trusted add+norm via collective_finish)."
+    ),
+    kind="collective",
+    make_inputs=_ar_norm_inputs,
+    # Two validator-allocated outputs: [norm_out, new_residual] — the stock chokepoint
+    # returns exactly this pair.
+    out_shapes=lambda i: [tuple(i["x"].shape), tuple(i["x"].shape)],
+    # Single-process hooks are unused for kind="collective" (verify_collective drives the
+    # real check); kept semantically correct for the world_size=1 degenerate case.
+    invoke_reference=lambda i: _ar_norm_reference_from_sum(i, i["x"].float(), None),
+    invoke_entry=lambda entry, i, outs, prepared: entry(
+        i["x"], i["residual"], i["weight"], i["eps"], outs[0], outs[1], i.get("__group__")),
+    collective_partial=lambda i, prepared: i["x"].float(),
+    invoke_collective=lambda entry, i, outs, group, prepared: entry(
+        i["x"], i["residual"], i["weight"], i["eps"], outs[0], outs[1], group),
+    collective_finish=_ar_norm_reference_from_sum,
+    shapes=(
+        {"num_tokens": 4, "hidden": 4096},
+        # DECODE-sized T at the ARENA hidden: the expected kernel class mode-switches on
+        # T (one-shot small / two-shot large), and an H-gated kernel routes off-H shapes
+        # to its reference — so without small-T AT the arena H, verify never exercises
+        # the one-shot CUDA path at all. That exact hole shipped an engine-garbage
+        # kernel past verify on 2026-07-07 (engine decode T=8 = one-shot, unverified).
+        # A slot's shape set must cover every dispatch mode of its kernel class.
+        {"num_tokens": 8, "hidden": 6144},
+        {"num_tokens": 32, "hidden": 6144},
+        {"num_tokens": 64, "hidden": 6144},
+        {"num_tokens": 256, "hidden": 6144},
+    ),
+    # Reduce order + norm rounding differ across algorithms (one-shot/two-shot/ring);
+    # gate on matched_ratio vs the fp32 composed reference, e2e token/KL gate mandatory.
+    correctness=Correctness("matched_ratio", min_ratio=0.99),
+    tolerances=_BF16_TOL,
+)
+
+
+# ---------------------------------------------------------------------------
+# Slot (collective): collective.moe_finalize_ar_rmsnorm — the DEEP fused-epilogue
+# waist: MoE finalize (gather permuted gemm2 rows, scale, sum over experts-per-token)
+# + all-reduce + residual-add + RMSNorm in ONE kernel. This is the fe_export deep
+# seam's kernel contract: the producer dep-patch exports flashinfer's pre-finalize
+# pointers (gemm_output / row_map / scales) instead of launching the standalone
+# finalize kernel, and the deferred-AR call site consumes them here — killing a
+# ~17us/layer latency-bound kernel + a full [T,H] round-trip at decode.
+#
+# Verifiable WITHOUT flashinfer: the validator seeds synthetic pre-finalize tensors
+# per rank, and finalize is LINEAR, so finalize-then-AR == AR-then-finalize:
+# collective_partial = trusted fp32 LOCAL finalize per rank, verify sums across
+# ranks, collective_finish = the same trusted add+norm as the shallow slot.
+#
+# ABI (matches fe_export.h, 2026-07-02 campaign):
+#   gemm_out [T_exp*K, H]  per-rank partial (unfused gemm2 output, permuted rows)
+#   row_map  [T_exp*K] i32 REPLICATED, K-MAJOR: slot (t, k) lives at t + k*T_exp
+#   scales   [T_exp, K] f32 REPLICATED, T-MAJOR
+#   residual [T, H], weight [H]  replicated; T <= T_exp (CUDA-graph batch padding:
+#   the consume call may HEAD-TRIM — same data_ptr, offset-0 slice).
+# ---------------------------------------------------------------------------
+
+
+def _moe_fin_inputs(*, num_tokens: int, exp_tokens: int, topk: int, hidden: int,
+                    dtype: torch.dtype, device: str, seed: int,
+                    rank: int = 0, world_size: int = 1) -> dict:
+    # gemm_out differs per rank (TP-sharded gemm2 emits per-rank partials the reduce
+    # sums); routing (row_map/scales) and residual/weight are REPLICATED model/router
+    # state -> seeded WITHOUT rank. Same replication-split discipline as the shallow
+    # slot. num_tokens is jittered by verify; exp_tokens is clamped to keep T <= T_exp.
+    exp_tokens = max(exp_tokens, num_tokens)
+    rows = exp_tokens * topk
+    gx = torch.Generator(device=device).manual_seed(seed + 1_000_003 * rank)
+    gs = torch.Generator(device=device).manual_seed(seed)
+    gemm_out = (torch.randn(rows, hidden, generator=gx, device=device,
+                            dtype=torch.float32) * 0.1).to(dtype)
+    row_map = torch.randperm(rows, generator=gs, device=device).to(torch.int32)
+    scales = (torch.rand(exp_tokens, topk, generator=gs, device=device,
+                         dtype=torch.float32) + 0.1) / topk
+    residual = (torch.randn(num_tokens, hidden, generator=gs, device=device,
+                            dtype=torch.float32) * 0.1).to(dtype)
+    weight = (torch.rand(hidden, generator=gs, device=device,
+                         dtype=torch.float32) * 0.5 + 0.75).to(dtype)
+    return {"gemm_out": gemm_out, "row_map": row_map, "scales": scales,
+            "residual": residual, "weight": weight, "eps": 1e-6}
+
+
+def _moe_fin_local_finalize(inputs: dict, prepared=None) -> "torch.Tensor":
+    # Trusted fp32 LOCAL finalize (this rank's partial): for token t,
+    # acc[t] = sum_k scales[t,k] * gemm_out[row_map[t + k*T_exp]]; head-trim to T.
+    t = inputs["residual"].shape[0]
+    t_exp, k = inputs["scales"].shape
+    per_k = inputs["gemm_out"].float()[inputs["row_map"].long().view(k, t_exp)]
+    acc = (per_k * inputs["scales"].float().t().unsqueeze(-1)).sum(dim=0)
+    return acc[:t]
+
+
+COLLECTIVE_MOE_FINALIZE_AR_RMSNORM = SlotSpec(
+    name="collective.moe_finalize_ar_rmsnorm",
+    entry="moe_finalize_ar_rmsnorm",
+    summary=(
+        "DEEP fused MoE epilogue (the fe_export contract): finalize (gather permuted "
+        "gemm2 rows via K-MAJOR row_map, scale by T-MAJOR scales, sum over K) + "
+        "all-reduce + residual-add + RMSNorm, one kernel. gemm_out:(T_exp*K,H) per-rank "
+        "partial; row_map/scales/residual/weight replicated; T<=T_exp (graph padding "
+        "head-trim). entry(gemm_out, row_map, scales, residual, weight, eps, out_norm, "
+        "out_residual, group). Validator owns both outputs + the group; verified "
+        "DISTRIBUTED without flashinfer — finalize is linear, so the reference is "
+        "trusted fp32 local finalize per rank -> cross-rank sum -> add+norm."
+    ),
+    kind="collective",
+    make_inputs=_moe_fin_inputs,
+    out_shapes=lambda i: [tuple(i["residual"].shape), tuple(i["residual"].shape)],
+    invoke_reference=lambda i: _ar_norm_reference_from_sum(
+        i, _moe_fin_local_finalize(i), None),
+    invoke_entry=lambda entry, i, outs, prepared: entry(
+        i["gemm_out"], i["row_map"], i["scales"], i["residual"], i["weight"], i["eps"],
+        outs[0], outs[1], i.get("__group__")),
+    collective_partial=_moe_fin_local_finalize,
+    invoke_collective=lambda entry, i, outs, group, prepared: entry(
+        i["gemm_out"], i["row_map"], i["scales"], i["residual"], i["weight"], i["eps"],
+        outs[0], outs[1], group),
+    collective_finish=_ar_norm_reference_from_sum,
+    shapes=(
+        # K=5 = M3 (top4 + fused shared expert). Head-trim (T < T_exp) exercised in the
+        # 1st/3rd shapes; num_tokens jitters per run, exp_tokens clamps to stay >= T.
+        {"num_tokens": 8, "exp_tokens": 16, "topk": 5, "hidden": 4096},
+        {"num_tokens": 64, "exp_tokens": 64, "topk": 5, "hidden": 6144},
+        {"num_tokens": 224, "exp_tokens": 256, "topk": 5, "hidden": 6144},
+    ),
+    correctness=Correctness("matched_ratio", min_ratio=0.99),
+    tolerances=_BF16_TOL,
+)
+
+
+# ---------------------------------------------------------------------------
 # Slot (COLLECTIVE block — owns its trailing reduce): moe.fused_experts_reduce
 #   prepare(w13, w2) -> prepared                                  (once at load)
 #   forward(x, topk_ids, topk_weights, prepared, out, group)      (per step)
@@ -753,6 +947,8 @@ SLOTS: dict[str, SlotSpec] = {
     MOE_FUSED_EXPERTS.name: MOE_FUSED_EXPERTS,
     MOE_FUSED_EXPERTS_REDUCE.name: MOE_FUSED_EXPERTS_REDUCE,
     COLLECTIVE_ALL_REDUCE.name: COLLECTIVE_ALL_REDUCE,
+    COLLECTIVE_AR_RESIDUAL_RMSNORM.name: COLLECTIVE_AR_RESIDUAL_RMSNORM,
+    COLLECTIVE_MOE_FINALIZE_AR_RMSNORM.name: COLLECTIVE_MOE_FINALIZE_AR_RMSNORM,
 }
 
 

@@ -174,7 +174,43 @@ def scan_path(path: str | Path) -> ScanResult:
     return scan_source(p.read_text(encoding="utf-8"), filename=p.name)
 
 
-def scan_tree(root: str | Path) -> ScanResult:
+# Suffixes that are never allowed in a bundle tree, declared or not: compiled/binary
+# artifacts that copy_fingerprint's import-closure walk cannot see and that scan_source
+# cannot inspect. A miner cannot launder one of these past the scan by "declaring" it as
+# a cuda_source (manifest.py's suffix check already blocks that at the manifest layer;
+# this is the belt to that suspenders — scan_tree must reject them even if some future
+# caller passes a bogus/wide-open allowlist). ``.pyc`` is only banned OUTSIDE
+# ``__pycache__`` (the normal bytecode cache dir is skipped entirely, see below).
+_BANNED_BINARY_SUFFIXES = frozenset({".so", ".o", ".a", ".dylib", ".bin"})
+
+# Benign metadata a bundle may carry with no scan/declaration needed: docs, license
+# text, the manifest itself, eligibility JSON, and git plumbing. Matched by exact
+# stem+suffix rules below, not just suffix, so this stays narrow.
+# ``rebuild.json`` is allowlisted by NAME because it is not free-form content: it is
+# strictly validated by ``optima/rebuild.py`` (fail-closed; may only select reviewed
+# patchers under ``optima/patchers/``) — the scan's job is done by that validator.
+_BENIGN_METADATA_NAMES = frozenset({"manifest.toml", "rebuild.json", ".gitignore"})
+_BENIGN_METADATA_STEM_PREFIXES = ("README", "LICENSE")
+
+
+def _is_benign_metadata(rel: Path) -> bool:
+    name = rel.name
+    if name in _BENIGN_METADATA_NAMES:
+        return True
+    if name.startswith(_BENIGN_METADATA_STEM_PREFIXES):
+        return True
+    # *.json under a top-level (or nested) metadata/ directory.
+    if rel.suffix == ".json" and "metadata" in rel.parts[:-1]:
+        return True
+    return False
+
+
+def scan_tree(
+    root: str | Path,
+    *,
+    declared_cuda_sources: "frozenset[Path] | set[Path] | None" = None,
+    declared_dep_patches: "frozenset[Path] | set[Path] | None" = None,
+) -> ScanResult:
     """Recursively scan EVERY ``.py`` under a bundle root — the vendored-tree guard.
 
     ``scan_path`` only covers the single declared entry module; a bundle can carry a whole
@@ -182,27 +218,84 @@ def scan_tree(root: str | Path) -> ScanResult:
     not slip in unscanned (the hole the single-file scan left). Aggregates violations across
     all files (skips ``__pycache__``). Still defense-in-depth, not a sandbox — but it closes
     the "ship the dangerous code in a file nobody scans" gap.
+
+    ``declared_cuda_sources`` is the resolved-path allowlist from a bundle's manifest
+    (``optima.manifest.all_declared_cuda_sources``) — the sanctioned "CUDA source" tier:
+    a ``.cu``/``.cuh`` file the manifest declares for an op, compiled only by a
+    validator-reviewed patcher (``optima/rebuild.py``), never scanned as Python here.
+
+    Backward-compatible signature: ``declared_cuda_sources=None`` (the default, used by
+    every existing call site that scans a tree without a loaded manifest) preserves the
+    OLD behavior for anything that isn't a scanned ``.py`` — such a file is silently
+    skipped, EXCEPT a file with a banned binary/artifact suffix (``.so``/``.o``/``.a``/
+    ``.dylib``/``.bin``, or a stray ``.pyc`` outside ``__pycache__``) is now rejected
+    unconditionally, declared or not, manifest or not. This is what closes the gap: a
+    ``.cu``/``.so``/``.o`` used to be invisible to this scan yet still entered
+    ``bundle_hash.content_hash`` (identity) and evaded ``copy_fingerprint``'s
+    import-closure walk. Once a manifest IS available, pass its declared cuda sources and
+    this function fails CLOSED on anything that is neither a scanned ``.py``, a declared
+    cuda_source, nor the benign-metadata allowlist (README*, LICENSE*, ``manifest.toml``,
+    ``*.json`` under ``metadata/``, ``.gitignore``) — so an undeclared ``.cu`` (or
+    anything else) is rejected with a clear message instead of silently passing through.
     """
     root = Path(root)
+    declared = frozenset(p.resolve() for p in (declared_cuda_sources or ()))
+    declared_patches = frozenset(p.resolve() for p in (declared_dep_patches or ()))
+    strict = declared_cuda_sources is not None or declared_dep_patches is not None
     out: list[str] = []
     for p in sorted(root.rglob("*")):
         if "__pycache__" in p.parts:
             continue
+        rel = p.relative_to(root)
         # Fail-closed on ANY symlink: rglob does not follow directory symlinks, so a
         # symlinked dir full of .py would otherwise be silently invisible to this scan
         # (while still perfectly importable at runtime). A bundle has no business
-        # containing symlinks at all.
+        # containing symlinks at all. This also catches a symlinked "cuda_source" —
+        # manifest.py already refuses to declare one, but a bundle can still place a
+        # symlink at a path nobody declared, so this stays the backstop.
         if p.is_symlink():
-            out.append(f"{p.relative_to(root)}: symlink (not allowed in a bundle)")
+            out.append(f"{rel}: symlink (not allowed in a bundle)")
             continue
-        if p.suffix != ".py" or not p.is_file():
+        if not p.is_file():
             continue
-        try:
-            text = p.read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError) as exc:  # noqa: PERF203
-            out.append(f"{p.relative_to(root)}: unreadable: {exc}")
+        # Fail CLOSED on binary/artifact suffixes, unconditionally — these can never be
+        # inspected by scan_source or folded into copy_fingerprint's closure walk, so no
+        # declaration can sanction them.
+        if p.suffix in _BANNED_BINARY_SUFFIXES or (p.suffix == ".pyc"):
+            out.append(f"{rel}: binary/artifact file not allowed in a bundle ({p.suffix or 'no suffix'})")
             continue
-        out.extend(scan_source(text, filename=str(p.relative_to(root))).violations)
+        if p.suffix == ".py":
+            try:
+                text = p.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError) as exc:  # noqa: PERF203
+                out.append(f"{rel}: unreadable: {exc}")
+                continue
+            out.extend(scan_source(text, filename=str(rel)).violations)
+            continue
+        if p.suffix in (".cu", ".cuh"):
+            if p.resolve() in declared:
+                continue  # sanctioned CUDA source tier — inspectable, not scanned as Python
+            if strict:
+                out.append(f"{rel}: .cu/.cuh file not declared in manifest cuda_sources")
+            continue  # no manifest context (old call sites) -> preserve prior silent-skip
+        if p.suffix in (".patch", ".diff"):
+            # Sanctioned dep-patch tier: a DECLARED text unified diff was already
+            # structurally validated at manifest load (optima/deppatch.py) and is applied
+            # only by the one reviewed patcher against an arena allowlist. An UNDECLARED
+            # patch file has no sanctioned reader — reject under a manifest, skip without.
+            if p.resolve() in declared_patches:
+                continue
+            if strict:
+                out.append(f"{rel}: .patch/.diff file not declared in manifest dep_patches")
+            continue
+        if strict:
+            if _is_benign_metadata(rel):
+                continue
+            out.append(f"{rel}: file is neither a scanned .py, a declared cuda_source, "
+                        "nor benign metadata")
+            continue
+        # Old behavior: anything else not covered above is silently skipped when no
+        # manifest context was supplied (unchanged from before this hardening).
     return ScanResult(ok=not out, violations=tuple(out))
 
 

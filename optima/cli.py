@@ -81,10 +81,12 @@ def cmd_set_weights(args: argparse.Namespace) -> int:
     from optima.commit_reveal import Ledger
 
     led = Ledger.load(args.ledger)
-    if not led.champion:
-        print(f"no champion in {args.ledger}; nothing to weight")
+    # THE emission-policy seam: the ledger says who earns what; this command only
+    # relays it. (Never re-derive winner-take-all here — see Ledger.current_weights.)
+    weights = led.current_weights(per_slot=args.per_slot)
+    if not weights:
+        print(f"no champion(s) in {args.ledger}; nothing to weight")
         return 1
-    weights = {led.champion.hotkey: 1.0}  # winner-take-all baseline (matches settle)
     subtensor = chain.connect(args.network)
     if args.dry_run:
         res = chain.set_weights(subtensor, None, args.netuid, weights, dry_run=True)
@@ -97,6 +99,137 @@ def cmd_set_weights(args: argparse.Namespace) -> int:
     res = chain.set_weights(subtensor, wallet, args.netuid, weights)
     print(f"set_weights submitted={res.get('submitted')} uids={res.get('uids')}")
     return 0 if res.get("submitted") else 1
+
+
+def cmd_chain_package(args: argparse.Namespace) -> int:
+    from optima.chain.fetch import package_bundle
+
+    out, ch = package_bundle(args.bundle, args.out)
+    print(f"archive:      {out}")
+    print(f"content_hash: {ch}")
+    print("host the archive at a stable URL, then commit it: optima chain-submit "
+          f"{args.bundle} --url <URL> --netuid <N> --network <WSS>")
+    return 0
+
+
+def cmd_chain_submit(args: argparse.Namespace) -> int:
+    from optima.chain.payload import PayloadError
+    from optima.chain.submit import submit_bundle
+
+    from optima import chain
+
+    subtensor = wallet = None
+    if not args.dry_run:
+        import bittensor as bt
+
+        subtensor = chain.connect(args.network)
+        wallet = bt.Wallet(name=args.wallet, hotkey=args.hotkey)
+    try:
+        res = submit_bundle(subtensor, wallet, args.netuid, args.bundle, args.url,
+                            blocks_until_reveal=args.blocks_until_reveal,
+                            dry_run=args.dry_run)
+    except PayloadError as e:
+        print(f"REFUSED before signing: {e}")
+        return 2
+    print(f"content_hash: {res['content_hash']}")
+    print(f"payload:      {res['payload']}")
+    if args.dry_run:
+        print("DRY RUN — nothing sent. The payload above is what would be committed "
+              f"(timelock, reveals after {args.blocks_until_reveal} blocks).")
+        return 0
+    ok = bool(res.get("submitted"))
+    print(f"set_reveal_commitment submitted={ok} "
+          f"(reveals after {args.blocks_until_reveal} blocks; the validator picks it "
+          "up on its next pass after the reveal)")
+    return 0 if ok else 1
+
+
+def cmd_chain_status(args: argparse.Namespace) -> int:
+    from optima import chain
+    from optima.chain.payload import decode_payload
+
+    subtensor = chain.connect(args.network)
+    block = int(subtensor.get_current_block())
+    print(f"network: {args.network}  netuid: {args.netuid}  block: {block}")
+    mg = chain.fetch_metagraph(subtensor, args.netuid)
+    print(f"neurons: {len(mg.uids)}  permits: {sum(mg.validator_permit)}")
+    if args.wallet:
+        import bittensor as bt
+
+        wallet = bt.Wallet(name=args.wallet, hotkey=args.hotkey)
+        hk = wallet.hotkey.ss58_address
+        uid = mg.uid_of(hk)
+        permit = bool(uid is not None and uid < len(mg.validator_permit)
+                      and mg.validator_permit[uid])
+        print(f"our hotkey {hk}: uid={uid} permit={permit}")
+    revealed = chain.read_revealed_commitments(subtensor, args.netuid)
+    print(f"revealed commitments: {len(revealed)}")
+    for hk, rc in sorted(revealed.items(), key=lambda kv: kv[1].block):
+        ref = decode_payload(hk, rc.block, rc.data)
+        if ref is None:
+            print(f"  block {rc.block}  {hk}  (unparseable payload)")
+        else:
+            print(f"  block {rc.block}  {hk}  {ref.content_hash[:16]}…  {ref.url}")
+    return 0
+
+
+def cmd_chain_validate(args: argparse.Namespace) -> int:
+    from optima import chain
+    from optima.chain.validator_loop import (
+        command_evaluator,
+        run_validator,
+        verify_evaluator,
+    )
+
+    if args.eval_cmd:
+        evaluator = command_evaluator(args.eval_cmd, timeout_s=args.eval_timeout)
+    else:
+        evaluator = verify_evaluator(device=args.eval_device, timeout_s=args.eval_timeout)
+        print("NOTE: verify-mode evaluator (pass/fail plumbing score of 1.0) — a 1.0 "
+              "never clears the dethrone margin, so crown plumbing runs with "
+              "--margin 0; wire --eval-cmd to the full GPU gate chain for real scoring")
+    subtensor = chain.connect(args.network, retry_forever=not args.once)
+    wallet = None
+    if not args.dry_run_weights:
+        import bittensor as bt
+
+        wallet = bt.Wallet(name=args.wallet, hotkey=args.hotkey)
+    res = run_validator(subtensor, wallet, args.netuid, ledger_path=args.ledger,
+                        bundles_dir=args.bundles_dir, evaluator=evaluator,
+                        margin=args.margin, interval_s=args.interval, once=args.once,
+                        dry_run_weights=args.dry_run_weights)
+    if args.once and res is not None:
+        print(f"pass @block {res.block} (round {res.round_id}): seen={res.seen} "
+              f"new={len(res.new)} copies={len(res.copies)} rejected={len(res.rejected)}")
+        for ch_, ok in res.evaluated.items():
+            print(f"  evaluated {ch_[:16]}… passed={ok}")
+        for ch_, why in res.rejected.items():
+            print(f"  rejected  {ch_[:16]}… {why}")
+        print(f"weights: {res.weights}  pushed={res.weights_pushed}")
+    return 0
+
+
+def cmd_chain_register(args: argparse.Namespace) -> int:
+    import bittensor as bt
+
+    from optima import chain
+
+    subtensor = chain.connect(args.network)
+    wallet = bt.Wallet(name=args.wallet, hotkey=args.hotkey)
+    hk = wallet.hotkey.ss58_address
+    if subtensor.is_hotkey_registered(hotkey_ss58=hk, netuid=args.netuid):
+        print(f"already registered: {hk}")
+    else:
+        cost = subtensor.recycle(args.netuid)
+        print(f"registering {hk} on netuid {args.netuid} (burn ≈ {cost}) …")
+        resp = subtensor.burned_register(wallet, args.netuid)
+        ok = bool(getattr(resp, "success", resp))
+        print(f"burned_register success={ok} {getattr(resp, 'message', '')}")
+        if not ok:
+            return 1
+    for check in chain.preflight(subtensor, wallet, args.netuid):
+        print(f"  [{'ok' if check.ok else 'MISSING'}] {check.name}: {check.detail}")
+    return 0
 
 
 def cmd_scan(args: argparse.Namespace) -> int:
@@ -611,12 +744,80 @@ def build_parser() -> argparse.ArgumentParser:
                         help="push the ledger champion's weights on-chain (king of the hill)")
     sp.add_argument("--ledger", default="optima_ledger.json")
     sp.add_argument("--netuid", type=int, required=True)
-    sp.add_argument("--network", default="finney", help="'test' for the public testnet")
+    sp.add_argument("--network", default="finney",
+                    help="named network or an explicit wss:// endpoint URL")
     sp.add_argument("--wallet", default="default")
     sp.add_argument("--hotkey", default="default")
+    sp.add_argument("--per-slot", action="store_true",
+                    help="weights from the per-slot championships (emission split), "
+                         "matching settle --per-slot")
     sp.add_argument("--dry-run", action="store_true",
                     help="build + print the (uids, weights) payload, do NOT submit")
     sp.set_defaults(func=cmd_set_weights)
+
+    # ---- chain: miner submission + the validator loop ----
+    sp = sub.add_parser("chain-package",
+                        help="tar.gz a bundle for hosting; prints the content hash to commit")
+    sp.add_argument("bundle")
+    sp.add_argument("--out", default=None, help="archive path (default <bundle>.tar.gz)")
+    sp.set_defaults(func=cmd_chain_package)
+
+    sp = sub.add_parser("chain-submit",
+                        help="miner: commit a bundle (hash + fetch URL) on-chain via "
+                             "timelock commit-reveal")
+    sp.add_argument("bundle")
+    sp.add_argument("--url", required=True, help="where the validator fetches the tar.gz")
+    sp.add_argument("--netuid", type=int, required=True)
+    sp.add_argument("--network", required=True,
+                    help="named network or an explicit wss:// endpoint URL")
+    sp.add_argument("--wallet", default="default")
+    sp.add_argument("--hotkey", default="default", help="the MINER hotkey name")
+    sp.add_argument("--blocks-until-reveal", type=int, default=10,
+                    help="timelock length; the payload is unreadable until then")
+    sp.add_argument("--dry-run", action="store_true",
+                    help="build + print the payload, do NOT sign or submit")
+    sp.set_defaults(func=cmd_chain_submit)
+
+    sp = sub.add_parser("chain-status",
+                        help="subnet snapshot: block, neurons, permits, revealed submissions")
+    sp.add_argument("--netuid", type=int, required=True)
+    sp.add_argument("--network", required=True)
+    sp.add_argument("--wallet", default=None, help="also report this wallet's uid/permit")
+    sp.add_argument("--hotkey", default="default")
+    sp.set_defaults(func=cmd_chain_status)
+
+    sp = sub.add_parser("chain-validate",
+                        help="the validator loop: commitments -> fetch -> evaluate -> "
+                             "settle -> weights")
+    sp.add_argument("--netuid", type=int, required=True)
+    sp.add_argument("--network", required=True)
+    sp.add_argument("--wallet", default="default")
+    sp.add_argument("--hotkey", default="default", help="the VALIDATOR hotkey name")
+    sp.add_argument("--ledger", default="chain_ledger.json")
+    sp.add_argument("--bundles-dir", default="chain_bundles",
+                    help="where fetched submissions are cached (keyed by content hash)")
+    sp.add_argument("--eval-cmd", default=None,
+                    help="eval command template with {bundle} and {report} placeholders "
+                         "(exit 0 = passed; JSON report carries score/kl_mean/slot). "
+                         "Default: verify-mode plumbing evaluator (CPU pass/fail)")
+    sp.add_argument("--eval-device", default="cpu",
+                    help="verify-mode device (default cpu)")
+    sp.add_argument("--eval-timeout", type=float, default=3600.0)
+    sp.add_argument("--margin", type=float, default=0.02, help="settle dethrone margin")
+    sp.add_argument("--interval", type=float, default=60.0, help="seconds between passes")
+    sp.add_argument("--once", action="store_true", help="single pass, then exit")
+    sp.add_argument("--dry-run-weights", action="store_true",
+                    help="run the full loop but never submit weights")
+    sp.set_defaults(func=cmd_chain_validate)
+
+    sp = sub.add_parser("chain-register",
+                        help="register this hotkey on a subnet (burned_register; needs "
+                             "the coldkey password) + preflight")
+    sp.add_argument("--netuid", type=int, required=True)
+    sp.add_argument("--network", required=True)
+    sp.add_argument("--wallet", default="default")
+    sp.add_argument("--hotkey", default="default")
+    sp.set_defaults(func=cmd_chain_register)
 
     sp = sub.add_parser("scan", help="static policy scan of a bundle")
     sp.add_argument("bundle")

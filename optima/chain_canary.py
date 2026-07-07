@@ -35,11 +35,15 @@ class Check:
 # the discovery checks below report what the installed SDK actually exposes, so a
 # rename shows up as a red check next to the real name.
 _EXPECTED_SUBTENSOR_METHODS: tuple[tuple[str, str], ...] = (
-    ("set_weights", "push king-of-the-hill weights on-chain"),
+    ("set_weights", "push king-of-the-hill weights on-chain (auto-routes to the "
+                    "drand commit-reveal path when the subnet enables it)"),
     ("metagraph", "read uids / hotkeys / stake / validator_permit"),
     ("get_all_commitments", "read every hotkey's commitment (the salted commit hash)"),
     ("set_commitment", "miner posts a commitment on-chain"),
+    ("set_reveal_commitment", "miner posts the timelock-encrypted submission payload"),
+    ("get_all_revealed_commitments", "validator reads every hotkey's revealed submissions"),
     ("is_hotkey_registered", "preflight: this validator is registered"),
+    ("burned_register", "join a subnet (validator/miner onboarding)"),
     ("get_current_block", "current block height"),
     ("get_block_hash", "block hash -> prompt seed (consensus + anti-prebake)"),
 )

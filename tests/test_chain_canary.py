@@ -48,7 +48,8 @@ def _fake_bittensor(methods: tuple[str, ...]) -> types.ModuleType:
 def test_full_fake_sdk_passes(monkeypatch):
     fake = _fake_bittensor((
         "set_weights", "metagraph", "get_all_commitments", "set_commitment",
-        "is_hotkey_registered", "get_current_block", "get_block_hash",
+        "set_reveal_commitment", "get_all_revealed_commitments",
+        "is_hotkey_registered", "burned_register", "get_current_block", "get_block_hash",
         "commit", "reveal_commitment",
     ))
     monkeypatch.setitem(sys.modules, "bittensor", fake)

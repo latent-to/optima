@@ -321,6 +321,28 @@ class Ledger:
         self.reveals.append(rev)
         return rev
 
+    # ---- emission policy ----
+
+    def current_weights(self, per_slot: bool = True) -> dict[str, float]:
+        """The emission weights implied by the CURRENT champion state (no re-settle).
+
+        THE single swap point for emission policy: every weight consumer (the chain
+        validator loop, ``optima set-weights``) reads this instead of re-deriving
+        winner-take-all inline. Today: per-slot championships split emission equally
+        across slots (a hotkey holding k of n slots earns k/n); ``per_slot=False``
+        is the single-champion baseline. The planned relative-improvement +
+        time-decay scheme replaces THIS method's body, nothing else.
+        """
+        if per_slot and self.champions:
+            share = 1.0 / len(self.champions)
+            weights: dict[str, float] = {}
+            for champ in self.champions.values():
+                weights[champ.hotkey] = weights.get(champ.hotkey, 0.0) + share
+            return weights
+        if self.champion:
+            return {self.champion.hotkey: 1.0}
+        return {}
+
     def structural_near_copies(self, structural_fingerprint: str, hotkey: str) -> list[str]:
         """ADVISORY: prior reveals by OTHER hotkeys whose structural skeleton matches
         (rename/constant-tweak similarity). Returned for review/flagging — NOT used to

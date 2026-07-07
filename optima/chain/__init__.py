@@ -9,10 +9,15 @@ The exact SDK methods called here are pinned by ``optima chain-compat``
 (optima/chain_canary.py); run it after any bittensor bump, and the wrappers' calls
 stay a thin, auditable layer over what that canary asserts.
 
-Optima keeps its own commit-reveal: a miner posts the *salted commit hash* via
-``set_commitment``; the validator reads it via ``get_all_commitments``; the reveal
-(bundle + salt) is verified off-chain by the Ledger. The chain is the durable,
-consensus source of *what was committed* and *who won*; the Ledger is the scoring half.
+Submissions ride the chain's NATIVE commit-reveal (SUBNET_BLUEPRINT §3): a miner
+posts a timelock-encrypted payload (``set_reveal_commitment``, ≤1024 bytes,
+drand-encrypted until the reveal round — nobody can read the bundle URL before
+reveal, and the reveal block is the anti-copy priority timestamp). The validator
+reads ``get_all_revealed_commitments`` and replays them into the Ledger in chain
+order; the Ledger keeps the off-chain half (copy detection + king-of-the-hill).
+The older salted-hash transport (``set_commitment``/``get_all_commitments``)
+remains for compatibility. The chain is the durable, consensus source of *what was
+committed* and *who won*; the Ledger is the scoring half.
 """
 
 from __future__ import annotations
@@ -34,6 +39,15 @@ class Commitment:
     hotkey: str
     data: str
     block: int = 0
+
+
+@dataclass
+class RevealedCommitment:
+    """One revealed (formerly timelock-encrypted) commitment. ``block`` is the reveal
+    block the chain recorded — the consensus anti-copy priority timestamp."""
+    hotkey: str
+    data: str
+    block: int
 
 
 @dataclass
@@ -83,11 +97,21 @@ def weights_to_uid_vector(weights_by_hotkey: dict[str, float],
 # RPC wrappers — lazy bittensor; the only code that touches the chain
 # --------------------------------------------------------------------------- #
 
-def connect(network: str = "finney"):
-    """Open a subtensor client. ``network='test'`` for the public testnet."""
+def connect(network: str = "finney", *, fallback_endpoints: Optional[list[str]] = None,
+            retry_forever: bool = False):
+    """Open a subtensor client. ``network`` is a named network ('finney', 'test') or an
+    explicit ``wss://`` endpoint URL. NOTE: the SDK's 'test' alias resolves to
+    ``wss://test.finney.opentensor.ai:443`` — pass the URL explicitly if you mean a
+    different testnet endpoint. ``fallback_endpoints``/``retry_forever`` enable the
+    SDK's retrying substrate client (auto-reconnect through the fallback list)."""
     import bittensor as bt
 
-    return bt.Subtensor(network=network)
+    kwargs: dict = {}
+    if fallback_endpoints:
+        kwargs["fallback_endpoints"] = list(fallback_endpoints)
+    if retry_forever:
+        kwargs["retry_forever"] = True
+    return bt.Subtensor(network=network, **kwargs)
 
 
 def fetch_metagraph(subtensor, netuid: int) -> MetagraphView:
@@ -113,6 +137,24 @@ def read_commitments(subtensor, netuid: int) -> dict[str, Commitment]:
         if data is None:
             continue
         out[hotkey] = Commitment(hotkey=hotkey, data=str(data), block=block)
+    return out
+
+
+def read_revealed_commitments(subtensor, netuid: int) -> dict[str, RevealedCommitment]:
+    """Read every hotkey's LATEST revealed commitment (native chain commit-reveal).
+
+    The chain returns each hotkey's reveal history (capped at the 10 most recent);
+    optima's submission protocol takes the newest entry as the hotkey's current
+    submission. Ordering across hotkeys is by reveal block — the caller replays
+    them into the Ledger sorted by ``(block, hotkey)`` so ledger seq = chain priority.
+    """
+    raw = subtensor.get_all_revealed_commitments(netuid=netuid)
+    out: dict[str, RevealedCommitment] = {}
+    for hotkey, history in dict(raw).items():
+        if not history:
+            continue
+        block, data = max(history, key=lambda pair: int(pair[0]))
+        out[hotkey] = RevealedCommitment(hotkey=hotkey, data=str(data), block=int(block))
     return out
 
 
@@ -148,6 +190,25 @@ def post_commitment(subtensor, wallet, netuid: int, data: str, *, dry_run: bool 
         logger.info("DRY RUN set_commitment netuid=%s data=%s", netuid, data)
         return {"submitted": False, "dry_run": True, "data": data}
     result = subtensor.set_commitment(wallet=wallet, netuid=netuid, data=data)
+    return {"submitted": True, "result": result}
+
+
+def post_reveal_commitment(subtensor, wallet, netuid: int, data: str, *,
+                           blocks_until_reveal: int = 10, dry_run: bool = False) -> dict:
+    """Miner side: post a timelock-encrypted commitment (the submission payload).
+
+    The payload is drand-encrypted by the SDK and auto-revealed by the chain after
+    ``blocks_until_reveal`` blocks — a copycat cannot read the bundle URL before the
+    reveal, and the reveal block is the consensus priority timestamp. Hotkey-signed
+    (no coldkey needed). Chain-side cap: 1024 bytes; budget ~3100 bytes/hotkey/epoch.
+    """
+    if dry_run:
+        logger.info("DRY RUN set_reveal_commitment netuid=%s bytes=%d data=%s",
+                    netuid, len(data.encode("utf-8")), data)
+        return {"submitted": False, "dry_run": True, "data": data}
+    result = subtensor.set_reveal_commitment(
+        wallet=wallet, netuid=netuid, data=data, blocks_until_reveal=blocks_until_reveal,
+    )
     return {"submitted": True, "result": result}
 
 

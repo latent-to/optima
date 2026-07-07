@@ -21,7 +21,13 @@ _SKIP_SUFFIXES = {".pyc", ".pyo"}
 
 def _iter_files(root: Path):
     for p in sorted(root.rglob("*")):
-        if not p.is_file():
+        # Skip symlinks: is_file()/read_bytes() would FOLLOW a symlink and fold an
+        # out-of-bundle file's bytes into the identity hash, so a bundle's hash could
+        # depend on mutable state elsewhere on disk (and rglob doesn't descend
+        # symlinked dirs, so their contents would be invisible here yet importable at
+        # runtime — the same split scan_tree now rejects). Identity is over the
+        # bundle's own regular files only; a symlinked bundle is refused at load.
+        if p.is_symlink() or not p.is_file():
             continue
         if any(part in _SKIP_DIRS for part in p.relative_to(root).parts):
             continue

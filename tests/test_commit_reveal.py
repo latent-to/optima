@@ -33,6 +33,23 @@ def test_content_hash_changes_with_content(tmp_path: Path):
     assert content_hash(b) != h1
 
 
+def test_content_hash_ignores_symlinks_so_identity_stays_in_bundle(tmp_path: Path):
+    # A symlink must not fold an out-of-bundle file's bytes into the identity hash
+    # (nor let the hash depend on the symlink target mutating). Two bundles with the
+    # same real files hash identically regardless of a symlink's presence/target.
+    outside = tmp_path / "outside.py"
+    outside.write_text("SECRET = 1\n")
+    b = tmp_path / "b"
+    (b / "kernels").mkdir(parents=True)
+    (b / "manifest.toml").write_text("bundle_id='x'\n")
+    (b / "kernels" / "k.py").write_text("x = 1\n")
+    h_plain = content_hash(b)
+    (b / "kernels" / "link.py").symlink_to(outside)
+    assert content_hash(b) == h_plain  # symlink ignored
+    outside.write_text("SECRET = 2\n")   # mutating the target does not move the hash
+    assert content_hash(b) == h_plain
+
+
 # ---- commit / reveal ----
 
 

@@ -15,6 +15,13 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# CPU dry-run / laptop development: pulls in the torch the core deliberately
+# leaves unpinned (a GPU box gets its torch from the sglang/CUDA install
+# instead — see docs/GPU_SETUP.md). `pip install -e ".[cpu,dev]"` is the
+# documented no-GPU quickstart. Note: on Linux the default torch wheel bundles
+# CUDA libs (heavier download); for a lean CPU-only install do
+# `pip install torch --index-url https://download.pytorch.org/whl/cpu` first.
+cpu = ["torch"]
 dev = ["pytest>=7"]
 
 [project.scripts]

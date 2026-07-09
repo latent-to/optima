@@ -1,0 +1,16 @@
+# Adversarial CPU dry-run bundle: same pure-torch packaging as miner_silu_torch,
+# but the kernel drops the SiLU nonlinearity (computes `gate * up`). It passes the
+# static scan and loads cleanly; op-correctness must FAIL. Exists so the "see a
+# wrong kernel get rejected" step of docs/MINER_GUIDE.md runs on machines without
+# a GPU or Triton (miner_silu_broken, the original, is a Triton kernel).
+# Not a real submission.
+
+bundle_id = "example-silu-broken-torch-cpu"
+abi_version = "optima-op-abi-v0"
+
+[[ops]]
+slot = "activation.silu_and_mul"
+source = "kernels/silu_and_mul.py"
+entry = "silu_and_mul"
+dtypes = ["float32", "bfloat16", "float16"]
+metadata = "metadata/silu_and_mul.json"

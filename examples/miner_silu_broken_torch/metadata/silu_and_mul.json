@@ -1,0 +1,6 @@
+{
+  "op": "activation.silu_and_mul",
+  "dtypes": ["float32", "bfloat16", "float16"],
+  "max_last_dim": 65536,
+  "notes": "Adversarial CPU dry-run bundle (drops SiLU); verify must FAIL it. No architecture gate so the rejection is reproducible anywhere torch runs."
+}

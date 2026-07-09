@@ -314,6 +314,18 @@ def cmd_verify(args: argparse.Namespace) -> int:
     m = load_manifest(args.bundle)
     if not _recursive_scan_ok(args.bundle, manifest=m):  # vendored-tree guard (every .py, not just entries)
         return 2
+    import torch
+    # Mirror the ACTUAL device resolution, including verify_collective's fallback:
+    # a collective needs world_size GPUs, so a 1-GPU box silently runs gloo/CPU.
+    ws = getattr(args, "world_size", None) or 2
+    has_collective = any(op.slot in SLOTS and get_slot(op.slot).kind == "collective"
+                         for op in m.ops)
+    cuda_ok = torch.cuda.is_available() and (
+        not has_collective or torch.cuda.device_count() >= ws)
+    if (args.device or ("cuda" if cuda_ok else "cpu")) == "cpu":
+        print("[note] some or all of this verify runs on CPU: it checks op-correctness "
+              "only — it does not predict GPU throughput, CUDA-graph capture, or the "
+              "fidelity gates (see docs/GPU_SETUP.md).")
     rc = 0
     for op in m.ops:
         if op.slot not in SLOTS:
@@ -727,7 +739,23 @@ def cmd_settle(args: argparse.Namespace) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="optima", description="Optima validator harness")
+    p = argparse.ArgumentParser(
+        prog="optima",
+        description=(
+            "Optima validator harness.\n"
+            "\n"
+            "Commands by workflow:\n"
+            "  develop a kernel (miner) ... slots, scan, verify, evaluate, bench\n"
+            "  submit on-chain (miner) .... hash, chain-register, chain-package,\n"
+            "                               chain-submit, chain-status\n"
+            "  score + settle (validator) . chain-validate, settle, ledger, set-weights,\n"
+            "                               commit, reveal (local-ledger simulation)\n"
+            "  environment checks ......... compat, chain-compat\n"
+            "\n"
+            "New to Optima? Start with docs/MINER_GUIDE.md."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     sub = p.add_subparsers(dest="cmd", required=True)
 
     sp = sub.add_parser("slots", help="list the op-slot ABI")
@@ -823,7 +851,16 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("bundle")
     sp.set_defaults(func=cmd_scan)
 
-    sp = sub.add_parser("verify", help="op-level correctness vs reference")
+    sp = sub.add_parser(
+        "verify", help="op-level correctness vs reference",
+        epilog=("examples:\n"
+                "  # CPU dry-run (no GPU needed; the miner-guide inner loop)\n"
+                "  optima verify examples/miner_silu_torch --device cpu --dtype float32\n"
+                "  # real shapes/dtypes on a GPU box\n"
+                "  optima verify my_bundle --device cuda --dtype bfloat16\n"
+                "  # a collective slot at the arena's TP size\n"
+                "  optima verify my_bundle --device cuda --world-size 4"),
+        formatter_class=argparse.RawDescriptionHelpFormatter)
     sp.add_argument("bundle")
     sp.add_argument("--dtype", default="bfloat16", choices=["bfloat16", "float16", "float32"])
     sp.add_argument("--device", default=None, help="cuda|cpu (default: auto)")
@@ -837,7 +874,17 @@ def build_parser() -> argparse.ArgumentParser:
                          "op's metadata (dev convenience); production uses the served-model key.")
     sp.set_defaults(func=cmd_verify)
 
-    sp = sub.add_parser("evaluate", help="end-to-end throughput + KL on a model")
+    sp = sub.add_parser(
+        "evaluate", help="end-to-end throughput + KL on a model",
+        epilog=("examples (always launch via `python -m optima.cli` on GPU —\n"
+                "sglang spawns the scheduler with mp spawn):\n"
+                "  # quick smoke on a small model\n"
+                "  python -m optima.cli evaluate my_bundle --model Qwen/Qwen2.5-1.5B-Instruct \\\n"
+                "      --num-prompts 64 --max-new-tokens 64\n"
+                "  # nondeterministic arena: fidelity via the in-engine audit, KL advisory\n"
+                "  python -m optima.cli evaluate my_bundle --model <model> \\\n"
+                "      --fidelity-mode audit --no-deterministic"),
+        formatter_class=argparse.RawDescriptionHelpFormatter)
     sp.add_argument("bundle")
     sp.add_argument("--model", required=True, help="model path for sglang.Engine")
     sp.add_argument("--dtype", default="bfloat16", choices=["bfloat16", "float16", "float32"])
@@ -911,8 +958,14 @@ def build_parser() -> argparse.ArgumentParser:
                     help="DEV ONLY: continue if candidate no-egress isolation is unavailable")
     sp.set_defaults(func=cmd_evaluate)
 
-    sp = sub.add_parser("bench",
-                        help="realistic eval: throughput on real benchmark prompts, gated by task accuracy + KL")
+    sp = sub.add_parser(
+        "bench",
+        help="realistic eval: throughput on real benchmark prompts, gated by task accuracy + KL",
+        epilog=("examples:\n"
+                "  # capability floor on a real task (start small, then raise --samples)\n"
+                "  python -m optima.cli bench my_bundle --model Qwen/Qwen2.5-1.5B-Instruct \\\n"
+                "      --benchmarks gsm8k --samples 128"),
+        formatter_class=argparse.RawDescriptionHelpFormatter)
     sp.add_argument("bundle")
     sp.add_argument("--model", required=True)
     sp.add_argument("--benchmarks", default="gsm8k",

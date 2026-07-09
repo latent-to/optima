@@ -21,6 +21,13 @@ from optima.registry import Eligibility, KernelImpl, KernelRegistry
 DEEP = moe_export.DEEP_SLOT
 SHALLOW = "collective.ar_residual_rmsnorm"
 
+# The real deep-bundle artifact lives in the gitignored experiments/ tree (dev
+# machine only) — anchor to the repo root so pytest's cwd doesn't matter.
+from pathlib import Path as _Path
+
+_DEEP_BUNDLE = (_Path(__file__).resolve().parent.parent
+                / "experiments/minimax_m3/bundle/miner_m3_fused_epilogue_deep")
+
 
 @pytest.fixture(autouse=True)
 def _fresh(monkeypatch):
@@ -590,17 +597,18 @@ def test_moe_export_install_rebinds_module_function(monkeypatch):
 # ---- the deep bundle artifact -----------------------------------------------------
 
 
+@pytest.mark.skipif(not _DEEP_BUNDLE.is_dir(),
+                    reason="needs the local experiments/ tree (gitignored; dev machine only)")
 def test_deep_bundle_manifest_shape():
     # Pins the deep bundle's load-bearing structure: BOTH epilogue slots declared on
     # ONE source module (they share the IPC workspace in module globals — the seam
     # loader guarantees one module instance per source file), the fe_export dep
     # patch declared, and the deep op carrying the measured min_num_tokens floor.
     import json
-    from pathlib import Path
 
     from optima.manifest import load_manifest
 
-    bundle = Path("experiments/minimax_m3/bundle/miner_m3_fused_epilogue_deep")
+    bundle = _DEEP_BUNDLE
     m = load_manifest(bundle)
     assert m.bundle_id == "m3-fused-epilogue-deep"
     slots = {op.slot: op for op in m.ops}

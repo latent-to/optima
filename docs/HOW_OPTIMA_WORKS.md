@@ -15,13 +15,14 @@ It points at every file. Paths are relative to this doc (`docs/`), so
 `../optima/slots.py` is the harness module `optima/slots.py`.
 
 > **Current scope:** ten slots across three kinds (op / block / collective) — run
-> `python -m optima.cli slots` for the live catalog; the README's slot list is the
-> state of record. Fidelity is gated by the **in-engine audit** or per-token **KL**
+> `python -m optima.cli slots` for the live catalog; `STATE_OF_RECORD.md` carries
+> the slot list of record. Fidelity is gated by the **in-engine audit** or per-token **KL**
 > (arena-dependent — see `docs/FIDELITY.md`) *plus* real **benchmark accuracy**
 > (Part 6). Validated on real GPUs up to gpt-oss-120b (1×H100) and
 > MiniMax-M3-NVFP4 (4×B300).
-> `README.md` is the live state-of-record (results + calibration); prose below may
-> lag it — where they disagree, **README wins**. Since 2026-07-07, submitted
+> `STATE_OF_RECORD.md` is the live state-of-record (results + calibration); prose
+> below may lag it — where they disagree, **the state of record wins**. Since
+> 2026-07-07, submitted
 > kernels **have** measured faster than stock sglang through the referee (the
 > fused-epilogue collectives, 1.044–1.074× vs the noise bar — see the README's
 > measured record); the bundles in `examples/` remain correctness demos.

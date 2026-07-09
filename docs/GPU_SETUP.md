@@ -83,7 +83,7 @@ scheduler with `mp spawn`, so the `__main__` guard matters.
 - `--tp-size N` on `evaluate`/`bench`; collective slots verify distributed
   (`optima verify --world-size N` — use the arena's TP size).
 - gpt-oss-120b fits a single H100; multi-GPU runs pick a MoE backend via
-  `--moe-runner-backend` (see the arena recipes in the README).
+  `--moe-runner-backend` (see the arena recipes in [STATE_OF_RECORD.md](STATE_OF_RECORD.md)).
 
 ## 6. Validator operators
 

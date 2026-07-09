@@ -31,8 +31,9 @@ This repo is the **validator harness** (the referee), plus example miner bundles
    and the complete threat model.
 2. `docs/SLOT_CONTRACT.md` — **the narrow waist: the four invariants a slot must
    never break.** Read before touching `optima/slots.py` or adding a seam. Short.
-3. `README.md` — current state of record (results, gates, run recipes). If it and
-   HOW_OPTIMA_WORKS disagree, **README wins** (it's kept current).
+3. `docs/STATE_OF_RECORD.md` — current state of record (results, gates, run
+   recipes). If it and any other doc disagree, **the state of record wins** (it's
+   kept current). `README.md` is the thin front door (quickstart + routing).
 4. `docs/SUBNET_BLUEPRINT.md` — how a real subnet (Affine) is built: chain
    plumbing, services, DB, copy detection, isolation. The production roadmap.
 5. `docs/DEV_ENVIRONMENT.md` — the GPU pods (lium), the `sn120` toolchain env, and
@@ -207,5 +208,5 @@ matters — sglang uses `mp spawn`).
 This repo's `AGENTS.md`, the `CLAUDE.md` shim, and `docs/` are the canonical
 *committed* context (they travel with the repo). The candid working log lives in
 `WORKLOG.md` (gitignored, local-only — keep it off GitHub). Auto-memory is a
-per-cwd supplement. Keep README + this file current when state changes; keep the
+per-cwd supplement. Keep docs/STATE_OF_RECORD.md + this file current when state changes; keep the
 blow-by-blow in `WORKLOG.md`, not in the committed docs.

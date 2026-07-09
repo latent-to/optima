@@ -6,9 +6,13 @@
 # clamped swigluoai, ~14 lines of CuTe-DSL + its torch reference. No vendored kernel, no
 # sglang import, no open()-patch: the override-point composes it into the base at load.
 #
-# Contrast experiments/minimax_m3/bundle/miner_m3_moe_swigluoai_nvfp4/ (the old shape): a
-# 155-line bundle that imported sglang for the layout and installed the win by open()-patching
-# site-packages flashinfer (sandbox-banned). This is the clean replacement.
+# GPU status: the override mechanism (manifest fields + optima_kernels.override composition)
+# is built and CPU-tested; the GPU base kernel it composes into is NOT yet built — M1.2 in
+# docs/SUBMISSION_MODEL_BUILD_SPEC.md. CPU/dense verify runs; the GPU path raises (see the
+# bundle README). The win numbers in metadata/moe.json are provenance, not a result of this
+# bundle. Contrast experiments/minimax_m3/bundle/miner_m3_moe_swigluoai_nvfp4/ (the old
+# shape): a 155-line bundle that imported sglang for the layout and installed the win by
+# open()-patching site-packages flashinfer (sandbox-banned). This is its clean replacement.
 
 bundle_id = "m3-swigluoai-override-v1"
 abi_version = "optima-op-abi-v0"

@@ -174,6 +174,8 @@ def cmd_chain_status(args: argparse.Namespace) -> int:
 
 
 def cmd_chain_validate(args: argparse.Namespace) -> int:
+    import logging
+
     from optima import chain
     from optima.chain.validator_loop import (
         command_evaluator,
@@ -189,6 +191,25 @@ def cmd_chain_validate(args: argparse.Namespace) -> int:
               "never clears the dethrone margin, so crown plumbing runs with "
               "--margin 0; wire --eval-cmd to the full GPU gate chain for real scoring")
     subtensor = chain.connect(args.network, retry_forever=not args.once)
+    # Daemon-mode observability: between passes the loop reports only through the
+    # "optima.chain.*" loggers (--once prints its own summary below). This must run
+    # AFTER connect(): the bittensor import reconfigures global logging — it sets
+    # every pre-existing third-party logger's level to CRITICAL (measured in the
+    # 2026-07-10 soak: the ledger advanced every pass while the log stayed empty;
+    # optima.chain.validator read level=50). Own the subtree outright: reset levels
+    # to inherit, dedicated handler, no propagation upward.
+    for _name, _lg in list(logging.root.manager.loggerDict.items()):
+        if _name.startswith("optima.") and isinstance(_lg, logging.Logger):
+            _lg.disabled = False
+            _lg.setLevel(logging.NOTSET)
+    _chain_lg = logging.getLogger("optima.chain")
+    _chain_lg.setLevel(logging.INFO)
+    _chain_lg.propagate = False
+    if not _chain_lg.handlers:
+        _handler = logging.StreamHandler()
+        _handler.setFormatter(
+            logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+        _chain_lg.addHandler(_handler)
     wallet = None
     if not args.dry_run_weights:
         import bittensor as bt
@@ -432,6 +453,7 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
         warmup_iters=args.warmup_iters,
         speedup_margin=args.speedup_margin,
         prompt_seed=args.prompt_seed,
+        input_len=args.input_len,
         top_logprobs_num=args.top_logprobs,
         ignore_eos=args.ignore_eos,
         kl_threshold=_kl_threshold,
@@ -901,6 +923,17 @@ def build_parser() -> argparse.ArgumentParser:
                          "1 + max(margin, 2*measured_noise). Keep low — real wins stack at 1-2%%; "
                          "the noise term, not this floor, guards an unstable box")
     sp.add_argument("--prompt-seed", type=int, default=0, help="per-epoch prompt sampling seed")
+    sp.add_argument("--input-len", type=int, default=None,
+                    help="approximate tokens per prompt (default: the 10-20-token short corpus). "
+                         "Set for prefill-heavy arenas: the short corpus is a pure-decode regime, "
+                         "so a prefill-side kernel win is invisible to the scorer without this. "
+                         "Prompts stay seed-deterministic, prefix-disjoint (no radix-cache "
+                         "inflation) and duplicate-block-free (optima/eval/prompts.py). "
+                         "PAIR WITH --engine-kwargs-json '{\"disable_radix_cache\": true}': the "
+                         "timed iterations replay the SAME prompts, so with the prefix cache on, "
+                         "iteration 2+ serves the whole input from cache and the run silently "
+                         "degrades to pure decode again (measured 2026-07-10: median-of-3 read "
+                         "267 tok/s cached vs 63 tok/s actually prefilling)")
     sp.add_argument("--top-logprobs", type=int, default=20)
     sp.add_argument("--ignore-eos", action=argparse.BooleanOptionalAction, default=True,
                     help="force generation to the max token budget so baseline and candidate emit IDENTICAL "

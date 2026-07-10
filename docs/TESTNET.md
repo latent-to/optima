@@ -100,6 +100,43 @@ so restarts skip known work and dead URLs are not refetched.
   weights to apply. Hyperparams there: tempo 360, commit-reveal weights ENABLED,
   weights_rate_limit 100 (skipped under commit-reveal).
 
+## Validated on netuid 307, round 2 (2026-07-10) — real weights
+
+Everything the 07-08 pass left dry-run, landed for real (the subnet owner
+start-called 307 around 07-08, so `SubtokenEnabled` and permits now work there):
+
+- Validator hotkey holds a validator permit (stake-weight via alpha stake; the
+  permit is top-`max_validators` by stake-weight, recalculated per epoch).
+- `chain-validate --once --margin 0` WITHOUT `--dry-run-weights`:
+  `set_weights` SUBMITTED (the SDK auto-routes through drand commit-reveal on
+  this subnet; the weights become visible in the metagraph after the reveal at
+  the next epoch boundary — check `Subtensor.weights(netuid)`).
+- Multi-miner emission split: a second miner hotkey committed a bundle for a
+  second slot → per-slot settle → weights `{miner: 2/3, miner2: 1/3}` pushed.
+- Copy demotion through the chain: the same bundle committed later by another
+  hotkey was demoted (`copies=1`, never evaluated), and the loop skipped the
+  redundant weight push (weights unchanged, not stale).
+- Broken bundle through the chain: failed the gate chain (`passed=False`,
+  score 0), crown unchanged.
+- Daemon mode + mid-epoch restart: kill and restart → next pass `new=0`
+  (EvalRecords suppress replay), weights stable.
+
+Operational gotchas (learned here):
+
+- **One active submission per hotkey.** The chain keeps a reveal history (last
+  10) but the protocol takes each hotkey's LATEST reveal as its current
+  submission. Two commits from one hotkey between validator passes = the
+  earlier one is superseded unseen. Stagger commits across passes.
+- **bittensor's import reconfigures global logging** — it sets pre-existing
+  loggers to CRITICAL, which silenced daemon mode entirely (the ledger advanced
+  while the log stayed empty). `chain-validate` now takes ownership of the
+  `optima.chain` logger subtree after connecting. A silent validator is an
+  unoperable validator; keep this in mind for any new entry point.
+- **dTAO staking slippage is real.** 307's pool was alpha-drained (constant
+  product: `alpha_in ~0.01`); 100 tTAO bought ~0.005 alpha — the measured
+  numbers match `x·y=k` exactly. Check the pool before assuming stake buys
+  stake-weight at par on mainnet.
+
 ## Threat-model notes
 
 - The validator never imports miner code: evaluation is subprocess-only, same as

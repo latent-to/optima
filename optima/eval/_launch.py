@@ -194,6 +194,80 @@ def engine_kwargs(cfg, *, active: bool = False) -> dict[str, Any]:
     return kwargs
 
 
+def _sweep_gpu_procs() -> int:
+    """Kill every OTHER process in this namespace holding an nvidia device fd.
+
+    Failed engine launches can strand scheduler subprocesses that survive both
+    the launch child's reap and sglang's own kill cascade (they re-session), each
+    pinning the model's full VRAM. Only ever called from a launch subprocess that
+    has not created its engine yet, and only when OPTIMA_GPU_SWEEP=1 — a dedicated
+    eval box where everything on the visible GPUs belongs to this evaluation.
+    """
+    import signal
+
+    me = os.getpid()
+    killed = 0
+    for pid_dir in os.listdir("/proc"):
+        if not pid_dir.isdigit() or int(pid_dir) == me:
+            continue
+        fd_dir = f"/proc/{pid_dir}/fd"
+        try:
+            for fd in os.listdir(fd_dir):
+                try:
+                    if os.readlink(f"{fd_dir}/{fd}").startswith("/dev/nvidia"):
+                        os.kill(int(pid_dir), signal.SIGKILL)
+                        killed += 1
+                        break
+                except OSError:
+                    continue
+        except OSError:  # process exited, or not ours to inspect
+            continue
+    if killed:
+        logger.warning("optima: GPU sweep killed %d stranded process(es)", killed)
+    return killed
+
+
+def _wait_gpu_drain(threshold_mib: int = 4096, timeout_s: float = 150.0) -> None:
+    """Block until every visible GPU is under ``threshold_mib`` used, or timeout.
+
+    Evaluate runs engine launches back-to-back out of subprocesses; the previous
+    launch's schedulers release their VRAM a beat after the driver regains control
+    (and a wedged shutdown can pin the whole model until the reap in the launch
+    finally fires). Sizing the next KV pool against that residue OOMs at startup.
+    Polls nvidia-smi (never initializes CUDA in this process); on timeout, warns
+    and proceeds — the guard must never fail a run on its own.
+    """
+    import subprocess
+    import time
+
+    deadline = time.monotonic() + timeout_s
+    sweep_at = time.monotonic() + 25.0  # give a clean shutdown a fair head start
+    swept = os.environ.get("OPTIMA_GPU_SWEEP") != "1"  # disabled -> pretend done
+    # Scope the wait to THIS launch's GPUs: on a shared box another lane's engine
+    # legitimately holds its own devices for the whole run — without the filter
+    # every launch here would stall out the full timeout staring at it.
+    query = ["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits"]
+    cvd = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
+    if cvd:
+        query += ["-i", cvd]
+    last = ""
+    while time.monotonic() < deadline:
+        try:
+            out = subprocess.run(query, capture_output=True, text=True, timeout=10).stdout
+            used = [int(x) for x in out.split()]
+        except Exception:  # noqa: BLE001 — no/odd nvidia-smi: nothing to wait for
+            return
+        if not used or max(used) < threshold_mib:
+            return
+        if not swept and time.monotonic() >= sweep_at:
+            _sweep_gpu_procs()
+            swept = True
+        last = ",".join(map(str, used))
+        time.sleep(2.0)
+    logger.warning("optima: GPUs did not drain below %d MiB within %.0fs (used MiB: %s); "
+                   "launching anyway", threshold_mib, timeout_s, last)
+
+
 @contextmanager
 def launched_engine(cfg, *, bundle_path: str, active: bool,
                     audit_rate: float = 0.0, audit_out: Optional[list] = None):
@@ -240,6 +314,7 @@ def launched_engine(cfg, *, bundle_path: str, active: bool,
         ):
             import sglang as sgl
 
+            _wait_gpu_drain()
             engine = sgl.Engine(**engine_kwargs(cfg, active=active))
             ok = False
             try:
@@ -252,6 +327,18 @@ def launched_engine(cfg, *, bundle_path: str, active: bool,
             finally:
                 try:
                     engine.shutdown()
+                except Exception:  # noqa: BLE001
+                    pass
+                # Some builds' Engine.shutdown() leaves scheduler subprocesses
+                # alive, each pinning the model's whole VRAM — which starves the
+                # NEXT launch's pool sizing (measured 2026-07-10: B' startup OOM
+                # behind 4x180GB orphaned schedulers). This launch subprocess owns
+                # every engine process, so reap the remaining tree before handing
+                # control back to the driver.
+                try:
+                    from sglang.srt.utils import kill_process_tree
+
+                    kill_process_tree(os.getpid(), include_parent=False)
                 except Exception:  # noqa: BLE001
                     pass
                 if active and ok and audit_out is not None:

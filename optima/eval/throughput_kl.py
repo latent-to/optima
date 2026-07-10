@@ -21,6 +21,7 @@ GPU-only; imports sglang lazily.
 
 from __future__ import annotations
 
+import logging
 import statistics
 import time
 from contextlib import contextmanager
@@ -30,6 +31,8 @@ from typing import Any, Optional
 import torch
 
 from optima.eval._launch import call_in_subprocess
+
+logger = logging.getLogger("optima.eval")
 from optima.eval.kl import KLReport, aligned_kl, extract_per_prompt, kl_gate_ok, token_match_rate
 from optima.eval.prompts import sample_prompts
 from optima.eval.scoring import score_speedup
@@ -82,6 +85,11 @@ class EvalConfig:
     allow_unsafe_no_isolation: bool = False
     seed: int = 0  # model seed
     prompt_seed: int = 0  # per-epoch prompt sampling seed
+    # Approximate tokens per prompt. None -> the short corpus (10-20 tok, a pure-decode
+    # regime). Set for prefill-heavy arenas: without it a prefill-side win (e.g. the MSA
+    # prefill indexer, ~30% of long-context serving prefill) is INVISIBLE to the scorer
+    # — the workload never exercises the kernel. See optima/eval/prompts.py.
+    input_len: Optional[int] = None
     # FLOOR on the required improvement (see optima/eval/scoring.py). The ACTUAL bar
     # is max(speedup_margin, score_k * measured_baseline_noise) — derived from the box,
     # not hand-picked. 0.5% floor (2026-07-07): real wins stack at 1-2%, and the
@@ -298,20 +306,36 @@ def _aligned_kl(baseline: ModeResult, candidate: ModeResult) -> KLReport:
 
 
 def evaluate(cfg: EvalConfig, bundle_path: str, prompts: Optional[list[str]] = None) -> EvalReport:
-    prompts = list(prompts) if prompts else sample_prompts(cfg.num_prompts, cfg.prompt_seed)
+    prompts = list(prompts) if prompts else sample_prompts(
+        cfg.num_prompts, cfg.prompt_seed, input_len=cfg.input_len)
 
     # Bookended A/B (we cannot lock GPU clocks on rented pods): measure stock BEFORE
     # and AFTER the candidate so the candidate is bracketed and the two baseline reads
     # bound the warmup/thermal drift across it. Each launch runs in its own fresh
     # process (call_in_subprocess) so the baseline's deterministic/CUDA global state
     # can't corrupt the candidate. See optima/eval/scoring.py.
-    baseline = call_in_subprocess(_run_launch, cfg, prompts, bundle_path="", active=False)
+    #
+    # One retry per launch: engine startup can die on a TRANSIENT — this build's
+    # KV-pool sizing snapshots free memory as a distributed MIN across ranks while
+    # weight-shard load buffers may still be in flight on a straggler rank, so an
+    # identical config can pass one launch and OOM the next (measured 2026-07-10).
+    # The relaunch enters through the child's drain-wait (+ optional orphan sweep),
+    # so a retry starts from clean GPUs. A launch that fails TWICE propagates.
+    def _launch(label: str, fn, *args, **kwargs):
+        try:
+            return call_in_subprocess(fn, *args, **kwargs)
+        except RuntimeError as exc:
+            logger.warning("optima: %s launch failed (%s); retrying once", label, exc)
+            time.sleep(30.0)
+            return call_in_subprocess(fn, *args, **kwargs)
+
+    baseline = _launch("baseline", _run_launch, cfg, prompts, bundle_path="", active=False)
     audit_mode = getattr(cfg, "fidelity_mode", "kl") == "audit"
     quality_result, audit_receipts = (
-        call_in_subprocess(_run_quality_launch, cfg, prompts, bundle_path=bundle_path)
+        _launch("quality", _run_quality_launch, cfg, prompts, bundle_path=bundle_path)
         if audit_mode else (None, []))
-    candidate = call_in_subprocess(_run_launch, cfg, prompts, bundle_path=bundle_path, active=True)
-    baseline2 = (call_in_subprocess(_run_launch, cfg, prompts, bundle_path="", active=False)
+    candidate = _launch("candidate", _run_launch, cfg, prompts, bundle_path=bundle_path, active=True)
+    baseline2 = (_launch("bookend", _run_launch, cfg, prompts, bundle_path="", active=False)
                  if cfg.bookend_baseline else None)
 
     baseline_reads = [baseline.tok_per_s] + ([baseline2.tok_per_s] if baseline2 else [])

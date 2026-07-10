@@ -124,6 +124,21 @@ def test_set_weights_submits_with_version_key():
     ]
 
 
+def test_set_weights_chain_side_failure_reported():
+    # An included extrinsic can still fail on-chain (rate limit / permit / CR
+    # window) — submitted must reflect the chain's verdict, not the SDK call
+    # returning (measured on 307: a rate-limited CR commit was silently inert).
+    class _Failed:
+        success = False
+        message = "CommittingWeightsTooFast"
+
+    st = _MockSubtensor(hotkeys=["a", "b"])
+    st.set_weights = lambda **kw: _Failed()
+    res = chain.set_weights(st, wallet=object(), netuid=1, weights_by_hotkey={"b": 1.0})
+    assert res["submitted"] is False
+    assert "TooFast" in res["message"]
+
+
 def test_set_weights_deregistered_champion_does_not_submit():
     st = _MockSubtensor(hotkeys=["a", "b"])
     res = chain.set_weights(st, wallet=object(), netuid=1, weights_by_hotkey={"ghost": 1.0})

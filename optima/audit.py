@@ -145,9 +145,27 @@ def record(slot: str, actual: Sequence[torch.Tensor],
                 ok = ok and cos >= corr.min_cosine
                 s["min_ratio"] = corr.min_cosine
             elif corr.mode == "topk_overlap":
-                # Selection slots are audited by their verify path only (the
-                # dispatcher-level output here is scores, not the selection).
-                return
+                # Selection slots: the dispatcher audits the CONSUMED product — the
+                # top-k index rows its (validator-owned) selector produced from miner
+                # scores vs the rows the stock function produced on the same pristine
+                # inputs (the stock baseline runs BEFORE the miner path on audited
+                # calls, so no input clones are needed). Per-row set overlap over the
+                # stock row's valid (>= 0) entries, vacuous rows skipped, mean gated
+                # at the slot's own min_overlap — verify-parity semantics.
+                ai = a.detach().to(torch.long)
+                ei = e.detach().to(torch.long)
+                valid = ei >= 0
+                rows = valid.any(dim=-1)
+                if not bool(rows.any()):
+                    baseline_refused(slot)  # nothing selected: coverage note only
+                    return
+                hit = (ei.unsqueeze(-1) == ai.unsqueeze(-2)).any(dim=-1)
+                per_row = ((hit & valid).sum(-1).float()
+                           / valid.sum(-1).clamp(min=1).float())
+                ov = float(per_row[rows].mean())
+                worst = min(worst, ov)
+                ok = ok and ov >= corr.min_overlap
+                s["min_ratio"] = corr.min_overlap
             else:
                 tol = spec.tolerance_for(a.dtype)
                 within = ((af - ef).abs() <= tol.atol + tol.rtol * ef.abs())

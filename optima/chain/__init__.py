@@ -181,7 +181,21 @@ def set_weights(subtensor, wallet, netuid: int, weights_by_hotkey: dict[str, flo
         version_key=version_key, wait_for_inclusion=wait_for_inclusion,
         wait_for_finalization=wait_for_finalization,
     )
-    return {"submitted": True, "result": result, "uids": uids, "weights": weights}
+    # An included extrinsic can still FAIL chain-side (rate limit, permit, CR
+    # window) — report that honestly or the caller records weights that never
+    # applied. Measured on 307 (2026-07-10): a second commit 24 blocks after the
+    # first was accepted by the SDK but never revealed (weights_rate_limit=100
+    # applies to CR commits too); the old unconditional submitted=True wrote the
+    # state file and suppressed every retry.
+    if isinstance(result, tuple):  # older SDKs: (success, message)
+        ok, message = bool(result[0]), str(result[1] if len(result) > 1 else "")
+    else:
+        ok = bool(getattr(result, "success", result))
+        message = str(getattr(result, "message", ""))
+    if not ok:
+        logger.warning("set_weights failed on-chain: %s", message or result)
+    return {"submitted": ok, "result": result, "message": message,
+            "uids": uids, "weights": weights}
 
 
 def post_commitment(subtensor, wallet, netuid: int, data: str, *, dry_run: bool = False) -> dict:

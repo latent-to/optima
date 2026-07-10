@@ -7,6 +7,12 @@ in the generic seam table (the compat canary would false-fail on a non-MSA pin).
 to the M3 *arena*; wire it via ``arenas.py``'s ``seam_adapters`` when that lands, or install
 it explicitly when the served model is MSA.
 
+NOTE (2026-07-10): the PREFILL sibling landed as a real seam — ``sglang_msa_prefill.py`` +
+the ``attention.msa_prefill_block_score`` slot — and it DOES live in the generic table:
+``SeamAdapter.requires`` (pointing at the M3-only ``minimax_sparse_ops`` package) makes the
+compat canary SKIP rather than false-fail on non-MSA pins, which retires the reason this
+decode stub stayed out. When the decode-side kernel materializes, wire it the same way.
+
 The chokepoint is the MSA backend's decode block-score kernel:
   sglang ``MiniMaxSparseAttnBackend`` -> the per-128-block index score pass (the lightning
   indexer's ``_decode_score_kernel`` in ``.../minimax_sparse_ops/decode/flash_with_topk_idx.py``).

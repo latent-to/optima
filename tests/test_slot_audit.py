@@ -266,3 +266,51 @@ def test_gsm8k_declares_stop_cue():
     from optima.eval.benchmarks import GSM8K
 
     assert "\nQuestion:" in GSM8K.stop
+
+
+# ---- topk_overlap slots (the msa_prefill selection audit, 2026-07-10) -----------
+
+MSA_SLOT = "attention.msa_prefill_block_score"
+
+
+def _sel(rows):
+    return torch.tensor(rows, dtype=torch.int32).unsqueeze(0)  # (H=1, rows, k)
+
+
+def test_topk_identical_selection_no_violation(monkeypatch):
+    _arm(monkeypatch)
+    idx = _sel([[0, 1, 2, 3, 4, 5, 6, 7], [8, 9, 10, 11, 12, 13, 14, 15]])
+    audit.record(MSA_SLOT, (idx,), (idx.clone(),))
+    s = audit._stats[MSA_SLOT]
+    assert s["n"] == 1 and s["violations"] == 0 and s["worst_frac"] == 1.0
+    assert s["mode"] == "topk_overlap" and s["min_ratio"] == 0.9
+
+
+def test_topk_disjoint_row_is_violation(monkeypatch):
+    # One fully-wrong row of four -> mean overlap 0.75 < the slot's 0.9 floor.
+    _arm(monkeypatch)
+    base = [[i * 8 + j for j in range(8)] for i in range(4)]
+    actual = [row[:] for row in base]
+    actual[0] = [100 + j for j in range(8)]
+    audit.record(MSA_SLOT, (_sel(actual),), (_sel(base),))
+    s = audit._stats[MSA_SLOT]
+    assert s["n"] == 1 and s["violations"] == 1
+    assert abs(s["worst_frac"] - 0.75) < 1e-6
+
+
+def test_topk_padding_rows_score_on_valid_entries_only(monkeypatch):
+    # -1 fill (short rows) is not a miss: overlap is over the stock row's valid set.
+    _arm(monkeypatch)
+    expected = _sel([[0, 1, 2, 3, -1, -1, -1, -1]])
+    actual = _sel([[0, 1, 2, 3, 9, 10, 11, 12]])
+    audit.record(MSA_SLOT, (actual,), (expected,))
+    s = audit._stats[MSA_SLOT]
+    assert s["n"] == 1 and s["violations"] == 0 and s["worst_frac"] == 1.0
+
+
+def test_topk_all_invalid_expected_counts_refused(monkeypatch):
+    _arm(monkeypatch)
+    empty = _sel([[-1] * 8])
+    audit.record(MSA_SLOT, (empty.clone(),), (empty,))
+    s = audit._stats[MSA_SLOT]
+    assert s["n"] == 0 and s["violations"] == 0 and s["baseline_refused"] == 1

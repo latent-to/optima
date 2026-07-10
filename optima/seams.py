@@ -73,6 +73,18 @@ SEAM_ADAPTERS: tuple[SeamAdapter, ...] = (
     SeamAdapter("moe_export", "sglang.srt.layers.quantization.modelopt_quant",
                 "sglang_moe_export", "flashinfer_cutlass_fused_moe",
                 ("collective.moe_finalize_ar_rmsnorm",), requires="flashinfer"),
+    # Module-LEVEL function chokepoint on the MSA (MiniMax-M3) arena's PREFILL indexer:
+    # every sparse layer's chunked-prefill block-scoring funnels through this wrapper
+    # (the score kernel alone is ~30% of long-context serving prefill). The miner fills
+    # the score SHEET; the wrapper's stock top-k tail keeps the SELECTION validator-
+    # owned. `requires` points at the M3-only package so the compat canary SKIPS this
+    # row on pins without the MSA backend (why the decode-side sibling stayed a stub —
+    # that reason no longer applies to table rows with `requires`).
+    SeamAdapter("msa_prefill",
+                "sglang.srt.layers.attention.minimax_sparse_ops.prefill.flash_with_topk_idx",
+                "sglang_msa_prefill", "flash_prefill_with_topk_index",
+                ("attention.msa_prefill_block_score",),
+                requires="sglang.srt.layers.attention.minimax_sparse_ops"),
     # NOT a slot seam: the dep_patches runtime consume side. When the active bundle
     # declared dependency patches (materialized as a csrc OVERLAY by the reviewed
     # patcher — optima/patchers/apply_dep_patch.py), this adapter repoints

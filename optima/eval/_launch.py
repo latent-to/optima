@@ -243,12 +243,17 @@ def _wait_gpu_drain(threshold_mib: int = 4096, timeout_s: float = 150.0) -> None
     deadline = time.monotonic() + timeout_s
     sweep_at = time.monotonic() + 25.0  # give a clean shutdown a fair head start
     swept = os.environ.get("OPTIMA_GPU_SWEEP") != "1"  # disabled -> pretend done
+    # Scope the wait to THIS launch's GPUs: on a shared box another lane's engine
+    # legitimately holds its own devices for the whole run — without the filter
+    # every launch here would stall out the full timeout staring at it.
+    query = ["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits"]
+    cvd = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
+    if cvd:
+        query += ["-i", cvd]
     last = ""
     while time.monotonic() < deadline:
         try:
-            out = subprocess.run(
-                ["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits"],
-                capture_output=True, text=True, timeout=10).stdout
+            out = subprocess.run(query, capture_output=True, text=True, timeout=10).stdout
             used = [int(x) for x in out.split()]
         except Exception:  # noqa: BLE001 — no/odd nvidia-smi: nothing to wait for
             return

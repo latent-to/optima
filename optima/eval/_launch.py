@@ -194,6 +194,39 @@ def engine_kwargs(cfg, *, active: bool = False) -> dict[str, Any]:
     return kwargs
 
 
+def _sweep_gpu_procs() -> int:
+    """Kill every OTHER process in this namespace holding an nvidia device fd.
+
+    Failed engine launches can strand scheduler subprocesses that survive both
+    the launch child's reap and sglang's own kill cascade (they re-session), each
+    pinning the model's full VRAM. Only ever called from a launch subprocess that
+    has not created its engine yet, and only when OPTIMA_GPU_SWEEP=1 — a dedicated
+    eval box where everything on the visible GPUs belongs to this evaluation.
+    """
+    import signal
+
+    me = os.getpid()
+    killed = 0
+    for pid_dir in os.listdir("/proc"):
+        if not pid_dir.isdigit() or int(pid_dir) == me:
+            continue
+        fd_dir = f"/proc/{pid_dir}/fd"
+        try:
+            for fd in os.listdir(fd_dir):
+                try:
+                    if os.readlink(f"{fd_dir}/{fd}").startswith("/dev/nvidia"):
+                        os.kill(int(pid_dir), signal.SIGKILL)
+                        killed += 1
+                        break
+                except OSError:
+                    continue
+        except OSError:  # process exited, or not ours to inspect
+            continue
+    if killed:
+        logger.warning("optima: GPU sweep killed %d stranded process(es)", killed)
+    return killed
+
+
 def _wait_gpu_drain(threshold_mib: int = 4096, timeout_s: float = 150.0) -> None:
     """Block until every visible GPU is under ``threshold_mib`` used, or timeout.
 
@@ -208,6 +241,8 @@ def _wait_gpu_drain(threshold_mib: int = 4096, timeout_s: float = 150.0) -> None
     import time
 
     deadline = time.monotonic() + timeout_s
+    sweep_at = time.monotonic() + 25.0  # give a clean shutdown a fair head start
+    swept = os.environ.get("OPTIMA_GPU_SWEEP") != "1"  # disabled -> pretend done
     last = ""
     while time.monotonic() < deadline:
         try:
@@ -219,6 +254,9 @@ def _wait_gpu_drain(threshold_mib: int = 4096, timeout_s: float = 150.0) -> None
             return
         if not used or max(used) < threshold_mib:
             return
+        if not swept and time.monotonic() >= sweep_at:
+            _sweep_gpu_procs()
+            swept = True
         last = ",".join(map(str, used))
         time.sleep(2.0)
     logger.warning("optima: GPUs did not drain below %d MiB within %.0fs (used MiB: %s); "

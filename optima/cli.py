@@ -174,6 +174,8 @@ def cmd_chain_status(args: argparse.Namespace) -> int:
 
 
 def cmd_chain_validate(args: argparse.Namespace) -> int:
+    import logging
+
     from optima import chain
     from optima.chain.validator_loop import (
         command_evaluator,
@@ -189,6 +191,25 @@ def cmd_chain_validate(args: argparse.Namespace) -> int:
               "never clears the dethrone margin, so crown plumbing runs with "
               "--margin 0; wire --eval-cmd to the full GPU gate chain for real scoring")
     subtensor = chain.connect(args.network, retry_forever=not args.once)
+    # Daemon-mode observability: between passes the loop reports only through the
+    # "optima.chain.*" loggers (--once prints its own summary below). This must run
+    # AFTER connect(): the bittensor import reconfigures global logging — it sets
+    # every pre-existing third-party logger's level to CRITICAL (measured in the
+    # 2026-07-10 soak: the ledger advanced every pass while the log stayed empty;
+    # optima.chain.validator read level=50). Own the subtree outright: reset levels
+    # to inherit, dedicated handler, no propagation upward.
+    for _name, _lg in list(logging.root.manager.loggerDict.items()):
+        if _name.startswith("optima.") and isinstance(_lg, logging.Logger):
+            _lg.disabled = False
+            _lg.setLevel(logging.NOTSET)
+    _chain_lg = logging.getLogger("optima.chain")
+    _chain_lg.setLevel(logging.INFO)
+    _chain_lg.propagate = False
+    if not _chain_lg.handlers:
+        _handler = logging.StreamHandler()
+        _handler.setFormatter(
+            logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+        _chain_lg.addHandler(_handler)
     wallet = None
     if not args.dry_run_weights:
         import bittensor as bt

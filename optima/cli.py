@@ -907,7 +907,12 @@ def build_parser() -> argparse.ArgumentParser:
                          "Set for prefill-heavy arenas: the short corpus is a pure-decode regime, "
                          "so a prefill-side kernel win is invisible to the scorer without this. "
                          "Prompts stay seed-deterministic, prefix-disjoint (no radix-cache "
-                         "inflation) and duplicate-block-free (optima/eval/prompts.py)")
+                         "inflation) and duplicate-block-free (optima/eval/prompts.py). "
+                         "PAIR WITH --engine-kwargs-json '{\"disable_radix_cache\": true}': the "
+                         "timed iterations replay the SAME prompts, so with the prefix cache on, "
+                         "iteration 2+ serves the whole input from cache and the run silently "
+                         "degrades to pure decode again (measured 2026-07-10: median-of-3 read "
+                         "267 tok/s cached vs 63 tok/s actually prefilling)")
     sp.add_argument("--top-logprobs", type=int, default=20)
     sp.add_argument("--ignore-eos", action=argparse.BooleanOptionalAction, default=True,
                     help="force generation to the max token budget so baseline and candidate emit IDENTICAL "

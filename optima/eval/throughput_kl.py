@@ -82,6 +82,11 @@ class EvalConfig:
     allow_unsafe_no_isolation: bool = False
     seed: int = 0  # model seed
     prompt_seed: int = 0  # per-epoch prompt sampling seed
+    # Approximate tokens per prompt. None -> the short corpus (10-20 tok, a pure-decode
+    # regime). Set for prefill-heavy arenas: without it a prefill-side win (e.g. the MSA
+    # prefill indexer, ~30% of long-context serving prefill) is INVISIBLE to the scorer
+    # — the workload never exercises the kernel. See optima/eval/prompts.py.
+    input_len: Optional[int] = None
     # FLOOR on the required improvement (see optima/eval/scoring.py). The ACTUAL bar
     # is max(speedup_margin, score_k * measured_baseline_noise) — derived from the box,
     # not hand-picked. 0.5% floor (2026-07-07): real wins stack at 1-2%, and the
@@ -298,7 +303,8 @@ def _aligned_kl(baseline: ModeResult, candidate: ModeResult) -> KLReport:
 
 
 def evaluate(cfg: EvalConfig, bundle_path: str, prompts: Optional[list[str]] = None) -> EvalReport:
-    prompts = list(prompts) if prompts else sample_prompts(cfg.num_prompts, cfg.prompt_seed)
+    prompts = list(prompts) if prompts else sample_prompts(
+        cfg.num_prompts, cfg.prompt_seed, input_len=cfg.input_len)
 
     # Bookended A/B (we cannot lock GPU clocks on rented pods): measure stock BEFORE
     # and AFTER the candidate so the candidate is bracketed and the two baseline reads

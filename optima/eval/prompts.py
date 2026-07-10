@@ -61,13 +61,47 @@ CORPUS: tuple[str, ...] = (
 )
 
 
-def sample_prompts(n: int, seed: int) -> list[str]:
+_APPROX_TOKENS_PER_SENTENCE = 18  # corpus sentences + the per-instance salt, roughly
+
+
+def _long_prompt(rng: random.Random, input_len: int) -> str:
+    """One synthetic long prompt of ~``input_len`` tokens (approximate by design —
+    the scorer is a PAIRED A/B, so what matters is that both arms see the identical
+    workload, not that the count is tokenizer-exact).
+
+    Two properties are load-bearing (learned from the real-transcript 256k prompt set):
+      * PREFIX-DISJOINT: a per-prompt salt header means no two prompts share a prefix,
+        so concurrent-request throughput can't be inflated by radix-cache hits.
+      * NO REPEATED BLOCKS: every sentence instance carries its own salt, so the KV
+        cache never contains exact duplicate blocks a kernel could special-case (and
+        long-context block scoring sees realistic, non-degenerate keys).
+    """
+    parts = [f"[case {rng.getrandbits(64):016x}] Read the following notes, then answer the final question."]
+    approx = 2 * _APPROX_TOKENS_PER_SENTENCE
+    while approx < input_len:
+        parts.append(f"Note {rng.getrandbits(32):08x}: {rng.choice(CORPUS)}")
+        approx += _APPROX_TOKENS_PER_SENTENCE
+    parts.append("Question: summarize the three most important ideas from the notes above.")
+    return " ".join(parts)
+
+
+def sample_prompts(n: int, seed: int, input_len: int | None = None) -> list[str]:
     """Deterministically sample ``n`` prompts for an epoch.
 
     Without replacement when ``n <= len(CORPUS)``, otherwise with replacement so
     callers can request large workloads for throughput measurement.
+
+    ``input_len`` (approximate tokens) switches to the LONG-PROMPT engine: without it
+    the corpus averages 10-20 tokens per prompt, so the measured regime is pure decode
+    and a prefill-side win (e.g. the MSA prefill indexer, ~30% of long-context serving
+    prefill) is INVISIBLE to the scorer. Long-context serving is prefill-dominated
+    (~91% of wall in the 2026-07-10 M3 256k workload), so arenas that sell that regime
+    must score it. Same determinism/rotation contract as the short corpus; production
+    intent remains a hosted real-distribution corpus (this is the stand-in).
     """
     rng = random.Random(seed)
+    if input_len is not None and input_len > 0:
+        return [_long_prompt(rng, input_len) for _ in range(n)]
     if n <= len(CORPUS):
         return rng.sample(list(CORPUS), n)
     return [rng.choice(CORPUS) for _ in range(n)]

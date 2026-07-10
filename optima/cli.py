@@ -432,6 +432,7 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
         warmup_iters=args.warmup_iters,
         speedup_margin=args.speedup_margin,
         prompt_seed=args.prompt_seed,
+        input_len=args.input_len,
         top_logprobs_num=args.top_logprobs,
         ignore_eos=args.ignore_eos,
         kl_threshold=_kl_threshold,
@@ -901,6 +902,12 @@ def build_parser() -> argparse.ArgumentParser:
                          "1 + max(margin, 2*measured_noise). Keep low — real wins stack at 1-2%%; "
                          "the noise term, not this floor, guards an unstable box")
     sp.add_argument("--prompt-seed", type=int, default=0, help="per-epoch prompt sampling seed")
+    sp.add_argument("--input-len", type=int, default=None,
+                    help="approximate tokens per prompt (default: the 10-20-token short corpus). "
+                         "Set for prefill-heavy arenas: the short corpus is a pure-decode regime, "
+                         "so a prefill-side kernel win is invisible to the scorer without this. "
+                         "Prompts stay seed-deterministic, prefix-disjoint (no radix-cache "
+                         "inflation) and duplicate-block-free (optima/eval/prompts.py)")
     sp.add_argument("--top-logprobs", type=int, default=20)
     sp.add_argument("--ignore-eos", action=argparse.BooleanOptionalAction, default=True,
                     help="force generation to the max token budget so baseline and candidate emit IDENTICAL "

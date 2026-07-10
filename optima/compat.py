@@ -83,8 +83,18 @@ def run_checks() -> list[Check]:
 
     from optima.seams import SEAM_ADAPTERS
 
+    def _requires_present(name: str) -> bool:
+        # find_spec on a DOTTED name imports the parent packages, so a missing parent
+        # RAISES (ModuleNotFoundError) instead of returning None — only top-level names
+        # degrade gracefully. A dotted `requires` (e.g. the M3-only minimax_sparse_ops
+        # subpackage) must mean SKIP on boxes without the parent, not a canary crash.
+        try:
+            return importlib.util.find_spec(name) is not None
+        except ModuleNotFoundError:
+            return False
+
     for adapter in SEAM_ADAPTERS:
-        if adapter.requires is not None and importlib.util.find_spec(adapter.requires) is None:
+        if adapter.requires is not None and not _requires_present(adapter.requires):
             # Row not assessable here (e.g. flashinfer only exists on engine boxes).
             # SKIP-as-ok so dev/intake boxes stay green; the pinned engine env — the
             # place a chokepoint break actually matters — always has the package.

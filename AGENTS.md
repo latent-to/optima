@@ -51,7 +51,16 @@ This repo is the **validator harness** (the referee), plus example miner bundles
   (same cheat-resistant contract — validator allocates outputs, miner fills them, the
   kernel never reaches the sampler — just a wider boundary): `activation.silu_and_mul`,
   `norm.rmsnorm` (ops); `attention.sdpa`/`attention.decode` (blocks via the
-  `RadixAttention.forward` seam, `OPTIMA_ATTENTION_SEAM=1`); `moe.fused_experts` (block
+  `RadixAttention.forward` seam, `OPTIMA_ATTENTION_SEAM=1`);
+  **`attention.msa_prefill_block_score`** (block via the MSA arena's
+  `flash_prefill_with_topk_index` seam, `OPTIMA_MSA_PREFILL_SEAM=1`: the miner fills the
+  prefill indexer's causal block-score SHEET, the validator keeps the stock top-k
+  selection + attend — gated on per-row `topk_overlap`, with a long-chunk verify shape
+  that makes causality violations detectable through the set metric; the seam row's
+  `requires` makes the compat canary SKIP it on pins without `minimax_sparse_ops`; its
+  regime is prefill-heavy serving, so score it with `evaluate --input-len` — the short
+  prompt corpus is a pure-decode regime that cannot see a prefill win);
+  `moe.fused_experts` (block
   via the `FusedMoE.forward` seam, `OPTIMA_MOE_SEAM=1`); `collective.all_reduce`
   (the TP comms waist, via the `GroupCoordinator.all_reduce` seam,
   `OPTIMA_COLLECTIVE_SEAM=1`); and **`moe.fused_experts_reduce`** — the experts block that

@@ -917,6 +917,164 @@ def _deep_consume(exp, input_tensor, residual, weight, eps, max_token_num,
 # dispatchers, receipted, and gated by the eval driver.)
 
 
+def make_msa_prefill_dispatcher(
+    baseline_fn: Callable[..., object],
+    module: object,
+    *,
+    registry: KernelRegistry = REGISTRY,
+    slot: str = "attention.msa_prefill_block_score",
+) -> Callable[..., object]:
+    """Build a replacement for the MODULE-LEVEL function
+    ``...minimax_sparse_ops.prefill.flash_with_topk_idx.flash_prefill_with_topk_index``
+    — the MSA arena's prefill-side indexer waist (the score kernel alone is ~30% of
+    long-context serving prefill; the 2026-07-10 M3 campaign's +19.6%/+22.4% e2e lever).
+
+    The cheat-resistant split (docs/SLOT_CONTRACT.md, same as the decode MSA slot): the
+    miner fills the per-(row, block) SCORE SHEET only; the validator keeps the stock
+    top-k selection kernel AND the attend over the chosen blocks, so the kernel stays
+    strictly upstream of the sampler and a wrong score merely mis-selects (the
+    topk_overlap op-gate + the e2e gate catch it).
+
+    SCOPE (production MSA config only; anything else -> stock verbatim): opt-in via
+    ``OPTIMA_MSA_PREFILL_SEAM=1``; ``disable_index_value`` (the stock kernel's ONLY
+    output is then the score slab), ``score_type == "max"``, no sink, ONE index-K head.
+    Never under Dynamo tracing or CUDA-graph capture (this path does a host sync for
+    the per-request metadata; serving prefill runs eager). Any exception -> announced
+    whole-batch stock fallback (partial slab writes are overwrite-safe: both kernels
+    share the -inf masking convention on the same pre-filled slab).
+
+    ``module`` is the (M3-arena-pinned) target module itself: the stock top-k tail is
+    reproduced from its OWN pieces (``get_cu_seqblocks``, ``_topk_index_kernel``,
+    ``robust_allocator``) so selection stays byte-stock. Version-pinned glue by design
+    — this module only exists on the MSA arena's pinned sglang build.
+
+    AUDIT NOTE: the in-engine audit (optima/audit.py) is NOT yet wired for this
+    dispatcher (same standing residual as the attention slots — docs/FIDELITY.md); the
+    slab feeds the STOCK selection kernel, so fidelity evidence = the topk_overlap
+    op-gate + e2e KL/benchmarks until the audit hook lands.
+    """
+    import os
+
+    def dispatched(q, k_cache, v_cache, sink, req_to_token, slot_ids, cu_seqlens,
+                   seq_lens, prefix_lens, max_seqlen_q, max_seqlen_k, block_size_q,
+                   block_size_k, topk, init_blocks=1, local_blocks=2, sm_scale=None,
+                   use_tma=False, score_type="max", disable_index_value=False,
+                   cu_seqblocks_q=None, max_seqblock_q=None, all_seqblock_q=None):
+        def stock():
+            return baseline_fn(q, k_cache, v_cache, sink, req_to_token, slot_ids,
+                               cu_seqlens, seq_lens, prefix_lens, max_seqlen_q,
+                               max_seqlen_k, block_size_q, block_size_k, topk,
+                               init_blocks, local_blocks, sm_scale, use_tma,
+                               score_type, disable_index_value, cu_seqblocks_q,
+                               max_seqblock_q, all_seqblock_q)
+
+        if _dynamo_compiling():  # traced region bakes pure stock (see _dynamo_compiling)
+            return stock()
+        if os.environ.get("OPTIMA_MSA_PREFILL_SEAM") != "1" or _in_cuda_graph():
+            return stock()
+        try:
+            num_kv_heads = k_cache.shape[1]
+            if not (disable_index_value and score_type == "max" and sink is None
+                    and num_kv_heads == 1 and q.is_cuda and q.dim() == 3):
+                return stock()
+            total_q, num_heads, head_dim = q.shape
+            impl = registry.lookup(
+                slot,
+                dtype_name=_dtype_name(q.dtype),
+                last_dim=head_dim,
+                arch=_arch_tag(q.device.index or 0),
+                num_tokens=total_q,
+            )
+            if impl is None:
+                return stock()
+
+            batch_size = cu_seqlens.shape[0] - 1
+            scale = float(sm_scale if sm_scale is not None else head_dim ** -0.5) * 1.4426950409
+
+            # ONE host sync for the batch metadata (eager prefill path; mirrors the
+            # stock wrapper's own reliance on host-known max_seqlen_q/batch_size).
+            cu = cu_seqlens[: batch_size + 1].cpu()
+            sls = seq_lens[:batch_size].cpu()
+            pls = prefix_lens[:batch_size].cpu()
+            sids = slot_ids[:batch_size].cpu()
+
+            # Pre-scan BEFORE writing anything: the slot's causal convention (key n
+            # visible to row m iff n <= prefix+m) requires seq == prefix + q_len.
+            meta = []
+            for b in range(batch_size):
+                qs, qe = int(cu[b]), int(cu[b + 1])
+                seq_b, pre_b = int(sls[b]), int(pls[b])
+                if qe - qs > 0 and seq_b != pre_b + (qe - qs):
+                    return stock()
+                meta.append((qs, qe, seq_b, pre_b, int(sids[b])))
+
+            max_seqblock_k = (max_seqlen_k + block_size_k - 1) // block_size_k
+            score = torch.full((num_heads, total_q, max_seqblock_k), float("-inf"),
+                               dtype=torch.float32, device=q.device)
+
+            for qs, qe, seq_b, pre_b, sid in meta:
+                if qe - qs == 0 or seq_b == 0:
+                    continue
+                nblk_b = (seq_b + block_size_k - 1) // block_size_k
+                # Gather-first: paged index-K -> contiguous (S, D). Paging layout is
+                # the validator's, not part of the miner contract.
+                slots_b = req_to_token[sid, :seq_b].to(torch.long)
+                kg = k_cache[slots_b, 0, :].contiguous()
+                for h in range(num_heads):
+                    q_bh = q[qs:qe, h, :].contiguous()
+                    impl.entry(q_bh, kg, pre_b, scale, block_size_k,
+                               score[h, qs:qe, :nblk_b])
+
+            # The validator-owned top-k tail, byte-stock from the target module's own
+            # pieces: the SELECTION never comes from miner code.
+            import triton  # noqa: PLC0415 - deferred; only on the GPU path
+
+            triton.set_allocator(module.robust_allocator)
+            if cu_seqblocks_q is None or max_seqblock_q is None or all_seqblock_q is None:
+                cu_seqblocks_q, max_seqblock_q, all_seqblock_q, _, _, _ = (
+                    module.get_cu_seqblocks(cu_seqlens, max_seqlen_q, block_size_q,
+                                            block_size_k))
+            topk_idx = torch.full((num_heads, all_seqblock_q, topk), fill_value=-1,
+                                  device=score.device, dtype=torch.int32)
+            grid = (max_seqblock_q, batch_size, num_heads)
+            module._topk_index_kernel[grid](
+                score, topk_idx, block_size_q, block_size_k, cu_seqlens,
+                cu_seqblocks_q, prefix_lens, topk, init_blocks, local_blocks,
+                score.stride(0), score.stride(1), score.stride(2),
+                topk_idx.stride(0), topk_idx.stride(1), topk_idx.stride(2),
+                MASK_INIT=False, MASK_LOCAL=False,
+            )
+            _log_msa_prefill_active()
+            return None, topk_idx  # o is None in the gated (disable_index_value) mode
+        except Exception as exc:  # noqa: BLE001
+            if registry.strict:
+                raise
+            _log_msa_prefill_fallback(exc)
+            return stock()
+
+    return dispatched
+
+
+_MSA_PREFILL_LOGGED_ACTIVE = False
+_MSA_PREFILL_LOGGED_FALLBACK = False
+
+
+def _log_msa_prefill_active() -> None:
+    global _MSA_PREFILL_LOGGED_ACTIVE
+    if not _MSA_PREFILL_LOGGED_ACTIVE:
+        _MSA_PREFILL_LOGGED_ACTIVE = True
+        logger.warning(
+            "optima: attention.msa_prefill_block_score seam ACTIVE — prefill indexer scores routed through miner kernel")
+
+
+def _log_msa_prefill_fallback(exc: Exception) -> None:
+    global _MSA_PREFILL_LOGGED_FALLBACK
+    if not _MSA_PREFILL_LOGGED_FALLBACK:
+        _MSA_PREFILL_LOGGED_FALLBACK = True
+        logger.warning(
+            "optima: attention.msa_prefill_block_score seam FELL BACK to baseline after kernel error: %r", exc)
+
+
 def _arfusion_group(use_attn_tp_group: bool):
     """The torch ProcessGroup the stock call would reduce over. ``use_attn_tp_group``
     mirrors the stock argument (attention-TP vs full-TP chain); under plain TP the two

@@ -8,8 +8,9 @@ slice. A clean branch means clean review history and bounded scope—not reimple
 The GitHub PR numbers and the architectural PR numbers in this document are intentionally
 different. GitHub PRs #31–#37 are merged sub-slices of architectural PR 1, not architectural
 PRs 1–7. Through #37's merge `21b0b482` (exact head `e2048cfb`), the clean extraction is +4,129/-194 production,
-+4,454/-6 tests, and +302/-32 docs relative to `203bb559`. The final distributed collective
-graph slice remains before architectural PR 1 is complete.
++4,454/-6 tests, and +302/-32 docs relative to `203bb559`. The distributed collective
+graph slice and one immediate live-collective descriptor/output-parity slice remain before
+architectural PR 1 is complete.
 
 ## Gate 0 — freeze the product contract
 
@@ -86,6 +87,13 @@ delta, names the legacy path it supersedes and deletes in the same diff, or reco
 was superseded. Coverage and static analysis nominate cleanup candidates; they are not deletion
 authority for GPU-only or intentionally public paths.
 
+The distributed-verifier code checkpoint adds +931/-87 production and +660/-2 tests over
+the governance-docs parent. Cumulative clean extraction is therefore +5,060 production and
++5,114 tests: 26.0% and 52.7% of the whole-plan budgets (34.8% combined). The original test
+guidance is no longer credible without later consolidation; do not hide that by line-golfing
+adversarial coverage. Treat the counts as scope pressure, delete paths when their replacement
+lands, and judge completion by the joined product acceptance test below.
+
 Implementation order is not a literal 1→2→3 pipeline. After PR 1 completes, land the pure
 product core of PR 3 first (`PR 3a` below), then PR 2, then the small runtime bridge (`PR 3b`).
 This makes the product-defining stack shape the executor input without pretending that stack
@@ -111,6 +119,17 @@ Exit:
 - one singleton and one atomic target resolve canonically regardless of manifest order;
 - component receipts are diagnostic, never external crown authority;
 - no OCI, chain, stack economics, or whole-system title enters this PR.
+
+The final contribution-foundation work is deliberately split into two review boundaries:
+
+1. distributed verifier correctness (trusted pre-candidate snapshots, fresh-value graph
+   replay, same-process multi-shape capture, real topology/dtype, strict diagnostic wire);
+2. live collective parity (one canonical descriptor/allocation projection, variant-keyed MoE
+   prepare state, and identical deep export/consume selection).
+
+After those reproduced P1s and one confirmation review pass, PR 1 freezes. A generic typed-input
+IR, arbitrary-topology framework, secure crown authority inside candidate workers, and SM120
+ports are explicitly not PR 1 work.
 
 ### PR 2 — Streaming isolated engine executor
 
@@ -324,8 +343,23 @@ to the backlog. New feature scope requires removing equivalent work or opening a
 ## Endpoint
 
 Gate 0 is on main. Architectural PR 1 has been extracted as merged GitHub PRs #31–#37 except
-for distributed collective graph proof. Architectural PR 3 remains the main genuinely missing
-product layer; PR 2 and later layers still have substantial donor material but are not merged.
+for the two collective closure slices above. Architectural PR 3 remains the main genuinely
+missing product layer; PR 2 and later layers still have substantial donor material but are not
+merged. The bounded merge sequence after the governance record is: PR 1 closure; PR 3a; vendor
+provenance; PR 2; PR 3b; PR 4; PR 5; PR 6; PR 7; PR 8. Split PR 2 or PR 4 only when reviewability
+requires it; do not repeat the seven-micro-PR cadence for every architectural layer.
+
+The refactor's operational acceptance test is:
+
+1. either real campaign bundle enters without a referee code edit;
+2. the validator materializes the frozen incumbent plus exactly that submitted delta;
+3. bounded isolated B/C/B' execute, with cohort/bookend amortization measured;
+4. after candidate destruction, pristine T independently grades sealed quality evidence;
+5. testnet intake and transactional settlement update the evaluation stack and global dry-run;
+6. reviewed winners assemble into a reproducible, chain-independent serving release;
+7. RTX proves the complete portable path, while B300 is reserved for SM103/NVLink/P2P,
+   real-candidate performance, calibration, and crown evidence.
+
 The refactor ends when all eight exit criteria and the product-contract acceptance test pass.
 The endpoint is explicit invariants, clean reproducible receipts, and documented residuals—not
 the impossible claim that no future reviewer can imagine another risk.

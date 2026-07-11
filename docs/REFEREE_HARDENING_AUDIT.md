@@ -664,3 +664,59 @@ collective graph proof on RTX; run the net-negative cleanup milestone; land PR 3
 latency simulation; land vendor provenance; extract PR 2; land PR 3b and its RTX lifecycle proof;
 then add PR 4 pristine-T/calibration authority. B300 is reserved for true SM103/NVLink candidate
 calibration and composed performance evidence, not generic control-plane development.
+
+## 2026-07-11 distributed-verifier code checkpoint and endpoint reset
+
+Governance PR #38 is ready and mergeable at `587be331` with all three CodeQL checks green.
+The stacked verifier code commit is `83f05b825186230f2ef4c92ba31ba15ce0a4845f` on
+`codex/distributed-collective-graph-proof`: production +931/-87, tests +660/-2 over the docs
+parent. The earlier 350-450/250-350 estimate was incomplete; it omitted reproduced attacks on
+trusted inputs, fixed-value graph replays, cross-shape capture state, and topology/dtype truth.
+No miner CUDA or SM120 portability code entered the slice.
+
+The verifier now:
+
+- snapshots candidate-inaccessible tensor inputs before prepare/entry and rejects input mutation;
+- refreshes every slot-declared request tensor at the same captured address, using a fresh trusted
+  reference on every replay, so output poisoning cannot be defeated by a cached correct answer;
+- preserves the unsynchronized eager temporal burst while separately capturing multiple shapes in
+  one loaded rank process, catching first-bucket workspace/shape caches;
+- executes the requested floating dtype, requires at least two ranks, binds TP to the actual WORLD
+  group, and rejects heterogeneous CUDA architectures;
+- uses the shared typed output contract for every collective output/workspace and grades every
+  output on eager execution plus each replay;
+- replaces candidate-written pickle with a bounded exact JSON schema and globally bounded
+  TERM/KILL cleanup. This wire remains forgeable inside the candidate worker and is explicitly
+  diagnostic, never pristine quality or crown authority.
+
+Exact code-head receipts:
+
+- local `pyenv activate sn120`: 634 passed, 14 skipped; compileall and diff check clean;
+- RTX/Linux excluding the dedicated GPU module: 639 passed, 2 skipped;
+- four concurrent disjoint GPU pairs: 6/6 each, 24/24 total;
+- both TP4 halves: multi-output AR+norm graph proof passed; TP8 faithful proof passed;
+- cached-correct-output, partial/no-op, cross-shape cache, divergent-rank, malformed-wire,
+  nonzero-exit, input/reference poisoning, and prepare-mutation controls rejected;
+- all eight RTX devices drained to 0 MiB/0%.
+
+The three real campaign bundles returned whole-bundle N/A on RTX/SM120 (rc=2) because they
+declare SM103. That is correct behavior. They remain mock intake/materialization submissions on
+RTX; their CUDA execution, performance, and crown evidence remain B300-only.
+
+This is not yet architectural PR 1 completion. Independent review found the live collective
+adapters still use legacy lookup and untyped allocation, and deep export can authorize a different
+variant than consume. The immediate final PR 1 slice is one shared canonical live descriptor/
+allocation projection across all-reduce, MoE-reduce, shallow AR+norm, and deep export/consume,
+including variant-keyed prepare caches. After that bounded slice and confirmation, PR 1 freezes.
+
+Budget truth through the verifier code is cumulative production +5,060 and tests +5,114 since
+pre-extraction main: 26.0% and 52.7% of the plan budgets, 34.8% combined. Line count is a scope
+alarm, not the terminal metric. The terminal acceptance test is zero-code bundle intake -> exact
+marginal stack -> bounded isolated B/C/B' -> destroyed-candidate pristine T -> transactional
+testnet settlement/evaluation-stack update -> reproducible reviewed serving release, joined on
+RTX with only SM103/NVLink/performance calibration left to B300.
+
+Do not repeat seven micro-PRs per architectural layer. The remaining bounded merge order is PR 1
+closure; PR 3a; vendor provenance; PR 2; PR 3b; PR 4; PR 5; PR 6; PR 7; PR 8, splitting PR 2 or
+PR 4 only if reviewability genuinely requires it. Superseded paths are deleted in their owner PR;
+a standalone cleanup PR is justified only when it is actually net-negative and preserves receipts.

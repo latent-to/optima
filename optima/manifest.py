@@ -56,6 +56,7 @@ def _load_toml(p: Path) -> dict:
 
 ABI_VERSION = "optima-op-abi-v0"
 _ID_RE = re.compile(r"^[0-9A-Za-z._\-]+$")
+DEFAULT_VARIANT = "default"
 
 
 class ManifestError(ValueError):
@@ -70,6 +71,7 @@ class OpEntry:
     dtypes: tuple[str, ...]
     architectures: tuple[str, ...]
     metadata: str | None
+    variant: str = DEFAULT_VARIANT
     prepare: str | None = None  # optional 2nd callable (weight-prep) for (prepare, forward) slots
     setup: str | None = None  # optional callable run ONCE at engine init (framework mode)
     # Override-point submission (the swigluoai class): the bundle does NOT ship a whole kernel —
@@ -116,11 +118,21 @@ class Manifest:
     dep_patches: tuple[DepPatchEntry, ...] = ()
     raw: dict[str, Any] = field(default_factory=dict)
 
-    def op_for(self, slot: str) -> OpEntry | None:
-        for op in self.ops:
-            if op.slot == slot:
-                return op
-        return None
+    def ops_for(self, slot: str) -> tuple[OpEntry, ...]:
+        """Return every implementation row for one semantic slot."""
+        return tuple(op for op in self.ops if op.slot == slot)
+
+    def op_for(self, slot: str, variant: str | None = None) -> OpEntry | None:
+        """Return one row without allowing manifest order to select a variant."""
+        matches = self.ops_for(slot)
+        if variant is not None:
+            return next((op for op in matches if op.variant == variant), None)
+        if len(matches) > 1:
+            raise ManifestError(
+                f"slot {slot!r} has multiple variants; specify one of "
+                f"{tuple(op.variant for op in matches)!r}"
+            )
+        return matches[0] if matches else None
 
 
 def _require(cond: bool, msg: str) -> None:
@@ -251,13 +263,34 @@ def load_manifest(bundle_root: str | Path) -> Manifest:
     _require(isinstance(ops_raw, list) and ops_raw, "manifest must contain a non-empty [[ops]] list")
 
     ops: list[OpEntry] = []
-    seen_slots: set[str] = set()
+    seen_variants: dict[str, dict[str, bool]] = {}
     for i, op in enumerate(ops_raw):
         _require(isinstance(op, dict), f"ops[{i}] must be a table")
         slot = str(op.get("slot", "")).strip()
         _require(bool(slot), f"ops[{i}] missing 'slot'")
-        _require(slot not in seen_slots, f"duplicate slot in manifest: {slot!r}")
-        seen_slots.add(slot)
+        variant_explicit = "variant" in op
+        raw_variant = op.get("variant", DEFAULT_VARIANT)
+        _require(
+            isinstance(raw_variant, str),
+            f"ops[{i}] ({slot}) 'variant' must be a string",
+        )
+        variant = raw_variant.strip()
+        _require(
+            bool(variant) and bool(_ID_RE.match(variant)),
+            f"ops[{i}] ({slot}) 'variant' must be a simple identifier: {variant!r}",
+        )
+        prior = seen_variants.setdefault(slot, {})
+        if prior:
+            _require(
+                variant_explicit and all(prior.values()),
+                f"duplicate slot {slot!r} requires every row to declare an explicit "
+                "unique 'variant' identifier",
+            )
+        _require(
+            variant not in prior,
+            f"duplicate variant {variant!r} for slot {slot!r}",
+        )
+        prior[variant] = variant_explicit
 
         source = str(op.get("source", "")).strip()
         entry = str(op.get("entry", "")).strip()
@@ -282,8 +315,20 @@ def load_manifest(bundle_root: str | Path) -> Manifest:
             metadata = str(metadata).strip()
             _safe_relpath(root, metadata, kind="metadata")
 
-        dtypes = tuple(str(d) for d in op.get("dtypes", ()))
-        archs = tuple(str(a) for a in op.get("architectures", ()))
+        def _string_array(name: str) -> tuple[str, ...]:
+            raw = op.get(name, ())
+            _require(
+                isinstance(raw, (list, tuple)),
+                f"ops[{i}] ({slot}) {name!r} must be an array of strings",
+            )
+            _require(
+                all(isinstance(value, str) and value.strip() for value in raw),
+                f"ops[{i}] ({slot}) {name!r} must contain non-empty strings",
+            )
+            return tuple(value.strip() for value in raw)
+
+        dtypes = _string_array("dtypes")
+        archs = _string_array("architectures")
 
         # Override-point fields (optional). override_point requires base_kernel; the names
         # are resolved against optima_kernels at load (here we only check structure).
@@ -309,7 +354,7 @@ def load_manifest(bundle_root: str | Path) -> Manifest:
             _validate_cuda_source(root, cs, slot=slot)
         cuda_sources = tuple(str(cs) for cs in cuda_sources_raw)
 
-        known = {"slot", "source", "entry", "prepare", "setup", "dtypes", "architectures",
+        known = {"slot", "variant", "source", "entry", "prepare", "setup", "dtypes", "architectures",
                  "metadata", "base_kernel", "override_point", "cuda_sources"}
         extra = {k: v for k, v in op.items() if k not in known}
 
@@ -321,6 +366,7 @@ def load_manifest(bundle_root: str | Path) -> Manifest:
                 dtypes=dtypes,
                 architectures=archs,
                 metadata=metadata,
+                variant=variant,
                 prepare=prepare,
                 setup=setup,
                 base_kernel=base_kernel,

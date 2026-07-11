@@ -274,12 +274,30 @@ def _op_identity(op) -> str:
     ``base_kernel`` / ``override_point`` are INCLUDED — an M1 override submission JIT-composes
     base+override at load, so the same epilogue source composed at a different hole (or into a
     different base) is a genuinely different kernel and must fingerprint distinctly, or honest
-    work gets demoted as a self-collision.
+    work gets demoted as a self-collision. ``variant`` is deliberately EXCLUDED: it is a routing
+    label, not source identity, and renaming it must not evade copy detection. Capability metadata
+    is likewise excluded, so relabeling a stolen implementation's domain does not make it fresh.
     """
     return "\x00".join([
         op.slot, op.entry, op.prepare or "", op.setup or "",
         op.base_kernel or "", op.override_point or "",
     ])
+
+
+def _aggregate_variant_fingerprints(parts: list[str], *, domain: str) -> str:
+    """Canonically fold every implementation row for one slot.
+
+    A singleton returns its component digest verbatim so existing ledger fingerprints remain
+    stable. Multiple rows are a sorted multiset: manifest order and variant labels are irrelevant,
+    while duplicate implementations still contribute twice and adding/removing/changing either
+    implementation changes the aggregate.
+    """
+    if not parts:
+        return ""
+    if len(parts) == 1:
+        return parts[0]
+    blob = domain + "\x00" + "\x1e".join(sorted(parts))
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
 
 def bundle_slot_fingerprints(bundle_root: str | Path) -> dict[str, str]:
@@ -290,19 +308,29 @@ def bundle_slot_fingerprints(bundle_root: str | Path) -> dict[str, str]:
     fingerprint by PADDING the bundle with an unrelated extra op (each slot is compared
     independently). Covers the op identity (``_op_identity``, incl. override composition)
     and the NORMALIZED source of the whole bundle-local import closure (so a body hidden
-    in an imported module is folded in). ``{}`` if any closure source can't be parsed.
+    in an imported module is folded in). Multiple variants of one slot are folded as a
+    canonical, order-independent multiset; the historical singleton digest is unchanged.
+    ``{}`` if any closure source can't be parsed.
     """
     root = Path(bundle_root)
     manifest = load_manifest(root)
-    out: dict[str, str] = {}
+    components: dict[str, list[str]] = {}
     try:
         for op in manifest.ops:
             closure = _closure_norm(root, resolve_source(root, op), normalized_source)
             blob = _op_identity(op) + "\x1e" + closure
-            out[op.slot] = hashlib.sha256(blob.encode("utf-8")).hexdigest()
+            components.setdefault(op.slot, []).append(
+                hashlib.sha256(blob.encode("utf-8")).hexdigest()
+            )
     except SyntaxError:
         return {}
-    return out
+    return {
+        slot: _aggregate_variant_fingerprints(
+            fingerprints,
+            domain="optima.slot.normalized-variants.v1",
+        )
+        for slot, fingerprints in components.items()
+    }
 
 
 # Normalized-source length below which a closure file is boilerplate (an empty
@@ -310,6 +338,142 @@ def bundle_slot_fingerprints(bundle_root: str | Path) -> dict[str, str]:
 # trivial shims would otherwise collide across honest bundles. A real kernel body
 # normalizes far above this.
 _SUBSTANTIAL_NORM_LEN = 80
+
+
+def _bound_top_level_names(node: ast.stmt) -> set[str]:
+    """Names one module-level statement binds for dependency projection."""
+
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        return {node.name}
+    if isinstance(node, ast.Import):
+        return {
+            alias.asname or alias.name.split(".", 1)[0]
+            for alias in node.names
+        }
+    if isinstance(node, ast.ImportFrom):
+        return {
+            alias.asname or alias.name
+            for alias in node.names
+            if alias.name != "*"
+        }
+
+    def _targets(target: ast.AST) -> set[str]:
+        if isinstance(target, ast.Name):
+            return {target.id}
+        if isinstance(target, (ast.Tuple, ast.List)):
+            return set().union(*(_targets(item) for item in target.elts))
+        return set()
+
+    if isinstance(node, ast.Assign):
+        return set().union(*(_targets(target) for target in node.targets))
+    if isinstance(node, (ast.AnnAssign, ast.AugAssign)):
+        return _targets(node.target)
+    return set()
+
+
+def _loaded_names(node: ast.AST) -> set[str]:
+    return {
+        child.id
+        for child in ast.walk(node)
+        if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Load)
+    }
+
+
+def _top_level_definition_fingerprints(source: str) -> set[str]:
+    """Path-independent fingerprints for each substantial top-level definition.
+
+    Whole-file hashes catch relocation but are vulnerable to same-file padding: a
+    copier can retain a stolen function and append an unrelated sibling.  For each
+    function/class, retain both its standalone normalized body and the minimal module
+    projection containing the top-level imports/constants/helpers it references.
+    Unrelated sibling definitions and imports therefore cannot perturb the copied
+    implementation's containment signal.
+
+    The dependency projection also preserves backward compatibility for the common
+    one-import/one-entry module: its projection is byte-identical to the historical
+    whole-file normalized fingerprint.  The standalone body protects new records
+    against padding an existing import statement itself.
+    """
+
+    tree = ast.parse(source)
+    body = list(tree.body)
+    bound_at: dict[str, int] = {}
+    future_imports: set[int] = set()
+    for index, node in enumerate(body):
+        for name in _bound_top_level_names(node):
+            bound_at[name] = index
+        if (
+            isinstance(node, ast.ImportFrom)
+            and node.module == "__future__"
+        ):
+            future_imports.add(index)
+
+    definitions = {
+        index
+        for index, node in enumerate(body)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+    }
+    fingerprints: set[str] = set()
+
+    def _add_projection(indexes: set[int], *, prune_imports: bool = False) -> None:
+        used_names = set().union(*(_loaded_names(body[index]) for index in indexes))
+        projected_body: list[ast.stmt] = []
+        for index in sorted(indexes):
+            node = body[index]
+            if prune_imports and isinstance(node, ast.Import):
+                aliases = [
+                    alias
+                    for alias in node.names
+                    if (alias.asname or alias.name.split(".", 1)[0]) in used_names
+                ]
+                if not aliases:
+                    continue
+                node = ast.Import(names=aliases)
+            elif (
+                prune_imports
+                and isinstance(node, ast.ImportFrom)
+                and node.module != "__future__"
+            ):
+                aliases = [
+                    alias
+                    for alias in node.names
+                    if alias.name == "*"
+                    or (alias.asname or alias.name) in used_names
+                ]
+                if not aliases:
+                    continue
+                node = ast.ImportFrom(
+                    module=node.module,
+                    names=aliases,
+                    level=node.level,
+                )
+            projected_body.append(node)
+        projection = ast.Module(
+            body=projected_body,
+            type_ignores=[],
+        )
+        normalized = normalized_source(ast.unparse(projection))
+        if len(normalized) >= _SUBSTANTIAL_NORM_LEN:
+            fingerprints.add(
+                hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+            )
+
+    for definition_index in definitions:
+        _add_projection({definition_index})
+
+        selected = set(future_imports) | {definition_index}
+        pending = [definition_index]
+        while pending:
+            current = pending.pop()
+            for name in _loaded_names(body[current]):
+                dependency = bound_at.get(name)
+                if dependency is not None and dependency not in selected:
+                    selected.add(dependency)
+                    pending.append(dependency)
+        _add_projection(selected)
+        _add_projection(selected, prune_imports=True)
+
+    return fingerprints
 
 
 def bundle_slot_file_fingerprints(bundle_root: str | Path) -> dict[str, list[str]]:
@@ -334,10 +498,12 @@ def bundle_slot_file_fingerprints(bundle_root: str | Path) -> dict[str, list[str
     closes the "ship a stolen binary/.cu behind a trivially different .py shim" gap: a
     declared cuda_source used to be invisible to copy_fingerprint's import-closure walk
     entirely (it isn't Python, isn't imported, and previously wasn't even scanned).
+    Sibling variants contribute to one union, so adding a fresh variant cannot hide a
+    stolen singleton from the ledger's subset-containment comparison.
     """
     root = Path(bundle_root)
     manifest = load_manifest(root)
-    out: dict[str, list[str]] = {}
+    out: dict[str, set[str]] = {}
     # Declared dep patches are BUNDLE-level (they modify the engine's dependency tree
     # for every slot the bundle claims), so their fingerprints fold into EVERY slot's
     # file set: a stolen deep-seam patch re-shipped behind a different kernel shim is
@@ -356,16 +522,21 @@ def bundle_slot_file_fingerprints(bundle_root: str | Path) -> dict[str, list[str
         for op in manifest.ops:
             entry = resolve_source(root, op)
             entry_key = entry.resolve()
-            fps: set[str] = set(patch_fps)
+            # All sibling variants contribute to one slot-level union. This keeps a
+            # stolen singleton's set contained in a stolen+fresh multi-variant bundle,
+            # which is the load-bearing relocation/padding copy signal in Ledger.reveal.
+            fps = out.setdefault(op.slot, set(patch_fps))
             for f in _closure_files(root, entry):
                 try:
-                    norm = normalized_source(f.read_text(encoding="utf-8"))
+                    source = f.read_text(encoding="utf-8")
+                    norm = normalized_source(source)
                 except (SyntaxError, OSError, UnicodeDecodeError):
                     if f.resolve() == entry_key:
                         raise
                     continue
                 if len(norm) >= _SUBSTANTIAL_NORM_LEN:
                     fps.add(hashlib.sha256(norm.encode("utf-8")).hexdigest())
+                fps.update(_top_level_definition_fingerprints(source))
             for cs in resolve_cuda_sources(root, op):
                 try:
                     raw = cs.read_bytes()
@@ -373,24 +544,35 @@ def bundle_slot_file_fingerprints(bundle_root: str | Path) -> dict[str, list[str
                     continue
                 fps.add(hashlib.sha256(raw).hexdigest())
                 fps.add(cuda_source_fingerprint(raw.decode("utf-8", errors="replace")))
-            out[op.slot] = sorted(fps)
     except SyntaxError:
         return {}
-    return out
+    return {slot: sorted(fingerprints) for slot, fingerprints in out.items()}
 
 
 def bundle_slot_structural_fingerprints(bundle_root: str | Path) -> dict[str, str]:
-    """Advisory per-slot structural (rename/constant-tweak) fingerprint over the closure."""
+    """Advisory per-slot structural fingerprint over every variant's closure.
+
+    The multi-variant fold is order-independent and label-independent; singleton output
+    remains byte-for-byte compatible with prior ledgers.
+    """
     root = Path(bundle_root)
     manifest = load_manifest(root)
-    out: dict[str, str] = {}
+    components: dict[str, list[str]] = {}
     try:
         for op in manifest.ops:
             closure = _closure_norm(root, resolve_source(root, op), structural_source)
-            out[op.slot] = hashlib.sha256((op.slot + "\x1e" + closure).encode("utf-8")).hexdigest()
+            components.setdefault(op.slot, []).append(
+                hashlib.sha256((op.slot + "\x1e" + closure).encode("utf-8")).hexdigest()
+            )
     except SyntaxError:
         return {}
-    return out
+    return {
+        slot: _aggregate_variant_fingerprints(
+            fingerprints,
+            domain="optima.slot.structural-variants.v1",
+        )
+        for slot, fingerprints in components.items()
+    }
 
 
 def _fold(slot_map: dict[str, str]) -> str:

@@ -111,12 +111,29 @@ class DepPatchEntry:
 
 
 @dataclass(frozen=True)
+class CompetitionEntry:
+    """A bundle's requested validator-owned contribution target.
+
+    This table is syntax only.  The miner may request an identifier and assert
+    whether it expects a singleton slot or a registered atomic target, but it
+    cannot declare members, overlap, displacement, or allowed features.  Those
+    are resolved independently by :mod:`optima.target_catalog`.
+    """
+
+    target: str
+    mode: str
+
+
+@dataclass(frozen=True)
 class Manifest:
     bundle_id: str
     abi_version: str
     ops: tuple[OpEntry, ...]
     dep_patches: tuple[DepPatchEntry, ...] = ()
     raw: dict[str, Any] = field(default_factory=dict)
+    # Appended after every historical field so positional construction retains
+    # the old meaning of arguments four and five.
+    competition: CompetitionEntry | None = None
 
     def ops_for(self, slot: str) -> tuple[OpEntry, ...]:
         """Return every implementation row for one semantic slot."""
@@ -376,6 +393,42 @@ def load_manifest(bundle_root: str | Path) -> Manifest:
             )
         )
 
+    competition_raw = data.get("competition")
+    competition: CompetitionEntry | None = None
+    if competition_raw is not None:
+        _require(
+            isinstance(competition_raw, dict),
+            "top-level 'competition' must be a {target, mode} table",
+        )
+        unknown = set(competition_raw) - {"target", "mode"}
+        _require(not unknown, f"competition has unknown keys: {sorted(unknown)}")
+
+        raw_target = competition_raw.get("target")
+        _require(
+            isinstance(raw_target, str),
+            "competition 'target' must be a string",
+        )
+        target = raw_target.strip()
+        _require(
+            bool(target) and bool(_ID_RE.match(target)),
+            f"competition 'target' must be a simple identifier: {target!r}",
+        )
+
+        raw_mode = competition_raw.get("mode")
+        _require(
+            isinstance(raw_mode, str),
+            "competition 'mode' must be a string",
+        )
+        mode = raw_mode.strip()
+        # Donor-era local bundles already carry ``mode = "system"``.  Preserve
+        # syntax compatibility for inspection/migration, but TargetCatalog never
+        # registers a system title.
+        _require(
+            mode in {"slot", "atomic", "system"},
+            "competition 'mode' must be 'slot', 'atomic', or legacy 'system'",
+        )
+        competition = CompetitionEntry(target=target, mode=mode)
+
     dep_raw = data.get("dep_patches", ())
     _require(
         isinstance(dep_raw, (list, tuple)),
@@ -397,8 +450,14 @@ def load_manifest(bundle_root: str | Path) -> Manifest:
         _require(not unknown, f"dep_patches[{i}] has unknown keys: {sorted(unknown)}")
         dep_patches.append(DepPatchEntry(target=target, path=rel))
 
-    return Manifest(bundle_id=bundle_id, abi_version=abi, ops=tuple(ops),
-                    dep_patches=tuple(dep_patches), raw=data)
+    return Manifest(
+        bundle_id=bundle_id,
+        abi_version=abi,
+        ops=tuple(ops),
+        dep_patches=tuple(dep_patches),
+        raw=data,
+        competition=competition,
+    )
 
 
 def resolve_source(bundle_root: str | Path, op: OpEntry) -> Path:

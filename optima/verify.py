@@ -38,7 +38,12 @@ from optima.capabilities import (
 )
 from optima.registry import Eligibility
 from optima.slots import SlotSpec
-from optima.tensor_spec import allocate_output_spec
+from optima.tensor_spec import (
+    allocate_output_spec,
+    tensor_storage_binding,
+    validate_output_allocation,
+    validate_tensor_binding,
+)
 
 
 @dataclass
@@ -329,7 +334,17 @@ def _clone_tensor_inputs(inputs: dict) -> dict:
     }
 
 
-def _input_mutation_detail(actual: dict, trusted: dict) -> str:
+def _input_bindings(inputs: dict) -> dict:
+    """Retain exact pre-candidate tensor/storage identities by input name."""
+
+    return {
+        name: tensor_storage_binding(value)
+        for name, value in inputs.items()
+        if torch.is_tensor(value)
+    }
+
+
+def _input_mutation_detail(actual: dict, trusted: dict, bindings: dict) -> str:
     """Return the first tensor input changed by candidate code, else ``""``."""
 
     for name, expected in trusted.items():
@@ -338,6 +353,13 @@ def _input_mutation_detail(actual: dict, trusted: dict) -> str:
         value = actual.get(name)
         if not torch.is_tensor(value):
             return f"input {name!r} ceased to be a tensor"
+        binding = bindings.get(name)
+        if binding is None:
+            return f"input {name!r} has no validator-owned binding"
+        try:
+            validate_tensor_binding(value, binding, name=f"input {name!r}")
+        except ValueError as exc:
+            return str(exc)
         if (value.shape != expected.shape or value.dtype != expected.dtype
                 or value.device != expected.device):
             return f"input {name!r} metadata changed"
@@ -346,7 +368,7 @@ def _input_mutation_detail(actual: dict, trusted: dict) -> str:
     return ""
 
 
-def _restore_tensor_inputs(actual: dict, trusted: dict) -> None:
+def _restore_tensor_inputs(actual: dict, trusted: dict, bindings: dict) -> None:
     """Copy trusted values into the original tensor objects captured by CUDA graphs."""
 
     with torch.no_grad():
@@ -356,6 +378,10 @@ def _restore_tensor_inputs(actual: dict, trusted: dict) -> None:
             value = actual.get(name)
             if not torch.is_tensor(value):
                 raise RuntimeError(f"input {name!r} ceased to be a tensor")
+            binding = bindings.get(name)
+            if binding is None:
+                raise RuntimeError(f"input {name!r} has no validator-owned binding")
+            validate_tensor_binding(value, binding, name=f"input {name!r}")
             if (value.shape != expected.shape or value.dtype != expected.dtype
                     or value.device != expected.device):
                 raise RuntimeError(f"input {name!r} metadata changed")
@@ -397,14 +423,18 @@ def _verify_graph_replays(
     slot: SlotSpec,
     entry: Callable[..., None],
     inputs: dict,
-    outs: list[torch.Tensor],
+    output_contract,
+    allocation,
     prepared,
     trusted_inputs: dict,
+    input_bindings: dict,
     replay_cases: list[_GraphReplayCase],
     *,
     tol,
     replay_count: int = _DEFAULT_GRAPH_REPLAYS,
     backend: Optional[_GraphBackend] = None,
+    fallback_dtype: torch.dtype,
+    fallback_device: str | torch.device,
 ) -> _GraphCheck:
     """Capture the candidate once and grade multiple genuine graph replays.
 
@@ -416,16 +446,27 @@ def _verify_graph_replays(
         raise ValueError("CUDA graph verification requires at least two replays")
     if len(replay_cases) != replay_count:
         raise ValueError("one fresh trusted case is required per graph replay")
+    outs = allocation.outputs
     graph_backend = backend or _CudaGraphBackend(outs[0].device)
 
     def invoke() -> None:
         slot.invoke_entry(entry, inputs, outs, prepared)
 
+    def validate_outputs() -> None:
+        validate_output_allocation(
+            output_contract,
+            allocation,
+            fallback_dtype=fallback_dtype,
+            fallback_device=fallback_device,
+            inputs=(value for value in inputs.values() if torch.is_tensor(value)),
+        )
+
     try:
-        _restore_tensor_inputs(inputs, trusted_inputs)
+        _restore_tensor_inputs(inputs, trusted_inputs, input_bindings)
         graph_backend.warmup(invoke)
         graph_backend.synchronize()
-        mutation = _input_mutation_detail(inputs, trusted_inputs)
+        validate_outputs()
+        mutation = _input_mutation_detail(inputs, trusted_inputs, input_bindings)
         if mutation:
             raise RuntimeError(mutation)
     except Exception as exc:  # noqa: BLE001 - candidate warmup failure is a verdict
@@ -435,10 +476,11 @@ def _verify_graph_replays(
             0,
         )
     try:
-        _restore_tensor_inputs(inputs, trusted_inputs)
+        _restore_tensor_inputs(inputs, trusted_inputs, input_bindings)
         graph = graph_backend.capture(invoke)
         graph_backend.synchronize()
-        mutation = _input_mutation_detail(inputs, trusted_inputs)
+        validate_outputs()
+        mutation = _input_mutation_detail(inputs, trusted_inputs, input_bindings)
         if mutation:
             raise RuntimeError(mutation)
     except Exception as exc:  # noqa: BLE001 - a graph_safe claim must actually capture
@@ -455,14 +497,15 @@ def _verify_graph_replays(
     completed = 0
     for replay, case in enumerate(replay_cases):
         try:
-            _restore_tensor_inputs(inputs, case.inputs)
+            _restore_tensor_inputs(inputs, case.inputs, input_bindings)
             _poison_outputs(outs, replay)
             # Be explicit about the poison-before-replay happens-before edge.  This
             # is a correctness gate, not a benchmark; the synchronization is desired.
             graph_backend.synchronize()
             graph_backend.replay(graph)
             graph_backend.synchronize()
-            mutation = _input_mutation_detail(inputs, case.inputs)
+            validate_outputs()
+            mutation = _input_mutation_detail(inputs, case.inputs, input_bindings)
             if mutation:
                 raise RuntimeError(mutation)
         except Exception as exc:  # noqa: BLE001 - replay failure is a failed claim
@@ -973,6 +1016,7 @@ def verify_entry(
         # still diagnostic (the candidate shares this worker process); pristine-T in
         # qualification is the eventual external authority.
         trusted_inputs = _clone_tensor_inputs(inputs)
+        input_bindings = _input_bindings(inputs)
         expected = [
             output.detach().clone()
             for output in _as_list(slot.invoke_reference(trusted_inputs))
@@ -1009,8 +1053,9 @@ def verify_entry(
         # Allocate from the same typed contract used by the live arena binding.
         # Legacy slots resolve ``out_shapes`` to inherited-dtype contiguous tensors,
         # exactly preserving their historical behavior.
+        output_contract = slot.output_contract(inputs)
         allocation = allocate_output_spec(
-            slot.output_contract(inputs),
+            output_contract,
             fallback_dtype=dtype,
             fallback_device=device,
             inputs=(v for v in inputs.values() if torch.is_tensor(v)),
@@ -1037,11 +1082,20 @@ def verify_entry(
                         f"slot {slot.name!r} is a (prepare, forward) slot but no 'prepare' callable was provided"
                     )
                 prepared = slot.invoke_prepare(prepare, inputs)  # runs the miner's weight-prep
-                mutation = _input_mutation_detail(inputs, trusted_inputs)
+                mutation = _input_mutation_detail(
+                    inputs, trusted_inputs, input_bindings
+                )
                 if mutation:
                     raise RuntimeError(f"prepare {mutation}")
             slot.invoke_entry(entry, inputs, outs, prepared)
-            mutation = _input_mutation_detail(inputs, trusted_inputs)
+            validate_output_allocation(
+                output_contract,
+                allocation,
+                fallback_dtype=dtype,
+                fallback_device=device,
+                inputs=(value for value in inputs.values() if torch.is_tensor(value)),
+            )
+            mutation = _input_mutation_detail(inputs, trusted_inputs, input_bindings)
             if mutation:
                 raise RuntimeError(mutation)
         except Exception as exc:  # noqa: BLE001 - report kernel failure as a fail
@@ -1066,9 +1120,11 @@ def verify_entry(
         # error.  Every eager-correct graph-required GPU shape must capture and replay.
         if passed and graph_required and graph_capable_run:
             graph = _verify_graph_replays(
-                slot, entry, inputs, outs, prepared, trusted_inputs, replay_cases,
+                slot, entry, inputs, output_contract, allocation, prepared,
+                trusted_inputs, input_bindings, replay_cases,
                 tol=tol,
                 replay_count=graph_replays, backend=_graph_backend,
+                fallback_dtype=dtype, fallback_device=device,
             )
             checked_replays = graph.replays
             passed = passed and graph.check.passed

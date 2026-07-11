@@ -23,10 +23,19 @@ def events(monkeypatch):
         lambda slot, exc: fallbacks.append((slot, type(exc).__name__)),
     )
     monkeypatch.setattr(dispatch._audit, "sampled", lambda: False)
+    monkeypatch.setattr(dispatch, "_moe_data_parallel_world_size", lambda: 1)
     return completed, fallbacks
 
 
-def _registry(slot, entry, *, prepare=None, graph_safe=False, strict=False):
+def _registry(
+    slot,
+    entry,
+    *,
+    prepare=None,
+    graph_safe=False,
+    strict=False,
+    dtype="float32",
+):
     registry = KernelRegistry()
     registry.register(
         KernelImpl(
@@ -35,7 +44,7 @@ def _registry(slot, entry, *, prepare=None, graph_safe=False, strict=False):
             entry=entry,
             prepare=prepare,
             eligibility=Eligibility(
-                dtypes=frozenset({"float32"}), graph_safe=graph_safe
+                dtypes=frozenset({dtype}), graph_safe=graph_safe
             ),
         )
     )
@@ -235,6 +244,7 @@ def test_moe_selected_audit_prelude_failure_is_fallback(events, monkeypatch):
 def test_allreduce_dispatcher_receipts_and_topology_skip(events, monkeypatch):
     completed, fallbacks = events
     monkeypatch.setenv("OPTIMA_COLLECTIVE_SEAM", "1")
+    monkeypatch.setattr(dispatch, "_allreduce_group_role", lambda *_args: "tp")
     x = torch.randn(2, 4)
 
     def good_entry(inp, out, _group):
@@ -244,16 +254,19 @@ def test_allreduce_dispatcher_receipts_and_topology_skip(events, monkeypatch):
         lambda *_a, **_k: "stock",
         registry=_registry("collective.all_reduce", good_entry),
     )
-    coordinator = SimpleNamespace(world_size=2, device_group=object())
+    coordinator = SimpleNamespace(
+        world_size=2, device_group=SimpleNamespace(size=lambda: 2)
+    )
     assert torch.is_tensor(good(coordinator, x))
     bad = dispatch.make_allreduce_dispatcher(
         lambda *_a, **_k: "stock",
         registry=_registry("collective.all_reduce", _boom),
     )
-    assert bad(coordinator, x) == "stock"
+    with pytest.raises(RuntimeError, match="candidate path failed"):
+        bad(coordinator, x)
     assert good(SimpleNamespace(world_size=1, device_group=object()), x) == "stock"
     assert completed == ["collective.all_reduce"]
-    assert fallbacks == [("collective.all_reduce", "RuntimeError")]
+    assert fallbacks == []
 
 
 def _fusion_baseline(x, residual, *_args, **_kwargs):
@@ -263,9 +276,9 @@ def _fusion_baseline(x, residual, *_args, **_kwargs):
 def test_shallow_and_deep_fusion_receipts(events, monkeypatch):
     completed, fallbacks = events
     monkeypatch.setenv("OPTIMA_ARFUSION_SEAM", "1")
-    monkeypatch.setattr(
-        dispatch, "_arfusion_group", lambda _use_attn: SimpleNamespace(size=lambda: 2)
-    )
+    group = SimpleNamespace(size=lambda: 2)
+    monkeypatch.setattr(dispatch, "_arfusion_group", lambda _use_attn: group)
+    monkeypatch.setattr(dispatch, "_arfusion_group_role", lambda _use_attn: "tp")
     x = torch.randn(2, 4)
     residual = torch.randn(2, 4)
     weight = torch.ones(4)
@@ -283,18 +296,20 @@ def test_shallow_and_deep_fusion_receipts(events, monkeypatch):
         _fusion_baseline,
         registry=_registry("collective.ar_residual_rmsnorm", _boom),
     )
-    assert shallow_bad(x, residual, weight)[0] == "stock"
+    with pytest.raises(RuntimeError, match="candidate path failed"):
+        shallow_bad(x, residual, weight)
 
-    exp = {"T": 2}
+    deep_x = torch.randn(2, 4, dtype=torch.bfloat16)
+    deep_residual = torch.randn(2, 4, dtype=torch.bfloat16)
+    deep_weight = torch.ones(4, dtype=torch.bfloat16)
     monkeypatch.setattr(dispatch._moe_export, "has_pends", lambda: True)
-    monkeypatch.setattr(dispatch._moe_export, "consume", lambda _x: exp)
     monkeypatch.setattr(
         dispatch._moe_export,
         "export_views",
         lambda _exp, _device: (
-            torch.randn(2, 4),
-            torch.zeros(2, dtype=torch.long),
-            torch.ones(2),
+            torch.randn(2, 4, dtype=torch.bfloat16),
+            torch.zeros(2, dtype=torch.int32),
+            torch.ones(2, 1, dtype=torch.float32),
         ),
     )
     monkeypatch.setattr(dispatch._moe_export, "trusted_finalize", lambda _exp, inp: inp)
@@ -307,25 +322,54 @@ def test_shallow_and_deep_fusion_receipts(events, monkeypatch):
         out_norm.copy_(residual)
         out_residual.copy_(residual)
 
-    deep = dispatch.make_arfusion_dispatcher(
-        _fusion_baseline,
-        registry=_registry("collective.moe_finalize_ar_rmsnorm", deep_entry),
+    deep_registry = _registry(
+        "collective.moe_finalize_ar_rmsnorm", deep_entry, dtype="bfloat16"
     )
-    assert torch.is_tensor(deep(x, residual, weight)[0])
+    deep = dispatch.make_arfusion_dispatcher(
+        _fusion_baseline, registry=deep_registry
+    )
+    deep_impl = deep_registry.variants("collective.moe_finalize_ar_rmsnorm")[0]
+    deep_descriptor = dispatch._collective_call_descriptor(
+        deep_x, group_size=2, exp_tokens=2, top_k=1, ep_size=1
+    )
+    exp = {
+        "T": 2,
+        "K": 1,
+        "hid": 4,
+        "selection": dispatch._moe_export.DeepSelection(
+            deep_impl,
+            deep_descriptor,
+            dispatch._moe_export.group_topology(group),
+        ),
+    }
+    monkeypatch.setattr(dispatch._moe_export, "consume", lambda _x: exp)
+    assert torch.is_tensor(deep(deep_x, deep_residual, deep_weight)[0])
+
+    deep_bad_registry = _registry(
+        "collective.moe_finalize_ar_rmsnorm", _boom, dtype="bfloat16"
+    )
     deep_bad = dispatch.make_arfusion_dispatcher(
         _fusion_baseline,
-        registry=_registry("collective.moe_finalize_ar_rmsnorm", _boom),
+        registry=deep_bad_registry,
     )
-    assert deep_bad(x, residual, weight)[0] == "stock"
+    bad_impl = deep_bad_registry.variants("collective.moe_finalize_ar_rmsnorm")[0]
+    bad_exp = {
+        **exp,
+        "selection": dispatch._moe_export.DeepSelection(
+            bad_impl,
+            deep_descriptor,
+            dispatch._moe_export.group_topology(group),
+        ),
+    }
+    monkeypatch.setattr(dispatch._moe_export, "consume", lambda _x: bad_exp)
+    with pytest.raises(RuntimeError, match="candidate path failed"):
+        deep_bad(deep_x, deep_residual, deep_weight)
 
     assert completed == [
         "collective.ar_residual_rmsnorm",
         "collective.moe_finalize_ar_rmsnorm",
     ]
-    assert fallbacks == [
-        ("collective.ar_residual_rmsnorm", "RuntimeError"),
-        ("collective.moe_finalize_ar_rmsnorm", "RuntimeError"),
-    ]
+    assert fallbacks == []
 
 
 def test_deep_trusted_recovery_is_not_candidate_fallback(events, monkeypatch):
@@ -336,7 +380,7 @@ def test_deep_trusted_recovery_is_not_candidate_fallback(events, monkeypatch):
     registry = KernelRegistry()
     registry.enable()
     result = dispatch._deep_consume(
-        {"T": 2},
+        {"T": 2, "K": 1, "hid": 4},
         torch.randn(2, 4),
         torch.randn(2, 4),
         torch.ones(4),
@@ -375,7 +419,7 @@ def test_deep_failed_recovery_does_not_claim_stock_was_served(events, monkeypatc
     registry = _registry("collective.moe_finalize_ar_rmsnorm", _boom)
     with pytest.raises(ValueError, match="recovery failed"):
         dispatch._deep_consume(
-            {"T": 2},
+            {"T": 2, "K": 1, "hid": 4},
             torch.randn(2, 4),
             torch.randn(2, 4),
             torch.ones(4),

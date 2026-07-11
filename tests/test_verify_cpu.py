@@ -201,6 +201,71 @@ def test_candidate_may_not_mutate_validator_inputs():
     assert "input 'x' was mutated" in result.shape_results[0].detail
 
 
+def test_candidate_may_not_rebind_validator_inputs_to_equal_storage():
+    slot = get_slot("activation.silu_and_mul")
+
+    def rebinding(x, out):
+        replacement = x.detach().clone()
+        x.set_(replacement)
+        _faithful_silu(x, out)
+
+    result = verify_entry(
+        slot,
+        rebinding,
+        dtype=torch.float32,
+        device="cpu",
+        seed=0,
+        shapes=[{"num_tokens": 2, "d": 8}],
+        graph_safe=False,
+    )
+
+    assert not result.passed
+    assert "validator-owned storage/tensor binding" in result.shape_results[0].detail
+
+
+def test_candidate_may_not_replace_validator_output_storage():
+    slot = get_slot("activation.silu_and_mul")
+
+    def replacing(x, out):
+        replacement = torch.empty_like(out)
+        out.set_(replacement)
+        _faithful_silu(x, out)
+
+    result = verify_entry(
+        slot,
+        replacing,
+        dtype=torch.float32,
+        device="cpu",
+        seed=0,
+        shapes=[{"num_tokens": 2, "d": 8}],
+        graph_safe=False,
+    )
+
+    assert not result.passed
+    assert "validator-owned storage" in result.shape_results[0].detail
+
+
+def test_candidate_may_not_change_validator_output_strides():
+    slot = get_slot("activation.silu_and_mul")
+
+    def restriding(x, out):
+        out.as_strided_(out.shape, (1, out.shape[0]))
+        _faithful_silu(x, out)
+
+    result = verify_entry(
+        slot,
+        restriding,
+        dtype=torch.float32,
+        device="cpu",
+        seed=0,
+        shapes=[{"num_tokens": 2, "d": 8}],
+        graph_safe=False,
+    )
+
+    assert not result.passed
+    assert "validator-owned storage/tensor binding" in result.shape_results[0].detail
+
+
 def test_one_loaded_entry_cannot_cache_first_captured_shape():
     slot = get_slot("activation.silu_and_mul")
     backend = _FakeGraphBackend()

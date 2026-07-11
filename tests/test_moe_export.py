@@ -15,6 +15,7 @@ import pytest
 import torch
 
 from optima import moe_export
+from optima.capabilities import collective_call_descriptor
 from optima.dispatch import make_arfusion_dispatcher
 from optima.registry import Eligibility, KernelImpl, KernelRegistry
 
@@ -105,24 +106,57 @@ class _FakeRaw:
         return self.export
 
 
-def _deep_registry(**elig):
+class _FakeGroup:
+    def __init__(self, size=2):
+        self._size = size
+
+    def size(self):
+        return self._size
+
+
+def _deep_registry(*, entry=None, variant="default", **elig):
     reg = KernelRegistry()
     reg.register(KernelImpl(
-        slot=DEEP, bundle_id="t", entry=lambda *a: None,
-        eligibility=Eligibility(dtypes=frozenset({"float32"}), **elig)))
+        slot=DEEP,
+        bundle_id="t",
+        entry=entry or (lambda *a: None),
+        variant=variant,
+        eligibility=Eligibility(dtypes=frozenset({"bfloat16"}), **elig),
+    ))
     reg.enable()
     return reg
 
 
-def _armed(monkeypatch, raw, *, n_layers=4, ordinal=1):
+def _export_kwargs(*, t=64, h=32, k=5, num_experts=8, output=None,
+                   tp_size=2, ep_size=1):
+    output = output if output is not None else torch.zeros(t, h, dtype=torch.bfloat16)
+    return output, {
+        "input": torch.zeros(t, h, dtype=torch.bfloat16),
+        "token_selected_experts": torch.zeros(t, k, dtype=torch.int32),
+        "token_final_scales": torch.ones(t, k, dtype=torch.float32),
+        "fc1_expert_weights": torch.zeros(num_experts, 1, dtype=torch.int64),
+        "tp_size": tp_size,
+        "ep_size": ep_size,
+        "output": output,
+    }
+
+
+def _armed(monkeypatch, raw, *, n_layers=4, ordinal=1, group=None):
+    import optima.dispatch as dispatch
+
+    group = group or _FakeGroup()
     monkeypatch.setattr(moe_export, "_input_ok",
                         lambda inp: torch.is_tensor(inp) and inp.dim() == 2)
+    monkeypatch.setattr(dispatch, "_arfusion_group", lambda _use_attn: group)
+    monkeypatch.setattr(dispatch, "_arfusion_group_role", lambda _use_attn: "tp")
+    monkeypatch.setattr(dispatch, "_moe_data_parallel_world_size", lambda: 1)
     moe_export._state["raw"] = raw
     # A non-last layer of a known-depth model (the last-layer veto needs both:
     # ordinal % n_layers == 0 means no successor prepare_attn will consume).
     moe_export._state["n_layers"] = n_layers
     moe_export._state["ordinal"] = ordinal
     moe_export.record_fuse_decision(True)
+    return group
 
 
 def _orig_recorder(calls, out):
@@ -133,18 +167,56 @@ def _orig_recorder(calls, out):
 
 
 def test_export_arms_skip_and_pends_by_output_ptr(monkeypatch):
-    out = torch.zeros(64, 32)
+    out, kwargs = _export_kwargs()
     raw = _FakeRaw(export=(1, 111, 222, 333, 64, 32, 32, 5, 16))
-    _armed(monkeypatch, raw)
+    group = _armed(monkeypatch, raw)
     calls = []
-    ret = moe_export.maybe_export(_orig_recorder(calls, out),
-                                  (None, torch.zeros(64, 32)), {},
-                                  registry=_deep_registry())
+    reg = _deep_registry()
+    ret = moe_export.maybe_export(_orig_recorder(calls, out), (), kwargs,
+                                  registry=reg)
     assert ret is out and len(calls) == 1
     assert raw.skip == [True, False]  # armed strictly around the call
     pend = moe_export._state["pends"][out.data_ptr()]
-    assert pend == {"g2": 111, "idx": 222, "scl": 333, "T": 64, "K": 5, "hid": 32}
+    assert {key: pend[key] for key in ("g2", "idx", "scl", "T", "K", "hid")} == {
+        "g2": 111, "idx": 222, "scl": 333, "T": 64, "K": 5, "hid": 32,
+    }
+    selection = pend["selection"]
+    assert isinstance(selection, moe_export.DeepSelection)
+    assert selection.impl is reg.variants(DEEP)[0]
+    assert selection.topology == moe_export.group_topology(group)
+    assert selection.descriptor.as_dict().items() >= {
+        "dtype": "bfloat16", "num_tokens": 64, "exp_tokens": 64,
+        "top_k": 5, "hidden_dim": 32,
+        "world_size": 2, "tp_size": 2, "ep_size": 1,
+    }.items()
     assert moe_export._state["exports"] == 1
+
+
+def test_cpu_export_double_does_not_claim_host_cuda_architecture(monkeypatch):
+    import optima.dispatch as dispatch
+
+    out, kwargs = _export_kwargs()
+    _armed(monkeypatch, _FakeRaw(export=(1, 1, 2, 3, 64, 32, 32, 5, 16)))
+    monkeypatch.setattr(dispatch, "_arch_tag", lambda _device=0: "sm120")
+
+    moe_export.maybe_export(
+        _orig_recorder([], out), (), kwargs, registry=_deep_registry()
+    )
+
+    descriptor = moe_export._state["pends"][out.data_ptr()]["selection"].descriptor
+    assert "architecture" not in descriptor
+
+
+def test_export_preflight_writes_no_fired_receipt(monkeypatch, tmp_path):
+    from optima import registry as registry_mod
+
+    monkeypatch.setenv("OPTIMA_SEAM_RECEIPT_DIR", str(tmp_path))
+    monkeypatch.setattr(registry_mod, "_FIRED_SLOTS", set())
+    out, kwargs = _export_kwargs()
+    _armed(monkeypatch, _FakeRaw(export=(1, 1, 2, 3, 64, 32, 32, 5, 16)))
+    moe_export.maybe_export(_orig_recorder([], out), (), kwargs,
+                            registry=_deep_registry())
+    assert not list(tmp_path.glob("fired*"))
 
 
 def test_no_defer_means_stock_and_no_skip(monkeypatch):
@@ -152,8 +224,8 @@ def test_no_defer_means_stock_and_no_skip(monkeypatch):
     monkeypatch.setattr(moe_export, "_input_ok", lambda inp: True)
     moe_export._state["raw"] = raw
     calls = []
-    moe_export.maybe_export(_orig_recorder(calls, torch.zeros(2)),
-                            (None, torch.zeros(64, 32)), {},
+    out, kwargs = _export_kwargs()
+    moe_export.maybe_export(_orig_recorder(calls, out), (), kwargs,
                             registry=_deep_registry())
     assert len(calls) == 1 and raw.skip == []
 
@@ -163,8 +235,8 @@ def test_defer_decision_consumed_even_when_gates_fail(monkeypatch):
     # or a later unrelated moe call would inherit a stale True.
     _armed(monkeypatch, _FakeRaw())
     calls = []
-    moe_export.maybe_export(_orig_recorder(calls, torch.zeros(2)),
-                            (None, torch.zeros(64, 32)), {"ep_size": 2},
+    out, kwargs = _export_kwargs(ep_size=2)
+    moe_export.maybe_export(_orig_recorder(calls, out), (), kwargs,
                             registry=_deep_registry())
     assert len(calls) == 1
     assert not moe_export._consume_will_defer()
@@ -175,43 +247,64 @@ def test_min_num_tokens_gates_the_export_side(monkeypatch):
     raw = _FakeRaw(export=(1, 1, 2, 3, 8, 32, 32, 5, 16))
     _armed(monkeypatch, raw)
     calls = []
-    moe_export.maybe_export(_orig_recorder(calls, torch.zeros(8, 32)),
-                            (None, torch.zeros(8, 32)), {},
+    out, kwargs = _export_kwargs(t=8)
+    moe_export.maybe_export(_orig_recorder(calls, out), (), kwargs,
                             registry=_deep_registry(min_num_tokens=48))
     assert len(calls) == 1 and raw.skip == [] and not moe_export._state["pends"]
+
+
+@pytest.mark.parametrize("dp_size", (None, 2))
+def test_moe_data_parallel_export_never_arms(monkeypatch, dp_size):
+    import optima.dispatch as dispatch
+
+    raw = _FakeRaw(export=(1, 1, 2, 3, 64, 32, 32, 5, 16))
+    _armed(monkeypatch, raw)
+    monkeypatch.setattr(
+        dispatch, "_moe_data_parallel_world_size", lambda: dp_size
+    )
+    calls = []
+    out, kwargs = _export_kwargs()
+
+    moe_export.maybe_export(
+        _orig_recorder(calls, out), (), kwargs, registry=_deep_registry()
+    )
+
+    assert len(calls) == 1
+    assert raw.skip == []
+    assert not moe_export._state["pends"]
 
 
 def test_unchanged_seq_means_finalize_fused_tactic_no_pend(monkeypatch):
     raw = _FakeRaw(export=(0, 1, 2, 3, 64, 32, 32, 5, 16))  # seq stays 0
     _armed(monkeypatch, raw)
-    out = torch.zeros(64, 32)
-    moe_export.maybe_export(_orig_recorder([], out), (None, torch.zeros(64, 32)), {},
+    out, kwargs = _export_kwargs()
+    moe_export.maybe_export(_orig_recorder([], out), (), kwargs,
                             registry=_deep_registry())
     assert raw.skip == [True, False] and not moe_export._state["pends"]
 
 
-def test_export_abi_mismatch_raises(monkeypatch):
-    # rows != T: the output is unfinalized and unrecoverable — refuse loudly.
-    raw = _FakeRaw(export=(1, 1, 2, 3, 63, 32, 32, 5, 16))
+def test_export_raw_k_mismatch_raises(monkeypatch):
+    # Preflight observed K=5; raw K=4 after skip means the output is unfinalized
+    # under a different ABI and must never escape to the model.
+    raw = _FakeRaw(export=(1, 1, 2, 3, 64, 32, 32, 4, 16))
     _armed(monkeypatch, raw)
+    out, kwargs = _export_kwargs(k=5)
     with pytest.raises(RuntimeError, match="export ABI mismatch"):
-        moe_export.maybe_export(_orig_recorder([], torch.zeros(64, 32)),
-                                (None, torch.zeros(64, 32)), {},
+        moe_export.maybe_export(_orig_recorder([], out), (), kwargs,
                                 registry=_deep_registry())
 
 
 def test_output_ptr_reuse_within_forward_raises(monkeypatch):
-    out = torch.zeros(64, 32)
+    out, kwargs = _export_kwargs()
     raw = _FakeRaw(export=(1, 1, 2, 3, 64, 32, 32, 5, 16))
     _armed(monkeypatch, raw)
     reg = _deep_registry()
-    moe_export.maybe_export(_orig_recorder([], out), (None, torch.zeros(64, 32)), {},
+    moe_export.maybe_export(_orig_recorder([], out), (), kwargs,
                             registry=reg)
     raw.export = (2, 1, 2, 3, 64, 32, 32, 5, 16)
     moe_export.record_fuse_decision(True)
     with pytest.raises(RuntimeError, match="reused before its export was consumed"):
-        moe_export.maybe_export(_orig_recorder([], out), (None, torch.zeros(64, 32)),
-                                {}, registry=reg)
+        moe_export.maybe_export(_orig_recorder([], out), (), kwargs, registry=reg)
 
 
 def test_missing_export_abi_disables_permanently(monkeypatch):
@@ -222,14 +315,13 @@ def test_missing_export_abi_disables_permanently(monkeypatch):
         raise AttributeError("fe_set_skip_finalize missing (stock build)")
     monkeypatch.setattr(moe_export, "_raw_module", no_abi)
     calls = []
-    moe_export.maybe_export(_orig_recorder(calls, torch.zeros(2)),
-                            (None, torch.zeros(64, 32)), {},
+    out, kwargs = _export_kwargs()
+    moe_export.maybe_export(_orig_recorder(calls, out), (), kwargs,
                             registry=_deep_registry())
     assert len(calls) == 1 and moe_export._state["disabled"]
     # disabled short-circuits every later call
     moe_export.record_fuse_decision(True)
-    moe_export.maybe_export(_orig_recorder(calls, torch.zeros(2)),
-                            (None, torch.zeros(64, 32)), {},
+    moe_export.maybe_export(_orig_recorder(calls, out), (), kwargs,
                             registry=_deep_registry())
     assert len(calls) == 2
 
@@ -239,8 +331,8 @@ def test_tuning_mode_never_arms(monkeypatch):
     raw = _FakeRaw(export=(1, 1, 2, 3, 64, 32, 32, 5, 16))
     _armed(monkeypatch, raw)
     monkeypatch.setattr(moe_export, "_tuning", lambda: True)
-    moe_export.maybe_export(_orig_recorder([], torch.zeros(64, 32)),
-                            (None, torch.zeros(64, 32)), {},
+    out, kwargs = _export_kwargs()
+    moe_export.maybe_export(_orig_recorder([], out), (), kwargs,
                             registry=_deep_registry())
     assert raw.skip == []
 
@@ -253,8 +345,8 @@ def test_last_layer_never_arms(monkeypatch):
     raw = _FakeRaw(export=(1, 1, 2, 3, 64, 32, 32, 5, 16))
     _armed(monkeypatch, raw, n_layers=4, ordinal=4)
     calls = []
-    moe_export.maybe_export(_orig_recorder(calls, torch.zeros(64, 32)),
-                            (None, torch.zeros(64, 32)), {},
+    out, kwargs = _export_kwargs()
+    moe_export.maybe_export(_orig_recorder(calls, out), (), kwargs,
                             registry=_deep_registry())
     assert len(calls) == 1 and raw.skip == [] and not moe_export._state["pends"]
     assert moe_export._state["last_layer_vetoes"] == 1
@@ -269,16 +361,14 @@ def test_last_layer_veto_is_modulo_for_capture_multipass(monkeypatch):
     # mid-stack ordinals in later passes still arm.
     raw = _FakeRaw(export=(1, 1, 2, 3, 64, 32, 32, 5, 16))
     _armed(monkeypatch, raw, n_layers=4, ordinal=8)  # pass 2's last layer
-    moe_export.maybe_export(_orig_recorder([], torch.zeros(64, 32)),
-                            (None, torch.zeros(64, 32)), {},
+    out, kwargs = _export_kwargs()
+    moe_export.maybe_export(_orig_recorder([], out), (), kwargs,
                             registry=_deep_registry())
     assert raw.skip == [] and moe_export._state["last_layer_vetoes"] == 1
 
-    out = torch.zeros(64, 32)
     moe_export._state["ordinal"] = 10  # pass 3, layer 2: mid-stack, safe
     moe_export.record_fuse_decision(True)
-    moe_export.maybe_export(_orig_recorder([], out),
-                            (None, torch.zeros(64, 32)), {},
+    moe_export.maybe_export(_orig_recorder([], out), (), kwargs,
                             registry=_deep_registry())
     assert raw.skip == [True, False] and out.data_ptr() in moe_export._state["pends"]
 
@@ -290,8 +380,8 @@ def test_unresolvable_layer_count_disables(monkeypatch):
     _armed(monkeypatch, raw, n_layers=0)  # unresolved
     monkeypatch.setattr(moe_export, "_num_layers", lambda: None)
     calls = []
-    moe_export.maybe_export(_orig_recorder(calls, torch.zeros(64, 32)),
-                            (None, torch.zeros(64, 32)), {},
+    out, kwargs = _export_kwargs()
+    moe_export.maybe_export(_orig_recorder(calls, out), (), kwargs,
                             registry=_deep_registry())
     assert len(calls) == 1 and raw.skip == [] and moe_export._state["disabled"]
 
@@ -336,14 +426,49 @@ def test_num_layers_disables_under_real_speculative(monkeypatch, tmp_path):
 # ---- dispatcher deep consume branch ---------------------------------------------
 
 
-def _pend(t=64, k=5, hid=32):
-    return {"g2": 1, "idx": 2, "scl": 3, "T": t, "K": k, "hid": hid}
+def _producer_descriptor(*, t=64, k=5, hid=32, group):
+    return collective_call_descriptor(
+        dtype="bfloat16",
+        architecture=None,
+        graph_mode="eager",
+        world_size=group.size(),
+        dimensions={
+            "ep_size": 1,
+            "num_tokens": t,
+            "exp_tokens": t,
+            "top_k": k,
+            "hidden_dim": hid,
+            "last_dim": hid,
+        },
+    )
+
+
+def _pend(*, registry=None, group=None, t=64, k=5, hid=32):
+    pend = {"g2": 1, "idx": 2, "scl": 3, "T": t, "K": k, "hid": hid}
+    if registry is not None and group is not None:
+        descriptor = _producer_descriptor(t=t, k=k, hid=hid, group=group)
+        impl = registry.select(DEEP, descriptor, write_fired_receipt=False).impl
+        assert impl is not None
+        pend["selection"] = moe_export.DeepSelection(
+            impl=impl,
+            descriptor=descriptor,
+            topology=moe_export.group_topology(group),
+        )
+    return pend
+
+
+def _produce_pend(monkeypatch, registry, group, *, t=64, k=5, hid=32):
+    out, kwargs = _export_kwargs(t=t, h=hid, k=k, tp_size=group.size())
+    raw = _FakeRaw(export=(1, 1, 2, 3, t, hid, hid, k, 16))
+    _armed(monkeypatch, raw, group=group)
+    moe_export.maybe_export(_orig_recorder([], out), (), kwargs, registry=registry)
+    return out, moe_export._state["pends"][out.data_ptr()]
 
 
 def _views_for(pend, seed=0):
     g = torch.Generator().manual_seed(seed)
     rows = pend["T"] * pend["K"]
-    gemm = torch.randn(rows, pend["hid"], generator=g) * 0.1
+    gemm = (torch.randn(rows, pend["hid"], generator=g) * 0.1).to(torch.bfloat16)
     row_map = torch.randperm(rows, generator=g).to(torch.int32)
     scales = (torch.rand(pend["T"], pend["K"], generator=g) + 0.1) / pend["K"]
     return gemm, row_map, scales
@@ -363,13 +488,7 @@ def _deep_entry_recorder(record):
 
 
 def _dual_registry(record, **deep_elig):
-    reg = KernelRegistry()
-    reg.register(KernelImpl(slot=DEEP, bundle_id="t",
-                            entry=_deep_entry_recorder(record),
-                            eligibility=Eligibility(dtypes=frozenset({"float32"}),
-                                                    **deep_elig)))
-    reg.enable()
-    return reg
+    return _deep_registry(entry=_deep_entry_recorder(record), **deep_elig)
 
 
 def _baseline_recorder(calls):
@@ -385,95 +504,143 @@ def _baseline_recorder(calls):
 def _fake_group(monkeypatch):
     import optima.dispatch as dispatch
 
-    monkeypatch.setattr(dispatch, "_arfusion_group",
-                        lambda use_attn: SimpleNamespace(size=lambda: 2))
+    group = _FakeGroup()
+    monkeypatch.setattr(dispatch, "_arfusion_group", lambda _use_attn: group)
+    monkeypatch.setattr(dispatch, "_arfusion_group_role", lambda _use_attn: "tp")
+    monkeypatch.setattr(dispatch, "_moe_data_parallel_world_size", lambda: 1)
+    return group
 
 
-def test_consume_routes_pend_to_deep_kernel(monkeypatch, _fake_group):
+def test_matching_producer_consumer_identity_executes(monkeypatch, _fake_group):
     monkeypatch.setenv("OPTIMA_ARFUSION_SEAM", "1")
-    pend = _pend()
-    _stub_views(monkeypatch, _views_for(pend))
     record, base_calls = [], []
-    d = make_arfusion_dispatcher(_baseline_recorder(base_calls),
-                                 registry=_dual_registry(record))
-    x = torch.zeros(64, 32)
-    moe_export._state["pends"][x.data_ptr()] = pend
-    out_norm, out_residual = d(x, x.clone(), torch.ones(32))
+    reg = _dual_registry(record)
+    x, pend = _produce_pend(monkeypatch, reg, _fake_group)
+    _stub_views(monkeypatch, _views_for(pend))
+    d = make_arfusion_dispatcher(_baseline_recorder(base_calls), registry=reg)
+    out_norm, out_residual = d(x, x.clone(), torch.ones(32, dtype=x.dtype))
     assert record and base_calls == []
-    assert torch.equal(out_norm, torch.full((64, 32), 1.0))
-    assert torch.equal(out_residual, torch.full((64, 32), 2.0))
+    assert torch.equal(out_norm, torch.full_like(x, 1.0))
+    assert torch.equal(out_residual, torch.full_like(x, 2.0))
     assert not moe_export._state["pends"]  # popped exactly once
 
 
 def test_consume_head_trims_graph_padding(monkeypatch, _fake_group):
     # T_consume < T_export (CUDA-graph batch padding): full views, trimmed residual.
     monkeypatch.setenv("OPTIMA_ARFUSION_SEAM", "1")
-    pend = _pend(t=64)
-    _stub_views(monkeypatch, _views_for(pend))
     record = []
-    d = make_arfusion_dispatcher(_baseline_recorder([]),
-                                 registry=_dual_registry(record))
-    x = torch.zeros(48, 32)
-    moe_export._state["pends"][x.data_ptr()] = pend
-    d(x, x.clone(), torch.ones(32))
+    reg = _dual_registry(record, min_num_tokens=48)
+    full, pend = _produce_pend(monkeypatch, reg, _fake_group, t=64)
+    _stub_views(monkeypatch, _views_for(pend))
+    d = make_arfusion_dispatcher(_baseline_recorder([]), registry=reg)
+    x = full[:48]
+    d(x, x.clone(), torch.ones(32, dtype=x.dtype))
     assert record == [((320, 32), (48, 32))]  # 64*5 rows kept, residual trimmed
 
 
 def test_consume_more_rows_than_export_raises(monkeypatch, _fake_group):
     monkeypatch.setenv("OPTIMA_ARFUSION_SEAM", "1")
-    d = make_arfusion_dispatcher(_baseline_recorder([]),
-                                 registry=_dual_registry([]))
-    x = torch.zeros(65, 32)
-    moe_export._state["pends"][x.data_ptr()] = _pend(t=64)
-    with pytest.raises(RuntimeError, match="pointer pairing broken"):
-        d(x, x.clone(), torch.ones(32))
+    reg = _dual_registry([])
+    d = make_arfusion_dispatcher(_baseline_recorder([]), registry=reg)
+    x = torch.zeros(65, 32, dtype=torch.bfloat16)
+    moe_export._state["pends"][x.data_ptr()] = _pend(
+        registry=reg, group=_fake_group, t=64
+    )
+    with pytest.raises(RuntimeError, match="pairing broken"):
+        d(x, x.clone(), torch.ones(32, dtype=x.dtype))
 
 
 def test_orphan_pend_reconstructs_before_stock(monkeypatch, _fake_group):
     # Deep kernel ineligible at consume time -> the TRUSTED finalize must run and
     # the stock fusion call must receive the FINALIZED tensor, never the raw input.
     monkeypatch.setenv("OPTIMA_ARFUSION_SEAM", "1")
-    pend = _pend()
+    producer_reg = _deep_registry()
+    x, pend = _produce_pend(monkeypatch, producer_reg, _fake_group)
     views = _views_for(pend)
     _stub_views(monkeypatch, views)
     base_calls = []
     reg = KernelRegistry()  # no deep kernel registered
     reg.enable()
     d = make_arfusion_dispatcher(_baseline_recorder(base_calls), registry=reg)
-    x = torch.zeros(64, 32)
-    moe_export._state["pends"][x.data_ptr()] = pend
-    out = d(x, x.clone(), torch.ones(32))
+    out = d(x, x.clone(), torch.ones(32, dtype=x.dtype))
     assert out[0] == "baseline"
     gemm, row_map, scales = views
     per_k = gemm.float()[row_map.long().view(pend["K"], pend["T"])]
     expect = (per_k * scales.float().t().unsqueeze(-1)).sum(dim=0)
-    assert torch.allclose(base_calls[0], expect, atol=1e-5)
+    assert torch.equal(base_calls[0], expect.to(x.dtype))
     assert moe_export._state["orphans"] == 1
 
 
-def test_deep_kernel_error_falls_back_to_reconstruct(monkeypatch, _fake_group):
+def test_deep_kernel_error_hard_fails_candidate_engine(monkeypatch, _fake_group):
     monkeypatch.setenv("OPTIMA_ARFUSION_SEAM", "1")
-    pend = _pend()
-    _stub_views(monkeypatch, _views_for(pend))
 
     def boom(*a):
         raise RuntimeError("deep kernel exploded")
 
-    reg = KernelRegistry()
-    reg.register(KernelImpl(slot=DEEP, bundle_id="t", entry=boom,
-                            eligibility=Eligibility(dtypes=frozenset({"float32"}))))
-    reg.enable()
+    reg = _deep_registry(entry=boom)
+    x, pend = _produce_pend(monkeypatch, reg, _fake_group)
+    _stub_views(monkeypatch, _views_for(pend))
     base_calls = []
     d = make_arfusion_dispatcher(_baseline_recorder(base_calls), registry=reg)
-    x = torch.zeros(64, 32)
-    moe_export._state["pends"][x.data_ptr()] = pend
-    assert d(x, x.clone(), torch.ones(32))[0] == "baseline"
-    assert len(base_calls) == 1  # reconstruct path, not a bare fallthrough
-
-    reg.set_strict(True)
-    moe_export._state["pends"][x.data_ptr()] = _pend()
     with pytest.raises(RuntimeError, match="deep kernel exploded"):
-        d(x, x.clone(), torch.ones(32))
+        d(x, x.clone(), torch.ones(32, dtype=x.dtype))
+    assert base_calls == []
+    assert moe_export._state["orphans"] == 0
+
+
+def test_producer_variant_identity_blocks_head_trim_variant_switch(
+    monkeypatch, _fake_group
+):
+    monkeypatch.setenv("OPTIMA_ARFUSION_SEAM", "1")
+    calls = []
+    reg = KernelRegistry()
+    reg.register(KernelImpl(
+        slot=DEEP,
+        bundle_id="t",
+        variant="large",
+        entry=lambda *args: calls.append("large"),
+        eligibility=Eligibility(
+            dtypes=frozenset({"bfloat16"}), min_num_tokens=48,
+        ),
+    ))
+    reg.register(KernelImpl(
+        slot=DEEP,
+        bundle_id="t",
+        variant="small",
+        entry=lambda *args: calls.append("small"),
+        eligibility=Eligibility(
+            dtypes=frozenset({"bfloat16"}), max_num_tokens=47,
+        ),
+    ))
+    reg.enable()
+    full, pend = _produce_pend(monkeypatch, reg, _fake_group, t=64)
+    assert pend["selection"].impl.variant == "large"
+    _stub_views(monkeypatch, _views_for(pend))
+    base_calls = []
+    d = make_arfusion_dispatcher(_baseline_recorder(base_calls), registry=reg)
+    x = full[:32]
+    assert d(x, x.clone(), torch.ones(32, dtype=x.dtype))[0] == "baseline"
+    assert calls == []
+    assert len(base_calls) == 1 and moe_export._state["orphans"] == 1
+
+
+def test_consume_topology_mismatch_recovers_without_candidate(
+    monkeypatch, _fake_group
+):
+    import optima.dispatch as dispatch
+
+    monkeypatch.setenv("OPTIMA_ARFUSION_SEAM", "1")
+    record = []
+    reg = _dual_registry(record)
+    x, pend = _produce_pend(monkeypatch, reg, _fake_group)
+    _stub_views(monkeypatch, _views_for(pend))
+    other_group = _FakeGroup(size=_fake_group.size())
+    monkeypatch.setattr(dispatch, "_arfusion_group", lambda _use_attn: other_group)
+    base_calls = []
+    d = make_arfusion_dispatcher(_baseline_recorder(base_calls), registry=reg)
+    assert d(x, x.clone(), torch.ones(32, dtype=x.dtype))[0] == "baseline"
+    assert record == []
+    assert len(base_calls) == 1 and moe_export._state["orphans"] == 1
 
 
 def test_plain_calls_untouched_when_no_pend(monkeypatch, _fake_group):
@@ -483,28 +650,10 @@ def test_plain_calls_untouched_when_no_pend(monkeypatch, _fake_group):
     reg = KernelRegistry()
     reg.enable()
     d = make_arfusion_dispatcher(_baseline_recorder(base_calls), registry=reg)
-    x = torch.zeros(64, 32)
+    x = torch.zeros(64, 32, dtype=torch.bfloat16)
     moe_export._state["pends"][0x123456] = _pend()  # some OTHER buffer's pend
-    assert d(x, x.clone(), torch.ones(32))[0] == "baseline"
+    assert d(x, x.clone(), torch.ones(32, dtype=x.dtype))[0] == "baseline"
     assert moe_export._state["pends"]  # untouched
-
-
-# ---- registry additions ----------------------------------------------------------
-
-
-def test_peek_matches_lookup_without_fired_receipt(tmp_path, monkeypatch):
-    from optima import registry as registry_mod
-
-    monkeypatch.setenv("OPTIMA_SEAM_RECEIPT_DIR", str(tmp_path))
-    monkeypatch.setattr(registry_mod, "_FIRED_SLOTS", set())
-    reg = _deep_registry(min_num_tokens=48, max_num_tokens=1024)
-    kw = dict(dtype_name="float32", last_dim=32, arch=None)
-    assert reg.peek(DEEP, num_tokens=64, **kw) is not None
-    assert reg.peek(DEEP, num_tokens=4, **kw) is None
-    assert reg.peek(DEEP, num_tokens=2048, **kw) is None
-    assert not list(tmp_path.glob("fired*")), "peek must not write 'fired'"
-    assert reg.lookup(DEEP, num_tokens=64, **kw) is not None
-    assert list(tmp_path.glob("fired*")), "lookup still writes 'fired'"
 
 
 def test_eligibility_min_num_tokens_from_metadata():

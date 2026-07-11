@@ -160,6 +160,7 @@ def _fake_group(monkeypatch):
 
     monkeypatch.setattr(dispatch, "_arfusion_group",
                         lambda use_attn: SimpleNamespace(size=lambda: 2))
+    monkeypatch.setattr(dispatch, "_arfusion_group_role", lambda _use_attn: "tp")
 
 
 def test_dispatcher_inactive_without_env(monkeypatch, _fake_group):
@@ -213,7 +214,7 @@ def test_dispatcher_graph_capture_requires_graph_safe(monkeypatch, _fake_group):
     assert calls2 == [] and torch.equal(out[0], torch.full((4, 8), 1.0))
 
 
-def test_dispatcher_kernel_error_falls_back_unless_strict(monkeypatch, _fake_group):
+def test_dispatcher_kernel_error_aborts_collective_engine(monkeypatch, _fake_group):
     monkeypatch.setenv("OPTIMA_ARFUSION_SEAM", "1")
 
     def boom(*a):
@@ -226,8 +227,11 @@ def test_dispatcher_kernel_error_falls_back_unless_strict(monkeypatch, _fake_gro
     calls = []
     d = make_arfusion_dispatcher(_baseline_recorder(calls), registry=reg)
     x = torch.zeros(4, 8)
-    assert d(x, x.clone(), x[0])[0] == "baseline"
-    assert calls == ["baseline"]
+    # Once one rank enters candidate collective code, a rank-local stock fallback
+    # could diverge from peers already inside NCCL. The whole candidate engine fails.
+    with pytest.raises(RuntimeError, match="kernel exploded"):
+        d(x, x.clone(), x[0])
+    assert calls == []
 
     reg.set_strict(True)
     with pytest.raises(RuntimeError, match="kernel exploded"):

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import time
+import tempfile
 
 import pytest
 
@@ -18,6 +19,100 @@ pytestmark = pytest.mark.skipif(CUDA2 is False, reason="requires at least two CU
 
 ALLREDUCE = "examples/miner_allreduce_torch/kernels/all_reduce.py"
 SHAPES = [{"num_tokens": 4, "hidden": 64}]
+
+
+def _live_dispatch_graph_worker(rank, world_size, store_path):
+    import torch.distributed as dist
+    import traceback
+
+    from optima.dispatch import make_allreduce_dispatcher
+    import optima.dispatch as dispatch
+    from optima.registry import Eligibility, KernelImpl, KernelRegistry
+
+    torch.cuda.set_device(rank)
+    dist.init_process_group(
+        "nccl",
+        init_method=f"file://{store_path}",
+        rank=rank,
+        world_size=world_size,
+    )
+    try:
+        os.environ["OPTIMA_COLLECTIVE_SEAM"] = "1"
+
+        # Use the pinned runtime's real coordinator and get_tp_group authority;
+        # monkeypatching Optima's role classifier would make this only an NCCL
+        # kernel test, not proof of the live Sglang adapter boundary.
+        from sglang.srt.distributed import parallel_state as ps
+
+        coordinator = ps.GroupCoordinator(
+            group_ranks=[list(range(world_size))],
+            local_rank=rank,
+            torch_distributed_backend="nccl",
+            use_pynccl=False,
+            use_pymscclpp=False,
+            use_custom_allreduce=False,
+            use_torch_symm_mem_all_reduce=False,
+            use_hpu_communicator=False,
+            use_xpu_communicator=False,
+            use_npu_communicator=False,
+            group_name="optima_live_test_tp",
+        )
+        ps._TP = coordinator
+        group = coordinator.device_group
+        assert dispatch._allreduce_group_role(coordinator, group) == "tp"
+
+        def entry(x, out, group):
+            out.copy_(x)
+            dist.all_reduce(out, group=group)
+
+        registry = KernelRegistry()
+        registry.register(
+            KernelImpl(
+                slot="collective.all_reduce",
+                bundle_id="live-cuda-test",
+                entry=entry,
+                eligibility=Eligibility(
+                    dtypes=frozenset({"float32"}), graph_safe=True
+                ),
+            )
+        )
+        registry.enable()
+        wrapped = make_allreduce_dispatcher(
+            lambda _self, x: dist.all_reduce(x) or x,
+            registry=registry,
+        )
+        x = torch.full((4, 64), float(rank + 1), device="cuda")
+
+        # Warm the exact live adapter and NCCL call before capture.
+        warmup = torch.cuda.Stream()
+        warmup.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(warmup):
+            for _ in range(2):
+                eager = wrapped(coordinator, x)
+        torch.cuda.current_stream().wait_stream(warmup)
+        torch.cuda.synchronize()
+        assert torch.equal(eager, torch.full_like(eager, 3.0))
+
+        dist.barrier()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            out = wrapped(coordinator, x)
+        # Capture records the collective; only replay is a gradeable execution.
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(out, torch.full_like(out, 3.0))
+
+        x.fill_(float(rank + 2))
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(out, torch.full_like(out, 5.0))
+    except BaseException:  # noqa: BLE001 - durable parent exit code owns the test
+        traceback.print_exc()
+        os._exit(1)
+    # Destroying a process group that owns a captured NCCL collective can hang in
+    # PyTorch/NCCL finalization. These are disposable test workers; successful
+    # process exit releases the CUDA context and the parent grades the exit code.
+    os._exit(0)
 
 
 def _verify(source=ALLREDUCE, *, slot="collective.all_reduce", entry="all_reduce",
@@ -40,6 +135,39 @@ def test_collective_nccl_cuda_graph_faithful_replays():
     assert result.graph_verified
     assert result.fully_verified
     assert result.shape_results[0].graph_replays == 3
+
+
+def test_live_allreduce_binding_captures_and_replays_actual_nccl_group():
+    import torch.multiprocessing as mp
+
+    from optima.verify_collective import _terminate_processes
+
+    pytest.importorskip("sglang.srt.distributed.parallel_state")
+
+    with tempfile.NamedTemporaryFile(delete=False) as store:
+        store_path = store.name
+    os.unlink(store_path)
+    try:
+        context = mp.spawn(
+            _live_dispatch_graph_worker,
+            args=(2, store_path),
+            nprocs=2,
+            join=False,
+        )
+        deadline = time.monotonic() + 120.0
+        joined = False
+        while time.monotonic() < deadline:
+            if context.join(timeout=1.0):
+                joined = True
+                break
+        if not joined:
+            _terminate_processes(list(context.processes), grace_s=2.0)
+            pytest.fail("live all-reduce graph workers timed out after 120s")
+    finally:
+        try:
+            os.unlink(store_path)
+        except FileNotFoundError:
+            pass
 
 
 @pytest.mark.parametrize("partial_write", [False, True])

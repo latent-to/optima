@@ -127,7 +127,10 @@ def _moe_reduce_registry(calls):
 
 
 def test_reduce_owning_kernel_skipped_when_tp_layer_defers_its_reduce(monkeypatch):
+    import optima.dispatch as dispatch
+
     monkeypatch.setenv("OPTIMA_MOE_SEAM", "1")
+    monkeypatch.setattr(dispatch, "_moe_data_parallel_world_size", lambda: 1)
     inputs = _moe_inputs()
     calls: list = []
     dispatched = make_moe_dispatcher(lambda *a: _BASELINE, registry=_moe_reduce_registry(calls))
@@ -138,7 +141,13 @@ def test_reduce_owning_kernel_skipped_when_tp_layer_defers_its_reduce(monkeypatc
 
 
 def test_reduce_owning_kernel_runs_when_layer_reduces(monkeypatch):
+    import optima.dispatch as dispatch
+
     monkeypatch.setenv("OPTIMA_MOE_SEAM", "1")
+    monkeypatch.setattr(dispatch, "_moe_data_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(
+        dispatch, "_tp_device_group", lambda: SimpleNamespace(size=lambda: 2)
+    )
     inputs = _moe_inputs()
     calls: list = []
     dispatched = make_moe_dispatcher(lambda *a: _BASELINE, registry=_moe_reduce_registry(calls))

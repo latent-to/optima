@@ -8,6 +8,8 @@ the test proves the distributed contract (experts + owned reduce) end to end on 
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 torch = pytest.importorskip("torch")
@@ -89,3 +91,43 @@ def test_prepare_cannot_mutate_raw_weights_and_grade_against_them(tmp_path):
 
     assert not result.passed
     assert "prepare input 'w13' was mutated" in result.shape_results[0].detail
+
+
+def test_prepare_state_is_reused_across_temporal_calls(tmp_path):
+    source = tmp_path / "one_call_prepared.py"
+    source.write_text(
+        Path(BUNDLE).read_text()
+        + "\n_base_prepare = prepare\n"
+        + "_base_entry = fused_experts_reduce\n"
+        + "def prepare(w13, w2):\n"
+        + "    state = _base_prepare(w13, w2)\n"
+        + "    state['calls'] = 0\n"
+        + "    return state\n"
+        + "def fused_experts_reduce(x, topk_ids, topk_weights, prepared, out, group=None):\n"
+        + "    prepared['calls'] += 1\n"
+        + "    if prepared['calls'] == 1:\n"
+        + "        return _base_entry(x, topk_ids, topk_weights, prepared, out, group)\n"
+        + "    out.zero_()\n"
+        + "    if dist.is_available() and dist.is_initialized():\n"
+        + "        dist.all_reduce(out, op=dist.ReduceOp.SUM, group=group)\n"
+    )
+    shapes = [
+        {"num_tokens": tokens, "num_experts": 4, "hidden": 16,
+         "inter": 8, "topk": 2}
+        for tokens in (2, 5)
+    ]
+
+    result = verify_collective(
+        get_slot("moe.fused_experts_reduce"),
+        str(source),
+        "fused_experts_reduce",
+        prepare_name="prepare",
+        world_size=2,
+        backend="gloo",
+        device="cpu",
+        shapes=shapes,
+    )
+
+    assert not result.passed
+    assert any("sequence" in str(row.shape) and not row.passed
+               for row in result.shape_results)

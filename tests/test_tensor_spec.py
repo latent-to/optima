@@ -11,6 +11,7 @@ from optima.tensor_spec import (  # noqa: E402
     OutputSpec,
     TensorSpec,
     allocate_output_spec,
+    validate_allocation_bindings,
     validate_output_spec,
     validate_tensor,
 )
@@ -114,3 +115,35 @@ def test_strided_row_major_policy_rejects_holes_between_columns():
             fallback_dtype=torch.float32,
             fallback_device="cpu",
         )
+
+
+def test_validator_owned_storage_binding_rejects_set_replacement():
+    contract = OutputSpec((TensorSpec(shape=(3, 5), dtype=torch.float32),))
+    allocation = allocate_output_spec(
+        contract, fallback_dtype=torch.float32, fallback_device="cpu"
+    )
+    out = allocation.outputs[0]
+    replacement = torch.empty_like(out)
+    out.set_(replacement)
+
+    # Shape/dtype/stride alone cannot distinguish the replacement; the retained
+    # original storage identity can.
+    validate_output_spec(
+        contract,
+        allocation.outputs,
+        fallback_dtype=torch.float32,
+        fallback_device="cpu",
+    )
+    with pytest.raises(ValueError, match="validator-owned storage"):
+        validate_allocation_bindings(allocation)
+
+
+def test_tensor_binding_rejects_in_place_stride_change():
+    contract = OutputSpec((TensorSpec(shape=(3, 5), dtype=torch.float32),))
+    allocation = allocate_output_spec(
+        contract, fallback_dtype=torch.float32, fallback_device="cpu"
+    )
+    allocation.outputs[0].as_strided_((3, 5), (1, 3))
+
+    with pytest.raises(ValueError, match="validator-owned storage/tensor binding"):
+        validate_allocation_bindings(allocation)

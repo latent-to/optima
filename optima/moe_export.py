@@ -51,14 +51,40 @@ from __future__ import annotations
 import logging
 import os
 import weakref
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Optional
 
 import torch
 
+from optima.capabilities import CallDescriptor, collective_call_descriptor
+
 logger = logging.getLogger("optima.moe_export")
 
 DEEP_SLOT = "collective.moe_finalize_ar_rmsnorm"
+
+
+@dataclass(frozen=True)
+class GroupTopology:
+    """Validator-observed identity of the process group the deep kernel will use.
+
+    Size alone is insufficient: two disjoint TP groups can have the same cardinality.
+    Real distributed execution therefore fingerprints the ordered global ranks.  The
+    object-identity fallback exists only for lightweight unit doubles in a process
+    without an initialized ``torch.distributed`` runtime.
+    """
+
+    world_size: int
+    fingerprint: tuple[Any, ...]
+
+
+@dataclass(frozen=True)
+class DeepSelection:
+    """Exact pre-arm routing decision carried from export to consume."""
+
+    impl: Any
+    descriptor: CallDescriptor
+    topology: GroupTopology
 
 # OPTIMA_DEEP_DEBUG=1: trace every arm/refusal/export/consume with the stream-
 # capturing flag. The 2026-07-07 GSM8K capture crash (pend collision inside the
@@ -83,7 +109,8 @@ _MAX_PENDS = 256
 _RECEIPT_EVERY = 256
 
 _state: dict[str, Any] = {
-    "pends": {},          # out data_ptr -> {"g2","idx","scl","T","K","hid"}
+    # out data_ptr -> export pointers/layout + exact pre-arm DeepSelection
+    "pends": {},
     "fwd": None,          # weakref.ref to the ForwardBatch of the live forward
     "fuse": False,        # last recorded should_fuse_mlp_allreduce_with_next_layer
     "rs": False,          # last recorded should_use_reduce_scatter
@@ -282,6 +309,68 @@ def _input_ok(inp) -> bool:
     return torch.is_tensor(inp) and inp.dim() == 2 and inp.is_cuda
 
 
+def group_topology(group: Any) -> Optional[GroupTopology]:
+    """Resolve the actual candidate communicator, never an env/caller size hint."""
+    if group is None:
+        return None
+    try:
+        import torch.distributed as dist
+
+        if dist.is_available() and dist.is_initialized():
+            size = int(dist.get_world_size(group))
+            if size <= 1:
+                return None
+            try:
+                ranks = tuple(int(rank) for rank in dist.get_process_group_ranks(group))
+            except AttributeError:
+                ranks = tuple(int(dist.get_global_rank(group, rank)) for rank in range(size))
+            if len(ranks) != size or len(set(ranks)) != size:
+                return None
+            return GroupTopology(size, ("global_ranks", *ranks))
+    except Exception:  # noqa: BLE001 - unresolved topology means stock, never a guess
+        return None
+
+    # Unit-test process-group doubles do not initialize torch.distributed.  Binding
+    # their object identity is still stronger than accepting a caller-provided size;
+    # production ProcessGroups always take the global-rank path above.
+    try:
+        size = int(group.size())
+    except Exception:  # noqa: BLE001
+        return None
+    if size <= 1:
+        return None
+    return GroupTopology(size, ("process_object", id(group)))
+
+
+def _producer_group_and_topology() -> tuple[Any, GroupTopology] | None:
+    """Resolve the MoE TP group used by the eventual deferred norm call."""
+    try:
+        # A deferred MoE output reaches forward_with_allreduce_fusion with
+        # use_attn_tp_group=False.  Resolve that exact group before destructively
+        # skipping finalize; the consumer must later prove it sees the same group.
+        from optima.dispatch import (
+            _arfusion_group,
+            _arfusion_group_role,
+            _moe_data_parallel_world_size,
+        )
+
+        if (
+            _moe_data_parallel_world_size() != 1
+            or _arfusion_group_role(False) != "tp"
+        ):
+            return None
+        group = _arfusion_group(False)
+    except Exception:  # noqa: BLE001 - unavailable/upstream-drifted group -> stock
+        return None
+    topology = group_topology(group)
+    return None if topology is None else (group, topology)
+
+
+def _arg(args: tuple, kwargs: dict, name: str, position: int) -> Any:
+    """Read one FlashInfer argument from its keyword or positional ABI."""
+    return kwargs.get(name, args[position] if len(args) > position else None)
+
+
 def maybe_export(orig: Callable[..., Any], args: tuple, kwargs: dict, *,
                  registry) -> Any:
     """The wrapped ``flashinfer_cutlass_fused_moe`` body. Falls through to ``orig``
@@ -308,31 +397,105 @@ def maybe_export(orig: Callable[..., Any], args: tuple, kwargs: dict, *,
         _dbg(f"me: pass-through (last-layer veto, ordinal={_state['ordinal']} n={n})")
         return orig(*args, **kwargs)
 
-    inp = kwargs.get("input", args[1] if len(args) > 1 else None)
+    # Pinned FlashInfer positional ABI (kwargs remain primary): input=0,
+    # selected/scales=1/2, fc1=3, tp/ep=13/15, output=19.
+    inp = _arg(args, kwargs, "input", 0)
     if not _input_ok(inp):
         _dbg("me: pass-through (input shape/device ineligible)")
         return orig(*args, **kwargs)
-    if kwargs.get("ep_size", 1) != 1:  # export layouts are TP-only (no EP reshuffle)
+    ep_size = _arg(args, kwargs, "ep_size", 15)
+    if type(ep_size) is not int or ep_size != 1:
+        # Export layouts are TP-only (no EP reshuffle).
         _dbg("me: pass-through (ep_size != 1)")
+        return orig(*args, **kwargs)
+
+    if _tuning():
+        _dbg("me: pass-through (autotuner active)")
+        return orig(*args, **kwargs)
+
+    # Select from facts the validator can observe BEFORE skipping finalize.  Use the
+    # final output buffer for dtype/H: FlashInfer may receive an FP8/FP4-packed input,
+    # while the deep ABI and downstream residual stream are BF16.
+    out_buf = _arg(args, kwargs, "output", 19)
+    selected_experts = _arg(args, kwargs, "token_selected_experts", 1)
+    final_scales = _arg(args, kwargs, "token_final_scales", 2)
+    fc1_weights = _arg(args, kwargs, "fc1_expert_weights", 3)
+    if not (
+        torch.is_tensor(out_buf)
+        and out_buf.dim() == 2
+        # export_views wraps the raw 16-bit payload as BF16. Accepting an FP16/FP32
+        # output here would make producer selection describe a different live ABI.
+        and out_buf.dtype == torch.bfloat16
+        and out_buf.device == inp.device
+        and torch.is_tensor(selected_experts)
+        and selected_experts.dim() == 2
+        and torch.is_tensor(final_scales)
+        and final_scales.dim() == 2
+        and torch.is_tensor(fc1_weights)
+        and fc1_weights.dim() >= 1
+        and int(fc1_weights.shape[0]) > 0
+    ):
+        _dbg("me: pass-through (routing/output ABI unavailable)")
+        return orig(*args, **kwargs)
+    exp_tokens, hidden = (int(out_buf.shape[0]), int(out_buf.shape[1]))
+    if (
+        int(inp.shape[0]) != exp_tokens
+        or int(selected_experts.shape[0]) != exp_tokens
+        or tuple(final_scales.shape) != tuple(selected_experts.shape)
+    ):
+        _dbg("me: pass-through (routing/output token shape mismatch)")
+        return orig(*args, **kwargs)
+    top_k = int(selected_experts.shape[1])
+    if not 1 <= top_k <= 64:
+        _dbg(f"me: pass-through (invalid top_k={top_k})")
+        return orig(*args, **kwargs)
+
+    resolved = _producer_group_and_topology()
+    if resolved is None:
+        _dbg("me: pass-through (MoE TP group unavailable or single-rank)")
+        return orig(*args, **kwargs)
+    _group, topology = resolved
+    tp_hint = _arg(args, kwargs, "tp_size", 13)
+    if tp_hint is not None and (
+        type(tp_hint) is not int or tp_hint != topology.world_size
+    ):
+        _dbg(
+            "me: pass-through (caller TP size disagrees with actual group: "
+            f"hint={tp_hint!r} actual={topology.world_size})"
+        )
         return orig(*args, **kwargs)
 
     from optima.dispatch import _arch_tag, _dtype_name, _in_cuda_graph
 
-    tokens, hidden = inp.shape[0], inp.shape[-1]
-    impl = registry.peek(DEEP_SLOT, dtype_name=_dtype_name(inp.dtype), last_dim=hidden,
-                         arch=_arch_tag(inp.device.index or 0), num_tokens=tokens)
+    descriptor = collective_call_descriptor(
+        dtype=_dtype_name(out_buf.dtype),
+        architecture=(
+            _arch_tag(out_buf.device.index or 0) if out_buf.is_cuda else None
+        ),
+        graph_mode="cuda_graph" if _in_cuda_graph() else "eager",
+        world_size=topology.world_size,
+        tp_size=topology.world_size,
+        dimensions={
+            "ep_size": 1,
+            "num_tokens": exp_tokens,
+            "exp_tokens": exp_tokens,
+            "top_k": top_k,
+            "hidden_dim": hidden,
+            "last_dim": hidden,
+        },
+    )
+    decision = registry.select(
+        DEEP_SLOT, descriptor, write_fired_receipt=False
+    )
+    impl = decision.impl
     if impl is None:
-        _dbg(f"me: pass-through (no eligible impl, T={tokens})")
+        _dbg(
+            "me: pass-through (no unique eligible deep variant, "
+            f"T_exp={exp_tokens} K={top_k} TP={topology.world_size})"
+        )
         return orig(*args, **kwargs)
-    # Only arm under capture if the consume kernel may RUN under capture — otherwise
-    # the fallback reconstruct would be captured into the timed graphs (correct but
-    # slow, replayed forever).
-    if _in_cuda_graph() and not impl.eligibility.graph_safe:
-        _dbg(f"me: pass-through (not graph_safe under capture, T={tokens})")
-        return orig(*args, **kwargs)
-    if _tuning():
-        _dbg(f"me: pass-through (autotuner active, T={tokens})")
-        return orig(*args, **kwargs)
+    selection = DeepSelection(impl=impl, descriptor=descriptor, topology=topology)
+
     try:
         raw = _raw_module()
     except AttributeError as exc:
@@ -347,18 +510,30 @@ def maybe_export(orig: Callable[..., Any], args: tuple, kwargs: dict, *,
 
     seq, g2, rmap, scl, rows, hid, phid, k, bits = (int(x) for x in raw.fe_get_export())
     if seq == _state["seq"]:
-        _dbg(f"me: finalize-fused tactic (seq unchanged at {seq}, T={tokens})")
+        _dbg(f"me: finalize-fused tactic (seq unchanged at {seq}, T={exp_tokens})")
         return ret  # no export: a FINALIZE-FUSED tactic ran — output already complete
     _state["seq"] = seq
 
     out_t = ret[0] if isinstance(ret, (list, tuple)) else ret
     # Export layout the consume side can't recover from must FAIL LOUDLY: the output
     # tensor is unfinalized garbage and there is no way back once we return it.
-    if not (rows == tokens and hid == hidden and phid == hidden
-            and bits == 16 and 1 <= k <= 64):
+    if not (
+        torch.is_tensor(out_t)
+        and out_t.dim() == 2
+        and tuple(out_t.shape) == (exp_tokens, hidden)
+        and out_t.dtype == out_buf.dtype
+        and out_t.device == out_buf.device
+        and rows == exp_tokens
+        and hid == hidden
+        and phid == hidden
+        and k == top_k
+        and bits == 16
+    ):
         raise RuntimeError(
-            f"optima deep seam: export ABI mismatch (rows={rows} T={tokens} hid={hid} "
-            f"phid={phid} bits={bits} k={k}) — refusing to serve an unfinalized output")
+            "optima deep seam: export ABI mismatch "
+            f"(rows={rows} T_exp={exp_tokens} hid={hid}/{hidden} phid={phid} "
+            f"bits={bits} k={k}/{top_k}) — refusing to serve an unfinalized output"
+        )
     optr = out_t.data_ptr()
     # Pends are cleared at every forward boundary, so within one forward an export
     # finding its own ptr still pending means its consume was missed — seam broken.
@@ -370,8 +545,15 @@ def maybe_export(orig: Callable[..., Any], args: tuple, kwargs: dict, *,
             f"pends={[hex(p) for p in _state['pends']]} capturing={_capturing()})")
     if len(_state["pends"]) > _MAX_PENDS:
         raise RuntimeError("optima deep seam: export pends leaking (never consumed)")
-    _state["pends"][optr] = {"g2": g2, "idx": rmap, "scl": scl, "T": rows, "K": k,
-                             "hid": hid}
+    _state["pends"][optr] = {
+        "g2": g2,
+        "idx": rmap,
+        "scl": scl,
+        "T": rows,
+        "K": k,
+        "hid": hid,
+        "selection": selection,
+    }
     _dbg(f"me: EXPORT seq={seq} optr={optr:#x} T={rows} K={k} "
          f"pends={len(_state['pends'])}")
     _state["exports"] += 1

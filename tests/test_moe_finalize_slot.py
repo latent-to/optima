@@ -13,6 +13,7 @@ import pytest
 torch = pytest.importorskip("torch")
 
 from optima.slots import get_slot  # noqa: E402
+from optima.registry import Eligibility  # noqa: E402
 from optima.verify_collective import verify_collective  # noqa: E402
 
 SLOT = "collective.moe_finalize_ar_rmsnorm"
@@ -104,3 +105,29 @@ def test_no_scales_fails_gloo_cpu(tmp_path):
     res = verify_collective(get_slot(SLOT), str(p), "moe_finalize_ar_rmsnorm",
                             world_size=2, backend="gloo", device="cpu", seed=0)
     assert not res.passed
+
+
+def test_float32_deep_variant_is_na_before_candidate_import(tmp_path):
+    marker = tmp_path / "imported"
+    source = tmp_path / "float32_only.py"
+    source.write_text(
+        "from pathlib import Path\n"
+        f"Path({str(marker)!r}).write_text('imported')\n"
+        + FAITHFUL
+    )
+    result = verify_collective(
+        get_slot(SLOT),
+        str(source),
+        "moe_finalize_ar_rmsnorm",
+        world_size=2,
+        backend="gloo",
+        device="cpu",
+        dtype_name="float32",
+        eligibility=Eligibility(dtypes=frozenset({"float32"})),
+        shapes=[{"num_tokens": 4, "exp_tokens": 8, "topk": 5, "hidden": 16}],
+    )
+
+    assert result.context_inapplicable
+    assert result.num_applicable == 0
+    assert not result.passed
+    assert not marker.exists()

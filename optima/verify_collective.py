@@ -28,10 +28,14 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
-from optima.capabilities import CONTEXT_FIELDS, CallDescriptor
+from optima.capabilities import (
+    CONTEXT_FIELDS,
+    CallDescriptor,
+    collective_call_descriptor,
+)
 from optima.registry import Eligibility
 from optima.slots import SlotSpec
-from optima.tensor_spec import allocate_output_spec
+from optima.tensor_spec import allocate_output_spec, validate_output_allocation
 from optima.verify import (
     _DEFAULT_GRAPH_REPLAYS,
     ShapeResult,
@@ -41,6 +45,7 @@ from optima.verify import (
     _CudaGraphBackend,
     _device_architecture,
     _graph_case_inputs,
+    _input_bindings,
     _input_mutation_detail,
     _poison_outputs,
     _restore_tensor_inputs,
@@ -184,6 +189,7 @@ def _read_rank_verdict(
 def _collective_descriptor(
     shape: dict,
     *,
+    slot_name: str | None = None,
     dtype_name: str,
     device: str,
     graph_safe: bool,
@@ -191,15 +197,14 @@ def _collective_descriptor(
     architecture: str | None,
     world_size: int,
 ) -> CallDescriptor:
-    fields: dict[str, Any] = {
-        "dtype": dtype_name,
-        "architecture": architecture or _device_architecture(device),
-        "graph_mode": "cuda_graph" if graph_safe and device == "cuda" else "eager",
-        "model": model_key,
-        "quant": "dense", "layout": "row_major",
-        "world_size": world_size,
-        "tp_size": world_size,
-    }
+    dimensions: dict[str, Any] = {}
+    if slot_name in {
+        "moe.fused_experts_reduce",
+        "collective.moe_finalize_ar_rmsnorm",
+    }:
+        # These two contracts explicitly exclude expert parallel dispatch/combine.
+        # EP is not a semantic dimension of a bare all-reduce or AR+norm call.
+        dimensions["ep_size"] = 1
     aliases = {
         "alignment": "alignment", "batch_size": "batch_size", "batch": "batch_size",
         "block_size": "block_size", "head_dim": "head_dim", "kv_len": "kv_len",
@@ -208,10 +213,23 @@ def _collective_descriptor(
         "num_tokens": "num_tokens", "page_size": "page_size", "q_len": "q_len",
         "top_k": "top_k", "topk": "top_k", "inter": "intermediate_dim",
     }
-    fields.update({dst: shape[src] for src, dst in aliases.items() if src in shape})
+    dimensions.update(
+        {dst: shape[src] for src, dst in aliases.items() if src in shape}
+    )
     if "hidden" in shape:
-        fields.update(hidden_dim=shape["hidden"], last_dim=shape["hidden"])
-    return CallDescriptor(fields)
+        dimensions.update(hidden_dim=shape["hidden"], last_dim=shape["hidden"])
+    return collective_call_descriptor(
+        dtype=dtype_name,
+        architecture=architecture or _device_architecture(device),
+        graph_mode="cuda_graph" if graph_safe and device == "cuda" else "eager",
+        # Live Sglang collective bindings do not yet receive a canonical arena-model
+        # identity. Omitting it here makes model-constrained variants consistently
+        # N/A instead of qualifying offline and then never routing live. PR3 manifests
+        # will supply the trusted identity to both sides together.
+        model=None,
+        world_size=world_size,
+        dimensions=dimensions,
+    )
 
 
 def _match_detail(match) -> str:
@@ -350,14 +368,42 @@ def _rank_worker(rank, world_size, backend, init_method, slot_name, source_path,
             and device == "cuda"
             and run_mode in {"single", "graph_sequence"}
         )
+        # Live layers prepare invariant weights once, then reuse the same prepared
+        # object across token buckets/calls. Cache by validator-observed static input
+        # ABI and retain the first static tensor objects for every repeated key.
+        prepared_cache: dict[tuple, tuple[Any, dict[str, Any]]] = {}
         for si, step in enumerate(steps):
             # Fresh data per step (a step must not be able to pass by leaving its
             # PREVIOUS output in place), same shapes on every rank.
             inputs = slot.make_inputs(dtype=dtype, device=dev, seed=seed + 7919 * si,
                                       rank=rank, world_size=world_size, **step)
+            prepared = None
+            prepare_key = None
+            static_inputs: dict[str, Any] = {}
+            if prepare_fn is not None and slot.invoke_prepare is not None:
+                dynamic = set(slot.graph_dynamic_inputs)
+                static_inputs = {
+                    name: value for name, value in inputs.items() if name not in dynamic
+                }
+                prepare_key = tuple(
+                    (
+                        name,
+                        "tensor",
+                        tuple(value.shape),
+                        str(value.dtype),
+                    )
+                    if torch.is_tensor(value)
+                    else (name, "scalar", type(value).__name__, repr(value))
+                    for name, value in sorted(static_inputs.items())
+                )
+                cached = prepared_cache.get(prepare_key)
+                if cached is not None:
+                    prepared, retained_static = cached
+                    inputs.update(retained_static)
             # Candidate code never receives these storages. References are derived
             # from them in phase 2, even if prepare/entry corrupt the live tensors.
             trusted_inputs = _clone_tensor_inputs(inputs)
+            input_bindings = _input_bindings(inputs)
 
             replay_inputs = []
             if verify_graph:
@@ -391,18 +437,25 @@ def _rank_worker(rank, world_size, backend, init_method, slot_name, source_path,
 
             # (prepare, forward) collective blocks (e.g. moe.fused_experts_reduce): run
             # the miner's weight-prep on THIS rank's shard before the forward.
-            prepared = None
-            if prepare_fn is not None and slot.invoke_prepare is not None:
+            if (
+                prepare_fn is not None
+                and slot.invoke_prepare is not None
+                and prepare_key not in prepared_cache
+            ):
                 prepared = slot.invoke_prepare(prepare_fn, inputs)
-                mutation = _input_mutation_detail(inputs, trusted_inputs)
+                mutation = _input_mutation_detail(
+                    inputs, trusted_inputs, input_bindings
+                )
                 if mutation:
                     raise RuntimeError(f"prepare {mutation}")
+                prepared_cache[prepare_key] = (prepared, static_inputs)
 
             # Validator-owned output buffer(s). Single-output slots keep the original
             # tensor-valued call shape; multi-output slots (e.g. ar_residual_rmsnorm's
             # [norm_out, new_residual]) receive the list.
+            output_contract = slot.output_contract(inputs)
             allocation = allocate_output_spec(
-                slot.output_contract(inputs),
+                output_contract,
                 fallback_dtype=dtype,
                 fallback_device=dev,
                 inputs=(v for v in inputs.values() if torch.is_tensor(v)),
@@ -411,6 +464,18 @@ def _rank_worker(rank, world_size, backend, init_method, slot_name, source_path,
             out_arg = outs[0] if len(outs) == 1 else outs
 
             invoke(entry, inputs, out_arg, dist.group.WORLD, prepared)  # miner fills the buffers
+            def validate_outputs():
+                validate_output_allocation(
+                    output_contract,
+                    allocation,
+                    fallback_dtype=dtype,
+                    fallback_device=dev,
+                    inputs=(
+                        value for value in inputs.values() if torch.is_tensor(value)
+                    ),
+                )
+
+            validate_outputs()
 
             if verify_graph:
                 # Snapshot eager output before warmup/capture overwrite the same
@@ -425,19 +490,27 @@ def _rank_worker(rank, world_size, backend, init_method, slot_name, source_path,
 
                 try:
                     graph_backend.synchronize()
-                    mutation = _input_mutation_detail(inputs, trusted_inputs)
+                    mutation = _input_mutation_detail(
+                        inputs, trusted_inputs, input_bindings
+                    )
                     if mutation:
                         raise RuntimeError(mutation)
-                    _restore_tensor_inputs(inputs, trusted_inputs)
+                    _restore_tensor_inputs(inputs, trusted_inputs, input_bindings)
                     graph_backend.warmup(graph_invoke)
                     graph_backend.synchronize()
-                    mutation = _input_mutation_detail(inputs, trusted_inputs)
+                    validate_outputs()
+                    mutation = _input_mutation_detail(
+                        inputs, trusted_inputs, input_bindings
+                    )
                     if mutation:
                         raise RuntimeError(mutation)
-                    _restore_tensor_inputs(inputs, trusted_inputs)
+                    _restore_tensor_inputs(inputs, trusted_inputs, input_bindings)
                     graph = graph_backend.capture(graph_invoke)
                     graph_backend.synchronize()
-                    mutation = _input_mutation_detail(inputs, trusted_inputs)
+                    validate_outputs()
+                    mutation = _input_mutation_detail(
+                        inputs, trusted_inputs, input_bindings
+                    )
                     if mutation:
                         raise RuntimeError(mutation)
                 except Exception as exc:  # noqa: BLE001 - false graph_safe claim
@@ -450,12 +523,15 @@ def _rank_worker(rank, world_size, backend, init_method, slot_name, source_path,
                 ]
                 for replay, logical in enumerate(replay_inputs):
                     try:
-                        _restore_tensor_inputs(inputs, logical)
+                        _restore_tensor_inputs(inputs, logical, input_bindings)
                         _poison_outputs(outs, replay)
                         graph_backend.synchronize()
                         graph_backend.replay(graph)
                         graph_backend.synchronize()
-                        mutation = _input_mutation_detail(inputs, logical)
+                        validate_outputs()
+                        mutation = _input_mutation_detail(
+                            inputs, logical, input_bindings
+                        )
                         if mutation:
                             raise RuntimeError(mutation)
                     except Exception as exc:  # noqa: BLE001 - every replay is required
@@ -478,7 +554,15 @@ def _rank_worker(rank, world_size, backend, init_method, slot_name, source_path,
             # Retain the complete allocation so future declared workspaces cannot
             # be reclaimed before comparison/replay finishes.
             staged.append(
-                (si, step, inputs, trusted_inputs, allocation, output_sets)
+                (
+                    si,
+                    step,
+                    inputs,
+                    trusted_inputs,
+                    input_bindings,
+                    allocation,
+                    output_sets,
+                )
             )
 
         # PHASE 2 — trusted references + comparison, after the whole burst: the fp32
@@ -486,9 +570,19 @@ def _rank_worker(rank, world_size, backend, init_method, slot_name, source_path,
         # math (collective_finish) if it does local work after the sum (residual add /
         # norm). No finish -> the sum IS the single expected output (bare all-reduce).
         passed, max_abs, score, detail, metric = True, 0.0, 1.0, "", "ratio"
-        for si, step, inputs, trusted_inputs, _allocation, output_sets in staged:
+        for (
+            si,
+            step,
+            inputs,
+            trusted_inputs,
+            input_bindings,
+            _allocation,
+            output_sets,
+        ) in staged:
             if not verify_graph:
-                mutation = _input_mutation_detail(inputs, trusted_inputs)
+                mutation = _input_mutation_detail(
+                    inputs, trusted_inputs, input_bindings
+                )
                 if mutation:
                     raise RuntimeError(mutation)
             for output_label, checked_outs, reference_inputs in output_sets:
@@ -769,12 +863,40 @@ def verify_collective(
         zip(catalog_shapes, test_shapes)
     ):
         shape = jittered_shape
+        if (
+            eligibility is not None
+            and slot.name == "collective.moe_finalize_ar_rmsnorm"
+            and dtype_name != "bfloat16"
+        ):
+            # The live FlashInfer export ABI is a 16-bit BF16 pointer contract.
+            # CPU float32 remains useful for validator-owned reference tests when no
+            # bundle eligibility is being qualified, but a float32 miner variant must
+            # be N/A rather than PASS offline and remain unreachable live.
+            context_blocked.append(True)
+            results.append(
+                ShapeResult(
+                    shape=shape,
+                    dtype=dtype_name,
+                    passed=True,
+                    max_abs_err=0.0,
+                    max_rel_err=0.0,
+                    pass_ratio=1.0,
+                    detail=(
+                        "validator N/A (outside live deep-export dtype domain): "
+                        "requires bfloat16"
+                    ),
+                    metric="n/a",
+                    applicable=False,
+                )
+            )
+            continue
         if eligibility is not None:
             candidates = [shape] + ([] if shape == catalog_shape else [catalog_shape])
             for candidate in candidates:
                 match = eligibility.match(
                     _collective_descriptor(
-                        candidate, dtype_name=dtype_name, device=device,
+                        candidate, slot_name=slot.name,
+                        dtype_name=dtype_name, device=device,
                         graph_safe=graph_safe, model_key=model_key,
                         architecture=architecture,
                         world_size=world_size,

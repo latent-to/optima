@@ -19,6 +19,7 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
+import optima.dispatch as dispatch  # noqa: E402
 from optima.dispatch import make_moe_dispatcher  # noqa: E402
 from optima.registry import Eligibility, KernelImpl, KernelRegistry  # noqa: E402
 from optima.sandbox import load_entry  # noqa: E402
@@ -26,6 +27,11 @@ from optima.slots import get_slot  # noqa: E402
 
 MOE_BUNDLE = "examples/miner_moe_fused_experts_torch/kernels/moe.py"
 _BASELINE = object()  # sentinel: the dispatcher returns this iff it fell back
+
+
+@pytest.fixture(autouse=True)
+def _single_moe_dp_rank(monkeypatch):
+    monkeypatch.setattr(dispatch, "_moe_data_parallel_world_size", lambda: 1)
 
 
 def _baseline_forward(self, hidden_states, topk_output):

@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from math import gcd
-from typing import Iterable, Optional, Sequence
+from typing import Any, Iterable, Optional, Sequence
 
 import torch
 
@@ -92,6 +92,163 @@ class TensorAllocation:
 
     outputs: list[torch.Tensor]
     workspace: list[torch.Tensor]
+    output_bindings: tuple["TensorStorageBinding", ...] = ()
+    workspace_bindings: tuple["TensorStorageBinding", ...] = ()
+
+
+@dataclass(frozen=True)
+class TensorStorageBinding:
+    """Exact validator-owned storage identity captured before candidate code runs.
+
+    Keeping the original storage object alive prevents allocator reuse from making a
+    miner-installed replacement appear to have the same address. Shape/stride/type
+    remain the responsibility of :func:`validate_output_spec`; this binds the tensor
+    object to the allocation the validator actually created.
+    """
+
+    storage: Any
+    storage_cdata: int
+    storage_ptr: int
+    storage_nbytes: int
+    data_ptr: int
+    storage_offset: int
+    shape: tuple[int, ...]
+    stride: tuple[int, ...]
+    dtype: torch.dtype
+    device: torch.device
+    layout: torch.layout
+
+
+def tensor_storage_binding(tensor: torch.Tensor) -> TensorStorageBinding:
+    storage = tensor.untyped_storage()
+    return TensorStorageBinding(
+        storage=storage,
+        storage_cdata=int(storage._cdata),
+        storage_ptr=int(storage.data_ptr()),
+        storage_nbytes=int(storage.nbytes()),
+        data_ptr=int(tensor.data_ptr()),
+        storage_offset=int(tensor.storage_offset()),
+        shape=tuple(tensor.shape),
+        stride=tuple(tensor.stride()),
+        dtype=tensor.dtype,
+        device=tensor.device,
+        layout=tensor.layout,
+    )
+
+
+def validate_tensor_binding(
+    tensor: torch.Tensor,
+    expected: TensorStorageBinding,
+    *,
+    name: str = "tensor",
+) -> None:
+    """Require the exact pre-candidate storage and tensor metadata."""
+
+    storage = tensor.untyped_storage()
+    actual = (
+        int(storage._cdata),
+        int(storage.data_ptr()),
+        int(storage.nbytes()),
+        int(tensor.data_ptr()),
+        int(tensor.storage_offset()),
+        tuple(tensor.shape),
+        tuple(tensor.stride()),
+        tensor.dtype,
+        tensor.device,
+        tensor.layout,
+    )
+    wanted = (
+        expected.storage_cdata,
+        expected.storage_ptr,
+        expected.storage_nbytes,
+        expected.data_ptr,
+        expected.storage_offset,
+        expected.shape,
+        expected.stride,
+        expected.dtype,
+        expected.device,
+        expected.layout,
+    )
+    if actual != wanted:
+        raise ValueError(
+            f"{name} no longer uses its validator-owned storage/tensor binding"
+        )
+
+
+def validate_allocation_bindings(allocation: TensorAllocation) -> None:
+    """Reject ``set_``/storage replacement of validator-owned live buffers."""
+
+    groups = (
+        ("output", allocation.outputs, allocation.output_bindings),
+        ("workspace", allocation.workspace, allocation.workspace_bindings),
+    )
+    for kind, tensors, bindings in groups:
+        if len(tensors) != len(bindings):
+            raise ValueError(
+                f"{kind} storage binding count {len(bindings)} != tensor count "
+                f"{len(tensors)}"
+            )
+        for index, (tensor, expected) in enumerate(zip(tensors, bindings)):
+            validate_tensor_binding(tensor, expected, name=f"{kind}[{index}]")
+
+
+def tensor_bindings(
+    tensors: Iterable[torch.Tensor],
+) -> tuple[TensorStorageBinding, ...]:
+    """Capture exact bindings while retaining every original storage strongly."""
+
+    return tuple(tensor_storage_binding(tensor) for tensor in tensors)
+
+
+def validate_tensor_bindings(
+    tensors: Iterable[torch.Tensor],
+    bindings: Sequence[TensorStorageBinding],
+    *,
+    kind: str = "input",
+) -> None:
+    tensors = tuple(tensors)
+    if len(tensors) != len(bindings):
+        raise ValueError(
+            f"{kind} binding count {len(bindings)} != tensor count {len(tensors)}"
+        )
+    for index, (tensor, binding) in enumerate(zip(tensors, bindings)):
+        validate_tensor_binding(tensor, binding, name=f"{kind}[{index}]")
+
+
+def validate_output_allocation(
+    spec: OutputSpec,
+    allocation: TensorAllocation,
+    *,
+    fallback_dtype: torch.dtype,
+    fallback_device: str | torch.device,
+    inputs: Iterable[torch.Tensor] = (),
+) -> None:
+    """Revalidate storage and the complete typed ABI after candidate execution."""
+
+    validate_allocation_bindings(allocation)
+    inputs = tuple(tensor for tensor in inputs if torch.is_tensor(tensor))
+    validate_output_spec(
+        spec,
+        allocation.outputs,
+        fallback_dtype=fallback_dtype,
+        fallback_device=fallback_device,
+        inputs=inputs,
+    )
+    if len(allocation.workspace) != len(spec.workspace):
+        raise ValueError(
+            f"workspace count {len(allocation.workspace)} != declared "
+            f"{len(spec.workspace)}"
+        )
+    checked: list[torch.Tensor] = list(allocation.outputs)
+    for tensor, tensor_spec in zip(allocation.workspace, spec.workspace):
+        validate_tensor(
+            tensor,
+            tensor_spec,
+            fallback_dtype=fallback_dtype,
+            fallback_device=fallback_device,
+            disjoint_from=(*inputs, *checked),
+        )
+        checked.append(tensor)
 
 
 def _resolved_dtype(spec: TensorSpec, fallback: torch.dtype) -> torch.dtype:
@@ -294,7 +451,14 @@ def allocate_output_spec(
         )
         destination.append(tensor)
         allocated.append(tensor)
-    return TensorAllocation(outputs=outputs, workspace=workspace)
+    return TensorAllocation(
+        outputs=outputs,
+        workspace=workspace,
+        output_bindings=tuple(tensor_storage_binding(tensor) for tensor in outputs),
+        workspace_bindings=tuple(
+            tensor_storage_binding(tensor) for tensor in workspace
+        ),
+    )
 
 
 def validate_output_spec(

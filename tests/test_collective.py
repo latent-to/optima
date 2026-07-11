@@ -88,6 +88,56 @@ def test_candidate_cannot_poison_its_own_trusted_reference(tmp_path):
     assert result.shape_results[0].detail
 
 
+def test_candidate_cannot_rebind_collective_input_to_equal_storage(tmp_path):
+    rebinding = tmp_path / "rebind_input.py"
+    rebinding.write_text(
+        "import torch.distributed as dist\n"
+        "def all_reduce(x, out, group=None):\n"
+        "    replacement = x.detach().clone()\n"
+        "    x.set_(replacement)\n"
+        "    out.copy_(x)\n"
+        "    dist.all_reduce(out, group=group)\n"
+    )
+
+    result = _verify(rebinding)
+
+    assert not result.passed
+    assert "validator-owned storage/tensor binding" in result.shape_results[0].detail
+
+
+def test_candidate_cannot_replace_collective_output_storage(tmp_path):
+    replacing = tmp_path / "replace_output.py"
+    replacing.write_text(
+        "import torch\n"
+        "def all_reduce(x, out, group=None):\n"
+        "    replacement = torch.empty_like(out)\n"
+        "    out.set_(replacement)\n"
+        "    out.copy_(x)\n"
+    )
+
+    result = _verify(replacing)
+
+    assert not result.passed
+    assert "validator-owned storage" in result.shape_results[0].detail
+
+
+def test_candidate_cannot_change_collective_output_strides(tmp_path):
+    restriding = tmp_path / "restride_output.py"
+    restriding.write_text(
+        "import torch.distributed as dist\n"
+        "def all_reduce(x, out, group=None):\n"
+        "    expected = x.clone()\n"
+        "    dist.all_reduce(expected, group=group)\n"
+        "    out.as_strided_(out.shape, (1, out.shape[0]))\n"
+        "    out.copy_(expected)\n"
+    )
+
+    result = _verify(restriding)
+
+    assert not result.passed
+    assert "validator-owned storage/tensor binding" in result.shape_results[0].detail
+
+
 def test_collective_dtype_and_topology_are_truthful():
     result = _verify(dtype_name="float64")
     assert result.passed, result.shape_results[0].detail

@@ -261,6 +261,40 @@ class CallDescriptor(Mapping[str, CapabilityScalar]):
         return CallDescriptor(values)
 
 
+def collective_call_descriptor(
+    *,
+    dtype: str,
+    architecture: str | None,
+    graph_mode: str,
+    world_size: int,
+    tp_size: int | None = None,
+    model: str | None = None,
+    quant: str = "dense",
+    layout: str = "row_major",
+    dimensions: Mapping[str, Any] | None = None,
+) -> CallDescriptor:
+    """Canonical descriptor shared by distributed verify and live bindings.
+
+    The caller owns semantic dimension extraction; this helper owns the stable
+    collective context vocabulary. ``world_size`` is the size of the actual process
+    group handed to the candidate, and TP defaults to that same group rather than a
+    caller-provided environment hint.
+    """
+
+    fields: dict[str, Any] = {
+        "dtype": dtype,
+        "architecture": architecture,
+        "graph_mode": graph_mode,
+        "layout": layout,
+        "quant": quant,
+        "model": model,
+        "world_size": world_size,
+        "tp_size": world_size if tp_size is None else tp_size,
+    }
+    fields.update(dimensions or {})
+    return CallDescriptor(fields)
+
+
 def msa_prefill_call_descriptor(
     *,
     dtype: str,

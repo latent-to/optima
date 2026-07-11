@@ -113,6 +113,13 @@ def _load_bundle_into_registry(bundle: str) -> None:
     from optima.slots import SLOTS
 
     manifest = load_manifest(bundle)
+    if any(op.setup for op in manifest.ops) and not _truthy(
+        os.environ.get("OPTIMA_FRAMEWORK_MODE")
+    ):
+        raise RuntimeError(
+            "bundle declares setup() but OPTIMA_FRAMEWORK_MODE is not armed; "
+            "refusing engine-wide mutation"
+        )
     # Recursive vendored-tree guard: a bundle can carry a whole vendored library; every .py
     # must clear the policy scan, not just the declared entries. Fail closed (load nothing).
     # Pass the manifest's declared cuda_sources + dep_patches so the runtime load
@@ -140,8 +147,8 @@ def _load_bundle_into_registry(bundle: str) -> None:
     # workspace in module globals) must not get two module instances — each would
     # re-init its own comm state and the second barrier could interleave across ranks.
     loaded_by_src: dict[Path, object] = {}
-    # Variant deduplication only. This does not gate setup() or make candidate
-    # execution trusted; the later OCI/no-egress isolation layer owns that boundary.
+    # Variant deduplication only; framework admission was enforced above. This set
+    # does not make candidate execution trusted—the later OCI/no-egress boundary does.
     setup_done: set[tuple[Path, str]] = set()
     for op in manifest.ops:
         if op.slot not in SLOTS:

@@ -299,7 +299,7 @@ def test_seam_loader_registers_every_variant(tmp_path):
 
 
 def test_shared_setup_runs_once_across_variants(tmp_path, monkeypatch):
-    from optima import sandbox
+    from optima import rebuild, sandbox
     from optima.registry import REGISTRY
     from optima.seam import _load_bundle_into_registry
 
@@ -328,7 +328,11 @@ def test_shared_setup_runs_once_across_variants(tmp_path, monkeypatch):
         'metadata = "metadata/b.json"\n'
     )
     calls = []
+    load_calls = []
+    rebuild_calls = []
     original = sandbox.callable_from
+    original_load = sandbox.load_module
+    original_rebuild = rebuild.apply_rebuild_plan
 
     def observed(module, name):
         fn = original(module, name)
@@ -341,10 +345,30 @@ def test_shared_setup_runs_once_across_variants(tmp_path, monkeypatch):
 
         return wrapped
 
+    def observed_load(path):
+        load_calls.append(path)
+        return original_load(path)
+
+    def observed_rebuild(path):
+        rebuild_calls.append(path)
+        return original_rebuild(path)
+
     monkeypatch.setattr(sandbox, "callable_from", observed)
+    monkeypatch.setattr(sandbox, "load_module", observed_load)
+    monkeypatch.setattr(rebuild, "apply_rebuild_plan", observed_rebuild)
     REGISTRY.clear()
     try:
+        monkeypatch.delenv("OPTIMA_FRAMEWORK_MODE", raising=False)
+        with pytest.raises(RuntimeError, match="OPTIMA_FRAMEWORK_MODE is not armed"):
+            _load_bundle_into_registry(str(bundle))
+        assert load_calls == []
+        assert rebuild_calls == []
+        assert calls == []
+
+        monkeypatch.setenv("OPTIMA_FRAMEWORK_MODE", "1")
         _load_bundle_into_registry(str(bundle))
+        assert len(load_calls) == 1
+        assert len(rebuild_calls) == 1
         assert calls == ["setup_engine"]
     finally:
         REGISTRY.clear()

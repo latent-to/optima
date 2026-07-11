@@ -112,6 +112,11 @@ Some wins can't be expressed as tensor-in/tensor-out (a backend swap, a source r
 Those do **not** get special-cased into the core. They go through the framework / rebuild
 tier, which is **experimental and fenced**:
 
+- A declared `setup()` is engine-wide mutation, not a slot capability. The trusted
+  launcher must explicitly arm framework mode, the scheduler independently checks that
+  decision before scanning/rebuilding/importing the bundle, and external token fidelity
+  takes precedence over any requested in-engine audit. A miner declaration never arms
+  its own grading lane.
 - It runs **only validator-shipped, reviewed patchers** (`rebuild.json` `repo_python` steps) —
   never miner-supplied code (`bundle_python` is rejected). Like PyTorch: you submit a patch to
   core to add a backend; you don't ship arbitrary code into the dispatcher.

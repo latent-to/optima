@@ -305,6 +305,18 @@ def _aligned_kl(baseline: ModeResult, candidate: ModeResult) -> KLReport:
     return aligned_kl(baseline.per_prompt, candidate.per_prompt)
 
 
+def effective_fidelity_mode(cfg: EvalConfig) -> str:
+    """Return the validator-owned quality lane for this candidate.
+
+    Framework mode is authoritative whenever engine-wide ``setup()`` mutation is
+    armed.  A caller may not combine it with ``fidelity_mode='audit'`` to make the
+    candidate's tamperable in-engine audit grade its own framework patch.
+    """
+    if getattr(cfg, "framework_mode", False):
+        return "framework"
+    return str(getattr(cfg, "fidelity_mode", "kl"))
+
+
 def evaluate(cfg: EvalConfig, bundle_path: str, prompts: Optional[list[str]] = None) -> EvalReport:
     prompts = list(prompts) if prompts else sample_prompts(
         cfg.num_prompts, cfg.prompt_seed, input_len=cfg.input_len)
@@ -330,7 +342,8 @@ def evaluate(cfg: EvalConfig, bundle_path: str, prompts: Optional[list[str]] = N
             return call_in_subprocess(fn, *args, **kwargs)
 
     baseline = _launch("baseline", _run_launch, cfg, prompts, bundle_path="", active=False)
-    audit_mode = getattr(cfg, "fidelity_mode", "kl") == "audit"
+    fidelity_mode = effective_fidelity_mode(cfg)
+    audit_mode = fidelity_mode == "audit"
     quality_result, audit_receipts = (
         _launch("quality", _run_quality_launch, cfg, prompts, bundle_path=bundle_path)
         if audit_mode else (None, []))
@@ -362,7 +375,7 @@ def evaluate(cfg: EvalConfig, bundle_path: str, prompts: Optional[list[str]] = N
 
         passed_quality, audit_desc = _audit.gate(
             audit_receipts, min_calls=cfg.audit_min_calls)
-    elif getattr(cfg, "framework_mode", False):
+    elif fidelity_mode == "framework":
         # The miner may have patched the engine (setup()), so its self-reported logprobs
         # are not trusted: gate on token-match vs the trusted stock baseline, not KL.
         passed_quality = total > 0 and token_match >= cfg.token_match_threshold
@@ -385,6 +398,6 @@ def evaluate(cfg: EvalConfig, bundle_path: str, prompts: Optional[list[str]] = N
         baseline, candidate, verdict.speedup, kl, passed_quality, verdict.passed_speedup, score,
         token_match, noise=verdict.noise, required_speedup=verdict.required,
         confident=verdict.confident, baseline2=baseline2,
-        fidelity_mode="audit" if audit_mode else ("framework" if getattr(cfg, "framework_mode", False) else "kl"),
+        fidelity_mode=fidelity_mode,
         audit_desc=audit_desc, audit_receipts=audit_receipts,
     )

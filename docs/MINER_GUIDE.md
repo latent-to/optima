@@ -238,7 +238,7 @@ entry  = "silu_and_mul"                # the function name inside it
 dtypes = ["bfloat16", "float16"]       # optional eligibility filter
 metadata = "metadata/my_kernel.json"   # optional
 # prepare = "prepare"                   # for (prepare, forward) slots like MoE
-# setup   = "setup"                     # optional one-time engine setup (advanced)
+# setup   = "setup"                     # engine-wide mutation; fenced framework lane only
 # architectures = ["sm90", "sm100"]     # optional GPU-arch gate (sm90=H100, sm100=B200)
 ```
 
@@ -247,6 +247,12 @@ slots at once. It may also carry multiple shape-specialized implementations of o
 slot: repeat `[[ops]]`, give every row a unique explicit `variant`, and declare
 non-overlapping capability domains in each row's metadata. Manifest order is never
 routing priority; a live call must match exactly one variant or Optima runs stock.
+
+`setup` is not an ordinary slot hook. It can mutate the whole engine, so Optima refuses
+to import or execute a bundle that declares it unless the validator explicitly arms the
+fenced framework lane. That lane requires candidate isolation and externally observed
+token fidelity; an in-engine audit cannot grade a framework patch. Declaring `setup`
+does not arm the lane on the miner's behalf.
 
 ### The kernel contract
 

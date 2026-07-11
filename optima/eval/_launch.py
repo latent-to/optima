@@ -89,7 +89,23 @@ def prepare_candidate_environment(cfg, *, bundle_path: str, active: bool) -> Non
     framework_mode = getattr(cfg, "framework_mode", False)
     isolate = getattr(cfg, "isolate", False)
     allow_unsafe = getattr(cfg, "allow_unsafe_no_isolation", False)
+    has_setup = False
+    if bundle_path:
+        from optima.manifest import load_manifest
+
+        manifest = load_manifest(bundle_path)
+        has_setup = any(op.setup for op in manifest.ops)
+        if has_setup and not framework_mode:
+            raise IsolationError(
+                "bundle declares setup() but framework_mode is not enabled. "
+                "Engine-wide mutation requires external token fidelity and isolation."
+            )
     if framework_mode and not isolate:
+        if has_setup:
+            raise IsolationError(
+                "setup() requires proven no-egress candidate isolation; "
+                "the unsafe development override cannot arm engine-wide mutation"
+            )
         if not allow_unsafe:
             raise IsolationError(
                 "framework_mode requires no-egress candidate isolation. "
@@ -102,6 +118,11 @@ def prepare_candidate_environment(cfg, *, bundle_path: str, active: bool) -> Non
         _offline_env()
     if isolate:
         if not isolate_network():
+            if has_setup:
+                raise IsolationError(
+                    "setup() requires proven no-egress candidate isolation; "
+                    "the unsafe development override cannot bypass a failed fence"
+                )
             if not allow_unsafe:
                 raise IsolationError(
                     "candidate network isolation was requested but could not be proven. "
@@ -309,6 +330,12 @@ def launched_engine(cfg, *, bundle_path: str, active: bool,
         with env(
             OPTIMA_BUNDLE_PATH=bundle_path or "",
             OPTIMA_ACTIVE="1" if active else "0",
+            # Only the trusted active-launch decision may arm setup(). Force an
+            # explicit zero for ordinary candidates and every baseline so an
+            # ambient parent variable cannot widen the submission lane.
+            OPTIMA_FRAMEWORK_MODE=(
+                "1" if active and getattr(cfg, "framework_mode", False) else "0"
+            ),
             SGLANG_PLUGINS="optima",
             **extra_env,
         ):

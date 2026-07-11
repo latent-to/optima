@@ -230,6 +230,11 @@ my_bundle/
 bundle_id  = "my-silu-v1"              # unique id, [0-9A-Za-z._-]
 abi_version = "optima-op-abi-v0"       # must be exactly this
 
+# Optional for a singleton; useful as an explicit compatibility assertion.
+[competition]
+target = "activation.silu_and_mul"
+mode = "slot"                          # "slot" or a registered "atomic" target
+
 [[ops]]                                 # one [[ops]] block per slot you target
 slot   = "activation.silu_and_mul"     # the slot id (from `optima slots`)
 variant = "general"                    # optional; required on every row when a slot repeats
@@ -242,17 +247,49 @@ metadata = "metadata/my_kernel.json"   # optional
 # architectures = ["sm90", "sm100"]     # optional GPU-arch gate (sm90=H100, sm100=B200)
 ```
 
-All paths are relative and must stay inside the bundle. A bundle can target several
-slots at once. It may also carry multiple shape-specialized implementations of one
-slot: repeat `[[ops]]`, give every row a unique explicit `variant`, and declare
-non-overlapping capability domains in each row's metadata. Manifest order is never
-routing priority; a live call must match exactly one variant or Optima runs stock.
+All paths are relative and must stay inside the bundle. It may carry multiple
+shape-specialized implementations of one slot: repeat `[[ops]]`, give every row a
+unique explicit `variant`, and declare non-overlapping capability domains in each
+row's metadata. Manifest order is never routing priority; a live call must match
+exactly one variant or Optima runs stock.
+
+`[competition]` requests the validator-owned contribution identity; it does not let
+the bundle invent one. A singleton bundle may omit it and resolves to its one slot.
+Several slots form one normal target only when their **exact semantic member set** is
+registered as an atomic target. The catalog registers the proven deep fused-epilogue
+pair under this corrected identity:
+
+```toml
+[competition]
+target = "collective.moe_epilogue.v1"
+mode = "atomic"
+```
+
+The catalog—not manifest row order—owns that target's canonical members, overlap,
+displacement, compatible targets, and permitted contribution features. Unknown
+multi-slot work is classified as unregistered for the future fenced discovery lane; this
+PR does not yet implement that router. It cannot silently become a slot/atomic target.
+Shape or architecture specialization within a registered slot is still metadata/bundle-
+only; it does not require a new target or Optima code change. Donor-era `mode = "system"`
+syntax remains parseable only for migration and never creates a registered system title.
+
+This contract layer does not partially rewrite the legacy score ledger: the existing
+CLI/chain paths keep their historical per-slot identity until evaluation-stack assembly
+and settlement migrate together. `[competition]` is canonical intake data now, not a
+claim that old `ops[0]` economics have already been replaced.
 
 `setup` is not an ordinary slot hook. It can mutate the whole engine, so Optima refuses
 to import or execute a bundle that declares it unless the validator explicitly arms the
 fenced framework lane. That lane requires candidate isolation and externally observed
 token fidelity; an in-engine audit cannot grade a framework patch. Declaring `setup`
 does not arm the lane on the miner's behalf.
+
+The identity-only resolver classifies features declared in the manifest and marks its
+external evidence incomplete. Reviewed patchers selected by `rebuild.json` are outside
+that object; the separate intake resolver requires their exact trusted capability
+projection before it can report complete feature evidence. The existing rebuild parser
+and patcher allowlist remain authoritative—target resolution neither executes a plan nor
+turns a miner-provided patcher name into permission.
 
 ### The kernel contract
 

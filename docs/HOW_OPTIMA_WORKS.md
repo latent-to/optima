@@ -14,7 +14,7 @@ This is the long-form explainer. By the end you should understand, with no gaps:
 It points at every file. Paths are relative to this doc (`docs/`), so
 `../optima/slots.py` is the harness module `optima/slots.py`.
 
-> **Current scope:** ten slots across three kinds (op / block / collective) — run
+> **Current scope:** eleven slots across three kinds (op / block / collective) — run
 > `python -m optima.cli slots` for the live catalog; `STATE_OF_RECORD.md` carries
 > the slot list of record. Fidelity is gated by the **in-engine audit** or per-token **KL**
 > (arena-dependent — see `docs/FIDELITY.md`) *plus* real **benchmark accuracy**
@@ -156,13 +156,28 @@ The manifest is **data, not code** — the validator parses it
 ([../optima/manifest.py](../optima/manifest.py)) to learn *which* slot the bundle
 targets and *where* the kernel source lives. It does not run anything yet.
 
+Loading rows and contribution identity are separate. An optional syntax-only
+`[competition]` table may request a registered target, while
+[../optima/target_catalog.py](../optima/target_catalog.py) resolves the distinct
+semantic slots (deduplicating variants) to a validator-owned singleton or exact atomic
+target. The catalog supplies canonical member order and explicit displacement/compatible-
+overlap policy; miners cannot declare those relationships. Unknown multi-slot work is
+classified as unregistered for the future discovery lane rather than inheriting `ops[0]`
+as an accidental reward identity. Identity-only resolution marks external feature evidence
+incomplete; intake resolution requires a trusted projection of exact rebuild capabilities.
+Neither duplicates nor executes `rebuild.json`, whose reviewed-patcher policy remains separate.
+Legacy CLI/chain score records are intentionally not wired to this catalog yet; stack assembly,
+qualification, intake, and settlement must migrate together so two identity authorities never
+coexist in one economic path.
+
 ### 3.2 The op-slot ABI — the contract
 
 The set of operations a miner is allowed to replace is the **slot catalog**,
 owned by the validator in [../optima/slots.py](../optima/slots.py). Today there are
-ten slots across three `kind`s — `op` (`activation.silu_and_mul`, `norm.rmsnorm`),
+eleven slots across three `kind`s — `op` (`activation.silu_and_mul`, `norm.rmsnorm`),
 `block` (`attention.sdpa`, `attention.decode`, `attention.msa_block_score`,
-`moe.fused_experts`), and `collective` (`collective.all_reduce`,
+`attention.msa_prefill_block_score`, `moe.fused_experts`), and `collective`
+(`collective.all_reduce`,
 `moe.fused_experts_reduce` — the experts block that owns its trailing reduce —
 and the fused epilogues `collective.ar_residual_rmsnorm` /
 `collective.moe_finalize_ar_rmsnorm`). A slot
@@ -784,8 +799,9 @@ The harness package, [../optima/](../optima):
 
 | File | Role |
 |---|---|
-| [slots.py](../optima/slots.py) | The slot ABI. `SlotSpec` (`invoke_reference`/`invoke_entry` for non-uniform signatures, `kind` = op/block/collective, a `Correctness` mode, `prepare`/`prepare_from_layer` for quant-layout slots), the **10 slots** (silu, rmsnorm ops; attention.sdpa/decode/msa_block_score + moe.fused_experts blocks; all_reduce, moe.fused_experts_reduce, ar_residual_rmsnorm, moe_finalize_ar_rmsnorm collectives), references, input generators, tolerances. Adding a slot = editing here. |
+| [slots.py](../optima/slots.py) | The slot ABI. `SlotSpec` (`invoke_reference`/`invoke_entry` for non-uniform signatures, `kind` = op/block/collective, a `Correctness` mode, `prepare`/`prepare_from_layer` for quant-layout slots), the **11 slots** (silu, rmsnorm ops; attention.sdpa/decode/msa decode+prefill block scores + moe.fused_experts blocks; all_reduce, moe.fused_experts_reduce, ar_residual_rmsnorm, moe_finalize_ar_rmsnorm collectives), references, input generators, tolerances. Adding a slot = editing here. |
 | [manifest.py](../optima/manifest.py) | Parse + validate `manifest.toml`. Schema + ABI check + **path-safety** (`_safe_relpath`). Pure-Python. |
+| [target_catalog.py](../optima/target_catalog.py) | Pure validator policy for canonical singleton/atomic contribution identity, exact members, displacement/compatible overlap, and allowed features. It contains no crown, chain, or settlement policy; stack manifests bind catalog identity in the later assembly layer. |
 | [sandbox.py](../optima/sandbox.py) | `scan_source` (AST policy tripwire), `load_entry` (import the kernel — isolate in prod), `probe_in_subprocess`. |
 | [registry.py](../optima/registry.py) | `KernelRegistry` (process-global `REGISTRY`), `KernelImpl`, `Eligibility`. The dispatcher's lookup table + active toggle. |
 | [dispatch.py](../optima/dispatch.py) | `make_{silu_and_mul,rmsnorm,attention,moe,allreduce}_dispatcher` — the one place a miner kernel is called; validator owns the allocation, the call site, + fallback. |

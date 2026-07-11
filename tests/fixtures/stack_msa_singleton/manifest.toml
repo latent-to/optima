@@ -1,0 +1,15 @@
+bundle_id = "fixture-msa-singleton"
+abi_version = "optima-op-abi-v0"
+
+[competition]
+target = "attention.msa_prefill_block_score"
+mode = "slot"
+
+[[ops]]
+slot = "attention.msa_prefill_block_score"
+variant = "fixture"
+source = "kernels/blockscore.py"
+entry = "blockscore"
+dtypes = ["bfloat16"]
+architectures = ["sm103"]
+metadata = "metadata/blockscore.json"

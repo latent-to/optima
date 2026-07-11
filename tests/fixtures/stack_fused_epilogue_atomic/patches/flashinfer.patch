@@ -1,0 +1,5 @@
+--- a/data/csrc/fused_moe/fused_moe.cu
++++ b/data/csrc/fused_moe/fused_moe.cu
+@@ -1 +1 @@
+-old_finalize();
++export_prefinalize();

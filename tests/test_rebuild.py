@@ -1,135 +1,207 @@
-"""The rebuild escape hatch must NEVER run bundle-supplied code (arbitrary RCE).
-
-Only validator-shipped, reviewed ``repo_python`` patchers are allowed; a bundle that
-tries to run its own script (`bundle_python`) is rejected *before* the script executes.
-See docs/SLOT_CONTRACT.md. Pure-stdlib (no torch) — runs anywhere.
-"""
+"""Strict, data-only rebuild authority and shared execution projection."""
 
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 
-from optima.rebuild import RebuildError, apply_rebuild_plan
+from optima.rebuild import (
+    RebuildError,
+    RebuildPlan,
+    apply_rebuild_plan,
+    parse_rebuild_plan,
+)
 
 
-def _bundle(tmp_path, plan):
+def test_rebuild_plan_schema_version_is_type_exact():
+    with pytest.raises(RebuildError, match="schema_version"):
+        RebuildPlan(schema_version=True, steps=())
+
+
+def _bundle(tmp_path: Path, plan: object) -> Path:
+    tmp_path.mkdir(parents=True, exist_ok=True)
     (tmp_path / "rebuild.json").write_text(json.dumps(plan))
     return tmp_path
 
 
-def test_no_plan_is_noop(tmp_path):
-    assert apply_rebuild_plan(tmp_path) is False  # no rebuild.json -> nothing to do
-
-
-def test_bundle_python_is_rejected_without_executing(tmp_path):
-    # A bundle trying to run its own code must be refused before the file runs.
-    marker = tmp_path / "pwned"
-    (tmp_path / "evil.py").write_text(f"open({str(marker)!r}, 'w').close()")
-    bundle = _bundle(tmp_path, {"steps": [{"type": "bundle_python", "path": "evil.py"}]})
-    with pytest.raises(RebuildError, match="not allowed"):
-        apply_rebuild_plan(bundle)
-    assert not marker.exists(), "bundle_python script executed — the fence is broken"
-
-
-def test_unknown_step_is_rejected(tmp_path):
-    bundle = _bundle(tmp_path, {"steps": [{"type": "curl_and_run", "path": "x"}]})
-    with pytest.raises(RebuildError, match="unsupported"):
-        apply_rebuild_plan(bundle)
-
-
-# ---- repo_python is restricted to the reviewed patcher dir (optima/patchers/) ----
-
-
-def _fake_repo(tmp_path):
-    """A fake repo root with an optima/patchers/ dir and a stray non-patcher module."""
+def _fake_repo(tmp_path: Path, *, marker: Path | None = None) -> Path:
     repo = tmp_path / "repo"
-    (repo / "optima" / "patchers").mkdir(parents=True)
-    (repo / "optima" / "cli.py").write_text(  # a non-patcher repo module w/ a side effect
-        f"open({str(tmp_path / 'cli_ran')!r}, 'w').close()\n"
-    )
+    patchers = repo / "optima" / "patchers"
+    patchers.mkdir(parents=True)
+    for name, label in (
+        ("apply_dep_patch.py", "patch"),
+        ("build_cuda_ext.py", "build"),
+    ):
+        body = "# reviewed\n"
+        if marker is not None:
+            body += f"open({str(marker)!r}, 'a').write({label!r} + '\\n')\n"
+        (patchers / name).write_text(body)
     return repo
 
 
-def test_reviewed_patcher_under_patchers_dir_runs(tmp_path, monkeypatch):
-    repo = _fake_repo(tmp_path)
-    marker = tmp_path / "patched"
-    (repo / "optima" / "patchers" / "good.py").write_text(f"open({str(marker)!r}, 'w').close()\n")
+def _step(name: str) -> dict[str, str]:
+    return {"type": "repo_python", "path": name}
+
+
+def test_no_plan_is_a_shared_noop(tmp_path):
+    assert parse_rebuild_plan(tmp_path) is None
+    assert apply_rebuild_plan(tmp_path) is False
+
+
+def test_parse_is_pure_and_canonicalizes_registered_order(tmp_path, monkeypatch):
+    marker = tmp_path / "ran"
+    repo = _fake_repo(tmp_path, marker=marker)
     monkeypatch.setenv("OPTIMA_REPO_ROOT", str(repo))
-    bundle = _bundle(tmp_path, {"steps": [{"type": "repo_python", "path": "good.py"}]})
-    assert apply_rebuild_plan(bundle) is True
-    assert marker.exists()  # the reviewed patcher ran
-
-
-def test_repo_python_cannot_run_a_non_patcher_repo_module(tmp_path, monkeypatch):
-    # The old behavior (containment-only) would have let this runpy optima/cli.py as __main__.
-    repo = _fake_repo(tmp_path)
-    monkeypatch.setenv("OPTIMA_REPO_ROOT", str(repo))
-    bundle = _bundle(tmp_path, {"steps": [{"type": "repo_python", "path": "optima/cli.py"}]})
-    with pytest.raises(RebuildError, match="escape|patcher"):
-        apply_rebuild_plan(bundle)
-    assert not (tmp_path / "cli_ran").exists()  # the stray module never executed
-
-
-def test_repo_python_rejects_parent_traversal(tmp_path, monkeypatch):
-    repo = _fake_repo(tmp_path)
-    monkeypatch.setenv("OPTIMA_REPO_ROOT", str(repo))
-    bundle = _bundle(tmp_path, {"steps": [{"type": "repo_python", "path": "../cli.py"}]})
-    with pytest.raises(RebuildError, match="simple relative|escape"):
-        apply_rebuild_plan(bundle)
-    assert not (tmp_path / "cli_ran").exists()
-
-
-def test_repo_python_missing_patcher_fails_closed(tmp_path, monkeypatch):
-    repo = _fake_repo(tmp_path)
-    monkeypatch.setenv("OPTIMA_REPO_ROOT", str(repo))
-    bundle = _bundle(tmp_path, {"steps": [{"type": "repo_python", "path": "nope.py"}]})
-    with pytest.raises(RebuildError, match="not found"):
-        apply_rebuild_plan(bundle)
-
-
-def test_repo_python_rejects_sibling_dir_that_prefixes_patchers(tmp_path, monkeypatch):
-    # A sibling dir whose name STRING-prefixes "optima/patchers" (optima/patchers_evil)
-    # takes the repo-relative branch, so containment (not the branch) must reject it.
-    repo = _fake_repo(tmp_path)
-    (repo / "optima" / "patchers_evil").mkdir()
-    (repo / "optima" / "patchers_evil" / "x.py").write_text(
-        f"open({str(tmp_path / 'evil_ran')!r}, 'w').close()\n"
+    bundle = _bundle(
+        tmp_path / "bundle",
+        {"steps": [_step("build_cuda_ext.py"), _step("apply_dep_patch.py")]},
     )
-    monkeypatch.setenv("OPTIMA_REPO_ROOT", str(repo))
-    bundle = _bundle(tmp_path, {"steps": [{"type": "repo_python", "path": "optima/patchers_evil/x.py"}]})
-    with pytest.raises(RebuildError, match="escape|not found"):
-        apply_rebuild_plan(bundle)
-    assert not (tmp_path / "evil_ran").exists()
+
+    plan = parse_rebuild_plan(bundle)
+    assert plan is not None and not marker.exists()
+    assert [step.patcher_id for step in plan.steps] == [
+        "optima.apply-dep-patch.v1",
+        "optima.build-cuda-ext.v1",
+    ]
+    assert plan.to_dict() == {
+        "steps": [
+            _step("optima/patchers/apply_dep_patch.py"),
+            _step("optima/patchers/build_cuda_ext.py"),
+        ]
+    }
+    assert all(len(step.patcher_sha256) == 64 for step in plan.steps)
+    assert plan.identity_data()["steps"][0]["patcher_id"] == (
+        "optima.apply-dep-patch.v1"
+    )
+
+    assert apply_rebuild_plan(bundle) is True
+    assert marker.read_text().splitlines() == ["patch", "build"]
 
 
-def test_repo_python_rejects_intermediate_symlinked_dir(tmp_path, monkeypatch):
-    # A symlinked SUBDIR under patchers/ (not the leaf) that points outside the reviewed
-    # set: the leaf isn't a symlink, so only resolve()+containment catches the escape.
+def test_parser_normalizes_the_only_two_accepted_path_spellings(tmp_path, monkeypatch):
     repo = _fake_repo(tmp_path)
-    outside = tmp_path / "outside_dir"
-    outside.mkdir()
-    (outside / "x.py").write_text(f"open({str(tmp_path / 'outside_ran')!r}, 'w').close()\n")
+    monkeypatch.setenv("OPTIMA_REPO_ROOT", str(repo))
+    short = parse_rebuild_plan(
+        _bundle(tmp_path / "short", {"steps": [_step("build_cuda_ext.py")]})
+    )
+    full = parse_rebuild_plan(
+        _bundle(
+            tmp_path / "full",
+            {"steps": [_step("optima/patchers/build_cuda_ext.py")]},
+        )
+    )
+    assert short is not None and full is not None
+    assert short.identity_data() == full.identity_data()
+
+
+@pytest.mark.parametrize(
+    "plan, message",
+    [
+        ([], "must be an object"),
+        ({}, "exactly.*steps"),
+        ({"steps": [], "extra": 1}, "exactly.*steps"),
+        ({"steps": {}}, "must be a list"),
+        ({"steps": [7]}, "step 0 must be an object"),
+        ({"steps": [{"type": "repo_python"}]}, "exactly.*type.*path"),
+        (
+            {"steps": [{"type": "repo_python", "path": "build_cuda_ext.py", "x": 1}]},
+            "exactly.*type.*path",
+        ),
+        ({"steps": [_step("../build_cuda_ext.py")]}, "traversal"),
+        ({"steps": [_step("optima/cli.py")]}, "registered file"),
+        ({"steps": [_step("unreviewed.py")]}, "unregistered"),
+        (
+            {"steps": [{"type": "bundle_python", "path": "evil.py"}]},
+            "not allowed",
+        ),
+        (
+            {"steps": [{"type": "curl_and_run", "path": "x"}]},
+            "unsupported",
+        ),
+        (
+            {"steps": [_step("build_cuda_ext.py"), _step("build_cuda_ext.py")]},
+            "duplicate rebuild patcher",
+        ),
+    ],
+)
+def test_strict_plan_schema_rejects_unregistered_authority(
+    tmp_path, monkeypatch, plan, message
+):
+    monkeypatch.setenv("OPTIMA_REPO_ROOT", str(_fake_repo(tmp_path)))
+    marker = tmp_path / "pwned"
+    (tmp_path / "bundle" / "evil.py").parent.mkdir(parents=True)
+    (tmp_path / "bundle" / "evil.py").write_text(
+        f"open({str(marker)!r}, 'w').close()"
+    )
+    bundle = _bundle(tmp_path / "bundle", plan)
+    with pytest.raises(RebuildError, match=message):
+        apply_rebuild_plan(bundle)
+    assert not marker.exists()
+
+
+def test_duplicate_json_keys_fail_closed(tmp_path, monkeypatch):
+    monkeypatch.setenv("OPTIMA_REPO_ROOT", str(_fake_repo(tmp_path)))
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    (bundle / "rebuild.json").write_text('{"steps": [], "steps": []}')
+    with pytest.raises(RebuildError, match="duplicate key"):
+        parse_rebuild_plan(bundle)
+
+
+def test_registered_patcher_must_exist_and_be_regular(tmp_path, monkeypatch):
+    repo = _fake_repo(tmp_path)
+    (repo / "optima" / "patchers" / "build_cuda_ext.py").unlink()
+    monkeypatch.setenv("OPTIMA_REPO_ROOT", str(repo))
+    bundle = _bundle(
+        tmp_path / "bundle", {"steps": [_step("build_cuda_ext.py")]}
+    )
+    with pytest.raises(RebuildError, match="not found"):
+        parse_rebuild_plan(bundle)
+
+
+def test_registered_patcher_symlink_is_rejected(tmp_path, monkeypatch):
+    repo = _fake_repo(tmp_path)
+    patcher = repo / "optima" / "patchers" / "build_cuda_ext.py"
+    outside = tmp_path / "outside.py"
+    outside.write_text("raise AssertionError('must not run')\n")
+    patcher.unlink()
     try:
-        (repo / "optima" / "patchers" / "sub").symlink_to(outside, target_is_directory=True)
+        patcher.symlink_to(outside)
     except OSError:
         pytest.skip("no symlink support")
     monkeypatch.setenv("OPTIMA_REPO_ROOT", str(repo))
-    bundle = _bundle(tmp_path, {"steps": [{"type": "repo_python", "path": "sub/x.py"}]})
-    with pytest.raises(RebuildError, match="escape"):
-        apply_rebuild_plan(bundle)
-    assert not (tmp_path / "outside_ran").exists()
-
-
-def test_repo_python_rejects_symlinked_patcher(tmp_path, monkeypatch):
-    # A symlink inside the patcher dir could re-point at an unreviewed target.
-    repo = _fake_repo(tmp_path)
-    outside = tmp_path / "outside.py"
-    outside.write_text(f"open({str(tmp_path / 'outside_ran')!r}, 'w').close()\n")
-    (repo / "optima" / "patchers" / "link.py").symlink_to(outside)
-    monkeypatch.setenv("OPTIMA_REPO_ROOT", str(repo))
-    bundle = _bundle(tmp_path, {"steps": [{"type": "repo_python", "path": "link.py"}]})
+    bundle = _bundle(
+        tmp_path / "bundle", {"steps": [_step("build_cuda_ext.py")]}
+    )
     with pytest.raises(RebuildError, match="symlink"):
         apply_rebuild_plan(bundle)
-    assert not (tmp_path / "outside_ran").exists()
+
+
+def test_dangling_rebuild_plan_symlink_is_rejected(tmp_path):
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    try:
+        (bundle / "rebuild.json").symlink_to(bundle / "missing.json")
+    except OSError:
+        pytest.skip("no symlink support")
+
+    with pytest.raises(RebuildError, match="non-symlink"):
+        parse_rebuild_plan(bundle)
+
+
+def test_patcher_source_bytes_are_part_of_identity(tmp_path, monkeypatch):
+    repo = _fake_repo(tmp_path)
+    monkeypatch.setenv("OPTIMA_REPO_ROOT", str(repo))
+    bundle = _bundle(
+        tmp_path / "bundle", {"steps": [_step("build_cuda_ext.py")]}
+    )
+    before = parse_rebuild_plan(bundle)
+    assert before is not None
+    (repo / "optima" / "patchers" / "build_cuda_ext.py").write_text(
+        "# reviewed revision two\n"
+    )
+    after = parse_rebuild_plan(bundle)
+    assert after is not None
+    assert before.identity_data() != after.identity_data()

@@ -1,0 +1,14 @@
+{
+  "architectures": ["sm103"],
+  "capabilities": {
+    "model": {"exact": "MiniMax-M3-NVFP4"},
+    "tp_size": {"exact": 4}
+  },
+  "dtypes": ["bfloat16"],
+  "graph_safe": true,
+  "max_num_tokens": 1024,
+  "min_num_tokens": 48,
+  "regime": {
+    "note": "Descriptive receipt prose must not enter selected identity."
+  }
+}

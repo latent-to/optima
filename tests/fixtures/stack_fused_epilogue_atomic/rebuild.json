@@ -1,0 +1,6 @@
+{
+  "steps": [
+    {"type": "repo_python", "path": "apply_dep_patch.py"},
+    {"type": "repo_python", "path": "build_cuda_ext.py"}
+  ]
+}

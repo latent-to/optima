@@ -56,6 +56,16 @@ two things **mandatory, not optional**:
   `world_size` ranks, runs the miner kernel as the real collective, and compares each rank's
   output to a `torch.distributed` reduce of the **fp32** partials (gloo/CPU for a numeric check,
   nccl/GPU for the real path).
+- **One canonical live ABI.** Offline verification and the version-pinned engine binding emit the
+  same `CallDescriptor` and allocate from the same typed output/workspace contract. The binding
+  derives size and role from the actual process group, retains validator-owned input/output
+  storage identities, and revalidates dtype/device/shape/stride/layout/storage after candidate
+  execution. A missing field or unknown/unsupported topology is stock, never a miner fallback.
+- **Collective selection is terminal for that engine call.** Before selection, ineligibility is
+  ordinary stock routing. After all ranks select the unique candidate route, any rank-local
+  prepare/allocation/entry/validation failure aborts the candidate engine; a one-rank stock retry
+  would diverge from peers entering candidate NCCL. Current MoE contracts explicitly exclude
+  MoE-DP/EP dispatch-combine and EP AR-fusion until those boundaries receive their own verifier.
 - **The end-to-end gate.** Per-collective error compounds across every layer, so the op-level
   cosine/matched_ratio is necessary-but-not-sufficient — the token/KL/accuracy gate is required.
 

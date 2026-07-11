@@ -703,11 +703,12 @@ The three real campaign bundles returned whole-bundle N/A on RTX/SM120 (rc=2) be
 declare SM103. That is correct behavior. They remain mock intake/materialization submissions on
 RTX; their CUDA execution, performance, and crown evidence remain B300-only.
 
-This is not yet architectural PR 1 completion. Independent review found the live collective
-adapters still use legacy lookup and untyped allocation, and deep export can authorize a different
-variant than consume. The immediate final PR 1 slice is one shared canonical live descriptor/
-allocation projection across all-reduce, MoE-reduce, shallow AR+norm, and deep export/consume,
-including variant-keyed prepare caches. After that bounded slice and confirmation, PR 1 freezes.
+At this verifier-only checkpoint, architectural PR 1 was not complete. Independent review found
+the live collective adapters still use legacy lookup and untyped allocation, and deep export can
+authorize a different variant than consume. The immediate final PR 1 slice is one shared canonical
+live descriptor/allocation projection across all-reduce, MoE-reduce, shallow AR+norm, and deep
+export/consume, including variant-keyed prepare caches. After that bounded slice and confirmation,
+PR 1 freezes.
 
 Budget truth through the verifier code is cumulative production +5,060 and tests +5,114 since
 pre-extraction main: 26.0% and 52.7% of the plan budgets, 34.8% combined. Line count is a scope
@@ -720,3 +721,55 @@ Do not repeat seven micro-PRs per architectural layer. The remaining bounded mer
 closure; PR 3a; vendor provenance; PR 2; PR 3b; PR 4; PR 5; PR 6; PR 7; PR 8, splitting PR 2 or
 PR 4 only if reviewability genuinely requires it. Superseded paths are deleted in their owner PR;
 a standalone cleanup PR is justified only when it is actually net-negative and preserves receipts.
+
+## 2026-07-11 PR #39 final — architectural PR 1 closed
+
+PR #39 (`codex/distributed-collective-graph-proof`) closes the contribution-contract layer at
+exact code head `e7b7ddcb`. The second commit replaces the remaining live collective legacy paths:
+all-reduce, reduce-owning MoE, shallow AR+norm, and deep export/consume now emit the same canonical
+descriptor used offline, allocate from the same typed output contract, and bind input/output/
+workspace storage plus metadata across candidate execution. MoE preparation is keyed by exact
+slot/bundle/variant/callable identity and the distributed verifier reuses invariant prepared state
+across dynamic token buckets like the live layer.
+
+Topology is validator-observed rather than miner- or layer-asserted. Class-wide all-reduce admits
+only pinned SGLang TP roles; MoE reduce follows the exact stock full-TP tail group. MoE DP/EP,
+EP AR fusion, quantized reduce-owning MoE, unknown groups, and missing authority remain stock.
+The destructive deep producer binds the exact implementation, descriptor, BF16 export ABI, and
+ordered global-rank topology through consume. Once any collective route crosses its deterministic
+selection boundary, a rank-local prepare/clone/allocation/entry/validation failure aborts the
+candidate engine; it never lets one rank execute stock while peers enter candidate NCCL.
+
+Two RTX-grounded defects were found and fixed during final proof. CPU deep-export doubles no longer
+inherit `sm120` merely because the host has a GPU. The direct live graph test is bounded and exits
+disposable workers after captured NCCL instead of hanging in process-group destruction; capture is
+graded only after replay. That test now instantiates the pinned SGLang `GroupCoordinator` and routes
+through its real `get_tp_group` authority rather than monkeypatching Optima's role classifier.
+
+Exact code-head evidence:
+
+- local `pyenv activate sn120`: **674 passed, 15 skipped**; compileall and diff check clean;
+- RTX/Linux excluding the dedicated GPU module: **679 passed, 2 skipped**;
+- four concurrent disjoint RTX pairs, each including the real SGLang live adapter and NCCL
+  capture/replay: **7 passed, 1 skipped per pair** (**28 passed, 4 skipped** total);
+- both TP4 halves: multi-output AR+norm capture/replay passed; TP8 faithful replay passed;
+- exact pinned runtime exposes both `get_moe_data_parallel_world_size` and the current
+  `is_in_tc_piecewise_cuda_graph` API used by the binding;
+- blockscore, shallow fused epilogue, and deep fused epilogue real campaign bundles each returned
+  whole-bundle N/A (rc=2) on SM120 because they declare SM103; no campaign CUDA was ported;
+- all eight devices drained to **0 MiB / 0%** after proof.
+
+Independent implementation/adversarial review and a final confirmation pass found no remaining
+P0/P1 in the frozen PR-1 matrix. Explicit nonclaims are preserved: generic arbitrary subgroups and
+off-catalog shape synthesis are not implemented; model/runtime/phase identity awaits PR 3 manifests;
+plain `moe.fused_experts` retains legacy descriptor lookup; in-process isolation and pristine crown
+authority remain PR 2/PR 4. These are fail-closed boundaries, not claims hidden by the tests.
+
+Classified size at the code head: verifier commit +931/-87 production and +660/-2 tests; live
+parity commit +1,354/-266 production and +1,402/-143 tests; whole PR versus `main` +2,243/-311
+production, +2,062/-145 tests, and +178/-15 docs including this final receipt update. Cumulative
+from clean pre-extraction main `203bb559`: production +6,343/-476, tests +6,490/-125, and docs
++1,521/-34. The test excess over
+the PR-1 guidance is explicitly accepted because it retains reproduced adversaries; duplicate
+mutation/graph/legacy-lookup cases were consolidated, and independent scope review found no PR 2/3
+drift or safe production deletion. The next merge unit is PR 3a, not another PR-1 slice.

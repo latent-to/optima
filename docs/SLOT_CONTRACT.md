@@ -86,16 +86,25 @@ per-step `max_len` host-sync); its graph-safe form is a paged-direct contract (t
 
 - **Additive only.** `abi_version` gates the bundle format; new `SlotSpec` fields are
   optional; never break a bundle that parsed before (Linux's "don't break userspace").
+- **Implementation specialization is data, not a new seam.** Several named `variant`
+  rows may implement the same semantic slot when their validator-parsed capability
+  domains do not overlap. A binding emits a canonical call descriptor, Optima selects
+  exactly one implementation, and every gap or ambiguity runs stock. Shape support and
+  output dtype/layout/stride are therefore validator-enforced contracts rather than
+  miner-owned fallback code. Offline verification must use the same invariant arena
+  context; it may synthesize bounded semantic probes inside a new declared domain, while
+  larger workload/range coverage remains an arena-profile responsibility and fails closed
+  when the validator cannot exercise it safely.
 - **Seam adapters are version-pinned glue, not the contract.** Each sglang chokepoint
   (`SiluAndMul.forward`, `RadixAttention.forward`, `FusedMoE.forward`, …) is a *lower-bell*
   adapter, re-validated on every `PINNED_SGLANG` bump via `optima compat`. Proliferate them
   freely; they never touch the four invariants.
-- **Extraction trigger (do NOT do early).** `SlotSpec` is a dataclass today, and that is
-  correct while it's small. When the next slot forces *yet another* optional field/callable —
-  or the `lambda` soup stops being readable — extract `Slot` into an interface (one class per
-  slot, mirroring sglang's `AttentionBackend` base class). Not before: premature abstraction
-  is its own way projects die. The refactor is local — it touches neither the invariants nor
-  any miner's bundle.
+- **The first extraction trigger has fired, narrowly.** Output allocation is now the
+  declarative `OutputSpec`/`TensorSpec` boundary shared by offline verification and live
+  bindings; legacy slots bridge from `out_shapes` unchanged. Inputs, invocation, references,
+  and comparison remain validator-owned `SlotSpec` callables. Extract those only when a
+  second concrete binding proves a stable typed-input/invocation pattern; do not describe
+  the present output ABI as a complete generic component IR.
 
 ## The escape hatch (where exotic submissions go FIRST)
 

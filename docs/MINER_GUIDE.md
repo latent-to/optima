@@ -232,6 +232,7 @@ abi_version = "optima-op-abi-v0"       # must be exactly this
 
 [[ops]]                                 # one [[ops]] block per slot you target
 slot   = "activation.silu_and_mul"     # the slot id (from `optima slots`)
+variant = "general"                    # optional; required on every row when a slot repeats
 source = "kernels/my_kernel.py"        # relative path to your module
 entry  = "silu_and_mul"                # the function name inside it
 dtypes = ["bfloat16", "float16"]       # optional eligibility filter
@@ -241,8 +242,11 @@ metadata = "metadata/my_kernel.json"   # optional
 # architectures = ["sm90", "sm100"]     # optional GPU-arch gate (sm90=H100, sm100=B200)
 ```
 
-All paths are relative and must stay inside the bundle. One `[[ops]]` per slot; a
-bundle can target several slots at once.
+All paths are relative and must stay inside the bundle. A bundle can target several
+slots at once. It may also carry multiple shape-specialized implementations of one
+slot: repeat `[[ops]]`, give every row a unique explicit `variant`, and declare
+non-overlapping capability domains in each row's metadata. Manifest order is never
+routing priority; a live call must match exactly one variant or Optima runs stock.
 
 ### The kernel contract
 
@@ -280,6 +284,13 @@ def fused_experts(x, topk_ids, topk_weights, prepared, out):   # every step
   "dtypes": ["bfloat16", "float16"],
   "architectures": ["sm90", "sm100"],
   "graph_safe": true,
+  "capabilities": {
+    "head_dim": 128,
+    "block_size": [64, 128],
+    "q_len": {"min": 1, "max": 4096},
+    "phase": "prefill",
+    "layout": "row_major"
+  },
   "notes": "free text"
 }
 ```
@@ -290,6 +301,29 @@ def fused_experts(x, topk_ids, topk_weights, prepared, out):   # every step
   CUDA graphs.** Without it, your block kernel falls back to the baseline in-graph and
   can't win. Only declare it if your kernel truly captures (no host syncs, no
   data-dependent shapes inside the graph).
+- `capabilities` — the normative specialization domain. A scalar means exact,
+  a list means one-of, and `{ "min": ..., "max": ... }` is an inclusive numeric
+  range. Missing live fields do not act as wildcards: the validator reports the
+  shape N/A and runs stock. Contradictory or overlapping variant domains are rejected.
+
+`attention.msa_prefill_block_score` is the first binding with a complete rich live
+descriptor. It supplies `dtype`, `architecture`, `head_dim`, `block_size`, `q_len`,
+`kv_len`, `top_k`, `phase`, `layout`, `graph_mode`, `quant`, `tp_size`, and
+`world_size` (plus the one-head call semantics). Other bindings currently expose only
+their legacy eligibility facts; a capability field they do not explicitly supply fails
+closed rather than being guessed from a similarly named tensor.
+
+Output allocation is also slot-typed. Legacy slots receive inherited-dtype contiguous
+outputs. MSA prefill receives an FP32 row-major score view whose row pitch may be padded;
+its kernel must use the supplied strides and must not assume contiguous BF16 storage.
+`optima verify` deliberately allocates the padded form and reports catalog shapes outside
+a variant's selected dtype/architecture/TP context as N/A. Run verification once for each
+arena dtype/context (`--tp-size` and `--world-size` when declared); sibling variants for
+other contexts are neutral only when at least one row is applicable. If a bounded MSA
+shape domain misses the static catalog, Optima synthesizes both random and causal probes
+inside it. Probe allocation has validator-owned safety ceilings, so an untestably large
+domain fails closed. A few probes do not prove an arbitrary wide range—the registered
+arena's workload distribution remains the end-to-end coverage authority.
 
 ### Advanced: override submissions and dependency patches
 

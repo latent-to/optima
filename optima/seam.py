@@ -140,6 +140,9 @@ def _load_bundle_into_registry(bundle: str) -> None:
     # workspace in module globals) must not get two module instances — each would
     # re-init its own comm state and the second barrier could interleave across ranks.
     loaded_by_src: dict[Path, object] = {}
+    # Variant deduplication only. This does not gate setup() or make candidate
+    # execution trusted; the later OCI/no-egress isolation layer owns that boundary.
+    setup_done: set[tuple[Path, str]] = set()
     for op in manifest.ops:
         if op.slot not in SLOTS:
             continue
@@ -181,7 +184,10 @@ def _load_bundle_into_registry(bundle: str) -> None:
                 bundle_id=manifest.bundle_id,
                 entry=entry,
                 prepare=prepare,
-                eligibility=eligibility_from_metadata(meta, op.dtypes),
+                eligibility=eligibility_from_metadata(
+                    meta, op.dtypes, op.architectures
+                ),
+                variant=op.variant,
             )
         )
         # FRAMEWORK MODE: an optional setup() runs ONCE here (candidate scheduler only —
@@ -192,5 +198,8 @@ def _load_bundle_into_registry(bundle: str) -> None:
         # (framework_mode) and it MUST run in the no-egress isolation worker before the
         # subnet opens to untrusted miners.
         if getattr(op, "setup", None):
-            callable_from(module, op.setup)()
-            logger.info("optima: ran setup() for %s", op.slot)
+            setup_key = (src_key, op.setup)
+            if setup_key not in setup_done:
+                callable_from(module, op.setup)()
+                setup_done.add(setup_key)
+                logger.info("optima: ran setup() for %s", op.slot)

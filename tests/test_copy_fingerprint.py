@@ -5,16 +5,21 @@ exact content hash is still caught, and (2) copy detection now spans rounds, so 
 copy revealed in a LATER round than the original is no longer mislabeled original.
 """
 
+import hashlib
 from pathlib import Path
+
+import pytest
 
 from optima.commit_reveal import Ledger, make_commitment
 from optima.copy_fingerprint import (
     bundle_fingerprint,
     bundle_slot_file_fingerprints,
     bundle_slot_fingerprints,
+    bundle_slot_structural_fingerprints,
     normalized_source,
     source_fingerprint,
     structural_fingerprint,
+    structural_source,
 )
 
 # A rename-everything + constant-tweak copy of ORIG: same structure, vars renamed
@@ -163,6 +168,31 @@ def _write_bundle(root: Path, ops: list[tuple[str, str, str]], files: dict[str, 
     return root
 
 
+def _write_variant_bundle(
+    root: Path,
+    rows: list[tuple[str, str, str, str]],
+    files: dict[str, str],
+) -> Path:
+    """Materialize explicit ``(slot, variant, source, entry)`` rows."""
+    root.mkdir(parents=True, exist_ok=True)
+    lines = ['bundle_id = "t"', 'abi_version = "optima-op-abi-v0"', ""]
+    for slot, variant, source, entry in rows:
+        lines += [
+            "[[ops]]",
+            f'slot = "{slot}"',
+            f'variant = "{variant}"',
+            f'source = "{source}"',
+            f'entry = "{entry}"',
+            "",
+        ]
+    (root / "manifest.toml").write_text("\n".join(lines))
+    for rel, src in files.items():
+        path = root / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(src)
+    return root
+
+
 def _reveal_bundle(led: Ledger, hotkey: str, ch: str, rnd: int, bundle: Path):
     led.commit(hotkey, make_commitment(ch, hotkey, "s"), rnd)
     return led.reveal(
@@ -231,4 +261,231 @@ def test_file_fingerprints_skip_boilerplate_and_follow_imports(tmp_path):
     file_fps = bundle_slot_file_fingerprints(b)["activation.silu_and_mul"]
     # the one-line re-export shim is boilerplate (below the substantial floor); the
     # imported body is followed and fingerprinted path-independently.
-    assert file_fps == [source_fingerprint(ORIG)]
+    assert source_fingerprint(ORIG) in file_fps
+
+
+# ---- multiple variants of one slot -----------------------------------------
+
+
+_SLOT = "activation.silu_and_mul"
+_ROWS = [
+    (_SLOT, "small", "kernels/small.py", "silu_and_mul"),
+    (_SLOT, "large", "kernels/large.py", "silu_and_mul"),
+]
+_VARIANT_FILES = {
+    "kernels/small.py": ORIG,
+    "kernels/large.py": DIFFERENT,
+}
+
+
+def test_singleton_slot_digest_behavior_is_preserved(tmp_path):
+    bundle = _write_bundle(
+        tmp_path / "single",
+        [(_SLOT, "kernels/silu.py", "silu_and_mul")],
+        {"kernels/silu.py": ORIG},
+    )
+    closure = "kernels/silu.py\x00" + normalized_source(ORIG)
+    identity = "\x00".join([_SLOT, "silu_and_mul", "", "", "", ""])
+    normalized_expected = hashlib.sha256(
+        (identity + "\x1e" + closure).encode("utf-8")
+    ).hexdigest()
+    structural_closure = "kernels/silu.py\x00" + structural_source(ORIG)
+    structural_expected = hashlib.sha256(
+        (_SLOT + "\x1e" + structural_closure).encode("utf-8")
+    ).hexdigest()
+
+    assert bundle_slot_fingerprints(bundle)[_SLOT] == normalized_expected
+    assert bundle_slot_structural_fingerprints(bundle)[_SLOT] == structural_expected
+
+
+def test_multi_variant_file_fingerprints_include_both_sources(tmp_path):
+    bundle = _write_variant_bundle(tmp_path / "multi", _ROWS, _VARIANT_FILES)
+
+    assert set(bundle_slot_file_fingerprints(bundle)[_SLOT]) >= {
+        source_fingerprint(ORIG),
+        source_fingerprint(DIFFERENT),
+    }
+
+
+def test_same_file_stolen_variant_plus_fresh_sibling_is_still_demoted(tmp_path):
+    singleton = _write_bundle(
+        tmp_path / "single",
+        [(_SLOT, "kernels/silu.py", "silu_and_mul")],
+        {"kernels/silu.py": ORIG},
+    )
+    fresh_sibling = '''\
+def silu_large(x, out):
+    d = x.shape[-1] // 2
+    out.copy_(x[..., :d] + x[..., d:])
+'''
+    shared_source = ORIG + "\n" + fresh_sibling
+    multi = _write_variant_bundle(
+        tmp_path / "multi",
+        [
+            (_SLOT, "stolen", "kernels/shared.py", "silu_and_mul"),
+            (_SLOT, "fresh", "kernels/shared.py", "silu_large"),
+        ],
+        {"kernels/shared.py": shared_source},
+    )
+
+    singleton_files = set(bundle_slot_file_fingerprints(singleton)[_SLOT])
+    multi_files = set(bundle_slot_file_fingerprints(multi)[_SLOT])
+    assert singleton_files < multi_files
+
+    ledger = Ledger()
+    original = _reveal_bundle(ledger, "alice", "H_SINGLE_SHARED", 0, singleton)
+    padded_copy = _reveal_bundle(ledger, "bob", "H_MULTI_SHARED", 1, multi)
+    assert original.original is True
+    assert padded_copy.original is False
+
+
+def test_same_file_padding_cannot_hide_from_legacy_whole_file_record(tmp_path):
+    singleton = _write_bundle(
+        tmp_path / "single",
+        [(_SLOT, "kernels/silu.py", "silu_and_mul")],
+        {"kernels/silu.py": ORIG},
+    )
+    # Model a record created before definition-level fingerprints existed: only
+    # the historical normalized whole-file value is available. The copier pads
+    # both the file and its import statement; the pruned dependency projection
+    # must still reproduce the old identity.
+    legacy_files = {source_fingerprint(ORIG)}
+    padded = ORIG.replace("import torch", "import torch, os") + '''\
+
+def silu_large(x, out):
+    d = x.shape[-1] // 2
+    out.copy_(x[..., :d] + x[..., d:])
+'''
+    multi = _write_variant_bundle(
+        tmp_path / "multi",
+        [
+            (_SLOT, "stolen", "kernels/shared.py", "silu_and_mul"),
+            (_SLOT, "fresh", "kernels/shared.py", "silu_large"),
+        ],
+        {"kernels/shared.py": padded},
+    )
+
+    assert legacy_files <= set(bundle_slot_file_fingerprints(multi)[_SLOT])
+    assert set(bundle_slot_file_fingerprints(singleton)[_SLOT]) >= legacy_files
+
+
+def test_padded_shared_imported_helper_retains_stolen_containment(tmp_path):
+    singleton = _write_bundle(
+        tmp_path / "single",
+        [(_SLOT, "kernels/entry.py", "silu_and_mul")],
+        {
+            "kernels/entry.py": "from .impl import silu_and_mul\n",
+            "kernels/impl.py": ORIG,
+        },
+    )
+    fresh_sibling = '''\
+def silu_large(x, out):
+    d = x.shape[-1] // 2
+    out.copy_(x[..., :d] + x[..., d:])
+'''
+    multi = _write_variant_bundle(
+        tmp_path / "multi",
+        [
+            (_SLOT, "stolen", "kernels/entry.py", "silu_and_mul"),
+            (_SLOT, "fresh", "kernels/entry.py", "silu_large"),
+        ],
+        {
+            "kernels/entry.py": (
+                "from .impl import silu_and_mul, silu_large\n"
+            ),
+            "kernels/impl.py": ORIG + "\n" + fresh_sibling,
+        },
+    )
+
+    singleton_files = set(bundle_slot_file_fingerprints(singleton)[_SLOT])
+    multi_files = set(bundle_slot_file_fingerprints(multi)[_SLOT])
+    assert singleton_files < multi_files
+
+    ledger = Ledger()
+    original = _reveal_bundle(ledger, "alice", "H_HELPER_SINGLE", 0, singleton)
+    padded_copy = _reveal_bundle(ledger, "bob", "H_HELPER_MULTI", 1, multi)
+    assert original.original is True
+    assert padded_copy.original is False
+
+
+def _all_slot_fingerprint_maps(bundle):
+    return (
+        bundle_slot_fingerprints(bundle),
+        bundle_slot_file_fingerprints(bundle),
+        bundle_slot_structural_fingerprints(bundle),
+    )
+
+
+def test_variant_row_reorder_does_not_change_fingerprints(tmp_path):
+    first = _write_variant_bundle(tmp_path / "first", _ROWS, _VARIANT_FILES)
+    reordered = _write_variant_bundle(
+        tmp_path / "second",
+        list(reversed(_ROWS)),
+        _VARIANT_FILES,
+    )
+
+    assert _all_slot_fingerprint_maps(first) == _all_slot_fingerprint_maps(reordered)
+
+
+def test_variant_rename_does_not_change_fingerprints(tmp_path):
+    first = _write_variant_bundle(tmp_path / "first", _ROWS, _VARIANT_FILES)
+    renamed = _write_variant_bundle(
+        tmp_path / "renamed",
+        [
+            (_SLOT, "renamed_small", "kernels/small.py", "silu_and_mul"),
+            (_SLOT, "renamed_large", "kernels/large.py", "silu_and_mul"),
+        ],
+        _VARIANT_FILES,
+    )
+
+    assert _all_slot_fingerprint_maps(first) == _all_slot_fingerprint_maps(renamed)
+
+
+def test_stolen_singleton_is_contained_and_demoted_in_multi_variant_bundle(tmp_path):
+    singleton = _write_bundle(
+        tmp_path / "single",
+        [(_SLOT, "kernels/silu.py", "silu_and_mul")],
+        {"kernels/silu.py": ORIG},
+    )
+    multi = _write_variant_bundle(tmp_path / "multi", _ROWS, _VARIANT_FILES)
+
+    singleton_files = set(bundle_slot_file_fingerprints(singleton)[_SLOT])
+    multi_files = set(bundle_slot_file_fingerprints(multi)[_SLOT])
+    assert singleton_files < multi_files
+
+    ledger = Ledger()
+    original = _reveal_bundle(ledger, "alice", "H_SINGLE", 0, singleton)
+    padded_copy = _reveal_bundle(ledger, "bob", "H_MULTI", 1, multi)
+    assert original.original is True
+    assert padded_copy.original is False
+
+
+@pytest.mark.parametrize(
+    ("path", "replacement"),
+    [
+        (
+            "kernels/small.py",
+            ORIG.replace("torch.nn.functional.silu(", "torch.nn.functional.relu("),
+        ),
+        (
+            "kernels/large.py",
+            DIFFERENT.replace("x[..., :d] * x[..., d:]", "x[..., :d] + x[..., d:]"),
+        ),
+    ],
+)
+def test_changing_either_variant_changes_normalized_and_structural_aggregate(
+    tmp_path,
+    path,
+    replacement,
+):
+    baseline = _write_variant_bundle(tmp_path / "baseline", _ROWS, _VARIANT_FILES)
+    changed_files = dict(_VARIANT_FILES)
+    changed_files[path] = replacement
+    changed = _write_variant_bundle(tmp_path / "changed", _ROWS, changed_files)
+
+    assert bundle_slot_fingerprints(baseline)[_SLOT] != bundle_slot_fingerprints(
+        changed
+    )[_SLOT]
+    assert bundle_slot_structural_fingerprints(
+        baseline
+    )[_SLOT] != bundle_slot_structural_fingerprints(changed)[_SLOT]

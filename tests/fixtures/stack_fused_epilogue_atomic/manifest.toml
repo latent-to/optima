@@ -1,0 +1,28 @@
+bundle_id = "fixture-fused-epilogue-atomic"
+abi_version = "optima-op-abi-v0"
+
+[competition]
+target = "collective.moe_epilogue.v1"
+mode = "atomic"
+
+[[dep_patches]]
+target = "flashinfer"
+path = "patches/flashinfer.patch"
+
+[[ops]]
+slot = "collective.ar_residual_rmsnorm"
+source = "kernels/fused_epilogue.py"
+entry = "ar_residual_rmsnorm"
+dtypes = ["bfloat16"]
+architectures = ["sm103"]
+metadata = "metadata/ar_norm.json"
+cuda_sources = ["kernels/fused_epilogue_sm103.cu"]
+
+[[ops]]
+slot = "collective.moe_finalize_ar_rmsnorm"
+source = "kernels/fused_epilogue.py"
+entry = "moe_finalize_ar_rmsnorm"
+dtypes = ["bfloat16"]
+architectures = ["sm103"]
+metadata = "metadata/moe_finalize.json"
+cuda_sources = ["kernels/fused_epilogue_sm103.cu"]

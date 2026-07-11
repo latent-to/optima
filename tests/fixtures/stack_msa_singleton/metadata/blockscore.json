@@ -1,0 +1,12 @@
+{
+  "architectures": ["sm103"],
+  "capabilities": {
+    "block_size": {"exact": 128},
+    "head_dim": {"exact": 128},
+    "model": {"exact": "MiniMax-M3-NVFP4"},
+    "phase": {"exact": "prefill"}
+  },
+  "dtypes": ["bfloat16"],
+  "graph_safe": true,
+  "notes": "Descriptive fixture padding; omitted from selected runtime metadata."
+}

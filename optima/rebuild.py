@@ -28,22 +28,74 @@ is deliberately removed; it is rejected with a clear error.)
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import runpy
 import sys
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
-# Reviewed patchers live ONLY here (repo-relative). A repo_python step may select a file
-# under this dir and nowhere else, so "reviewed patcher" is an enforced boundary, not an
-# honor system. Empty today (the feature is forward-looking); a plan naming a missing
-# patcher fails closed.
+# Reviewed patchers live ONLY here (repo-relative). A repo_python step may select a
+# registered file under this directory and nowhere else.
 _PATCHER_SUBDIR = ("optima", "patchers")
+_REGISTERED_PATCHERS = {
+    "apply_dep_patch.py": ("optima.apply-dep-patch.v1", 0),
+    "build_cuda_ext.py": ("optima.build-cuda-ext.v1", 1),
+}
 
 
 class RebuildError(RuntimeError):
     pass
 
+
+@dataclass(frozen=True)
+class RebuildStep:
+    """One resolved validator-owned patcher invocation; never bundle code."""
+
+    step_type: str
+    patcher_id: str
+    path: str
+    patcher_sha256: str
+    _script_path: Path = field(repr=False, compare=False)
+
+    def snapshot(self) -> dict[str, str]:
+        return {
+            "type": self.step_type,
+            "patcher_id": self.patcher_id,
+            "path": self.path,
+            "patcher_sha256": self.patcher_sha256,
+        }
+
+    def runtime_step(self) -> dict[str, str]:
+        return {"type": self.step_type, "path": self.path}
+
+
+@dataclass(frozen=True)
+class RebuildPlan:
+    schema_version: int
+    steps: tuple[RebuildStep, ...]
+
+    def __post_init__(self) -> None:
+        if type(self.schema_version) is not int or self.schema_version != 1:
+            raise RebuildError("rebuild schema_version must be 1")
+        if not isinstance(self.steps, tuple) or not all(
+            isinstance(step, RebuildStep) for step in self.steps
+        ):
+            raise RebuildError("rebuild steps must be a tuple of RebuildStep values")
+
+    def snapshot(self) -> dict[str, object]:
+        return {
+            "schema_version": self.schema_version,
+            "steps": [step.snapshot() for step in self.steps],
+        }
+
+    identity_data = snapshot
+
+    def to_dict(self) -> dict[str, object]:
+        """Canonical validator-generated ``rebuild.json`` projection."""
+        return {"steps": [step.runtime_step() for step in self.steps]}
 
 def _repo_root() -> Path:
     """The repo root. Deterministic (this package's parent), NOT the process CWD — the
@@ -56,6 +108,121 @@ def _repo_root() -> Path:
     return Path(__file__).resolve().parents[1]
 
 
+def _strict_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise RebuildError(f"rebuild.json contains duplicate key {key!r}")
+        result[key] = value
+    return result
+
+
+def _canonical_patcher_name(rel: object) -> str:
+    if not isinstance(rel, str) or not rel or rel.startswith("/"):
+        raise RebuildError(f"patcher path must be a canonical relative string: {rel!r}")
+    path = Path(rel)
+    if ".." in path.parts:
+        raise RebuildError(f"patcher path must not contain traversal: {rel!r}")
+    if len(path.parts) == 1:
+        name = path.name
+    elif path.parts == (*_PATCHER_SUBDIR, path.name):
+        name = path.name
+    else:
+        raise RebuildError(
+            f"patcher path must name a registered file under "
+            f"{os.path.join(*_PATCHER_SUBDIR)!r}: {rel!r}"
+        )
+    if name not in _REGISTERED_PATCHERS:
+        raise RebuildError(f"unregistered rebuild patcher {name!r}")
+    return name
+
+
+def _resolve_registered_patcher(repo_root: Path, name: str) -> Path:
+    patcher_dir = repo_root.joinpath(*_PATCHER_SUBDIR).resolve()
+    candidate = repo_root.joinpath(*_PATCHER_SUBDIR, name)
+    if candidate.is_symlink():
+        raise RebuildError(f"patcher path must not be a symlink: {name!r}")
+    resolved = candidate.resolve()
+    if patcher_dir not in resolved.parents:
+        raise RebuildError(
+            f"patcher path escapes reviewed directory {os.path.join(*_PATCHER_SUBDIR)!r}"
+        )
+    if not resolved.is_file():
+        raise RebuildError(f"registered rebuild patcher not found: {name!r}")
+    return resolved
+
+
+def parse_rebuild_plan(bundle_path: str | Path) -> RebuildPlan | None:
+    """Strictly parse and resolve rebuild authority without executing a patcher."""
+    bundle = Path(bundle_path).resolve()
+    plan_path = bundle / "rebuild.json"
+    if plan_path.is_symlink():
+        raise RebuildError(f"rebuild plan must be a regular non-symlink file: {plan_path}")
+    if not plan_path.exists():
+        return None
+    if not plan_path.is_file():
+        raise RebuildError(f"rebuild plan must be a regular non-symlink file: {plan_path}")
+    try:
+        plan = json.loads(
+            plan_path.read_text(encoding="utf-8"), object_pairs_hook=_strict_object
+        )
+    except RebuildError:
+        raise
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise RebuildError(f"invalid rebuild.json: {exc}") from exc
+    if not isinstance(plan, dict):
+        raise RebuildError("rebuild.json must be an object")
+    if set(plan) != {"steps"}:
+        raise RebuildError("rebuild.json must contain exactly the 'steps' key")
+    raw_steps = plan["steps"]
+    if not isinstance(raw_steps, list):
+        raise RebuildError("rebuild.json 'steps' must be a list")
+
+    repo_root = _repo_root()
+    parsed: list[tuple[int, RebuildStep]] = []
+    seen: set[str] = set()
+    for index, step in enumerate(raw_steps):
+        if not isinstance(step, dict):
+            raise RebuildError(f"rebuild step {index} must be an object")
+        if set(step) != {"type", "path"}:
+            raise RebuildError(
+                f"rebuild step {index} must contain exactly 'type' and 'path'"
+            )
+        if step["type"] == "bundle_python":
+            raise RebuildError(
+                "rebuild step 'bundle_python' is not allowed: a bundle may not "
+                "execute its own code"
+            )
+        if step["type"] != "repo_python":
+            raise RebuildError(f"unsupported rebuild step type: {step['type']!r}")
+        name = _canonical_patcher_name(step["path"])
+        if name in seen:
+            raise RebuildError(f"duplicate rebuild patcher {name!r}")
+        seen.add(name)
+        patcher_id, order = _REGISTERED_PATCHERS[name]
+        script = _resolve_registered_patcher(repo_root, name)
+        try:
+            source_hash = hashlib.sha256(script.read_bytes()).hexdigest()
+        except OSError as exc:
+            raise RebuildError(
+                f"cannot read registered rebuild patcher {name!r}"
+            ) from exc
+        parsed.append(
+            (
+                order,
+                RebuildStep(
+                    step_type="repo_python",
+                    patcher_id=patcher_id,
+                    path=f"{os.path.join(*_PATCHER_SUBDIR)}/{name}",
+                    patcher_sha256=source_hash,
+                    _script_path=script,
+                ),
+            )
+        )
+    parsed.sort(key=lambda row: row[0])
+    return RebuildPlan(schema_version=1, steps=tuple(step for _, step in parsed))
+
+
 def apply_rebuild_plan(bundle_path: str | Path) -> bool:
     """Apply ``rebuild.json`` from ``bundle_path`` if present.
 
@@ -64,64 +231,18 @@ def apply_rebuild_plan(bundle_path: str | Path) -> bool:
     caller before this function is invoked.
     """
     bundle = Path(bundle_path).resolve()
-    plan_path = bundle / "rebuild.json"
-    if not plan_path.exists():
+    plan = parse_rebuild_plan(bundle)
+    if plan is None:
         return False
-    if not plan_path.is_file():
-        raise RebuildError(f"rebuild plan is not a file: {plan_path}")
-
-    plan = json.loads(plan_path.read_text(encoding="utf-8"))
-    if not isinstance(plan, dict):
-        raise RebuildError("rebuild.json must be an object")
-    steps = plan.get("steps", [])
-    if not isinstance(steps, list):
-        raise RebuildError("rebuild.json 'steps' must be a list")
-
-    repo_root = _repo_root()
-    for i, step in enumerate(steps):
-        if not isinstance(step, dict):
-            raise RebuildError(f"rebuild step {i} must be an object")
-        typ = step.get("type")
-        if typ == "repo_python":
-            # ONLY validator-shipped, reviewed patchers under optima/patchers/. Never
-            # bundle code, and never an arbitrary repo module.
-            script = _safe_patcher_path(repo_root, str(step.get("path", "")))
-            _run_python_script(script, bundle=bundle)
-        elif typ == "bundle_python":
-            raise RebuildError(
-                "rebuild step 'bundle_python' is not allowed: a bundle may not execute its "
-                "own code in the candidate process (arbitrary RCE). Use a validator-shipped, "
-                "reviewed 'repo_python' patcher instead. See docs/SLOT_CONTRACT.md."
-            )
-        else:
-            raise RebuildError(f"unsupported rebuild step type: {typ!r}")
+    for step in plan.steps:
+        try:
+            current_hash = hashlib.sha256(step._script_path.read_bytes()).hexdigest()
+        except OSError as exc:
+            raise RebuildError(f"cannot reread rebuild patcher {step.path!r}") from exc
+        if current_hash != step.patcher_sha256:
+            raise RebuildError(f"rebuild patcher changed after parsing: {step.path!r}")
+        _run_python_script(step._script_path, bundle=bundle)
     return True
-
-
-def _safe_patcher_path(repo_root: Path, rel: str) -> Path:
-    """Resolve ``rel`` to a reviewed patcher, refusing anything outside ``optima/patchers/``.
-
-    ``rel`` may be given relative to the repo root (``optima/patchers/foo.py``) or to the
-    patcher dir itself (``foo.py``); either way the RESOLVED path must be contained in the
-    patcher dir, be a regular ``.py`` file, and not be a symlink (which could re-point
-    outside the reviewed set)."""
-    if not rel or rel.startswith("/") or ".." in Path(rel).parts:
-        raise RebuildError(f"patcher path must be a simple relative path: {rel!r}")
-    patcher_dir = repo_root.joinpath(*_PATCHER_SUBDIR).resolve()
-    # Accept either a repo-relative or a patcher-dir-relative spelling.
-    candidate = (repo_root / rel) if rel.startswith(os.path.join(*_PATCHER_SUBDIR)) else (patcher_dir / rel)
-    if candidate.is_symlink():
-        raise RebuildError(f"patcher path must not be a symlink: {rel!r}")
-    p = candidate.resolve()
-    if p != patcher_dir and patcher_dir not in p.parents:
-        raise RebuildError(
-            f"patcher path escapes the reviewed patcher dir {os.path.join(*_PATCHER_SUBDIR)!r}: {rel!r}"
-        )
-    if p.suffix != ".py":
-        raise RebuildError(f"patcher must be a .py file: {rel!r}")
-    if p.is_symlink() or not p.is_file():
-        raise RebuildError(f"reviewed patcher not found under {os.path.join(*_PATCHER_SUBDIR)!r}: {rel!r}")
-    return p
 
 
 def _run_python_script(script: Path, *, bundle: Path) -> None:

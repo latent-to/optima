@@ -311,30 +311,65 @@ def _recursive_scan_ok(bundle: str, manifest=None) -> bool:
     return tree.ok
 
 
-def _declared_model(bundle: str, op) -> str | None:
-    """Dev convenience: read the model an op's metadata JSON declares, to pick the
-    validator's per-model slot profile when --model isn't given. Never reads thresholds
-    from metadata (those are validator-owned in slots.MODEL_PROFILES) — only the model id,
-    which selects WHICH validator profile applies. Best-effort; returns None on any issue."""
+def _declared_metadata(bundle: str, op) -> dict:
+    """Read normative eligibility metadata; malformed content fails closed."""
     if not getattr(op, "metadata", None):
-        return None
-    try:
-        import json
-        from pathlib import Path
+        return {}
+    import json
+    from pathlib import Path
 
-        meta = json.loads((Path(bundle) / op.metadata).read_text())
-        return meta.get("model") or meta.get("model_profile")
-    except Exception:
-        return None
+    value = json.loads((Path(bundle) / op.metadata).read_text())
+    if not isinstance(value, dict):
+        raise ValueError(f"metadata for {op.slot!r} must be a JSON object")
+    return value
 
 
 def cmd_verify(args: argparse.Namespace) -> int:
+    from optima.registry import (
+        KernelImpl,
+        KernelRegistry,
+        eligibility_from_metadata,
+    )
     from optima.slots import SLOTS, get_slot, model_profile, slot_for_model
     from optima.verify import format_verify, verify_entry
 
     m = load_manifest(args.bundle)
     if not _recursive_scan_ok(args.bundle, manifest=m):  # vendored-tree guard (every .py, not just entries)
         return 2
+
+    # Parse every known row once and run the complete bundle through the SAME
+    # registration rules used by the live seam before loading any candidate source.
+    # Per-row verification alone cannot detect two individually valid domains that
+    # overlap and would make live routing ambiguous.
+    metadata_by_row: dict[int, dict] = {}
+    domain_registry = KernelRegistry()
+
+    def _domain_only_entry(*_args, **_kwargs):
+        raise AssertionError("domain preflight entries are never invoked")
+
+    for row_index, op in enumerate(m.ops):
+        if op.slot not in SLOTS:
+            continue
+        label = f"{op.slot} variant={op.variant!r}"
+        try:
+            metadata = _declared_metadata(args.bundle, op)
+            eligibility = eligibility_from_metadata(
+                metadata, op.dtypes, op.architectures
+            )
+            domain_registry.register(
+                KernelImpl(
+                    slot=op.slot,
+                    bundle_id=m.bundle_id,
+                    entry=_domain_only_entry,
+                    eligibility=eligibility,
+                    variant=op.variant,
+                )
+            )
+        except (OSError, ValueError) as exc:
+            print(f"  [FAIL] {label}: invalid or ambiguous variant domain: {exc}")
+            return 2
+        metadata_by_row[row_index] = metadata
+
     import torch
     # Mirror the ACTUAL device resolution, including verify_collective's fallback:
     # a collective needs world_size GPUs, so a 1-GPU box silently runs gloo/CPU.
@@ -348,21 +383,29 @@ def cmd_verify(args: argparse.Namespace) -> int:
               "only — it does not predict GPU throughput, CUDA-graph capture, or the "
               "fidelity gates (see docs/GPU_SETUP.md).")
     rc = 0
-    for op in m.ops:
+    known_rows = 0
+    context_inapplicable_rows = 0
+    for row_index, op in enumerate(m.ops):
+        label = f"{op.slot} variant={op.variant!r}"
         if op.slot not in SLOTS:
-            print(f"  [SKIP] {op.slot}: not a known slot on this validator")
+            print(f"  [SKIP] {label}: not a known slot on this validator")
             continue
-        model_key = args.model or _declared_model(args.bundle, op)
+        known_rows += 1
+        metadata = metadata_by_row[row_index]
+        model_key = args.model or metadata.get("model") or metadata.get("model_profile")
         if model_profile(model_key, op.slot) is not None:
             via = "via --model" if args.model else "declared in metadata"
-            print(f"  [profile] {op.slot}: model {model_key!r} ({via}) -> validator slot profile "
+            print(f"  [profile] {label}: model {model_key!r} ({via}) -> validator slot profile "
                   "(activation + low-bit metric)")
         slot = slot_for_model(op.slot, model_key)
         src = resolve_source(args.bundle, op)
+        graph_safe = None if slot.kind == "op" else bool(
+            metadata.get("graph_safe", False)
+        )
 
         scan = scan_path(src)
         if not scan.ok:
-            print(f"  [FAIL] {op.slot}: failed policy scan")
+            print(f"  [FAIL] {label}: failed policy scan")
             for v in scan.violations:
                 print(f"      {v}")
             rc = 2
@@ -381,6 +424,7 @@ def cmd_verify(args: argparse.Namespace) -> int:
                                        # rebuild plan (declared cuda_sources) must apply
                                        # in the ranks that load the kernel
                                        bundle_path=str(args.bundle))
+            print(f"  [variant {op.variant!r}]")
             print(format_verify(result))
             if not result.passed:
                 rc = 2
@@ -398,10 +442,22 @@ def cmd_verify(args: argparse.Namespace) -> int:
             jitter_seed=args.seed,  # count-dim jitter so shapes vary per run (anti shape-branch)
             model_key=model_key,  # validator per-model slot profile (activation + metric)
             override_point=op.override_point,  # compose a miner epilogue into the base kernel
+            graph_safe=graph_safe,
+            eligibility_metadata=metadata,
+            manifest_dtypes=op.dtypes,
+            manifest_architectures=op.architectures,
+            tp_size=getattr(args, "tp_size", None),
+            world_size=getattr(args, "world_size", None),
         )
+        print(f"  [variant {op.variant!r}]")
         print(format_verify(result))
-        if not result.passed:
+        if result.context_inapplicable:
+            context_inapplicable_rows += 1
+        elif not result.passed:
             rc = 2
+    if known_rows and context_inapplicable_rows == known_rows and rc == 0:
+        print("no bundle variant is applicable to the selected verify context")
+        rc = 2
     return rc
 
 
@@ -890,6 +946,8 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--world-size", type=int, default=None, dest="world_size",
                     help="ranks for DISTRIBUTED verify of collective slots (default 2; "
                          "use the arena TP size, e.g. 4, on a multi-GPU box)")
+    sp.add_argument("--tp-size", type=int, default=None, dest="tp_size",
+                    help="tensor-parallel size for capability-aware non-collective verify")
     sp.add_argument("--model", default=None,
                     help="validator model key for the per-model slot profile (activation + "
                          "low-bit metric), e.g. MiniMax-M3. Default: the model declared in the "

@@ -53,6 +53,8 @@ from typing import Callable, Optional, Sequence
 import torch
 import torch.nn.functional as F
 
+from optima.tensor_spec import OutputSpec, TensorSpec
+
 
 @dataclass(frozen=True)
 class Tolerance:
@@ -131,6 +133,9 @@ class SlotSpec:
     invoke_reference: Callable[[dict], Sequence[torch.Tensor]]  # (inputs) -> expected outputs (HIGH PRECISION)
     invoke_entry: Callable[..., None]  # (entry, inputs, outs, prepared) -> None; writes each tensor in `outs`
     shapes: tuple[dict, ...]
+    # Additive typed-output ABI. Existing slots inherit dtype/device and remain
+    # contiguous through ``out_shapes``.
+    output_spec: Optional[Callable[[dict], OutputSpec]] = None
     # Optional 2nd miner callable for (prepare, forward) slots: `prepare` runs ONCE at
     # load on the raw weights (quant/layout transform); the validator holds the result
     # and passes it to `entry` each step as `prepared`. None -> a plain forward-only slot.
@@ -175,6 +180,29 @@ class SlotSpec:
         if dtype in (torch.float16, torch.bfloat16):
             return Tolerance(atol=2e-2, rtol=2e-2)
         return Tolerance(atol=1e-4, rtol=1e-4)
+
+    def output_contract(self, inputs: dict) -> OutputSpec:
+        """Resolve one output declaration for both verify and live bindings."""
+        if self.output_spec is not None:
+            contract = self.output_spec(inputs)
+            if not isinstance(contract, OutputSpec):
+                raise TypeError(
+                    f"slot {self.name!r} output_spec returned "
+                    f"{type(contract).__name__}, expected OutputSpec"
+                )
+            return contract
+
+        shapes = self.out_shapes(inputs)
+        if isinstance(shapes, tuple) and (
+            not shapes or isinstance(shapes[0], int)
+        ):
+            shapes = [shapes]
+        return OutputSpec(
+            tuple(
+                TensorSpec(shape=tuple(shape), name=f"out[{index}]")
+                for index, shape in enumerate(shapes)
+            )
+        )
 
 
 _BF16_TOL = {
@@ -982,7 +1010,9 @@ def _msa_prefill_block_score_reference(q, index_k, prefix_len, scale, block_size
 
 
 def _msa_prefill_inputs(*, q_len: int, prefix_blocks: int, head_dim: int, block_size: int,
-                        dtype: torch.dtype, device: str, seed: int) -> dict:
+                        dtype: torch.dtype, device: str, seed: int,
+                        causal_probe: bool = False,
+                        prefix_len_override: int | None = None) -> dict:
     g = torch.Generator(device=device).manual_seed(seed)
 
     def rnd(*shape: int) -> torch.Tensor:
@@ -994,15 +1024,66 @@ def _msa_prefill_inputs(*, q_len: int, prefix_blocks: int, head_dim: int, block_
     # multiple) so the tail-block path is always exercised.
     q_len = max(1, q_len)
     prefix_blocks = max(_MSA_TOPK + 4, prefix_blocks)
-    prefix_len = prefix_blocks * block_size + 39                  # ragged on purpose
+    prefix_len = (
+        prefix_blocks * block_size + 39
+        if prefix_len_override is None
+        else int(prefix_len_override)
+    )
+    if prefix_len < 0:
+        raise ValueError("MSA prefix_len must be non-negative")
     seq_len = prefix_len + q_len                                  # chunked serving: S = prefix + T
+    q = rnd(q_len, head_dim)
+    index_k = rnd(seq_len, head_dim)
+    if causal_probe:
+        # Make every non-final row's first future key uniquely attractive to that
+        # row. Feature dimensions cycle when q_len > head_dim; each newly exposed
+        # future block still displaces a trusted-prefix block. A kernel that ignores
+        # the per-row causal mask therefore fails even when random probes dilute it.
+        q.zero_()
+        index_k.zero_()
+        row = torch.arange(q_len, device=device)
+        feature = row % head_dim
+        q[row, feature] = 1
+        visible_prefix_blocks = (prefix_len + block_size) // block_size
+        moderate_blocks = min(visible_prefix_blocks, _MSA_TOPK + 2)
+        index_k[
+            torch.arange(moderate_blocks, device=device) * block_size
+        ] = 1
+        if q_len > 1:
+            future_row = torch.arange(q_len - 1, device=device)
+            future_position = prefix_len + 1 + future_row
+            index_k[future_position, future_row % head_dim] = 100
     return {
-        "q": rnd(q_len, head_dim),
-        "index_k": rnd(seq_len, head_dim),
+        "q": q,
+        "index_k": index_k,
         "prefix_len": prefix_len,
         "scale": head_dim ** -0.5 * 1.4426950409,                 # a realistic opaque multiplier
         "block_size": block_size,
     }
+
+
+def _msa_prefill_out_shape(inputs: dict) -> tuple[int, int]:
+    return (
+        inputs["q"].shape[0],
+        (inputs["index_k"].shape[0] + inputs["block_size"] - 1)
+        // inputs["block_size"],
+    )
+
+
+def _msa_prefill_output_spec(inputs: dict) -> OutputSpec:
+    return OutputSpec(
+        outputs=(
+            TensorSpec(
+                shape=_msa_prefill_out_shape(inputs),
+                dtype=torch.float32,
+                stride_policy="strided",
+                stride_padding=7,
+                alignment_bytes=4,
+                aliasing="disjoint",
+                name="block_scores",
+            ),
+        )
+    )
 
 
 ATTENTION_MSA_PREFILL_BLOCK_SCORE = SlotSpec(
@@ -1017,8 +1098,8 @@ ATTENTION_MSA_PREFILL_BLOCK_SCORE = SlotSpec(
     ),
     kind="block",
     make_inputs=_msa_prefill_inputs,
-    out_shapes=lambda i: [(i["q"].shape[0],
-                           (i["index_k"].shape[0] + i["block_size"] - 1) // i["block_size"])],
+    out_shapes=lambda i: [_msa_prefill_out_shape(i)],
+    output_spec=_msa_prefill_output_spec,
     invoke_reference=lambda i: [_msa_prefill_block_score_reference(
         i["q"], i["index_k"], i["prefix_len"], i["scale"], i["block_size"])],
     invoke_entry=lambda entry, i, outs, prepared: entry(
@@ -1030,12 +1111,23 @@ ATTENTION_MSA_PREFILL_BLOCK_SCORE = SlotSpec(
         {"q_len": 128, "prefix_blocks": 16, "head_dim": 128, "block_size": 128},  # chunk-ish
         {"q_len": 33, "prefix_blocks": 20, "head_dim": 64, "block_size": 128},    # ragged T
         {"q_len": 64, "prefix_blocks": 24, "head_dim": 128, "block_size": 64},    # small blocks
-        # The CAUSALITY catcher: a chunk spanning many blocks with a modest prefix, so early
-        # rows can illegally see many future blocks. On short-T shapes an acausal kernel's
-        # per-row deficit dilutes to ~0.97-0.99 mean overlap (measured); here it lands ~0.81,
-        # well under the 0.9 floor. Do not drop this shape — it is what makes the causal rule
-        # enforceable through a set metric.
-        {"q_len": 1024, "prefix_blocks": 12, "head_dim": 64, "block_size": 128},  # long chunk
+        # Orthogonal future-key probes keep causality observable for exact short-q
+        # variants; random short chunks can otherwise dilute one bad row above 0.9.
+        {"q_len": 16, "prefix_blocks": 12, "head_dim": 128, "block_size": 128,
+         "causal_probe": True},
+        {"q_len": 128, "prefix_blocks": 16, "head_dim": 128, "block_size": 128,
+         "causal_probe": True},
+        {"q_len": 33, "prefix_blocks": 20, "head_dim": 64, "block_size": 128,
+         "causal_probe": True},
+        {"q_len": 64, "prefix_blocks": 24, "head_dim": 128, "block_size": 64,
+         "causal_probe": True},
+        # CAUSALITY catchers for every (head_dim, block_size) family represented above.
+        # A shape-specialized variant sees only its own family, so one global long shape is
+        # insufficient. With a modest prefix and a chunk spanning several blocks, early rows
+        # can illegally see enough future blocks that measured overlap falls below 0.9.
+        {"q_len": 512, "prefix_blocks": 12, "head_dim": 64, "block_size": 128},
+        {"q_len": 512, "prefix_blocks": 12, "head_dim": 128, "block_size": 64},
+        {"q_len": 512, "prefix_blocks": 12, "head_dim": 128, "block_size": 128},
     ),
     # The output is a SELECTION sheet: gate on per-row top-k block SETS, not values (an fp8
     # index-K may perturb every score yet select the same blocks). The floor is 0.9, NOT the

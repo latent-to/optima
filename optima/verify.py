@@ -27,11 +27,18 @@ end-to-end gate on fresh prompts is the backstop against shape-branching there.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable, Optional
+from typing import Callable, Optional, Protocol
 
 import torch
 
+from optima.capabilities import (
+    CONTEXT_FIELDS,
+    CallDescriptor,
+    msa_prefill_call_descriptor,
+)
+from optima.registry import Eligibility
 from optima.slots import SlotSpec
+from optima.tensor_spec import allocate_output_spec
 
 
 @dataclass
@@ -44,6 +51,13 @@ class ShapeResult:
     pass_ratio: float = 1.0  # fraction within tol (matched_ratio) OR cosine (cosine mode); informative
     detail: str = ""
     metric: str = "ratio"  # label for pass_ratio: "ratio" | "cosine"
+    # Number of successful CUDA-graph replays checked against the trusted
+    # reference for this shape.  Zero means this was an eager-only verification
+    # (including every CPU run), not that graph correctness was established.
+    graph_replays: int = 0
+    # False means the validator proved this catalog shape lies outside the
+    # variant's declared domain and did not invoke miner code.
+    applicable: bool = True
 
 
 @dataclass
@@ -52,10 +66,45 @@ class VerifyResult:
     dtype: str
     passed: bool
     shape_results: list[ShapeResult]
+    # ``passed`` remains the ordinary numerical verdict so CPU verification keeps
+    # its historical meaning.  A crown/qualification path for a graph-safe bundle
+    # must additionally require ``graph_verified`` whenever ``graph_required`` is
+    # true; this prevents a CPU-only run from masquerading as graph proof.
+    graph_required: bool = False
+    graph_verified: bool = False
+    # Zero denotes an unfiltered legacy run. A filtered variant must exercise at
+    # least one validator-controlled shape; arena-grade coverage policy is later.
+    coverage_required: int = 0
+    # True means this variant targets a different invariant arena context
+    # (dtype/architecture/phase/layout/TP/etc.), not that it matched this arena
+    # but escaped the validator's shape probes. Bundle verification may report
+    # such a row N/A when another sibling variant is applicable.
+    context_inapplicable: bool = False
+    # False means the declared finite domain exceeded the validator's bounded
+    # semantic-probe budget. Partial enumeration is never a passing verdict.
+    domain_coverage_complete: bool = True
+    domain_coverage_detail: str = ""
 
     @property
     def num_failed(self) -> int:
-        return sum(1 for r in self.shape_results if not r.passed)
+        return sum(1 for r in self.shape_results if r.applicable and not r.passed)
+
+    @property
+    def num_applicable(self) -> int:
+        return sum(1 for r in self.shape_results if r.applicable)
+
+    @property
+    def num_not_applicable(self) -> int:
+        return len(self.shape_results) - self.num_applicable
+
+    @property
+    def coverage_sufficient(self) -> bool:
+        return self.coverage_required == 0 or self.num_applicable >= self.coverage_required
+
+    @property
+    def fully_verified(self) -> bool:
+        """Whether every gate requested by this verification run was proven."""
+        return self.passed and (not self.graph_required or self.graph_verified)
 
 
 def _as_list(x) -> list:
@@ -78,10 +127,20 @@ def _compare(
     e = expected.float()
     if correctness.mode == "topk_overlap":
         # Selection metric: only WHICH top-k are picked matters (not the score values), so
-        # this runs BEFORE the finite guard (masked-out positions are legitimately -inf). A
-        # buggy kernel emitting NaN -> ranked last (nan_to_num), so it just loses overlap.
+        # masked-out positions may legitimately be -inf. NaN/+inf are never legitimate
+        # block scores, however: rejecting them is also load-bearing for graph replay,
+        # whose NaN poison must prove that every output cell was rewritten.
+        if torch.isnan(a).any() or torch.isposinf(a).any():
+            return (
+                False,
+                float("inf"),
+                float("inf"),
+                0.0,
+                "actual has NaN or +inf block scores",
+                "overlap",
+            )
         k = correctness.top_k
-        ta = torch.nan_to_num(a, nan=float("-inf")).topk(k, dim=-1).indices
+        ta = a.topk(k, dim=-1).indices
         te = e.topk(k, dim=-1).indices
         overlap = (ta.unsqueeze(-1) == te.unsqueeze(-2)).any(dim=-1).float().mean(dim=-1)
         score = float(overlap.mean())
@@ -120,9 +179,221 @@ def _compare(
     return passed, float(abs_err.max()), float(rel_err.max()), ratio, detail, "ratio"
 
 
+@dataclass
+class _OutputCheck:
+    passed: bool
+    max_abs: float
+    max_rel: float
+    min_score: float
+    detail: str
+    metric: str
+
+
+def _compare_outputs(outs: list[torch.Tensor], expected: list[torch.Tensor], *, tol,
+                     correctness) -> _OutputCheck:
+    """Compare every declared output and retain the worst result.
+
+    Kept separate from ``verify_entry`` because CUDA-graph replay must apply the
+    exact same comparator as eager verification on every replay.  A different or
+    weaker graph comparator would recreate the very eager-vs-captured gap this gate
+    is intended to close.
+    """
+    if len(outs) != len(expected):
+        return _OutputCheck(
+            False, float("inf"), float("inf"), 0.0,
+            f"output count mismatch {len(outs)} vs {len(expected)}", "ratio",
+        )
+
+    passed = True
+    max_abs = 0.0
+    max_rel = 0.0
+    min_score_seen = 1.0
+    metric = "ratio"
+    details: list[str] = []
+    for j, (out, reference) in enumerate(zip(outs, expected)):
+        p, ma, mr, score, detail, metric = _compare(
+            out, reference, atol=tol.atol, rtol=tol.rtol, correctness=correctness
+        )
+        passed = passed and p
+        max_abs = max(max_abs, ma)
+        max_rel = max(max_rel, mr)
+        min_score_seen = min(min_score_seen, score)
+        if detail:
+            details.append(f"out[{j}]: {detail}" if len(outs) > 1 else detail)
+    return _OutputCheck(
+        passed, max_abs, max_rel, min_score_seen, "; ".join(details), metric
+    )
+
+
+class _GraphBackend(Protocol):
+    """Small adapter so graph orchestration can be unit-tested without a GPU."""
+
+    def warmup(self, fn: Callable[[], None]) -> None: ...
+
+    def capture(self, fn: Callable[[], None]): ...
+
+    def replay(self, graph) -> None: ...
+
+    def synchronize(self) -> None: ...
+
+
+class _CudaGraphBackend:
+    """Real PyTorch CUDA-graph capture backend.
+
+    Warmup happens on a side stream, as required for graph-safe lazy/JIT kernels,
+    before genuine ``torch.cuda.CUDAGraph`` capture.  Candidate Python runs during
+    capture but not replay, which is load-bearing: a branch on
+    ``torch.cuda.is_current_stream_capturing()`` is frozen into the graph and its
+    captured behavior is what the replay comparisons grade.
+    """
+
+    def __init__(self, device: torch.device) -> None:
+        self.device = torch.device(device)
+        with torch.cuda.device(self.device):
+            # torch.cuda.graph's implicit stream is class-global and therefore
+            # can be stranded on the first GPU used in this process. Pin an
+            # explicit stream to the candidate output device instead.
+            self.capture_stream = torch.cuda.Stream(device=self.device)
+
+    def warmup(self, fn: Callable[[], None]) -> None:
+        with torch.cuda.device(self.device):
+            current = torch.cuda.current_stream(self.device)
+            warmup_stream = torch.cuda.Stream(device=self.device)
+            warmup_stream.wait_stream(current)
+            with torch.cuda.stream(warmup_stream):
+                fn()
+            current.wait_stream(warmup_stream)
+            torch.cuda.synchronize(self.device)
+
+    def capture(self, fn: Callable[[], None]):
+        with torch.cuda.device(self.device):
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, stream=self.capture_stream):
+                fn()
+            return graph
+
+    def replay(self, graph) -> None:
+        with torch.cuda.device(self.device):
+            graph.replay()
+
+    def synchronize(self) -> None:
+        torch.cuda.synchronize(self.device)
+
+
+_DEFAULT_GRAPH_REPLAYS = 3
+
+
+def _poison_outputs(outs: list[torch.Tensor], replay: int) -> None:
+    """Overwrite outputs before each replay so a partial/no-op graph cannot pass.
+
+    The poison is intentionally changed per replay for integral outputs.  Floating
+    outputs use NaN, which every comparator rejects unless the replay overwrites the
+    relevant cells, including score sheets graded by ``topk_overlap``.
+    """
+    with torch.no_grad():
+        for out in outs:
+            if out.dtype.is_floating_point or out.dtype.is_complex:
+                out.fill_(float("nan"))
+            elif out.dtype == torch.bool:
+                out.fill_(bool(replay % 2))
+            else:
+                info = torch.iinfo(out.dtype)
+                out.fill_(info.max - (replay % 17))
+
+
+@dataclass
+class _GraphCheck:
+    check: _OutputCheck
+    replays: int
+
+
+def _verify_graph_replays(
+    slot: SlotSpec,
+    entry: Callable[..., None],
+    inputs: dict,
+    outs: list[torch.Tensor],
+    prepared,
+    expected: list[torch.Tensor],
+    *,
+    tol,
+    replay_count: int = _DEFAULT_GRAPH_REPLAYS,
+    backend: Optional[_GraphBackend] = None,
+) -> _GraphCheck:
+    """Capture the candidate once and grade multiple genuine graph replays.
+
+    ``backend`` is injectable solely to exercise the orchestration with CPU tensors
+    in unit tests.  Production callers omit it and therefore always use
+    ``torch.cuda.CUDAGraph``.
+    """
+    if replay_count < 2:
+        raise ValueError("CUDA graph verification requires at least two replays")
+    graph_backend = backend or _CudaGraphBackend(outs[0].device)
+
+    def invoke() -> None:
+        slot.invoke_entry(entry, inputs, outs, prepared)
+
+    try:
+        graph_backend.warmup(invoke)
+    except Exception as exc:  # noqa: BLE001 - candidate warmup failure is a verdict
+        return _GraphCheck(
+            _OutputCheck(False, float("inf"), float("inf"), 0.0,
+                         f"cuda graph warmup raised: {type(exc).__name__}: {exc}", "ratio"),
+            0,
+        )
+    try:
+        graph = graph_backend.capture(invoke)
+    except Exception as exc:  # noqa: BLE001 - a graph_safe claim must actually capture
+        return _GraphCheck(
+            _OutputCheck(False, float("inf"), float("inf"), 0.0,
+                         f"cuda graph capture raised: {type(exc).__name__}: {exc}", "ratio"),
+            0,
+        )
+
+    max_abs = 0.0
+    max_rel = 0.0
+    min_score = 1.0
+    metric = "ratio"
+    completed = 0
+    for replay in range(replay_count):
+        try:
+            _poison_outputs(outs, replay)
+            # Be explicit about the poison-before-replay happens-before edge.  This
+            # is a correctness gate, not a benchmark; the synchronization is desired.
+            graph_backend.synchronize()
+            graph_backend.replay(graph)
+            graph_backend.synchronize()
+        except Exception as exc:  # noqa: BLE001 - replay failure is a failed claim
+            return _GraphCheck(
+                _OutputCheck(
+                    False, float("inf"), float("inf"), 0.0,
+                    f"cuda graph replay[{replay}] raised: {type(exc).__name__}: {exc}",
+                    "ratio",
+                ),
+                completed,
+            )
+
+        completed = replay + 1
+        current = _compare_outputs(outs, expected, tol=tol, correctness=slot.correctness)
+        max_abs = max(max_abs, current.max_abs)
+        max_rel = max(max_rel, current.max_rel)
+        min_score = min(min_score, current.min_score)
+        metric = current.metric
+        if not current.passed:
+            detail = current.detail or "output mismatch"
+            return _GraphCheck(
+                _OutputCheck(False, max_abs, max_rel, min_score,
+                             f"cuda graph replay[{replay}]: {detail}", metric),
+                completed,
+            )
+
+    return _GraphCheck(
+        _OutputCheck(True, max_abs, max_rel, min_score, "", metric), completed
+    )
+
+
 # Count-like shape keys safe to jitter (varying these doesn't break a kernel that
 # legitimately specializes on the feature dims like hidden / head_dim / inter).
-_JITTER_KEYS = ("num_tokens", "batch", "ctx")
+_JITTER_KEYS = ("num_tokens", "batch", "ctx", "q_len", "prefix_blocks")
 
 
 def _jitter_shapes(shapes: list[dict], seed: int) -> list[dict]:
@@ -136,10 +407,317 @@ def _jitter_shapes(shapes: list[dict], seed: int) -> list[dict]:
     for sh in shapes:
         s = dict(sh)
         for k in _JITTER_KEYS:
+            if s.get("causal_probe") is True and k == "q_len":
+                # This semantic probe assigns one orthogonal feature dimension
+                # per query row. Its catalog q_len is part of the adversary, not
+                # a free count dimension; varying values and prefix length remain.
+                continue
             if k in s and isinstance(s[k], int):
                 s[k] = max(1, s[k] + rng.randint(-1, 3) + (s[k] // 3) * rng.randint(0, 1))
         out.append(s)
     return out
+
+
+_MSA_PROBE_MAX_HEAD_DIM = 512
+_MSA_PROBE_MAX_BLOCK_SIZE = 4096
+_MSA_PROBE_MAX_Q_LEN = 1024
+_MSA_PROBE_MAX_KV_LEN = 32768
+_MSA_PROBE_MAX_MATMUL_WORK = 300_000_000
+_MSA_PROBE_MAX_TOTAL_WORK = 600_000_000
+_MSA_MAX_CANDIDATE_COMBINATIONS = 64
+_MSA_MAX_SYNTHESIZED_SHAPES = 32
+
+
+def _msa_shape_descriptor(
+    slot: SlotSpec,
+    shape: dict,
+    *,
+    dtype: torch.dtype,
+    architecture: Optional[str],
+    tp_size: Optional[int],
+    world_size: Optional[int],
+) -> CallDescriptor | None:
+    """Describe an MSA probe without allocating its potentially large tensors."""
+
+    q_len = int(shape["q_len"])
+    head_dim = int(shape["head_dim"])
+    block_size = int(shape["block_size"])
+    if min(q_len, head_dim, block_size) < 1:
+        return None
+    prefix_len = shape.get("prefix_len_override")
+    if prefix_len is None:
+        prefix_blocks = max(int(shape.get("prefix_blocks", 12)), 12)
+        prefix_len = prefix_blocks * block_size + 39
+    prefix_len = int(prefix_len)
+    kv_len = prefix_len + q_len
+    if prefix_len < 0 or kv_len < q_len:
+        return None
+    return msa_prefill_call_descriptor(
+        dtype=_name(dtype),
+        architecture=architecture,
+        head_dim=head_dim,
+        block_size=block_size,
+        q_len=q_len,
+        kv_len=kv_len,
+        top_k=int(slot.correctness.top_k),
+        num_kv_heads=1,
+        tp_size=tp_size,
+        world_size=world_size,
+    )
+
+
+def _msa_numeric_domain_values(
+    eligibility: Eligibility,
+    fields: set[str],
+    defaults: set[int],
+    *,
+    limit: int,
+    legacy_minimum: int | None = None,
+    legacy_maximum: int | None = None,
+) -> tuple[list[int], list[int], bool, bool]:
+    """Return safe validator candidates, with domain-derived values first."""
+
+    derived: set[int] = set()
+    constrained = False
+    outside_limit = False
+    for predicate in eligibility.capabilities.predicates:
+        if predicate.field not in fields:
+            continue
+        constrained = True
+        if predicate.allowed:
+            values = {
+                int(value)
+                for value in predicate.allowed
+                if isinstance(value, int) and not isinstance(value, bool)
+            }
+            outside_limit = outside_limit or any(
+                value < 1 or value > limit for value in values
+            )
+            derived.update(values)
+            continue
+        lo = 1 if predicate.minimum is None else predicate.minimum
+        declared_hi = predicate.maximum
+        outside_limit = outside_limit or lo < 1 or lo > limit
+        outside_limit = outside_limit or declared_hi is None or declared_hi > limit
+        hi = limit if declared_hi is None else min(declared_hi, limit)
+        if lo <= hi:
+            derived.update((lo, hi, (lo + hi) // 2))
+    if legacy_minimum is not None:
+        constrained = True
+        outside_limit = outside_limit or not 1 <= legacy_minimum <= limit
+        derived.add(legacy_minimum)
+    if legacy_maximum is not None:
+        constrained = True
+        outside_limit = outside_limit or not 1 <= legacy_maximum <= limit
+        derived.add(legacy_maximum)
+    elif legacy_minimum is not None:
+        # A legacy lower bound with no upper bound denotes an unbounded live
+        # domain, just like a named {min: ...} predicate. The bounded verifier
+        # may sample it, but may not call that complete qualification evidence.
+        outside_limit = True
+    derived = {value for value in derived if 1 <= value <= limit}
+    ordinary = {value for value in defaults if 1 <= value <= limit} - derived
+    return sorted(derived), sorted(ordinary), constrained, outside_limit
+
+
+def _synthesize_msa_capability_shapes(
+    slot: SlotSpec,
+    eligibility: Eligibility,
+    catalog_shapes: list[dict],
+    *,
+    dtype: torch.dtype,
+    architecture: Optional[str],
+    tp_size: Optional[int],
+    world_size: Optional[int],
+) -> tuple[list[dict], bool, str]:
+    """Create bounded semantic probes when a declared MSA domain misses the catalog.
+
+    This is not arena-grade range coverage. It makes new exact/ranged shape domains
+    ingestible without an Optima edit while retaining a strict allocation/work ceiling;
+    the later ArenaProfile layer owns workload distributions and larger probes.
+    """
+
+    catalog_matches = [
+        shape
+        for shape in catalog_shapes
+        if (descriptor := _msa_shape_descriptor(
+            slot,
+            shape,
+            dtype=dtype,
+            architecture=architecture,
+            tp_size=tp_size,
+            world_size=world_size,
+        )) is not None and eligibility.match(descriptor).accepted
+    ]
+
+    head_defaults = {int(shape["head_dim"]) for shape in catalog_shapes}
+    block_defaults = {int(shape["block_size"]) for shape in catalog_shapes}
+    q_defaults = {int(shape["q_len"]) for shape in catalog_shapes}
+    head_derived, head_ordinary, head_constrained, head_outside = (
+        _msa_numeric_domain_values(
+        eligibility,
+        {"head_dim", "last_dim"},
+        head_defaults,
+        limit=_MSA_PROBE_MAX_HEAD_DIM,
+        legacy_maximum=eligibility.max_last_dim,
+        )
+    )
+    block_derived, block_ordinary, block_constrained, block_outside = (
+        _msa_numeric_domain_values(
+        eligibility,
+        {"block_size"},
+        block_defaults,
+        limit=_MSA_PROBE_MAX_BLOCK_SIZE,
+        )
+    )
+    q_derived, q_ordinary, q_constrained, q_outside = _msa_numeric_domain_values(
+        eligibility,
+        {"q_len", "num_tokens"},
+        q_defaults,
+        limit=_MSA_PROBE_MAX_Q_LEN,
+        legacy_minimum=eligibility.min_num_tokens,
+        legacy_maximum=eligibility.max_num_tokens,
+    )
+    kv_derived, _kv_ordinary, kv_constrained, kv_outside = (
+        _msa_numeric_domain_values(
+        eligibility,
+        {"kv_len"},
+        set(),
+        limit=_MSA_PROBE_MAX_KV_LEN,
+        )
+    )
+    if not (head_constrained or block_constrained or q_constrained or kv_constrained):
+        return [], True, ""
+    if head_outside or block_outside or q_outside or kv_outside:
+        return (
+            [],
+            False,
+            "declared MSA capability domain exceeds the bounded probe limits",
+        )
+
+    def _dimension_values(
+        derived: list[int],
+        ordinary: list[int],
+        constrained: bool,
+        field: str,
+    ) -> list[int]:
+        if constrained and derived:
+            return derived
+        if catalog_matches:
+            values = sorted({int(shape[field]) for shape in catalog_matches})
+            return values[:1]
+        return ordinary[:1]
+
+    heads = _dimension_values(
+        head_derived, head_ordinary, head_constrained, "head_dim"
+    )
+    blocks = _dimension_values(
+        block_derived, block_ordinary, block_constrained, "block_size"
+    )
+    q_lengths = _dimension_values(
+        q_derived, q_ordinary, q_constrained, "q_len"
+    )
+    kv_lengths = kv_derived
+    if not heads or not blocks or not q_lengths or (kv_constrained and not kv_lengths):
+        return [], True, ""
+
+    kv_factor = len(kv_lengths) if kv_constrained else 1
+    candidate_combinations = len(heads) * len(blocks) * len(q_lengths) * kv_factor
+    if candidate_combinations > _MSA_MAX_CANDIDATE_COMBINATIONS:
+        return (
+            [],
+            False,
+            f"declared MSA capability cross-product has {candidate_combinations} "
+            f"probe combinations; limit is {_MSA_MAX_CANDIDATE_COMBINATIONS}",
+        )
+
+    synthesized: list[dict] = []
+    seen: set[tuple[int, int, int, int]] = set()
+    catalog_prefixes: dict[tuple[int, int, int], int] = {}
+    for shape in catalog_shapes:
+        q_len = int(shape["q_len"])
+        head_dim = int(shape["head_dim"])
+        block_size = int(shape["block_size"])
+        prefix_len = shape.get("prefix_len_override")
+        if prefix_len is None:
+            prefix_len = max(int(shape.get("prefix_blocks", 12)), 12) * block_size + 39
+        prefix_len = int(prefix_len)
+        seen.add((q_len, head_dim, block_size, prefix_len))
+        catalog_prefixes.setdefault((q_len, head_dim, block_size), prefix_len)
+    total_work = 0
+    for head_dim in heads:
+        for block_size in blocks:
+            for q_len in q_lengths:
+                # Prefix length is a semantic property of each block-size
+                # combination. Reusing the byte/token prefix from a catalog case
+                # with a smaller block can leave <= top_k visible blocks and make
+                # the selection grade vacuous. Scale it independently here; an
+                # identical catalog case is already removed by ``seen`` below.
+                default_prefix = catalog_prefixes.get(
+                    (q_len, head_dim, block_size),
+                    max(12, int(slot.correctness.top_k) + 4) * block_size + 39,
+                )
+                candidate_kv = kv_lengths if kv_constrained else [default_prefix + q_len]
+                for kv_len in candidate_kv:
+                    prefix_len = kv_len - q_len
+                    visible_blocks = (prefix_len + block_size) // block_size
+                    if prefix_len < 0 or visible_blocks <= int(slot.correctness.top_k):
+                        return (
+                            [],
+                            False,
+                            "an MSA capability combination cannot form a "
+                            "non-vacuous top-k probe",
+                        )
+                    key = (q_len, head_dim, block_size, prefix_len)
+                    if key in seen:
+                        continue
+                    shape = {
+                        "q_len": q_len,
+                        "prefix_blocks": max(12, prefix_len // block_size),
+                        "prefix_len_override": prefix_len,
+                        "head_dim": head_dim,
+                        "block_size": block_size,
+                    }
+                    descriptor = _msa_shape_descriptor(
+                        slot,
+                        shape,
+                        dtype=dtype,
+                        architecture=architecture,
+                        tp_size=tp_size,
+                        world_size=world_size,
+                    )
+                    if descriptor is None or not eligibility.match(descriptor).accepted:
+                        return (
+                            [],
+                            False,
+                            "an MSA capability combination could not be represented "
+                            "by the canonical call descriptor",
+                        )
+                    work = q_len * kv_len * head_dim
+                    probe_count = 2 if q_len > 1 else 1
+                    if work > _MSA_PROBE_MAX_MATMUL_WORK:
+                        return (
+                            [],
+                            False,
+                            "an MSA capability probe exceeds the per-shape work limit",
+                        )
+                    if (
+                        len(synthesized) + probe_count
+                        > _MSA_MAX_SYNTHESIZED_SHAPES
+                        or total_work + work * probe_count > _MSA_PROBE_MAX_TOTAL_WORK
+                    ):
+                        return (
+                            [],
+                            False,
+                            "declared MSA capability domain exceeds the total probe budget",
+                        )
+                    seen.add(key)
+                    synthesized.append(shape)
+                    total_work += work
+                    if q_len > 1:
+                        synthesized.append({**shape, "causal_probe": True})
+                        total_work += work
+    return synthesized, True, ""
 
 
 def verify_entry(
@@ -152,6 +730,13 @@ def verify_entry(
     seed: int = 0,
     shapes: Optional[list[dict]] = None,
     jitter_seed: Optional[int] = None,
+    graph_safe: Optional[bool] = None,
+    graph_replays: int = _DEFAULT_GRAPH_REPLAYS,
+    eligibility: Optional[Eligibility] = None,
+    architecture: Optional[str] = None,
+    tp_size: Optional[int] = None,
+    world_size: Optional[int] = None,
+    _graph_backend: Optional[_GraphBackend] = None,
 ) -> VerifyResult:
     """Verify a miner ``entry`` against the slot's reference.
 
@@ -160,6 +745,15 @@ def verify_entry(
     *(prepare, forward)* slot (``slot.prepare`` set, e.g. ``moe.fused_experts``) pass
     the miner's ``prepare`` callable too — it runs once on the raw weights and its
     result is handed to ``entry`` as ``prepared`` (otherwise ``prepared`` is None).
+
+    On CUDA, op slots are graph-verified by default because their serving seam is
+    always captured.  Block slots are graph-verified when the caller passes their
+    declared ``graph_safe=True`` metadata.  CPU runs retain the eager numerical gate
+    but return ``graph_required=True, graph_verified=False`` when graph proof was
+    requested.  With ``eligibility``, validator code describes every generated
+    call before invocation: off-domain shapes are reported N/A without entering
+    miner code, and a domain matching zero catalog shapes fails verification.
+    ``_graph_backend`` is a private CPU-test hook; production must omit it.
     """
     if getattr(slot, "kind", None) == "collective":
         raise ValueError(
@@ -167,17 +761,110 @@ def verify_entry(
             "optima.verify_collective.verify_collective, not the single-process verify_entry"
         )
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+    graph_required = slot.kind == "op" if graph_safe is None else bool(graph_safe)
+    graph_capable_run = str(device).startswith("cuda") or _graph_backend is not None
     tol = slot.tolerance_for(dtype)
-    test_shapes = shapes if shapes is not None else list(slot.shapes)
+    catalog_shapes = list(shapes) if shapes is not None else list(slot.shapes)
+    domain_coverage_complete = True
+    domain_coverage_detail = ""
+    if eligibility is not None and slot.name == "attention.msa_prefill_block_score":
+        resolved_arch = architecture or _device_architecture(device)
+        synthesized, domain_coverage_complete, domain_coverage_detail = (
+            _synthesize_msa_capability_shapes(
+                slot, eligibility, catalog_shapes, dtype=dtype,
+                architecture=resolved_arch, tp_size=tp_size, world_size=world_size,
+            )
+        )
+        catalog_shapes.extend(synthesized)
+    test_shapes = catalog_shapes
     if jitter_seed is not None:
-        test_shapes = _jitter_shapes(test_shapes, jitter_seed)
+        test_shapes = _jitter_shapes(catalog_shapes, jitter_seed)
 
     results: list[ShapeResult] = []
-    for i, shape in enumerate(test_shapes):
+    context_blocked: list[bool] = []
+    for i, (catalog_shape, jittered_shape) in enumerate(
+        zip(catalog_shapes, test_shapes)
+    ):
+        shape = jittered_shape
         inputs = slot.make_inputs(dtype=dtype, device=device, seed=seed + i, **shape)
+        if eligibility is not None:
+            descriptor = _verification_call_descriptor(
+                slot,
+                inputs,
+                dtype=dtype,
+                device=device,
+                architecture=architecture,
+                tp_size=tp_size,
+                world_size=world_size,
+            )
+            match = eligibility.match(descriptor)
+            if not match.accepted and shape != catalog_shape:
+                # Jitter is an anti-hardcoding challenge, not a license to move a
+                # shape-specialized implementation outside its own declared domain.
+                # If the perturbed call is out-of-domain but the validator's catalog
+                # call is in-domain, qualify the latter. Exact-value variants still
+                # receive fresh input values/seeds; ranges retain jitter whenever the
+                # perturbation remains inside the range.
+                catalog_inputs = slot.make_inputs(
+                    dtype=dtype,
+                    device=device,
+                    seed=seed + i,
+                    **catalog_shape,
+                )
+                catalog_descriptor = _verification_call_descriptor(
+                    slot,
+                    catalog_inputs,
+                    dtype=dtype,
+                    device=device,
+                    architecture=architecture,
+                    tp_size=tp_size,
+                    world_size=world_size,
+                )
+                catalog_match = eligibility.match(catalog_descriptor)
+                if catalog_match.accepted:
+                    shape = catalog_shape
+                    inputs = catalog_inputs
+                    match = catalog_match
+            if not match.accepted:
+                static_context_fields = CONTEXT_FIELDS | {
+                    "ep_size",
+                    "tp_size",
+                    "world_size",
+                }
+                context_blocked.append(
+                    any(
+                        mismatch.field in static_context_fields
+                        for mismatch in match.mismatches
+                    )
+                )
+                reasons = "; ".join(
+                    f"{m.field} {m.reason}: expected {m.expected}"
+                    + ("" if m.actual is None else f", got {m.actual!r}")
+                    for m in match.mismatches
+                )
+                results.append(ShapeResult(
+                    shape=shape,
+                    dtype=_name(dtype),
+                    passed=True,
+                    max_abs_err=0.0,
+                    max_rel_err=0.0,
+                    detail=f"validator N/A (outside declared capability domain): {reasons}",
+                    metric="n/a",
+                    applicable=False,
+                ))
+                continue
+        context_blocked.append(False)
         expected = _as_list(slot.invoke_reference(inputs))
-        out_shapes = _as_list(slot.out_shapes(inputs))
-        outs = [torch.empty(s, dtype=dtype, device=device) for s in out_shapes]
+        # Allocate from the same typed contract used by the live arena binding.
+        # Legacy slots resolve ``out_shapes`` to inherited-dtype contiguous tensors,
+        # exactly preserving their historical behavior.
+        allocation = allocate_output_spec(
+            slot.output_contract(inputs),
+            fallback_dtype=dtype,
+            fallback_device=device,
+            inputs=(v for v in inputs.values() if torch.is_tensor(v)),
+        )
+        outs = allocation.outputs
         try:
             prepared = None
             if slot.invoke_prepare is not None:
@@ -195,32 +882,132 @@ def verify_entry(
             )
             continue
 
-        passed = True
-        max_abs = 0.0
-        max_rel = 0.0
-        min_score_seen = 1.0
-        metric = "ratio"
-        details: list[str] = []
-        for j, (o, e) in enumerate(zip(outs, expected)):
-            p, ma, mr, score, detail, metric = _compare(o, e, atol=tol.atol, rtol=tol.rtol, correctness=slot.correctness)
-            passed = passed and p
-            max_abs = max(max_abs, ma)
-            max_rel = max(max_rel, mr)
-            min_score_seen = min(min_score_seen, score)
-            if detail:
-                details.append(f"out[{j}]: {detail}" if len(outs) > 1 else detail)
+        eager = _compare_outputs(outs, expected, tol=tol, correctness=slot.correctness)
+        passed = eager.passed
+        max_abs = eager.max_abs
+        max_rel = eager.max_rel
+        min_score_seen = eager.min_score
+        metric = eager.metric
+        details = [eager.detail] if eager.detail else []
+        checked_replays = 0
+
+        # Do not attempt capture after an eager mismatch: it cannot rescue the
+        # candidate, and some broken kernels leave state that only obscures the root
+        # error.  Every eager-correct graph-required GPU shape must capture and replay.
+        if passed and graph_required and graph_capable_run:
+            graph = _verify_graph_replays(
+                slot, entry, inputs, outs, prepared, expected, tol=tol,
+                replay_count=graph_replays, backend=_graph_backend,
+            )
+            checked_replays = graph.replays
+            passed = passed and graph.check.passed
+            max_abs = max(max_abs, graph.check.max_abs)
+            max_rel = max(max_rel, graph.check.max_rel)
+            min_score_seen = min(min_score_seen, graph.check.min_score)
+            metric = graph.check.metric
+            if graph.check.detail:
+                details.append(graph.check.detail)
         results.append(
             ShapeResult(shape=shape, dtype=_name(dtype), passed=passed,
                         max_abs_err=max_abs, max_rel_err=max_rel, pass_ratio=min_score_seen,
-                        detail="; ".join(details), metric=metric)
+                        detail="; ".join(details), metric=metric,
+                        graph_replays=checked_replays)
         )
 
+    applicable = [result for result in results if result.applicable]
+    coverage_required = 1 if eligibility is not None else 0
+    coverage_sufficient = (
+        len(applicable) >= coverage_required if coverage_required else bool(applicable)
+    )
+    graph_verified = bool(
+        graph_required and graph_capable_run and applicable
+        and all(r.passed and r.graph_replays == graph_replays for r in applicable)
+    )
+    context_inapplicable = bool(
+        eligibility is not None
+        and not applicable
+        and context_blocked
+        and all(context_blocked)
+    )
     return VerifyResult(
         slot=slot.name,
         dtype=_name(dtype),
-        passed=all(r.passed for r in results) and len(results) > 0,
+        passed=(
+            domain_coverage_complete
+            and coverage_sufficient
+            and all(r.passed for r in applicable)
+        ),
         shape_results=results,
+        graph_required=graph_required,
+        graph_verified=graph_verified,
+        coverage_required=coverage_required,
+        context_inapplicable=context_inapplicable,
+        domain_coverage_complete=domain_coverage_complete,
+        domain_coverage_detail=domain_coverage_detail,
     )
+
+
+def _verification_call_descriptor(
+    slot: SlotSpec,
+    inputs: dict,
+    *,
+    dtype: torch.dtype,
+    device: str,
+    architecture: Optional[str],
+    tp_size: Optional[int],
+    world_size: Optional[int],
+) -> CallDescriptor:
+    """Build the same canonical call description as a live arena binding.
+
+    Fields are semantic and therefore never guessed from vaguely similar tensor
+    names.  A slot needs an explicit validator mapping before miners can constrain
+    its richer dimensions; MSA prefill is the first migrated binding.
+    """
+
+    resolved_arch = architecture or _device_architecture(device)
+    if slot.name != "attention.msa_prefill_block_score":
+        primary = next(
+            (
+                inputs[name]
+                for name in ("x", "q", "input", "input_tensor", "residual", "gemm_out")
+                if name in inputs and torch.is_tensor(inputs[name])
+            ),
+            None,
+        )
+        fields = {"dtype": _name(dtype), "architecture": resolved_arch}
+        if primary is not None and primary.dim() > 0:
+            fields["last_dim"] = int(primary.shape[-1])
+            if slot.name in {
+                "collective.ar_residual_rmsnorm",
+                "collective.moe_finalize_ar_rmsnorm",
+            }:
+                fields["num_tokens"] = int(primary.shape[0])
+        return CallDescriptor(fields)
+    q = inputs["q"]
+    index_k = inputs["index_k"]
+    return msa_prefill_call_descriptor(
+        dtype=_name(q.dtype),
+        architecture=resolved_arch,
+        head_dim=int(q.shape[-1]),
+        block_size=int(inputs["block_size"]),
+        q_len=int(q.shape[0]),
+        kv_len=int(index_k.shape[0]),
+        top_k=int(slot.correctness.top_k),
+        num_kv_heads=1,
+        tp_size=tp_size,
+        world_size=world_size,
+    )
+
+
+def _device_architecture(device: str) -> Optional[str]:
+    resolved = torch.device(device)
+    if resolved.type != "cuda" or not torch.cuda.is_available():
+        return None
+    index = resolved.index
+    if index is None:
+        index = torch.cuda.current_device()
+    major, minor = torch.cuda.get_device_capability(index)
+    return f"sm{major}{minor}"
 
 
 def verify_entry_from_source(
@@ -236,6 +1023,13 @@ def verify_entry_from_source(
     jitter_seed: Optional[int] = None,
     model_key: Optional[str] = None,
     override_point: Optional[str] = None,
+    graph_safe: Optional[bool] = None,
+    graph_replays: int = _DEFAULT_GRAPH_REPLAYS,
+    eligibility_metadata: Optional[dict] = None,
+    manifest_dtypes: tuple[str, ...] = (),
+    manifest_architectures: tuple[str, ...] = (),
+    tp_size: Optional[int] = None,
+    world_size: Optional[int] = None,
 ) -> VerifyResult:
     """Load the miner module and verify it — module-level + picklable so the CLI can run
     it via ``call_in_subprocess`` in a FRESH process. This keeps the trusted validator/CLI
@@ -266,8 +1060,17 @@ def verify_entry_from_source(
     else:
         entry = callable_from(module, entry_name)
         prepare = callable_from(module, prepare_name) if prepare_name else None
+    eligibility = None
+    if eligibility_metadata is not None:
+        from optima.registry import eligibility_from_metadata
+
+        eligibility = eligibility_from_metadata(
+            eligibility_metadata, manifest_dtypes, manifest_architectures
+        )
     return verify_entry(slot, entry, prepare=prepare, dtype=dtype, device=device, seed=seed,
-                        shapes=shapes, jitter_seed=jitter_seed)
+                        shapes=shapes, jitter_seed=jitter_seed, graph_safe=graph_safe,
+                        graph_replays=graph_replays, eligibility=eligibility,
+                        tp_size=tp_size, world_size=world_size)
 
 
 def _name(dtype: torch.dtype) -> str:
@@ -275,17 +1078,44 @@ def _name(dtype: torch.dtype) -> str:
 
 
 def format_verify(result: VerifyResult) -> str:
-    lines = [f"[{'PASS' if result.passed else 'FAIL'}] {result.slot} dtype={result.dtype}"]
+    graph = " graph=not-required"
+    if result.graph_required:
+        graph = " graph=verified" if result.graph_verified else " graph=NOT_VERIFIED"
+    coverage = ""
+    if result.coverage_required or result.num_not_applicable:
+        coverage = (
+            f" coverage={result.num_applicable}/{result.coverage_required}"
+            f" n/a={result.num_not_applicable}"
+        )
+    if not result.domain_coverage_complete:
+        coverage += " domain_coverage=INCOMPLETE"
+        if result.domain_coverage_detail:
+            coverage += f" ({result.domain_coverage_detail})"
+    if result.context_inapplicable:
+        status = "N/A"
+    elif not result.passed:
+        status = "FAIL"
+    elif result.graph_required and not result.graph_verified:
+        status = "NUMERICAL_PASS"
+    else:
+        status = "PASS"
+    lines = [
+        f"[{status}] {result.slot} "
+        f"dtype={result.dtype}{graph}{coverage}"
+    ]
     for r in result.shape_results:
-        status = "ok " if r.passed else "FAIL"
+        status = "N/A" if not r.applicable else ("ok " if r.passed else "FAIL")
         if r.metric == "cosine":
             score = f" cos={r.pass_ratio:.5f}"
         elif r.metric == "overlap":
             score = f" overlap={r.pass_ratio:.4f}"
+        elif r.metric == "n/a":
+            score = ""
         else:
             score = "" if r.pass_ratio >= 1.0 else f" ratio={r.pass_ratio:.4f}"
+        replay = f" graph_replays={r.graph_replays}" if r.graph_replays else ""
         lines.append(
             f"  {status} shape={r.shape} max_abs={r.max_abs_err:.3e} max_rel={r.max_rel_err:.3e}{score}"
-            + (f"  {r.detail}" if r.detail else "")
+            + replay + (f"  {r.detail}" if r.detail else "")
         )
     return "\n".join(lines)

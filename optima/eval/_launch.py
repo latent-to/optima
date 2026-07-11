@@ -289,6 +289,66 @@ def _wait_gpu_drain(threshold_mib: int = 4096, timeout_s: float = 150.0) -> None
                    "launching anyway", threshold_mib, timeout_s, last)
 
 
+def _active_execution_members(
+    active_receipts: list[dict], *, expected_member_count: int
+) -> list[str]:
+    """Validate active scheduler membership and return the identical slot set."""
+    pids: list[int] = []
+    slot_sets: list[tuple[str, ...]] = []
+    for receipt in active_receipts:
+        pid = receipt.get("pid")
+        slots = receipt.get("slots")
+        if type(pid) is not int or pid < 1:
+            raise RuntimeError("candidate engine launch: malformed active-member PID")
+        if (
+            not isinstance(slots, list)
+            or not slots
+            or any(not isinstance(slot, str) or not slot for slot in slots)
+            or len(set(slots)) != len(slots)
+        ):
+            raise RuntimeError("candidate engine launch: malformed active slot set")
+        pids.append(pid)
+        slot_sets.append(tuple(sorted(slots)))
+    if len(set(pids)) != len(pids):
+        raise RuntimeError("candidate engine launch: duplicate active-member PID")
+    if len(pids) != expected_member_count:
+        raise RuntimeError(
+            "candidate engine launch: incomplete active-member coverage "
+            f"({len(pids)}/{expected_member_count}); refusing a partially active engine"
+        )
+    if not slot_sets or len(set(slot_sets)) != 1:
+        raise RuntimeError(
+            "candidate engine launch: scheduler members disagree on registered slots"
+        )
+    return list(slot_sets[0])
+
+
+def _require_execution_completion(
+    receipt_dir: str,
+    *,
+    active_receipts: list[dict],
+    expected_slots: list[str],
+    expected_member_count: int,
+) -> str:
+    """Fail closed unless every active member completed every registered slot."""
+    from optima import receipts
+
+    completed = receipts.collect(receipt_dir, "completed")
+    fallbacks = receipts.collect(receipt_dir, "fallback")
+    passed, detail = receipts.completed_gate(
+        completed,
+        expected_slots=expected_slots,
+        member_receipts=active_receipts,
+        expected_member_count=expected_member_count,
+        fallback_receipts=fallbacks,
+    )
+    if not passed:
+        raise RuntimeError(
+            "candidate engine run failed execution coverage: " + detail
+        )
+    return detail
+
+
 @contextmanager
 def launched_engine(cfg, *, bundle_path: str, active: bool,
                     audit_rate: float = 0.0, audit_out: Optional[list] = None):
@@ -300,10 +360,11 @@ def launched_engine(cfg, *, bundle_path: str, active: bool,
 
     An ACTIVE launch demands seam receipts (see optima/receipts.py): at least one
     scheduler rank must report the bundle loaded+enabled before we hand the engine
-    to the caller, and at least one rank must report the miner impl actually
-    SELECTED (``fired``) before the context exits cleanly. Without this, a missing
-    bootstrap/env silently scores stock-vs-stock (bit-identical logits, KL 0.0,
-    PASS) — the phantom-pass class hit on 2026-07-07.
+    to the caller. After generation, every active scheduler member must report a
+    completed model-facing output for every registered slot, with zero selected-path
+    fallbacks. ``fired`` remains routing-only: lookup may precede a later stock route
+    or exception. These receipts prevent accidental phantom execution but are still
+    forgeable process-local diagnostics until complete-engine isolation lands.
 
     ``audit_rate > 0`` arms the IN-ENGINE AUDIT (optima/audit.py) in the ranks:
     sampled dispatcher calls are re-run through the captured stock baseline and
@@ -322,7 +383,9 @@ def launched_engine(cfg, *, bundle_path: str, active: bool,
     seam.mark_driver()
     prepare_candidate_environment(cfg, bundle_path=bundle_path, active=active)
     receipt_dir = tempfile.mkdtemp(prefix="optima_receipts_") if active else ""
-    extra_env = {"OPTIMA_SEAM_RECEIPT_DIR": receipt_dir} if active else {}
+    # Explicitly clear an ambient directory for baseline launches so they cannot
+    # contaminate a candidate's fresh evidence namespace.
+    extra_env = {"OPTIMA_SEAM_RECEIPT_DIR": receipt_dir if active else ""}
     if active and audit_rate > 0.0:
         extra_env["OPTIMA_SLOT_AUDIT"] = f"{audit_rate:g}"
         extra_env["OPTIMA_SLOT_AUDIT_SEED"] = str(random.SystemRandom().randrange(2**31))
@@ -342,13 +405,24 @@ def launched_engine(cfg, *, bundle_path: str, active: bool,
             import sglang as sgl
 
             _wait_gpu_drain()
-            engine = sgl.Engine(**engine_kwargs(cfg, active=active))
+            resolved_engine_kwargs = engine_kwargs(cfg, active=active)
+            engine = sgl.Engine(**resolved_engine_kwargs)
             ok = False
+            active_receipts: list[dict] = []
+            expected_slots: list[str] = []
+            expected_member_count = int(
+                resolved_engine_kwargs.get("tp_size", 1) or 1
+            )
             try:
                 if active:
-                    got = receipts.require(receipt_dir, "active",
-                                           context="candidate engine launch")
-                    logger.info("optima: seam active receipts: %s", got)
+                    active_receipts = receipts.require(
+                        receipt_dir, "active", context="candidate engine launch"
+                    )
+                    expected_slots = _active_execution_members(
+                        active_receipts,
+                        expected_member_count=expected_member_count,
+                    )
+                    logger.info("optima: seam active receipts: %s", active_receipts)
                 yield engine
                 ok = True
             finally:
@@ -371,11 +445,13 @@ def launched_engine(cfg, *, bundle_path: str, active: bool,
                 if active and ok and audit_out is not None:
                     audit_out.extend(receipts.collect(receipt_dir, "audit"))
                 if active and ok:
-                    # After the caller's generations: the impl must have actually been
-                    # selected at least once, else the engine config never exercised
-                    # the slot and every downstream number is stock-vs-stock.
-                    receipts.require(receipt_dir, "fired",
-                                     context="candidate engine run (post-generation)")
+                    detail = _require_execution_completion(
+                        receipt_dir,
+                        active_receipts=active_receipts,
+                        expected_slots=expected_slots,
+                        expected_member_count=expected_member_count,
+                    )
+                    logger.info("optima: %s", detail)
     finally:
         if receipt_dir:
             shutil.rmtree(receipt_dir, ignore_errors=True)

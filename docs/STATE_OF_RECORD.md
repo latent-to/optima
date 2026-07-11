@@ -167,7 +167,7 @@ optima/
   seams.py                  # single source of truth for the seam adapters (bootstrap/activate/compat derive from it)
   eval/scoring.py           # noise-robust speedup verdict (bookended A/B, noise-derived margin, no-decision)
   audit.py                  # the IN-ENGINE AUDIT: sampled per-call stock-baseline comparison inside the scored engine
-  receipts.py               # seam-health receipts (bundle loaded / impl fired / audit / export counters) by file
+  receipts.py               # strict active/routed/completed/fallback member coverage; diagnostic, not crown authority
   copy_fingerprint.py       # reformat-invariant near-copy fingerprint (AST-normalized)
   manifest.py               # bundle manifest parse + path-safety (+ dep_patches declarations)
   sandbox.py                # static policy scan + isolated load (defense-in-depth)

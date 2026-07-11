@@ -400,7 +400,7 @@ disjoint GPUs so drift cancels).
 | `verify` op-correctness fails | wrong math, wrong dtype handling, or shape mismatch vs the slot contract | check the exact signature in `optima slots`; compare to the matching example bundle |
 | `verify` fails only on *some* shapes | your kernel branches on shape or hard-codes dims | make it shape-generic; the verify shapes are jittered per run precisely to catch this |
 | your module raises at import (`load_failed` receipt) | a GPU-only import on a CPU box, or a syntax error | guard GPU imports; make sure the module imports cleanly everywhere it might load |
-| `evaluate` runs but your kernel never fires (no `fired` receipt) | dtype/arch eligibility excludes the run, a block kernel isn't `graph_safe` so it fell back, or the seam wasn't armed (`OPTIMA_*_SEAM=1`) | widen `metadata`, declare `graph_safe`, check the `active`/`load_failed`/`fired` receipt lines in the launch logs |
+| `evaluate` aborts for missing `completed` coverage | the workload never reached an applicable variant on every rank/slot, or a selected path failed before producing the model-facing output | check `active` membership, `fired` routing diagnostics, capability/graph gates, and any `fallback` receipt; never interpret `fired` alone as execution |
 | audit gate fails (audit mode) | your kernel's output differs from stock beyond the slot's tolerance on real calls — often dropped work | the audit re-ran stock on clones of your actual inputs; treat every violation as real |
 | KL gate fails on a *faithful* kernel (kl mode) | you didn't measure the stock-vs-stock noise floor; your "drift" may be the model's own nondeterminism — or your kernel genuinely isn't bit-faithful | measure the floor first; on nondeterministic arenas the audit mode is the gate and KL is advisory |
 | speedup gate fails | your kernel is simply slower than sglang's (the common case) | profile; see §8 — a faithful-but-slower kernel is the default outcome, not a bug |
@@ -411,13 +411,14 @@ disjoint GPUs so drift cancels).
 0.0, accuracy delta exactly 0.0, a large speedup — usually means the candidate
 engine came up **without your kernel**: missing seam `.pth`, a bad env var, or a
 bundle load failure made the dispatcher fall back to stock, and you measured
-stock-vs-stock. The receipt system exists for exactly this: the driver demands an
-`active` receipt (bundle loaded) and a `fired` receipt (the registry actually
-selected your kernel at least once), and **aborts the eval rather than scoring a
-stock-vs-stock run when they're missing** (the receipt lines themselves appear in
-the launch logs, not the final report block). If you ever see a speedup with no
-`fired` receipt in the logs, it is not attributable to your kernel. Locally
-without the `.pth` installed, running stock is expected
+stock-vs-stock. The driver therefore requires `active` from every expected scheduler
+member, `completed` for every registered slot/member pair, and no selected-path
+`fallback`. `fired` is deliberately weaker: it proves only that registry routing
+selected a candidate, before adapter marshalling, the entry, and validator-owned tail
+work finish. Missing completion or any fallback aborts the eval. These receipts catch
+accidental phantom paths but remain forgeable inside today's shared candidate process;
+external qualification and complete-engine isolation own correctness/crown authority.
+Locally without the `.pth` installed, running stock is expected
 (see [GPU_SETUP.md](GPU_SETUP.md)).
 
 Common contract mistakes worth checking before anything else: returning a tensor
@@ -539,7 +540,7 @@ offline; they are not the production submission path.
 **Ready to submit when:**
 
 - [ ] `optima scan` and `optima verify --device cuda` pass on your bundle
-- [ ] `evaluate` shows a speedup over the noise bar *with* an `active` + `fired` receipt (§7 — no phantom-pass)
+- [ ] `evaluate` shows a speedup over the noise bar with complete `active`/`completed` slot-member coverage and zero `fallback` receipts (§7)
 - [ ] fidelity green in the arena's mode (audit violations 0 / KL under threshold) and `bench` shows no accuracy regression
 - [ ] block/collective kernels: `graph_safe` declared and the kernel actually captures
 - [ ] the hosted tar.gz re-hashes to what `chain-package` printed
@@ -567,9 +568,10 @@ offline; they are not the production submission path.
 - **in-engine audit** — the fidelity mode on nondeterministic arenas: an untimed
   launch samples your kernel's real calls, re-runs stock on cloned inputs, and
   compares under the slot's verify tolerances; zero violations required.
-- **receipts** — seam-health markers (`active`, `fired`, `load_failed`, …) the
-  eval demands so a result is attributable to your kernel; a missing `fired`
-  means you measured stock-vs-stock (§7).
+- **receipts** — candidate-process control-flow diagnostics: `active` means loaded,
+  `fired` means selected, `completed` means the full model-facing path returned, and
+  `fallback` means selected work failed and stock was served. They prevent accidental
+  phantom scoring but do not prove hostile-code isolation or correctness (§7).
 - **graph-safe** — a kernel that can run inside a CUDA graph capture. Required for
   block/collective kernels to be scored (scoring is graphs-ON).
 - **king-of-the-hill** — the best kernel per slot is champion; you take the title only

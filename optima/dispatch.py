@@ -22,6 +22,7 @@ import torch
 
 from optima import audit as _audit
 from optima import moe_export as _moe_export
+from optima import receipts as _receipts
 from optima.capabilities import msa_prefill_call_descriptor
 from optima.registry import REGISTRY, KernelRegistry
 from optima.slots import get_slot
@@ -97,13 +98,16 @@ def make_silu_and_mul_dispatcher(
         a_x = x.clone() if aud else None  # pre-call clone: the kernel may scribble on x
         try:
             impl.entry(x, out)
-        except Exception:
+        except Exception as exc:
             if registry.strict:
                 raise
             # Quality/throughput already protect us; a crashing kernel just loses.
-            return baseline_forward(self, x)
+            stock = baseline_forward(self, x)
+            _receipts.fallback(slot, exc)
+            return stock
         if aud:
             _audit.run(slot, (out,), lambda: baseline_forward(self, a_x))
+        _receipts.completed(slot)
         return out
 
     return dispatched
@@ -155,6 +159,7 @@ def make_rmsnorm_dispatcher(
                 impl.entry(x, weight, out, eps)
                 if aud:
                     _audit.run(slot, (out,), lambda: baseline_forward(self, a_x, None, None))
+                _receipts.completed(slot)
                 return out
             a_x, a_res = (x.clone(), residual.clone()) if aud else (None, None)
             new_residual = x + residual  # validator owns the add
@@ -163,11 +168,14 @@ def make_rmsnorm_dispatcher(
             if aud:
                 _audit.run(slot, (out, new_residual),
                            lambda: baseline_forward(self, a_x, a_res, None))
+            _receipts.completed(slot)
             return out, new_residual
-        except Exception:
+        except Exception as exc:
             if registry.strict:
                 raise
-            return baseline_forward(self, x, residual, post_residual_addition)
+            stock = baseline_forward(self, x, residual, post_residual_addition)
+            _receipts.fallback(slot, exc)
+            return stock
 
     return dispatched
 
@@ -209,6 +217,7 @@ def make_attention_dispatcher(
     def dispatched(self, q, k, v, forward_batch, save_kv_cache: bool = True, **kwargs):
         if _dynamo_compiling():  # traced region bakes pure stock (see _dynamo_compiling)
             return baseline_forward(self, q, k, v, forward_batch, save_kv_cache, **kwargs)
+        selected = False
         if _attention_seam_active():
             try:
                 if forward_batch.forward_mode.is_decode() and _decode_supported(self, k, v, kwargs):
@@ -219,10 +228,21 @@ def make_attention_dispatcher(
                         arch=_arch_tag(q.device.index or 0) if q.is_cuda else None,
                     )
                     if impl is not None:
-                        return _run_decode_kernel(self, q, k, v, forward_batch, save_kv_cache, impl)
-            except Exception:
+                        selected = True
+                        out = _run_decode_kernel(
+                            self, q, k, v, forward_batch, save_kv_cache, impl
+                        )
+                        _receipts.completed(slot)
+                        return out
+            except Exception as exc:
                 if registry.strict:
                     raise
+                if selected:
+                    stock = baseline_forward(
+                        self, q, k, v, forward_batch, save_kv_cache, **kwargs
+                    )
+                    _receipts.fallback(slot, exc)
+                    return stock
                 # any mismatch with this sglang's internals -> trust the baseline
         return baseline_forward(self, q, k, v, forward_batch, save_kv_cache, **kwargs)
 
@@ -326,6 +346,8 @@ def make_moe_dispatcher(
         if _dynamo_compiling():  # traced region bakes pure stock (see _dynamo_compiling)
             return baseline_forward(self, hidden_states, topk_output)
         _maybe_inspect_moe(self, hidden_states, topk_output)
+        selected_slot = None
+        route_exc = None
         if _moe_seam_active():
             try:
                 if not (_moe_supported(self) and hidden_states.dim() == 2):
@@ -373,6 +395,7 @@ def make_moe_dispatcher(
                                 _moe_debug(lambda s=slot: f"SKIP {s}: quant mismatch "
                                                           f"(kernel={set(impl.eligibility.quant)} layer={quant_fmt})")
                                 continue
+                            selected_slot = slot
                             # Audit: baseline forward_impl on a pre-call clone (its TP
                             # reduce is collective — rank-seeded sampling keeps lockstep).
                             # Both sides are post-reduce here (the kernel path replays the
@@ -385,14 +408,20 @@ def make_moe_dispatcher(
                                            lambda: baseline_forward(self, a_x, topk_output))
                             _log_once_active(slot)
                             _moe_debug(lambda s=slot, m=x.shape[0]: f"FIRED slot={s} M={m} quant={quant_fmt}")
+                            _receipts.completed(slot)
                             return out
             except Exception as exc:  # noqa: BLE001
                 if registry.strict:
                     raise
+                if selected_slot is not None:
+                    route_exc = exc
                 _log_once_fallback(exc)
                 _moe_debug(lambda e=exc: f"FELL BACK after kernel error: {e!r}")
                 # any mismatch with this sglang's internals -> trust the baseline
-        return baseline_forward(self, hidden_states, topk_output)
+        stock = baseline_forward(self, hidden_states, topk_output)
+        if route_exc is not None:
+            _receipts.fallback(selected_slot, route_exc)
+        return stock
 
     return dispatched
 
@@ -700,6 +729,8 @@ def make_allreduce_dispatcher(
     def dispatched(self, input_, *args, **kwargs):
         if _dynamo_compiling():  # traced region bakes pure stock (see _dynamo_compiling)
             return baseline_all_reduce(self, input_, *args, **kwargs)
+        selected = False
+        route_exc = None
         if _collective_seam_active() and not args and not kwargs:
             try:
                 if (torch.is_tensor(input_) and input_.dim() == 2
@@ -713,6 +744,7 @@ def make_allreduce_dispatcher(
                     # Under CUDA graphs (the scoring config) only run a kernel the miner
                     # DECLARED graph-capturable; else trust the stock reduce in-graph.
                     if impl is not None and not (_in_cuda_graph() and not impl.eligibility.graph_safe):
+                        selected = True
                         # Audited baseline is COLLECTIVE (see arfusion note): rank-seeded
                         # sampling + lockstep dispatch make the extra reduce safe.
                         aud = not _in_cuda_graph() and _audit.sampled()
@@ -723,12 +755,18 @@ def make_allreduce_dispatcher(
                         if aud:
                             _audit.run(slot, (out,), lambda: baseline_all_reduce(self, a_in))
                         _log_collective_active()
+                        _receipts.completed(slot)
                         return out
             except Exception as exc:  # noqa: BLE001
                 if registry.strict:
                     raise
+                if selected:
+                    route_exc = exc
                 _log_collective_fallback(exc)
-        return baseline_all_reduce(self, input_, *args, **kwargs)
+        stock = baseline_all_reduce(self, input_, *args, **kwargs)
+        if route_exc is not None:
+            _receipts.fallback(slot, route_exc)
+        return stock
 
     return dispatched
 
@@ -812,6 +850,8 @@ def make_arfusion_dispatcher(
                         exp, input_tensor, residual, weight, eps, max_token_num,
                         use_oneshot, trigger_completion_at_end, fp32_acc,
                         use_attn_tp_group, registry=registry, baseline_fn=baseline_fn)
+            selected = False
+            route_exc = None
             try:
                 # Contiguity guard = STOCK PARITY: the stock function refuses
                 # non-contiguous input/residual/weight (real call sites pass views —
@@ -835,6 +875,7 @@ def make_arfusion_dispatcher(
                     if impl is not None and not (_in_cuda_graph() and not impl.eligibility.graph_safe):
                         group = _arfusion_group(use_attn_tp_group)
                         if group is not None and group.size() > 1:
+                            selected = True
                             # The audited baseline is COLLECTIVE: safe only because the
                             # sampling RNG is rank-identically seeded (audit.py) and all
                             # ranks reach this dispatcher in lockstep; never under capture.
@@ -852,13 +893,24 @@ def make_arfusion_dispatcher(
                                                                trigger_completion_at_end,
                                                                fp32_acc, use_attn_tp_group))
                             _log_arfusion_active()
+                            _receipts.completed(slot)
                             return out_norm, out_residual
             except Exception as exc:  # noqa: BLE001
                 if registry.strict:
                     raise
+                if selected:
+                    route_exc = exc
                 _log_arfusion_fallback(exc)
-        return baseline_fn(input_tensor, residual, weight, eps, max_token_num, use_oneshot,
-                           trigger_completion_at_end, fp32_acc, use_attn_tp_group)
+            stock = baseline_fn(
+                input_tensor, residual, weight, eps, max_token_num, use_oneshot,
+                trigger_completion_at_end, fp32_acc, use_attn_tp_group
+            )
+            if route_exc is not None:
+                _receipts.fallback(slot, route_exc)
+            return stock
+        return baseline_fn(input_tensor, residual, weight, eps, max_token_num,
+                           use_oneshot, trigger_completion_at_end, fp32_acc,
+                           use_attn_tp_group)
 
     return dispatched
 
@@ -888,6 +940,8 @@ def _deep_consume(exp, input_tensor, residual, weight, eps, max_token_num,
         raise RuntimeError(
             f"optima deep seam: consume T={t} exceeds export T={exp['T']} — "
             "pointer pairing broken, refusing to serve an unfinalized output")
+    selected = False
+    route_exc = None
     try:
         impl = registry.lookup(
             _DEEP_SLOT,
@@ -899,6 +953,7 @@ def _deep_consume(exp, input_tensor, residual, weight, eps, max_token_num,
         if impl is not None and not (_in_cuda_graph() and not impl.eligibility.graph_safe):
             group = _arfusion_group(use_attn_tp_group)
             if group is not None and group.size() > 1:
+                selected = True
                 gemm_out, row_map, scales = _moe_export.export_views(
                     exp, input_tensor.device)
                 # Collective audit: rank-identical sampling (audit.py) keeps the
@@ -928,18 +983,24 @@ def _deep_consume(exp, input_tensor, residual, weight, eps, max_token_num,
 
                     _audit.run(_DEEP_SLOT, (out_norm, out_residual), _reference)
                 _log_arfusion_active()
+                _receipts.completed(_DEEP_SLOT)
                 return out_norm, out_residual
     except Exception as exc:  # noqa: BLE001
         if registry.strict:
             raise
+        if selected:
+            route_exc = exc
         _log_arfusion_fallback(exc)
     # Trusted recovery: fp32 finalize from the exported views (head-trimmed to this
     # call's T), then the stock fusion path on the now-FINALIZED tensor. Correct but
     # slow — receipted as an orphan so a nonzero count is visible seam-health data.
     finalized = _moe_export.trusted_finalize(exp, input_tensor)
     _moe_export.orphaned(exp)
-    return baseline_fn(finalized, residual, weight, eps, max_token_num, use_oneshot,
-                       trigger_completion_at_end, fp32_acc, use_attn_tp_group)
+    stock = baseline_fn(finalized, residual, weight, eps, max_token_num, use_oneshot,
+                        trigger_completion_at_end, fp32_acc, use_attn_tp_group)
+    if route_exc is not None:
+        _receipts.fallback(_DEEP_SLOT, route_exc)
+    return stock
 
 
 # (The 2026-07-07 one-off "stockcheck" diagnostic that lived here was productized
@@ -1010,6 +1071,7 @@ def make_msa_prefill_dispatcher(
             return stock()
         if os.environ.get("OPTIMA_MSA_PREFILL_SEAM") != "1" or _in_cuda_graph():
             return stock()
+        selected = False
         try:
             num_kv_heads = k_cache.shape[1]
             contract_top_k = int(output_slot.correctness.top_k)
@@ -1082,6 +1144,7 @@ def make_msa_prefill_dispatcher(
             committed = registry.select(slot, first_descriptor)
             if committed.impl is not first_impl:
                 return stock()
+            selected = True
 
             # In-engine audit (per-rank independent here — the indexer is not a
             # collective): stock runs FIRST on pristine inputs; the comparison target
@@ -1110,6 +1173,7 @@ def make_msa_prefill_dispatcher(
                                dtype=score_dtype, device=score_device)
 
             contract_validated = False
+            candidate_calls = 0
             for b, qs, qe, seq_b, pre_b, sid in meta:
                 if qe - qs == 0 or seq_b == 0:
                     continue
@@ -1143,6 +1207,10 @@ def make_msa_prefill_dispatcher(
                         )
                         contract_validated = True
                     impl.entry(q_bh, kg, pre_b, scale, block_size_k, out_view)
+                    candidate_calls += 1
+
+            if not candidate_calls:
+                raise RuntimeError("committed MSA route executed no candidate calls")
 
             # The validator-owned top-k tail, byte-stock from the target module's own
             # pieces: the SELECTION never comes from miner code.
@@ -1169,12 +1237,17 @@ def make_msa_prefill_dispatcher(
                 else:
                     _audit.record(slot, (topk_idx,), (expected_idx,))
             _log_msa_prefill_active()
+            if candidate_calls:
+                _receipts.completed(slot)
             return None, topk_idx  # o is None in the gated (disable_index_value) mode
         except Exception as exc:  # noqa: BLE001
             if registry.strict:
                 raise
             _log_msa_prefill_fallback(exc)
-            return stock()
+            stock_result = stock()
+            if selected:
+                _receipts.fallback(slot, exc)
+            return stock_result
 
     return dispatched
 

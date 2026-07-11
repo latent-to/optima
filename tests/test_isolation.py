@@ -179,7 +179,16 @@ def test_launch_scopes_framework_arming_and_restores_parent(
     monkeypatch.setattr(seam, "mark_driver", lambda: None)
     monkeypatch.setattr(_launch, "prepare_candidate_environment", lambda *_a, **_k: None)
     monkeypatch.setattr(_launch, "_wait_gpu_drain", lambda: None)
-    monkeypatch.setattr(receipts, "require", lambda *_a, **_k: [{"slots": ["s"]}])
+    monkeypatch.setattr(
+        receipts,
+        "require",
+        lambda *_a, **_k: [
+            {"slots": ["s"], "pid": 10, "rank": -1, "world_size": -1}
+        ],
+    )
+    monkeypatch.setattr(
+        _launch, "_require_execution_completion", lambda *_a, **_k: "ok"
+    )
 
     with _launch.launched_engine(
         cfg, bundle_path="bundle" if active else "", active=active

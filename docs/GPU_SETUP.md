@@ -68,12 +68,12 @@ python -m optima.cli evaluate examples/miner_silu_triton \
     --model Qwen/Qwen2.5-0.5B-Instruct --no-deterministic
 ```
 
-The eval demands an `active` receipt (bundle loaded) and a `fired` receipt (your
-kernel actually ran) and **fails loudly when they're missing** instead of scoring
-a stock-vs-stock run. The receipt lines appear in the launch logs (INFO level),
-not in the final report block. If a run looks suspiciously clean and you can't
-find a `fired` receipt in the logs, the usual cause is a missing `optima.pth`
-(see the phantom-pass section of [MINER_GUIDE.md](MINER_GUIDE.md)).
+The eval demands `active` receipts from every expected scheduler member, then one
+`completed` receipt for every registered slot/member pair and zero `fallback`
+receipts. `fired` means only that routing selected a candidate; later adapter or
+kernel work may still fail or intentionally serve stock. Missing completion aborts
+instead of scoring stock-vs-stock. These process-local receipts are diagnostics,
+not correctness or isolation authority (see [MINER_GUIDE.md](MINER_GUIDE.md)).
 
 Always launch GPU evals via `python -m optima.cli ...` — sglang spawns the
 scheduler with `mp spawn`, so the `__main__` guard matters.

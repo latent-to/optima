@@ -51,6 +51,8 @@ DISCOVERY_ENVIRONMENT_KEYS = (
 _SCHEDULER_ROLE = "scheduler"
 _SCHEDULER_MODULE = "sglang.srt.managers.scheduler"
 _SCHEDULER_QUALNAME = "run_scheduler_process"
+_TRAMPOLINE_MODULE = "optima.discovery_overlay"
+_TRAMPOLINE_QUALNAME = "_scheduler_overlay_entry"
 _DRIVER_MODULE = "sglang/__init__.py"
 _ACTIVATION_SCHEMA = "optima.discovery-driver-activation.v1"
 _ACTIVATION_POLICY_SCHEMA = "optima.discovery-activation-policy.v1"
@@ -89,6 +91,8 @@ def activation_policy_digest() -> str:
             "pp_size": 1,
             "qualname": _SCHEDULER_QUALNAME,
             "start_method": "spawn",
+            "trampoline_module": _TRAMPOLINE_MODULE,
+            "trampoline_qualname": _TRAMPOLINE_QUALNAME,
         },
         "schema": _ACTIVATION_POLICY_SCHEMA,
         "transport": "stock-driver-cloexec-ready-frame",
@@ -682,6 +686,34 @@ def require_stock_driver_origin(
     return DiscoveryDriverOrigin("sglang", installed_version, _DRIVER_MODULE)
 
 
+def _scheduler_overlay_entry(*args, **kwargs):
+    """Activate the sealed overlay before importing the scheduler target.
+
+    ``multiprocessing.spawn`` otherwise imports the stock scheduler module while
+    unpickling its target, which is already too late to switch package roots.
+    The stock driver verifies the original target before substituting this
+    validator-owned entry point.
+    """
+
+    install()
+    expected = _required_digest(os.environ, EXPECTED_IDENTITY)
+    try:
+        module = importlib.import_module(_SCHEDULER_MODULE)
+        target = getattr(module, _SCHEDULER_QUALNAME)
+    except (AttributeError, ImportError) as exc:
+        raise DiscoveryOverlayActivationError(
+            f"discovery scheduler target cannot import from the overlay: {exc}"
+        ) from None
+    if (
+        _target_identity(target) != (_SCHEDULER_MODULE, _SCHEDULER_QUALNAME)
+        or os.environ.get(ACTIVE_IDENTITY) != expected
+    ):
+        raise DiscoveryOverlayActivationError(
+            "discovery scheduler trampoline did not activate the sealed overlay"
+        )
+    return target(*args, **kwargs)
+
+
 def install_process_role_hook() -> None:
     """Mark only exact scheduler spawn children while an overlay is armed."""
 
@@ -737,8 +769,10 @@ def install_process_role_hook() -> None:
                 )
             saved_role = os.environ.get(PROCESS_ROLE)
             saved_parent = os.environ.get(ROLE_PARENT_PID)
+            original_target = getattr(process, "_target", None)
             os.environ[PROCESS_ROLE] = role
             os.environ[ROLE_PARENT_PID] = str(os.getpid())
+            process._target = _scheduler_overlay_entry
             try:
                 result = original(process, *args, **kwargs)
                 member = _with_started_pid(pending, process)
@@ -757,6 +791,7 @@ def install_process_role_hook() -> None:
                     os.environ.pop(ROLE_PARENT_PID, None)
                 else:
                     os.environ[ROLE_PARENT_PID] = saved_parent
+                process._target = original_target
 
     start.__optima_discovery_role_hook__ = True
     start.__optima_original_start__ = original

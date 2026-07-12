@@ -8,6 +8,8 @@ from types import SimpleNamespace
 
 import pytest
 
+import optima.discovery_overlay as overlay_module
+
 from optima.discovery_overlay import (
     ACTIVE_IDENTITY,
     ARMED,
@@ -153,6 +155,59 @@ def _install_fake_start(monkeypatch, seen: list[tuple[str, str]]) -> object:
     monkeypatch.setattr(multiprocessing.process.BaseProcess, "start", original)
     install_process_role_hook()
     return multiprocessing.process.BaseProcess.start
+
+
+def test_scheduler_spawn_substitutes_trampoline_then_restores_target(
+    tmp_path, monkeypatch
+):
+    identity = _h("overlay")
+    root = _overlay_root(tmp_path)
+    _arm_environment(monkeypatch, root, identity, 1)
+    observed: list[tuple[str, str]] = []
+
+    def original(process, *args, **kwargs):
+        target = process._target
+        observed.append((target.__module__, target.__qualname__))
+        return "started"
+
+    monkeypatch.setattr(multiprocessing.process.BaseProcess, "start", original)
+    install_process_role_hook()
+    process = _FakeProcess(
+        server_args=_server_args(1), pid=351, gpu_id=0, tp_rank=0
+    )
+    assert multiprocessing.process.BaseProcess.start(process) == "started"
+    assert observed == [
+        ("optima.discovery_overlay", "_scheduler_overlay_entry")
+    ]
+    assert process._target is _scheduler_target
+
+
+def test_scheduler_trampoline_requires_active_overlay_before_calling_target(
+    monkeypatch,
+):
+    identity = _h("overlay")
+    monkeypatch.setenv(EXPECTED_IDENTITY, identity)
+    calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+
+    def target(*args, **kwargs):
+        calls.append((args, kwargs))
+        return "ran"
+
+    target.__module__ = "sglang.srt.managers.scheduler"
+    target.__qualname__ = "run_scheduler_process"
+    module = SimpleNamespace(run_scheduler_process=target)
+    monkeypatch.setattr(
+        overlay_module.importlib, "import_module", lambda name: module
+    )
+    monkeypatch.setattr(overlay_module, "install", lambda: None)
+
+    with pytest.raises(DiscoveryOverlayActivationError, match="did not activate"):
+        overlay_module._scheduler_overlay_entry("first")
+    assert calls == []
+
+    monkeypatch.setenv(ACTIVE_IDENTITY, identity)
+    assert overlay_module._scheduler_overlay_entry("first", rank=2) == "ran"
+    assert calls == [(('first',), {"rank": 2})]
 
 
 def test_launch_environment_clears_every_inactive_marker(tmp_path):

@@ -1,0 +1,114 @@
+{
+  "architectural_unit": "3a-materializer",
+  "artifacts": [
+    {
+      "availability": "unavailable",
+      "id": "tests.local-full",
+      "kind": "test-log",
+      "locator": null,
+      "reason": "The local 814-pass and 15-skip summary was recorded without retaining the raw log.",
+      "sha256": null,
+      "size_bytes": null
+    },
+    {
+      "availability": "unavailable",
+      "id": "review.materializer",
+      "kind": "review-report",
+      "locator": null,
+      "reason": "The reported materializer scope and red-team reviews were not retained as artifacts.",
+      "sha256": null,
+      "size_bytes": null
+    }
+  ],
+  "claims": [
+    {
+      "artifact_ids": [],
+      "id": "scope.deterministic-materialization",
+      "statement": "The repository contains deterministic selected-closure materialization and strict reopen checks.",
+      "status": "verified"
+    },
+    {
+      "artifact_ids": [
+        "tests.local-full"
+      ],
+      "id": "tests.full",
+      "statement": "The local suite was reported as 814 passed and 15 skipped; its raw log is unavailable.",
+      "status": "reported_unretained"
+    }
+  ],
+  "classified_diff": {
+    "documentation": {
+      "added": 0,
+      "deleted": 0
+    },
+    "evidence": {
+      "added": 0,
+      "deleted": 0
+    },
+    "production": {
+      "added": 1745,
+      "deleted": 54
+    },
+    "test": {
+      "added": 1611,
+      "deleted": 86
+    },
+    "tooling": {
+      "added": 0,
+      "deleted": 0
+    },
+    "vendor": {
+      "added": 0,
+      "deleted": 0
+    }
+  },
+  "exit_criteria": [
+    {
+      "artifact_ids": [],
+      "id": "tree.content-addressed",
+      "statement": "Materialized trees bind selected contribution inventories, generated namespaces, modes, and complete directory contents.",
+      "status": "verified"
+    },
+    {
+      "artifact_ids": [],
+      "id": "authority.none",
+      "statement": "The unit adds no engine execution, grading, crown, or chain state authority.",
+      "status": "verified"
+    }
+  ],
+  "github_pr": 42,
+  "identity": {
+    "base_commit": "f6c56dd21241e2e3372b45a409ded5e71ac1f8a7",
+    "implementation_commit": "d2feb2213227c05fc6bbc457e8943600e8675fae",
+    "implementation_tree": "f5ba93dc58b178661352296b430350456d6d7181",
+    "merge_commit": "9c2d47732c8513aa1e639e5fadece6e262089a2e"
+  },
+  "nonclaims": [
+    "chain.authority",
+    "engine.execution",
+    "native.compilation",
+    "quality.authority"
+  ],
+  "record_type": "pr_evidence",
+  "reviews": [
+    {
+      "artifact_id": "review.materializer",
+      "phase": "implementation",
+      "status": "reported_unretained",
+      "summary": "Implementation review was reported; no report bytes were retained."
+    },
+    {
+      "artifact_id": "review.materializer",
+      "phase": "adversarial",
+      "status": "reported_unretained",
+      "summary": "Post-rebase red-team review was reported; no report bytes were retained."
+    },
+    {
+      "artifact_id": "review.materializer",
+      "phase": "confirmation",
+      "status": "reported_unretained",
+      "summary": "Scope and materializer confirmation were reported; no report bytes were retained."
+    }
+  ],
+  "schema_version": 1
+}

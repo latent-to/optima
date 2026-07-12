@@ -1,0 +1,114 @@
+{
+  "architectural_unit": "3a-core",
+  "artifacts": [
+    {
+      "availability": "unavailable",
+      "id": "tests.local-full",
+      "kind": "test-log",
+      "locator": null,
+      "reason": "The local 737-pass and 15-skip summary was recorded without retaining the raw log.",
+      "sha256": null,
+      "size_bytes": null
+    },
+    {
+      "availability": "unavailable",
+      "id": "review.core",
+      "kind": "review-report",
+      "locator": null,
+      "reason": "The reported core and scope reviews were not retained as artifacts.",
+      "sha256": null,
+      "size_bytes": null
+    }
+  ],
+  "claims": [
+    {
+      "artifact_ids": [],
+      "id": "scope.identity-planning",
+      "statement": "The diff is limited to target, stack identity, manifest, and marginal planning code with focused tests.",
+      "status": "verified"
+    },
+    {
+      "artifact_ids": [
+        "tests.local-full"
+      ],
+      "id": "tests.full",
+      "statement": "The local suite was reported as 737 passed and 15 skipped; its raw log is unavailable.",
+      "status": "reported_unretained"
+    }
+  ],
+  "classified_diff": {
+    "documentation": {
+      "added": 0,
+      "deleted": 0
+    },
+    "evidence": {
+      "added": 0,
+      "deleted": 0
+    },
+    "production": {
+      "added": 2342,
+      "deleted": 16
+    },
+    "test": {
+      "added": 1265,
+      "deleted": 5
+    },
+    "tooling": {
+      "added": 0,
+      "deleted": 0
+    },
+    "vendor": {
+      "added": 0,
+      "deleted": 0
+    }
+  },
+  "exit_criteria": [
+    {
+      "artifact_ids": [],
+      "id": "marginal.exact-one-delta",
+      "statement": "The repository contains canonical exact-one-target and atomic replacement planning with rollback identity.",
+      "status": "verified"
+    },
+    {
+      "artifact_ids": [],
+      "id": "authority.none",
+      "statement": "The unit adds no launch, score, settlement, or chain mutation entry point.",
+      "status": "verified"
+    }
+  ],
+  "github_pr": 41,
+  "identity": {
+    "base_commit": "f0745c996adbe2a7b83ac6263344293a122c7627",
+    "implementation_commit": "6be2c8eaeed1b3c33256260866732d65c701ae9d",
+    "implementation_tree": "674bb810d7dc8b5e40a0fd4adf6d6157a141b637",
+    "merge_commit": "f6c56dd21241e2e3372b45a409ded5e71ac1f8a7"
+  },
+  "nonclaims": [
+    "chain.authority",
+    "engine.launch",
+    "quality.authority",
+    "settlement.authority"
+  ],
+  "record_type": "pr_evidence",
+  "reviews": [
+    {
+      "artifact_id": "review.core",
+      "phase": "implementation",
+      "status": "reported_unretained",
+      "summary": "Implementation review was reported; no report bytes were retained."
+    },
+    {
+      "artifact_id": "review.core",
+      "phase": "adversarial",
+      "status": "reported_unretained",
+      "summary": "Final scope review was reported; no report bytes were retained."
+    },
+    {
+      "artifact_id": "review.core",
+      "phase": "confirmation",
+      "status": "reported_unretained",
+      "summary": "Independent core confirmation was reported; no report bytes were retained."
+    }
+  ],
+  "schema_version": 1
+}

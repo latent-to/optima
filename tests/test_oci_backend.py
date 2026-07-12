@@ -587,7 +587,7 @@ def test_reference_runtime_accepts_control_receipt_through_both_reopens(
         run=lambda *_args: marker,
     )
     assert raw.value is marker
-    assert raw.native_publication_digest == control.publication_digest
+    assert raw.publication_digest == control.publication_digest
     assert executor.device_guard.deadlines == [  # type: ignore[attr-defined]
         ("pre", 200.0),
         ("post", 200.0),

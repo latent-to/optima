@@ -577,3 +577,52 @@ def test_projection_rejects_overlapping_active_and_post_release_samples(tmp_path
     )
     with pytest.raises(RawSpeedEvidenceError, match="sample facts"):
         _project(lifecycle, delta, case, calibration, runtime_policy)
+
+
+def test_projection_accepts_ready_miss_before_authoritative_passing_tail(tmp_path):
+    lifecycle, delta, case, calibration, runtime_policy = _lifecycle(tmp_path)
+    receipts = list(lifecycle.baseline_before.device_receipts)
+    active = receipts[1]
+    intermediate_miss = replace(
+        active.samples[-1],
+        monotonic_s=(
+            active.samples[-2].monotonic_s + active.samples[-1].monotonic_s
+        ) / 2,
+        active_envelope_passed=False,
+        active_envelope_reason="ready envelope not reached yet",
+    )
+    receipts[1] = replace(
+        active,
+        samples=(*active.samples[:-1], intermediate_miss, active.samples[-1]),
+    )
+    with_miss = replace(
+        lifecycle,
+        baseline_before=replace(
+            lifecycle.baseline_before,
+            device_receipts=tuple(receipts),
+        ),
+    )
+
+    assert _project(with_miss, delta, case, calibration, runtime_policy)
+
+    failed_tail = list(receipts)
+    failed_tail[1] = replace(
+        receipts[1],
+        samples=(
+            *receipts[1].samples[:-1],
+            replace(
+                receipts[1].samples[-1],
+                active_envelope_passed=False,
+                active_envelope_reason="ready tail failed",
+            ),
+        ),
+    )
+    with_failed_tail = replace(
+        lifecycle,
+        baseline_before=replace(
+            lifecycle.baseline_before,
+            device_receipts=tuple(failed_tail),
+        ),
+    )
+    with pytest.raises(RawSpeedEvidenceError, match="sample facts"):
+        _project(with_failed_tail, delta, case, calibration, runtime_policy)

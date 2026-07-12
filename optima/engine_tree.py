@@ -40,6 +40,7 @@ _MATERIALIZER_VERSION = 1
 _FILE_MODE = 0o444
 _DIR_MODE = 0o755
 _INTERNAL_BUNDLE_ID = "optima-materialized-v1"
+_DISCOVERY_METADATA = "metadata/optima_discovery.json"
 _REBUILD_ORDER = {
     "optima/patchers/apply_dep_patch.py": 0,
     "optima/patchers/build_cuda_ext.py": 1,
@@ -1450,6 +1451,119 @@ def reopen_materialized_engine_tree(
         files=row_tuple,
         runtime_manifest=runtime_manifest,
     )
+
+
+def materialize_discovery_engine_tree(
+    incumbent_root: str | Path,
+    discovery: object,
+    *,
+    policy: object,
+    build_profile: object,
+    destination: str | Path,
+) -> MaterializedEngineTree:
+    """Add one source-intent discovery delta to an exact incumbent tree.
+
+    This step copies proposal bytes only. The image-pinned SGLang overlay is
+    constructed later by the hermetic OCI prebuild and published by the common
+    native-artifact authority.
+    """
+
+    from optima.discovery import (
+        DiscoveryBuildProfile,
+        DiscoveryPolicy,
+        InspectedDiscovery,
+        discovery_candidate_stack_digest,
+        inspect_discovery,
+        require_discovery_build_profile,
+    )
+
+    if (
+        type(discovery) is not InspectedDiscovery
+        or type(policy) is not DiscoveryPolicy
+        or type(build_profile) is not DiscoveryBuildProfile
+    ):
+        raise EngineTreeError("discovery materialization requires exact typed inputs")
+    incumbent = reopen_materialized_engine_tree(incumbent_root)
+    observed = inspect_discovery(discovery.root)
+    if observed != discovery:
+        raise EngineTreeError("discovery proposal changed after inspection")
+    try:
+        require_discovery_build_profile(discovery.manifest, build_profile, policy)
+    except (TypeError, ValueError) as exc:
+        raise EngineTreeError(f"discovery build profile is invalid: {exc}") from None
+
+    destination_path = Path(destination)
+    destination_resolved = destination_path.resolve(strict=False)
+    sources = (incumbent.root, discovery.root)
+    if any(
+        destination_resolved == source
+        or source in destination_resolved.parents
+        or destination_resolved in source.parents
+        for source in sources
+    ):
+        raise EngineTreeError("discovery destination overlaps an immutable input tree")
+
+    try:
+        metadata = json.loads(
+            _stable_read(
+                incumbent.root, "metadata/optima_engine_tree.json"
+            ).decode("utf-8")
+        )
+    except (OSError, UnicodeError, ValueError) as exc:
+        raise EngineTreeError(f"incumbent materialized metadata is invalid: {exc}") from None
+    if not isinstance(metadata, dict):
+        raise EngineTreeError("incumbent materialized metadata is not an object")
+    contributions = _validate_contribution_rows(metadata.get("contributions"))
+
+    files: dict[str, bytes] = {}
+    for row in incumbent.files:
+        if row.path == "metadata/optima_engine_tree.json":
+            continue
+        raw = _stable_read(incumbent.root, row.path)
+        if row.mode != _FILE_MODE or row.size != len(raw) or row.sha256 != sha256_hex(raw):
+            raise EngineTreeError(f"incumbent file changed during discovery copy: {row.path!r}")
+        _put_file(files, row.path, raw)
+    for row in discovery.files:
+        raw = _stable_read(discovery.root, row.path)
+        if row.size != len(raw) or row.sha256 != sha256_hex(raw):
+            raise EngineTreeError(f"discovery proposal file changed: {row.path!r}")
+        _put_file(files, f"discovery/{row.path}", raw)
+
+    candidate_stack_digest = discovery_candidate_stack_digest(
+        incumbent_stack_digest=incumbent.stack_digest,
+        incumbent_tree_digest=incumbent.tree_digest,
+        proposal_digest=discovery.proposal_digest,
+        policy_digest=policy.digest,
+        build_profile_digest=build_profile.digest,
+    )
+    discovery_metadata = {
+        "build_profile": build_profile.to_dict(),
+        "build_profile_digest": build_profile.digest,
+        "incumbent_stack_digest": incumbent.stack_digest,
+        "incumbent_tree_digest": incumbent.tree_digest,
+        "policy": policy.to_dict(),
+        "policy_digest": policy.digest,
+        "proposal_digest": discovery.proposal_digest,
+        "proposal_files": [row.to_dict() for row in discovery.files],
+        "schema": "optima.discovery-engine-tree.v1",
+    }
+    _put_file(
+        files,
+        _DISCOVERY_METADATA,
+        json.dumps(
+            discovery_metadata, ensure_ascii=False, indent=2, sort_keys=True
+        ).encode("utf-8") + b"\n",
+    )
+    result = _write_materialized_tree(
+        destination_path,
+        stack_digest=candidate_stack_digest,
+        files=files,
+        runtime_manifest=incumbent.runtime_manifest,
+        contributions=contributions,
+    )
+    if reopen_materialized_engine_tree(incumbent.root) != incumbent:
+        raise EngineTreeError("incumbent tree changed during discovery materialization")
+    return result
 
 
 def materialize_engine_tree(

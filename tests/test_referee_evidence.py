@@ -255,6 +255,28 @@ def test_pr4e_contract_closes_hardware_discovered_qualification_scope() -> None:
         validate_scope(contract, over_budget)
 
 
+def test_pr5_contract_bounds_discovery_and_carries_the_ready_tail_fix() -> None:
+    contract = load_json(EVIDENCE / "contracts/pr5.json")
+    validate_contract_document(contract)
+    changes = {
+        item["path"]: ({"add": "A", "modify": "M"}[item["change"]], 1, 0)
+        for item in contract["required_in_place"]
+    }
+    validate_scope(contract, changes)
+    schema = load_json(EVIDENCE / "schema-v2.json")
+    validate_v2_schema_contract(schema, contract)
+
+    outside = dict(changes)
+    outside["optima/chain/validator_loop.py"] = ("M", 1, 0)
+    with pytest.raises(EvidenceError, match="outside frozen pr5"):
+        validate_scope(contract, outside)
+
+    over_budget = dict(changes)
+    over_budget["optima/discovery.py"] = ("A", 5501, 0)
+    with pytest.raises(EvidenceError, match="pr5 line budget"):
+        validate_scope(contract, over_budget)
+
+
 def test_authority_boundary_walks_transitive_and_relative_repo_imports(tmp_path: Path) -> None:
     eval_dir = tmp_path / "optima/eval"
     eval_dir.mkdir(parents=True)

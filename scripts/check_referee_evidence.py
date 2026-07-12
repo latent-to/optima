@@ -120,6 +120,44 @@ PR4E_AUTHORITY_ROOTS = [
     "optima.eval.qualification",
 ]
 PR4E_FORBIDDEN_MODULES = PR4C_FORBIDDEN_MODULES
+PR5_BASE = "1b8a35568bc0910a898a2b9b19165cbe956d23c7"
+PR5_PRODUCTION = [
+    "optima/bootstrap.py",
+    "optima/discovery.py",
+    "optima/discovery_overlay.py",
+    "optima/engine_tree.py",
+    "optima/eval/marginal_runtime.py",
+    "optima/eval/native_artifact.py",
+    "optima/eval/oci_backend.py",
+    "optima/eval/oci_outer_session.py",
+    "optima/eval/oci_prebuild.py",
+    "optima/eval/oci_session_protocol.py",
+    "optima/eval/oci_session_worker.py",
+    "optima/eval/qualification.py",
+    "optima/eval/qualification_runner.py",
+    "optima/eval/scoring.py",
+]
+PR5_TESTS = [
+    "tests/test_discovery.py",
+    "tests/test_discovery_overlay.py",
+    "tests/test_engine_tree.py",
+    "tests/test_marginal_runtime.py",
+    "tests/test_native_artifact.py",
+    "tests/test_oci_backend.py",
+    "tests/test_oci_outer_session.py",
+    "tests/test_oci_prebuild.py",
+    "tests/test_oci_session_protocol.py",
+    "tests/test_oci_session_worker.py",
+    "tests/test_qualification.py",
+    "tests/test_qualification_runner.py",
+    "tests/test_scoring.py",
+]
+PR5_AUTHORITY_ROOTS = [
+    "optima.discovery",
+    "optima.discovery_overlay",
+    "optima.eval.qualification_runner",
+]
+PR5_FORBIDDEN_MODULES = PR4C_FORBIDDEN_MODULES
 
 
 class EvidenceError(ValueError):
@@ -430,6 +468,23 @@ def validate_contract_document(contract: dict[str, Any], where: str = "contract"
                 {"change": "modify", "path": "optima/eval/qualification.py"},
             ],
             "authority": {"forbidden_modules": PR4E_FORBIDDEN_MODULES, "roots": PR4E_AUTHORITY_ROOTS},
+        },
+        "pr5": {
+            "schema_version": 2,
+            "architectural_unit": "5",
+            "base_commit": PR5_BASE,
+            "budget": {"exemption_policy": "none", "production_additions_max": 5500, "test_additions_max": 4000},
+            "production": PR5_PRODUCTION,
+            "test": PR5_TESTS,
+            "required": [
+                {"change": "add", "path": "optima/discovery.py"},
+                {"change": "add", "path": "optima/discovery_overlay.py"},
+                {"change": "modify", "path": "optima/eval/oci_prebuild.py"},
+                {"change": "modify", "path": "optima/eval/oci_session_worker.py"},
+                {"change": "modify", "path": "optima/eval/qualification_runner.py"},
+                {"change": "modify", "path": "optima/eval/scoring.py"},
+            ],
+            "authority": {"forbidden_modules": PR5_FORBIDDEN_MODULES, "roots": PR5_AUTHORITY_ROOTS},
         },
     }
     spec = specs.get(contract["contract_id"])
@@ -792,7 +847,7 @@ def validate_repository(root: Path, *, records_only: bool = False, pr_base: str 
             raise EvidenceError(f"duplicate scope contract: {contract['contract_id']}")
         contract_ids.add(contract["contract_id"])
         contracts.append((contract_path, contract))
-    if contract_ids != {"pr4a", "pr4b", "pr4c", "pr4d", "pr4e"}:
+    if contract_ids != {"pr4a", "pr4b", "pr4c", "pr4d", "pr4e", "pr5"}:
         raise EvidenceError(f"scope contract set differs: {sorted(contract_ids)}")
     if records_only:
         return

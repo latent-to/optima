@@ -308,10 +308,7 @@ def _validate_execution_evidence(
         )
         or any(
             not sample.active_envelope_passed
-            for sample in active.samples[
-                active.release_sample_index:
-                active.release_sample_index + active.post_release_ready_samples
-            ]
+            for sample in active.samples[-active.post_release_ready_samples:]
         )
     ):
         raise RawSpeedEvidenceError("device sample facts disagree with receipt counters")

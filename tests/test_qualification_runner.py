@@ -4,6 +4,7 @@ import hashlib
 import threading
 from contextlib import contextmanager
 from dataclasses import replace
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -14,17 +15,21 @@ from optima.eval.evidence_store import EvidenceArtifactRef, publish_evidence, re
 from optima.eval.oci_backend import OCIBackendError, OCIEngineExecutor
 from optima.eval.oci_process import OCIQuiescenceReceipt
 from optima.eval.qualification import (
+    DiscoveryQualificationProfile,
     GraphVerificationGrade,
     QualificationDecision,
+    QualificationError,
     SelectionCommitment,
     SelectionEntropyReceipt,
 )
 from optima.eval.reference_protocol import ReferenceRoleInput, ReferenceTokenEvidence
 from optima.eval.reference_quality import ReferenceQualityVerdict
+from tests.test_qualification import _discovery_execution, _reference
 
 
 _REAL_PUBLISH_CAUSAL = runner.publish_causal_qualification
 _REAL_REOPEN_CAUSAL = runner.reopen_causal_qualification
+_REAL_QUALIFICATION_AUTHORITY = runner.qualification_authority_digest
 
 
 def _d(label: str) -> str:
@@ -98,6 +103,13 @@ class _Harness:
         exercise_judge_cache: bool = False,
     ) -> None:
         assert len(graph) == len(speed) == len(quality)
+        # This runner harness predates the typed authority constructor and
+        # intentionally replaces the fully validated input boundary with
+        # lightweight records. Preserve exact production type checks while
+        # identifying only these registered-lane test doubles as that type.
+        monkeypatch.setattr(
+            runner, "CandidateQualificationAuthority", SimpleNamespace
+        )
         self.calls: list[str] = []
         self.reference_calls = 0
         self.reference_request_counts: list[int] = []
@@ -142,7 +154,9 @@ class _Harness:
                 ),
                 graph_requirement=SimpleNamespace(digest=_d(f"requirement-{index}")),
                 graph_artifact_ref=_artifact(f"graph-{index}"),
-                graph_evidence_ref=object(),
+                graph_evidence_ref=SimpleNamespace(
+                    digest=_d(f"graph-evidence-ref-{index}")
+                ),
             )
             for index in range(len(graph))
         )
@@ -171,30 +185,61 @@ class _Harness:
         prepared = SimpleNamespace(
             source=SimpleNamespace(digest=_d("source")),
             candidates=tuple(
-                SimpleNamespace(arm=row.arm, launch=row.candidate.launch)
-                for row in lifecycle_candidates
+                SimpleNamespace(
+                    arm=row.arm,
+                    launch=row.candidate.launch,
+                    binding=SimpleNamespace(
+                        launch_binding=SimpleNamespace(
+                            native_build_spec=SimpleNamespace(
+                                digest=_d(f"candidate-native-{index}")
+                            ),
+                            runtime_preflight_receipt=SimpleNamespace(
+                                sha256=_d(f"candidate-preflight-{index}")
+                            ),
+                        )
+                    ),
+                )
+                for index, row in enumerate(lifecycle_candidates)
             ),
             baseline_launch=SimpleNamespace(digest=_d("baseline-launch")),
+            incumbent_binding=SimpleNamespace(
+                launch_binding=SimpleNamespace(
+                    runtime_preflight_receipt=SimpleNamespace(
+                        sha256=_d("incumbent-preflight")
+                    )
+                )
+            ),
         )
         self.value = SimpleNamespace(
             prepared=prepared,
-            model_mount=object(),
+            model_mount=SimpleNamespace(digest=_d("model-mount")),
             candidates=authorities,
             commitment=self.commitment,
             selection_secret=self.secret,
             evidence_root=SimpleNamespace(),
-            pristine_stack=object(),
-            pristine_launch=object(),
-            pristine_binding=object(),
+            pristine_stack=SimpleNamespace(digest=_d("pristine-stack")),
+            pristine_launch=SimpleNamespace(digest=_d("pristine-launch")),
+            pristine_binding=SimpleNamespace(
+                native_build_spec=SimpleNamespace(digest=_d("pristine-native")),
+                controller_distribution_digest=_d("pristine-controller"),
+                runtime_preflight_receipt=SimpleNamespace(
+                    sha256=_d("pristine-preflight")
+                ),
+            ),
             reference_engine_config=SimpleNamespace(digest=_d("reference-engine-config")),
-            reference_preflight=object(),
+            reference_preflight=SimpleNamespace(digest=_d("reference-preflight")),
             expected_launch_resource_policy_digest=_d("launch-policy"),
             expected_runtime_resource_policy_digest=_d("runtime-policy"),
             expected_device_policy_digest=_d("device-policy"),
-            calibration_threshold_policy=object(),
+            calibration_threshold_policy=SimpleNamespace(
+                digest=_d("calibration-threshold-policy")
+            ),
             calibration_manifest=self.calibration,
             calibration_artifact_ref=_artifact("calibration"),
-            calibration_context=object(),
+            calibration_context=SimpleNamespace(
+                digest=_d("calibration-context"),
+                workload_digest=_d("workload"),
+            ),
         )
 
         self.executor = object.__new__(OCIEngineExecutor)
@@ -523,6 +568,133 @@ class _Harness:
         return self.published_attempt
 
 
+def _discovery_harness(monkeypatch, tmp_path: Path) -> _Harness:
+    harness = _Harness(
+        monkeypatch,
+        graph=(QualificationDecision.PASS,),
+        speed=(QualificationDecision.PASS,),
+        quality=(QualificationDecision.PASS,),
+    )
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    execution_root = tmp_path / "execution"
+    execution_root.mkdir()
+    requirement, lifecycle = _discovery_execution(execution_root)
+    after_receipts = tuple(
+        SimpleNamespace(**row.__dict__, completed_monotonic_s=2.0)
+        for row in lifecycle.baseline_after.device_receipts
+    )
+    lifecycle = replace(
+        lifecycle,
+        baseline_after=replace(
+            lifecycle.baseline_after, device_receipts=after_receipts
+        ),
+    )
+    prepared = lifecycle.prepared
+    arm = prepared.source
+    reference = _reference()
+    context_digest = _d("discovery-calibration-context")
+    workload_digest = runner.marginal_workload_digest(
+        prepared.baseline_session_plan
+    )
+    profile = DiscoveryQualificationProfile(
+        reference,
+        context_digest,
+        harness.calibration.digest,
+        requirement.digest,
+        ("mean_nll", "task_score", "topk_kl"),
+        "2",
+        prepared.baseline_session_plan.max_new_tokens,
+        prepared.baseline_session_plan.top_logprobs_num,
+        1,
+        _d("support-policy"),
+        _d("hidden-task-policy"),
+        harness.value.expected_runtime_resource_policy_digest,
+        True,
+        2,
+    )
+    authority = runner.DiscoveryCandidateQualificationAuthority(
+        arm.selected_delta_digest, profile, requirement
+    )
+    prompt_digests = runner._planned_prompt_digests(prepared)
+    secret_commitment = hashlib.sha256(
+        b"optima-selection-secret-v1\0" + harness.secret
+    ).hexdigest()
+    commitment = SelectionCommitment(
+        prepared.source.digest,
+        reference.digest,
+        workload_digest,
+        reference.selection_policy_digest,
+        secret_commitment,
+        prompt_digests,
+        1,
+    )
+    entropy = SelectionEntropyReceipt(
+        commitment.entropy_source_digest,
+        commitment.digest,
+        _d("discovery-entropy"),
+        _d("discovery-entropy-authority"),
+    )
+
+    harness.lifecycle = lifecycle
+    harness.discovery_requirement = requirement
+    harness.discovery_lifecycle = lifecycle
+    harness.grades = {}
+    harness.commitment = commitment
+    harness.entropy = entropy
+    harness.hidden_judge.binding = runner.HiddenJudgeBinding(
+        reference.hidden_corpus_commitment,
+        reference.hidden_judge_digest,
+        profile.hidden_task_policy_digest,
+    )
+    harness.value.prepared = prepared
+    harness.value.candidates = (authority,)
+    harness.value.commitment = commitment
+    harness.value.evidence_root = tmp_path / "quality"
+
+    harness.attempt_reference = EvidenceArtifactRef(
+        runner.DISCOVERY_ATTEMPT_DOMAIN,
+        _d("discovery-attempt-artifact"),
+        2,
+        "application/json",
+        runner.DISCOVERY_ATTEMPT_SCHEMA,
+    )
+    harness.published_attempt = None
+
+    def publish_attempt(root, attempt):
+        assert root is harness.value.evidence_root
+        assert type(attempt) is runner.DiscoveryQualificationAttempt
+        harness.published_attempt = attempt
+        return harness.attempt_reference
+
+    def reopen_attempt(root, reference, *, expected):
+        assert root is harness.value.evidence_root
+        assert reference == harness.attempt_reference
+        assert expected is harness.value
+        return harness.published_attempt
+
+    monkeypatch.setattr(
+        runner, "qualification_authority_digest", _REAL_QUALIFICATION_AUTHORITY
+    )
+    monkeypatch.setattr(runner, "publish_causal_qualification", publish_attempt)
+    monkeypatch.setattr(runner, "reopen_causal_qualification", reopen_attempt)
+    return harness
+
+
+def _run_discovery(harness: _Harness):
+    ids = iter(f"{index + 1:032x}" for index in range(3))
+    reference = runner.run_causal_qualification(
+        harness.value,
+        executor=harness.executor,
+        entropy_provider=harness.entropy_provider,
+        hidden_judge=harness.hidden_judge,
+        deadline=100.0,
+        id_factory=lambda: next(ids),
+    )
+    assert reference == harness.attempt_reference
+    assert type(harness.published_attempt) is runner.DiscoveryQualificationAttempt
+    return harness.published_attempt
+
+
 def test_causal_order_uses_one_multi_candidate_t_lifetime(monkeypatch) -> None:
     harness = _Harness(
         monkeypatch,
@@ -548,6 +720,128 @@ def test_causal_order_uses_one_multi_candidate_t_lifetime(monkeypatch) -> None:
         QualificationDecision.PASS,
         QualificationDecision.PASS,
     ]
+
+
+def test_discovery_authority_attempt_roundtrip_and_cross_lane_rejection(
+    monkeypatch, tmp_path: Path
+) -> None:
+    registered = _Harness(
+        monkeypatch,
+        graph=(QualificationDecision.PASS,),
+        speed=(QualificationDecision.PASS,),
+        quality=(QualificationDecision.PASS,),
+    ).run()
+    harness = _discovery_harness(monkeypatch, tmp_path / "discovery")
+    attempt = _run_discovery(harness)
+
+    assert attempt.reports[0].execution_grade.execution_passed
+    assert attempt.reports[0].decision is QualificationDecision.PASS
+    assert attempt.authority_digest == _REAL_QUALIFICATION_AUTHORITY(harness.value)
+
+    captured: dict[str, object] = {}
+    real_digest = runner.canonical_digest
+
+    def capture(domain: str, value: object) -> str:
+        if domain == "optima.qualification.discovery-causal-authority":
+            captured["payload"] = value
+        return real_digest(domain, value)
+
+    monkeypatch.setattr(runner, "canonical_digest", capture)
+    assert _REAL_QUALIFICATION_AUTHORITY(harness.value) == attempt.authority_digest
+    payload = captured["payload"]
+
+    def keys(value: object) -> set[str]:
+        if isinstance(value, dict):
+            return set(value) | {
+                key for row in value.values() for key in keys(row)
+            }
+        if isinstance(value, (list, tuple)):
+            return {key for row in value for key in keys(row)}
+        return set()
+
+    authority_keys = keys(payload)
+    forbidden = (
+        "target",
+        "catalog",
+        "contribution",
+        "graph_artifact",
+        "graph_evidence",
+        "graph_requirement",
+    )
+    assert not {
+        key
+        for key in authority_keys
+        if any(marker in key for marker in forbidden)
+    }
+
+    monkeypatch.setattr(runner, "canonical_digest", real_digest)
+    monkeypatch.setattr(runner, "publish_evidence", publish_evidence)
+    discovery_root = tmp_path / "durable-discovery"
+    discovery_ref = _REAL_PUBLISH_CAUSAL(discovery_root, attempt)
+    assert (
+        discovery_ref.domain,
+        discovery_ref.schema,
+        reopen_evidence(discovery_root, discovery_ref),
+    ) == (
+        runner.DISCOVERY_ATTEMPT_DOMAIN,
+        runner.DISCOVERY_ATTEMPT_SCHEMA,
+        runner.canonical_json_bytes(attempt.to_dict()),
+    )
+    assert runner.DiscoveryQualificationAttempt.from_dict(
+        runner._canonical_payload(reopen_evidence(discovery_root, discovery_ref))
+    ) == attempt
+
+    registered_root = tmp_path / "durable-registered"
+    registered_ref = _REAL_PUBLISH_CAUSAL(registered_root, registered)
+    with pytest.raises(runner.QualificationRunnerError, match="artifact type"):
+        _REAL_REOPEN_CAUSAL(
+            registered_root, registered_ref, expected=harness.value
+        )
+
+
+def test_discovery_attempt_rejects_missing_grade_and_wrong_activation_binding(
+    monkeypatch, tmp_path: Path
+) -> None:
+    harness = _discovery_harness(monkeypatch, tmp_path)
+    attempt = _run_discovery(harness)
+    report = attempt.reports[0]
+    grade = report.execution_grade
+    requirement = harness.discovery_requirement
+    prepared = harness.discovery_lifecycle.prepared.candidates[0]
+
+    missing_grade = attempt.to_dict()
+    del missing_grade["reports"][0]["execution_grade"]
+    with pytest.raises(runner.QualificationRunnerError, match="fields"):
+        runner.DiscoveryQualificationAttempt.from_dict(missing_grade)
+
+    missing_activation = attempt.to_dict()
+    missing_activation["reports"][0]["execution_grade"][
+        "activation_receipt"
+    ] = None
+    with pytest.raises(QualificationError, match="lacks activation"):
+        runner.DiscoveryQualificationAttempt.from_dict(missing_activation)
+
+    with pytest.raises(QualificationError, match="retained binding"):
+        runner.reopen_discovery_execution_binding(
+            requirement,
+            replace(grade, candidate_lifecycle_digest=_d("wrong lifecycle")),
+            prepared,
+            candidate_lifecycle_digest=grade.candidate_lifecycle_digest,
+            session_id=grade.session_id,
+        )
+
+    wrong_receipt = replace(
+        grade.activation_receipt,
+        overlay_identity_digest=_d("wrong activation overlay"),
+    )
+    with pytest.raises(QualificationError, match="not authoritative"):
+        runner.reopen_discovery_execution_binding(
+            requirement,
+            replace(grade, activation_receipt=wrong_receipt),
+            prepared,
+            candidate_lifecycle_digest=grade.candidate_lifecycle_digest,
+            session_id=grade.session_id,
+        )
 
 
 def test_candidate_headlines_recompute_pass_fail_and_no_decision(monkeypatch) -> None:
@@ -726,6 +1020,113 @@ def test_reports_and_attempt_expose_no_score_crown_or_settlement_fields(monkeypa
 
     emitted = keys(attempt.to_dict())
     assert not ({"score", "crown", "crownable", "settlement", "winner"} & emitted)
+
+
+def test_registered_authority_digest_and_report_wire_format_remain_stable(
+    monkeypatch, tmp_path: Path
+) -> None:
+    harness = _Harness(
+        monkeypatch,
+        graph=(QualificationDecision.PASS,),
+        speed=(QualificationDecision.PASS,),
+        quality=(QualificationDecision.PASS,),
+    )
+    attempt = harness.run()
+    value = harness.value
+    captured: dict[str, object] = {}
+    real_digest = runner.canonical_digest
+
+    def capture(domain: str, payload: object) -> str:
+        if domain == "optima.qualification.causal-authority":
+            captured["payload"] = payload
+        return real_digest(domain, payload)
+
+    monkeypatch.setattr(runner, "CandidateQualificationAuthority", SimpleNamespace)
+    monkeypatch.setattr(runner, "canonical_digest", capture)
+    authority_digest = _REAL_QUALIFICATION_AUTHORITY(value)
+    assert authority_digest == real_digest(
+        "optima.qualification.causal-authority", captured["payload"]
+    )
+    authority_payload = captured["payload"]
+    assert set(authority_payload) == {
+        "calibration",
+        "candidates",
+        "commitment",
+        "incumbent_preflight",
+        "model_mount",
+        "policies",
+        "reference",
+        "source",
+    }
+    assert set(authority_payload["candidates"][0]) == {
+        "arm",
+        "delta",
+        "graph_artifact",
+        "graph_evidence_ref",
+        "graph_requirement",
+        "launch",
+        "native",
+        "preflight",
+        "profile",
+        "target",
+    }
+    monkeypatch.setattr(runner, "canonical_digest", real_digest)
+
+    report_fields = (
+        "selected_delta_digest",
+        "marginal_arm_digest",
+        "candidate_launch_digest",
+        "target_id",
+        "profile_digest",
+        "calibration_digest",
+        "graph_grade_digest",
+        "graph_decision",
+        "speed_evidence_digest",
+        "speed_decision",
+        "speedup",
+        "quality_evidence_digest",
+        "quality_decision",
+        "candidate_mean_teacher_nll",
+        "raw_quality_artifact",
+        "raw_quality_binding",
+        "speed_witness",
+        "t_request_sha256",
+        "decision",
+        "reason",
+        "retryable",
+    )
+    report = attempt.reports[0]
+    assert tuple(report.to_dict()) == report_fields
+    assert runner.canonical_json_bytes(report.to_dict()) == runner.canonical_json_bytes(
+        {
+            field: runner._encode_record(getattr(report, field))
+            for field in report_fields
+        }
+    )
+    assert tuple(attempt.to_dict()) == (
+        "authority_digest",
+        "source_digest",
+        "cohort_trajectory_digest",
+        "commitment",
+        "teardown_before_t",
+        "entropy",
+        "entropy_observed_monotonic_s",
+        "selection",
+        "reference_execution",
+        "teardown_after_t",
+        "reports",
+    )
+
+    monkeypatch.setattr(runner, "publish_evidence", publish_evidence)
+    root = tmp_path / "registered-wire"
+    reference = _REAL_PUBLISH_CAUSAL(root, attempt)
+    assert (reference.domain, reference.schema) == (
+        runner.ATTEMPT_DOMAIN,
+        runner.ATTEMPT_SCHEMA,
+    )
+    assert reopen_evidence(root, reference) == runner.canonical_json_bytes(
+        attempt.to_dict()
+    )
 
 
 def test_durable_attempt_roundtrip_rejects_nested_decision_tamper(

@@ -9,7 +9,19 @@ from pathlib import Path
 
 import pytest
 
-from optima.engine_tree import materialize_engine_tree
+from optima.discovery import (
+    DEFAULT_DISCOVERY_POLICY,
+    DISCOVERY_ABI_VERSION,
+    DiscoveryBuildProfile,
+    build_discovery_overlay_stage,
+    inspect_discovery,
+    reopen_discovery_engine_binding,
+    reopen_discovery_overlay,
+)
+from optima.engine_tree import (
+    materialize_discovery_engine_tree,
+    materialize_engine_tree,
+)
 from optima.eval.engine_launch import (
     EngineLaunchSpec,
     LogicalHardwareSpec,
@@ -36,6 +48,7 @@ from optima.eval.oci_process import (
     OCIProcessManager,
     OCIProcessResult,
 )
+from optima.eval.native_artifact import publish_native_artifact
 from optima.eval.runtime_preflight import RuntimePreflightReceipt
 from optima.stack_identity import canonical_json_bytes
 from optima.stack_manifest import EvaluationStackContext, EvaluationStackManifest
@@ -79,6 +92,68 @@ def _tree(tmp_path: Path):
         resolver={},
         destination=tmp_path / "tree",
     )
+
+
+def _discovery_source(root: Path) -> Path:
+    (root / "patches").mkdir(parents=True)
+    (root / "manifest.toml").write_text(
+        'bundle_id = "prebuild-discovery"\n'
+        f'abi_version = "{DISCOVERY_ABI_VERSION}"\n'
+        'build_profile = "prebuild-sm120-tp8"\n'
+        'patches = ["patches/change.patch"]\n'
+        'dependencies = ["cuda13"]\n'
+        'conflicts = []\n'
+        'requested_promotion = "new_singleton"\n'
+        "\n[applicability]\n"
+        'arenas = ["minimax-m3-rtx-tp8-v1"]\n'
+        'models = ["minimax-m3-nvfp4"]\n'
+        'architectures = ["sm120"]\n'
+        "tensor_parallel_sizes = [8]\n"
+    )
+    (root / "patches" / "change.patch").write_text(
+        "--- a/sglang/srt/layers/activation.py\n"
+        "+++ b/sglang/srt/layers/activation.py\n"
+        "@@ -1 +1 @@\n"
+        "-VALUE = 1\n"
+        "+VALUE = 2\n"
+    )
+    return root
+
+
+def _discovery_profile() -> DiscoveryBuildProfile:
+    return DiscoveryBuildProfile(
+        profile_id="prebuild-sm120-tp8",
+        sglang_version=DEFAULT_DISCOVERY_POLICY.sglang_version,
+        arena="minimax-m3-rtx-tp8-v1",
+        model="minimax-m3-nvfp4",
+        architecture="sm120",
+        tensor_parallel_size=8,
+        features=("cuda13",),
+        build_inputs=(("image", _digest("discovery-image")),),
+    )
+
+
+def _discovery_tree(tmp_path: Path):
+    incumbent_root = tmp_path / "incumbent"
+    incumbent_root.mkdir()
+    incumbent = _tree(incumbent_root)
+    discovery = inspect_discovery(_discovery_source(tmp_path / "proposal"))
+    return materialize_discovery_engine_tree(
+        incumbent.root,
+        discovery,
+        policy=DEFAULT_DISCOVERY_POLICY,
+        build_profile=_discovery_profile(),
+        destination=tmp_path / "discovery-tree",
+    )
+
+
+def _stock_sglang(tmp_path: Path) -> Path:
+    site = tmp_path / "stock-site"
+    package = site / "sglang"
+    (package / "srt" / "layers").mkdir(parents=True)
+    (package / "__init__.py").write_text('__version__ = "stock"\n')
+    (package / "srt" / "layers" / "activation.py").write_text("VALUE = 1\n")
+    return site
 
 
 def _policy(**changes: object) -> OCIPrebuildPolicy:
@@ -140,7 +215,14 @@ def _physical() -> PhysicalHardwareBinding:
     )
 
 
-def _preflight(*, image: str, platform: str, worker: str, policy: OCIPrebuildPolicy):
+def _preflight(
+    *,
+    image: str,
+    platform: str,
+    worker: str,
+    policy: OCIPrebuildPolicy,
+    sglang_version: str = "0.0.0.dev1",
+):
     return RuntimePreflightReceipt(
         schema="optima-runtime-preflight-v2",
         requested_image="registry.example/optima@sha256:" + image,
@@ -152,7 +234,7 @@ def _preflight(*, image: str, platform: str, worker: str, policy: OCIPrebuildPol
         docker_binary=DOCKER,
         uid=policy.uid,
         gid=policy.gid,
-        sglang_version="0.0.0.dev1",
+        sglang_version=sglang_version,
         worker_distribution="optima-harness",
         worker_version="0.0.1",
         worker_distribution_digest=worker,
@@ -172,8 +254,14 @@ def _preflight(*, image: str, platform: str, worker: str, policy: OCIPrebuildPol
     )
 
 
-def _case(tmp_path: Path, *, policy: OCIPrebuildPolicy | None = None):
-    tree = _tree(tmp_path)
+def _case(
+    tmp_path: Path,
+    *,
+    policy: OCIPrebuildPolicy | None = None,
+    tree=None,
+    sglang_version: str = "0.0.0.dev1",
+):
+    tree = tree or _tree(tmp_path)
     policy = policy or _policy()
     seccomp = tmp_path / "seccomp.json"
     seccomp.write_text('{"defaultAction":"SCMP_ACT_ERRNO"}\n')
@@ -220,7 +308,13 @@ def _case(tmp_path: Path, *, policy: OCIPrebuildPolicy | None = None):
         native_build_spec_digest=native.digest,
         hardware=_hardware(),
     )
-    preflight = _preflight(image=image, platform=platform, worker=worker, policy=policy)
+    preflight = _preflight(
+        image=image,
+        platform=platform,
+        worker=worker,
+        policy=policy,
+        sglang_version=sglang_version,
+    )
     binding = TrustedLaunchBinding(
         materialized_tree_root=tree.root,
         controller_distribution_digest=launch.controller_distribution_digest,
@@ -239,15 +333,24 @@ def _case(tmp_path: Path, *, policy: OCIPrebuildPolicy | None = None):
     return tree, launch, binding, preflight, config
 
 
-def _write_receipt(stage: Path, *, launch: EngineLaunchSpec, native: NativeBuildSpec) -> None:
+def _write_receipt(
+    stage: Path,
+    *,
+    launch: EngineLaunchSpec,
+    native: NativeBuildSpec,
+    discovery_overlay_identity_digest: str | None = None,
+) -> None:
+    entries = sorted((*[path.name for path in stage.iterdir()], PREBUILD_RECEIPT))
     row = {
         "build_spec_digest": native.digest,
         "rebuild_applied": False,
         "schema": PREBUILD_SCHEMA,
-        "stage_entries": [PREBUILD_RECEIPT],
+        "stage_entries": entries,
         "target_architecture": native.target_architecture,
         "tree_digest": launch.tree_digest,
     }
+    if discovery_overlay_identity_digest is not None:
+        row["discovery_overlay_identity_digest"] = discovery_overlay_identity_digest
     (stage / PREBUILD_RECEIPT).write_bytes(canonical_json_bytes(row) + b"\n")
 
 
@@ -391,11 +494,111 @@ def test_run_builds_publishes_reopens_and_then_reuses(
     assert first.publication.root.is_dir()
     assert first.publication.build_spec_digest == binding.native_build_spec.digest
     assert first.publication.root.stat().st_mode & 0o777 == 0o555
+    assert first.discovery_overlay_identity_digest is None
     assert not manager.leases_root.joinpath("prebuild-test.json").exists()
 
     second = run_oci_prebuild(launch, binding, config, manager=manager)
     assert second.reused and second.container_elapsed_seconds is None
+    assert second.discovery_overlay_identity_digest is None
     assert second.publication.publication_digest == first.publication.publication_digest
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="production publication uses Linux renameat2")
+def test_discovery_run_reopens_publication_and_reuses_bound_overlay(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tree = _discovery_tree(tmp_path)
+    stock_site = _stock_sglang(tmp_path)
+    policy = _policy(pinned_build_roots=(str(stock_site.resolve()),))
+    _tree_row, launch, binding, _preflight_row, config = _case(
+        tmp_path,
+        policy=policy,
+        tree=tree,
+        sglang_version=DEFAULT_DISCOVERY_POLICY.sglang_version,
+    )
+    discovery = reopen_discovery_engine_binding(tree)
+    manager = OCIProcessManager(
+        docker_binary=DOCKER,
+        recovery_root=config.recovery_root,
+        executor_id=config.executor_id,
+        runner=_Controls(),
+    )
+    stage_holder: list[Path] = []
+
+    def mount(_lease, path, **_kwargs):
+        Path(path).mkdir(parents=True)
+        stage_holder.append(Path(path))
+        return Path(path)
+
+    def run(_lease, _argv, *, timeout_s, stdin_bytes=b""):
+        assert timeout_s == config.policy.timeout_seconds and stdin_bytes == b""
+        identity = build_discovery_overlay_stage(
+            discovery.discovery,
+            stock_site_root=stock_site,
+            native_stage_root=stage_holder[-1],
+            policy=discovery.policy,
+            build_profile=discovery.build_profile,
+        )
+        _write_receipt(
+            stage_holder[-1],
+            launch=launch,
+            native=binding.native_build_spec,
+            discovery_overlay_identity_digest=identity.digest,
+        )
+        return OCIProcessResult(0, 1.5)
+
+    monkeypatch.setattr(manager, "mount_tmpfs", mount)
+    monkeypatch.setattr(manager, "run", run)
+    first = run_oci_prebuild(launch, binding, config, manager=manager)
+    assert first.discovery_overlay_identity_digest is not None
+    reopened = reopen_discovery_overlay(
+        first.publication,
+        expected_identity_digest=first.discovery_overlay_identity_digest,
+    )
+    assert reopened.identity.proposal_digest == discovery.discovery.proposal_digest
+
+    second = run_oci_prebuild(launch, binding, config, manager=manager)
+    assert second.reused
+    assert second.discovery_overlay_identity_digest == first.discovery_overlay_identity_digest
+    assert second.publication.publication_digest == first.publication.publication_digest
+
+
+def test_cached_discovery_receipt_cannot_lie_about_published_overlay(
+    tmp_path: Path,
+) -> None:
+    tree = _discovery_tree(tmp_path)
+    stock_site = _stock_sglang(tmp_path)
+    policy = _policy(pinned_build_roots=(str(stock_site.resolve()),))
+    _tree_row, launch, binding, _preflight_row, config = _case(
+        tmp_path,
+        policy=policy,
+        tree=tree,
+        sglang_version=DEFAULT_DISCOVERY_POLICY.sglang_version,
+    )
+    discovery = reopen_discovery_engine_binding(tree)
+    stage = tmp_path / "forged-stage"
+    stage.mkdir()
+    build_discovery_overlay_stage(
+        discovery.discovery,
+        stock_site_root=stock_site,
+        native_stage_root=stage,
+        policy=discovery.policy,
+        build_profile=discovery.build_profile,
+    )
+    _write_receipt(
+        stage,
+        launch=launch,
+        native=binding.native_build_spec,
+        discovery_overlay_identity_digest=_digest("wrong-overlay-identity"),
+    )
+    publish_native_artifact(
+        stage,
+        config.publication_root,
+        build_spec_digest=binding.native_build_spec.digest,
+    )
+
+    with pytest.raises(OCIPrebuildError, match="overlay publication cannot reopen"):
+        run_oci_prebuild(launch, binding, config)
 
 
 @pytest.mark.parametrize("deadline", (float("nan"), float("inf"), -float("inf"), True, "10"))
@@ -559,6 +762,22 @@ def test_binding_mismatch_rejects_before_lease(
     assert not config.recovery_root.exists()
 
 
+def test_discovery_profile_must_match_image_preflight_before_lease(
+    tmp_path: Path,
+) -> None:
+    tree = _discovery_tree(tmp_path)
+    _tree_row, launch, binding, _preflight_row, config = _case(
+        tmp_path,
+        tree=tree,
+        sglang_version="wrong-image-sglang",
+    )
+
+    with pytest.raises(OCIPrebuildError, match="image SGLang preflight"):
+        run_oci_prebuild(launch, binding, config)
+
+    assert not config.recovery_root.exists()
+
+
 def test_publication_and_recovery_roots_must_not_overlap_materialized_tree_or_each_other(
     tmp_path: Path,
 ) -> None:
@@ -617,10 +836,153 @@ def test_container_build_scrubs_ambient_environment_and_applies_build_phase(
         for forbidden in ("HTTPS_PROXY", "LD_PRELOAD", "PYTHONPATH"):
             assert forbidden not in os.environ
         assert os.environ["OPTIMA_REBUILD_PHASE"] == "build"
-        assert json.loads(receipt.read_text())["rebuild_applied"] is False
+        ordinary = json.loads(receipt.read_text())
+        assert ordinary == {
+            "build_spec_digest": required["OPTIMA_NATIVE_BUILD_SPEC_DIGEST"],
+            "rebuild_applied": False,
+            "schema": PREBUILD_SCHEMA,
+            "stage_entries": [PREBUILD_RECEIPT],
+            "target_architecture": "sm120",
+            "tree_digest": tree.tree_digest,
+        }
+        assert receipt.read_bytes() == canonical_json_bytes(ordinary) + b"\n"
     finally:
         os.environ.clear()
         os.environ.update(original_environment)
+
+
+def test_discovery_container_builds_fixed_overlay_and_conditional_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import importlib.metadata
+    import optima.eval.oci_prebuild as prebuild_mod
+
+    tree = _discovery_tree(tmp_path)
+    stage = tmp_path / "stage"
+    stage.mkdir()
+    stock_site = _stock_sglang(tmp_path)
+
+    class Distribution:
+        version = DEFAULT_DISCOVERY_POLICY.sglang_version
+
+        @staticmethod
+        def locate_file(path: str) -> Path:
+            assert path == "sglang"
+            return stock_site / "sglang"
+
+    monkeypatch.setattr(importlib.metadata, "distribution", lambda name: Distribution())
+    monkeypatch.setattr(prebuild_mod, "CONTAINER_TREE", str(tree.root))
+    monkeypatch.setattr(prebuild_mod, "CONTAINER_STAGE", str(stage))
+    original_environment = dict(os.environ)
+    required = {
+        "OPTIMA_NATIVE_BUILD_SPEC_DIGEST": _digest("discovery-build"),
+        "OPTIMA_ENGINE_TREE_DIGEST": tree.tree_digest,
+        "OPTIMA_TARGET_GPU_ARCH": "sm120",
+        "OPTIMA_NATIVE_ARTIFACT_STAGE": str(stage),
+        "OPTIMA_PINNED_BUILD_ROOTS": str(stock_site.resolve()),
+        "OPTIMA_BUILD_PATH": "/usr/local/cuda/bin:/usr/bin:/bin",
+        "OPTIMA_BUILD_TMPDIR": "/tmp",
+        "OPTIMA_NATIVE_COMPILE_TIMEOUT_S": "60",
+        "OPTIMA_REBUILD_CONTAINER": "1",
+    }
+    try:
+        os.environ.update(required)
+        receipt_path = container_build()
+    finally:
+        os.environ.clear()
+        os.environ.update(original_environment)
+
+    receipt = json.loads(receipt_path.read_text())
+    identity_digest = receipt["discovery_overlay_identity_digest"]
+    assert receipt["stage_entries"] == ["dep_overlays", PREBUILD_RECEIPT]
+    assert receipt_path.read_bytes() == canonical_json_bytes(receipt) + b"\n"
+    publication = publish_native_artifact(
+        stage,
+        tmp_path / "publications",
+        build_spec_digest=required["OPTIMA_NATIVE_BUILD_SPEC_DIGEST"],
+    )
+    overlay = reopen_discovery_overlay(
+        publication,
+        expected_identity_digest=identity_digest,
+    )
+    assert overlay.identity.proposal_digest == inspect_discovery(
+        tree.root / "discovery"
+    ).proposal_digest
+    assert (overlay.site_root / "sglang/srt/layers/activation.py").read_text() == (
+        "VALUE = 2\n"
+    )
+
+
+@pytest.mark.parametrize(
+    "version,inside_root,match",
+    (
+        ("wrong-version", True, "version differs"),
+        (DEFAULT_DISCOVERY_POLICY.sglang_version, False, "outside validator-pinned"),
+    ),
+)
+def test_stock_sglang_distribution_must_match_version_and_pinned_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    version: str,
+    inside_root: bool,
+    match: str,
+) -> None:
+    import importlib.metadata
+    import optima.eval.oci_prebuild as prebuild_mod
+
+    stock_site = _stock_sglang(tmp_path)
+    pinned = stock_site if inside_root else tmp_path / "other-root"
+    pinned.mkdir(exist_ok=True)
+
+    class Distribution:
+        @staticmethod
+        def locate_file(_path: str) -> Path:
+            return stock_site / "sglang"
+
+    distribution = Distribution()
+    distribution.version = version
+    monkeypatch.setattr(importlib.metadata, "distribution", lambda name: distribution)
+    with pytest.raises(OCIPrebuildError, match=match):
+        prebuild_mod._stock_sglang_site_root(
+            expected_version=DEFAULT_DISCOVERY_POLICY.sglang_version,
+            pinned_build_roots=(str(pinned.resolve()),),
+        )
+
+
+def test_stock_sglang_distribution_resolves_pinned_editable_install(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import importlib.metadata
+    import importlib.util
+    from types import SimpleNamespace
+
+    import optima.eval.oci_prebuild as prebuild_mod
+
+    source_site = _stock_sglang(tmp_path)
+    metadata_site = tmp_path / "site-packages"
+    metadata_site.mkdir()
+
+    class Distribution:
+        version = DEFAULT_DISCOVERY_POLICY.sglang_version
+
+        @staticmethod
+        def locate_file(_path: str) -> Path:
+            return metadata_site / "sglang"
+
+    monkeypatch.setattr(importlib.metadata, "distribution", lambda name: Distribution())
+    monkeypatch.setattr(
+        importlib.util,
+        "find_spec",
+        lambda name: SimpleNamespace(
+            origin=str(source_site / "sglang" / "__init__.py"),
+            submodule_search_locations=(str(source_site / "sglang"),),
+        ),
+    )
+
+    assert prebuild_mod._stock_sglang_site_root(
+        expected_version=DEFAULT_DISCOVERY_POLICY.sglang_version,
+        pinned_build_roots=(str(source_site.resolve()),),
+    ) == source_site.resolve()
 
 
 def test_seccomp_bytes_and_existing_publication_fail_closed(

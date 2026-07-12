@@ -18,6 +18,7 @@ import secrets
 import stat
 import struct
 import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Iterator
@@ -55,6 +56,7 @@ from optima.seams import seam_binding_environment
 CONTAINER_TREE_PATH = "/optima/engine-tree"
 CONTAINER_ARTIFACT_BASE = "/optima/native-artifacts"
 CONTAINER_CACHE_PATH = "/optima/runtime-cache"
+DISCOVERY_OVERLAY_RELPATH = Path("dep_overlays/discovery")
 NVIDIA_SMI = "/usr/bin/nvidia-smi"
 
 _DIGEST_ENV = {
@@ -146,6 +148,17 @@ def _required_digest_env(name: str) -> str:
         or value == "0" * 64
     ):
         raise SessionWorkerError(f"{name} must be a nonzero lowercase SHA-256 digest")
+    return value
+
+
+def _required_sglang_version() -> str:
+    value = os.environ.get("OPTIMA_EXPECTED_SGLANG_VERSION", "").strip()
+    if (
+        not value
+        or len(value) > 256
+        or any(character.isspace() or character == "\x00" for character in value)
+    ):
+        raise SessionWorkerError("expected SGLang version is invalid")
     return value
 
 
@@ -300,6 +313,45 @@ def _artifact_root() -> Path:
     return requested
 
 
+def _requested_discovery_overlay(
+    *, reference_mode: bool
+) -> tuple[Path, str] | None:
+    """Read the closed host-selected discovery binding before engine entry."""
+
+    from optima import discovery_overlay
+
+    armed = os.environ.get(discovery_overlay.ARMED, "").strip()
+    values = {
+        key: os.environ.get(key, "").strip()
+        for key in discovery_overlay.DISCOVERY_ENVIRONMENT_KEYS
+    }
+    if not armed:
+        if any(values.values()):
+            raise SessionWorkerError(
+                "disabled discovery launch contains an ambient marker"
+            )
+        return None
+    if armed != "1" or reference_mode:
+        raise SessionWorkerError(
+            "discovery activation is invalid for this session role"
+        )
+    allowed = {
+        discovery_overlay.ARMED,
+        discovery_overlay.EXPECTED_IDENTITY,
+    }
+    if any(value for key, value in values.items() if key not in allowed):
+        raise SessionWorkerError(
+            "discovery launch contains a worker-owned transient marker"
+        )
+    identity = _required_digest_env(discovery_overlay.EXPECTED_IDENTITY)
+    root = _artifact_root() / DISCOVERY_OVERLAY_RELPATH
+    if not _read_only_directory(root):
+        raise SessionWorkerError(
+            "discovery overlay is absent from the read-only native publication"
+        )
+    return root, identity
+
+
 def _validate_live_preflight(
     config: EngineSessionConfig, *, launch_digest: str
 ) -> tuple[RuntimePreflightFacts, object]:
@@ -349,9 +401,9 @@ def _validate_live_preflight(
     ):
         raise SessionWorkerError("live OCI sandbox is not loopback-only and hardened")
 
-    expected_sglang = os.environ.get("OPTIMA_EXPECTED_SGLANG_VERSION", "").strip()
+    expected_sglang = _required_sglang_version()
     observed_sglang = importlib.metadata.version("sglang")
-    if not expected_sglang or observed_sglang != expected_sglang:
+    if observed_sglang != expected_sglang:
         raise SessionWorkerError("installed SGLang differs from the launch identity")
     architectures = _gpu_architectures()
     if len(architectures) != config.tp_size:
@@ -420,54 +472,100 @@ def _engine_session(config: EngineSessionConfig, tree: object) -> Iterator[objec
     gate_environment = seam_binding_environment(
         () if reference_mode else config.seam_bindings
     )
-    with _environment(**gate_environment):
-        if reference_mode:
-            os.environ["PYTHONPATH"] = ""
-        else:
-            _prepare_descendant_bootstrap()
-        from optima.manifest import load_manifest
+    from optima import discovery_overlay
 
-        tree_root = Path(getattr(tree, "root"))
-        runtime_manifest = getattr(tree, "runtime_manifest", None)
-        manifest = load_manifest(tree_root) if runtime_manifest is not None else None
-    active = bool(manifest is not None and manifest.ops)
-    framework_mode = bool(
-        manifest is not None and any(operation.setup for operation in manifest.ops)
-    )
-    cfg = SimpleNamespace(
-        model_path=config.model_path,
-        dtype=config.dtype,
-        deterministic=config.deterministic,
-        attention_backend=config.attention_backend,
-        disable_cuda_graph=config.disable_cuda_graph,
-        mem_fraction_static=config.mem_fraction_static,
-        log_level=config.log_level,
-        max_running_requests=config.max_running_requests,
-        tp_size=config.tp_size,
-        moe_runner_backend=config.moe_runner_backend,
-        disable_custom_all_reduce=config.disable_custom_all_reduce,
-        extra_engine_kwargs=dict(config.engine_kwargs),
-        seam_bindings=config.seam_bindings,
-        seed=0,
-        framework_mode=framework_mode,
-        isolate=True,
-        allow_unsafe_no_isolation=False,
-    )
-    from optima.eval.engine_worker import isolated_engine_session
+    discovery = _requested_discovery_overlay(reference_mode=reference_mode)
+    discovery_environment = discovery_overlay.disabled_environment()
+    if discovery is not None:
+        overlay_root, identity = discovery
+        discovery_environment = discovery_overlay.launch_environment(
+            overlay_root=overlay_root,
+            expected_identity_digest=identity,
+        )
+    try:
+        with _environment(**discovery_environment):
+            if discovery is not None:
+                discovery_overlay.arm_driver_activation(
+                    expected_identity_digest=identity,
+                    expected_members=config.tp_size,
+                )
+                discovery_overlay.install_process_role_hook()
+            with _environment(**gate_environment):
+                if reference_mode:
+                    os.environ["PYTHONPATH"] = ""
+                else:
+                    _prepare_descendant_bootstrap()
+                from optima.manifest import load_manifest
 
-    bundle_path = str(tree_root) if active else ""
-    if manifest is not None and manifest.dep_patches and not os.environ.get(
-        "FLASHINFER_WORKSPACE_BASE", ""
-    ):
-        raise SessionWorkerError("dep-patched tree lacks its sealed runtime workspace")
-    with isolated_engine_session(
-        cfg,
-        bundle_path=bundle_path,
-        active=active,
-        framework_mode=framework_mode,
-        install_seams=not reference_mode,
-    ) as handle:
-        yield handle
+                tree_root = Path(getattr(tree, "root"))
+                runtime_manifest = getattr(tree, "runtime_manifest", None)
+                manifest = (
+                    load_manifest(tree_root)
+                    if runtime_manifest is not None
+                    else None
+                )
+            active = bool(manifest is not None and manifest.ops)
+            framework_mode = bool(
+                manifest is not None
+                and any(operation.setup for operation in manifest.ops)
+            )
+            cfg = SimpleNamespace(
+                model_path=config.model_path,
+                dtype=config.dtype,
+                deterministic=config.deterministic,
+                attention_backend=config.attention_backend,
+                disable_cuda_graph=config.disable_cuda_graph,
+                mem_fraction_static=config.mem_fraction_static,
+                log_level=config.log_level,
+                max_running_requests=config.max_running_requests,
+                tp_size=config.tp_size,
+                moe_runner_backend=config.moe_runner_backend,
+                disable_custom_all_reduce=config.disable_custom_all_reduce,
+                extra_engine_kwargs=dict(config.engine_kwargs),
+                seam_bindings=config.seam_bindings,
+                seed=0,
+                framework_mode=framework_mode,
+                isolate=True,
+                allow_unsafe_no_isolation=False,
+            )
+            from optima.eval.engine_worker import isolated_engine_session
+
+            bundle_path = str(tree_root) if active else ""
+            if manifest is not None and manifest.dep_patches and not os.environ.get(
+                "FLASHINFER_WORKSPACE_BASE", ""
+            ):
+                raise SessionWorkerError(
+                    "dep-patched tree lacks its sealed runtime workspace"
+                )
+            with isolated_engine_session(
+                cfg,
+                bundle_path=bundle_path,
+                active=active,
+                framework_mode=framework_mode,
+                install_seams=not reference_mode,
+            ) as handle:
+                receipt = None
+                if discovery is not None:
+                    sglang_module = sys.modules.get("sglang")
+                    if sglang_module is None:
+                        raise SessionWorkerError(
+                            "engine construction returned without stock driver SGLang"
+                        )
+                    receipt = discovery_overlay.require_driver_activation(
+                        sglang_module,
+                        overlay_root,
+                        expected_identity_digest=identity,
+                        expected_members=config.tp_size,
+                        expected_sglang_version=_required_sglang_version(),
+                    )
+                yield SimpleNamespace(
+                    engine=handle.engine,
+                    require_completion=handle.require_completion,
+                    discovery_activation_receipt=receipt,
+                )
+    finally:
+        if discovery is not None:
+            discovery_overlay.clear_driver_activation()
 
 
 def _engine_outputs(outputs: object, *, request: BatchRequest) -> BatchEvidence:
@@ -820,7 +918,11 @@ def run_session(*, input_fd: int = 0, output_fd: int | None = None) -> int:
                 protocol_fd,
                 frame_message(
                     ready_message(
-                        session_id=session_id, launch_digest=launch_digest
+                        session_id=session_id,
+                        launch_digest=launch_digest,
+                        discovery_activation=getattr(
+                            handle, "discovery_activation_receipt", None
+                        ),
                     ),
                     max_bytes=MAX_CONTROL_BYTES,
                 ),

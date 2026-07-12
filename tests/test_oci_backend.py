@@ -10,6 +10,7 @@ from types import SimpleNamespace
 
 import pytest
 
+import optima.discovery as discovery
 import optima.eval.oci_backend as backend
 from optima.eval.device_state import (
     DeviceStateActiveReceipt,
@@ -298,7 +299,7 @@ def _case(tmp_path: Path) -> SimpleNamespace:
     config = OCIBackendConfig(prebuild=prebuild, runtime=runtime)
     resolved = ResolvedEngineLaunch(
         launch,
-        SimpleNamespace(root=tree, runtime_manifest=None),
+        SimpleNamespace(root=tree, files=(), runtime_manifest=None),
         native,
         physical,
         tuple(sorted(preflight.launch_identity().items())),
@@ -311,6 +312,7 @@ def _case(tmp_path: Path) -> SimpleNamespace:
         build_spec_digest=native.digest,
         publication_digest=_digest("native-publication"),
         reused=False,
+        files=(),
     )
     return SimpleNamespace(
         runtime=runtime,
@@ -508,17 +510,21 @@ def test_reference_reopens_control_receipt_then_rejects_added_native_file(
     )
     _install_execution_fakes(case, executor, monkeypatch)
     control = SimpleNamespace(
-        **vars(case.publication),
-        directories=(),
-        files=(SimpleNamespace(path="prebuild.json"),),
+        **dict(
+            vars(case.publication),
+            directories=(),
+            files=(SimpleNamespace(path="prebuild.json"),),
+        )
     )
     changed = SimpleNamespace(
-        **vars(case.publication),
-        directories=("cuda",),
-        files=(
-            SimpleNamespace(path="prebuild.json"),
-            SimpleNamespace(path="cuda/kernel.so"),
-        ),
+        **dict(
+            vars(case.publication),
+            directories=("cuda",),
+            files=(
+                SimpleNamespace(path="prebuild.json"),
+                SimpleNamespace(path="cuda/kernel.so"),
+            ),
+        )
     )
     reopened = iter((control, changed))
     monkeypatch.setattr(
@@ -537,6 +543,7 @@ def test_reference_reopens_control_receipt_then_rejects_added_native_file(
             preflight=case.preflight,
             model_root=case.model,
             session_protocol="reference",
+            discovery_overlay_identity_digest=None,
             run=lambda *_args: object(),
         )
     assert executor.device_guard.deadlines == [  # type: ignore[attr-defined]
@@ -556,9 +563,11 @@ def test_reference_runtime_accepts_control_receipt_through_both_reopens(
     )
     _install_execution_fakes(case, executor, monkeypatch)
     control = SimpleNamespace(
-        **vars(case.publication),
-        directories=(),
-        files=(SimpleNamespace(path="prebuild.json"),),
+        **dict(
+            vars(case.publication),
+            directories=(),
+            files=(SimpleNamespace(path="prebuild.json"),),
+        )
     )
     monkeypatch.setattr(
         backend,
@@ -584,6 +593,7 @@ def test_reference_runtime_accepts_control_receipt_through_both_reopens(
         preflight=case.preflight,
         model_root=case.model,
         session_protocol="reference",
+        discovery_overlay_identity_digest=None,
         run=lambda *_args: marker,
     )
     assert raw.value is marker
@@ -643,7 +653,9 @@ def test_model_mount_receipt_rejects_relative_crlf_and_replacement(
         case.mount.reopen()
 
 
-def test_runtime_argv_is_exact_closed_and_mount_minimal(tmp_path: Path) -> None:
+def test_runtime_argv_is_exact_closed_and_mount_minimal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     case = _case(tmp_path)
     manager = _manager(case)
     lease = manager.register(
@@ -694,6 +706,7 @@ def test_runtime_argv_is_exact_closed_and_mount_minimal(tmp_path: Path) -> None:
     assert f"src={case.publication.root},dst=/optima/native-artifacts/" in mounts[2]
     assert f"src={case.publication.root.parent.parent}," not in mounts[2]
     assert f"src={cache},dst=/optima/runtime-cache" in mounts[3]
+    assert not any("OPTIMA_DISCOVERY_" in row for row in argv)
     encoded = "\n".join(argv).lower()
     for forbidden in (".pass", "credentials", "docker.sock", "result-output"):
         assert forbidden not in encoded
@@ -717,6 +730,40 @@ def test_runtime_argv_is_exact_closed_and_mount_minimal(tmp_path: Path) -> None:
     )
     assert '--gpus="device=0,1"' in multi_argv
 
+    identity = _digest("discovery-overlay")
+    discovery_publication = SimpleNamespace(
+        **{
+            **case.publication.__dict__,
+            "files": (SimpleNamespace(path="dep_overlays/discovery/overlay.json"),),
+        }
+    )
+    monkeypatch.setattr(
+        discovery,
+        "reopen_discovery_overlay",
+        lambda publication, **kwargs: SimpleNamespace(
+            publication=publication, kwargs=kwargs
+        ),
+    )
+    discovery_argv = build_runtime_argv(
+        lease=lease,
+        resolved=case.resolved,
+        preflight=case.preflight,
+        model_root=case.model,
+        publication=discovery_publication,
+        cache_root=cache,
+        seccomp_path=lease.stage_paths[0],
+        runtime=case.runtime,
+        discovery_overlay_identity_digest=identity,
+    )
+    assert f"--env=OPTIMA_DISCOVERY_EXPECTED_IDENTITY={identity}" in discovery_argv
+    assert "--env=OPTIMA_DISCOVERY_OVERLAY_ARMED=1" in discovery_argv
+    assert len(tuple(row for row in discovery_argv if row.startswith("--mount="))) == 4
+    assert not any(
+        "OPTIMA_DISCOVERY_OVERLAY_ROOT" in row
+        or "OPTIMA_DISCOVERY_DRIVER_PID" in row
+        for row in discovery_argv
+    )
+
     reference_argv = build_runtime_argv(
         lease=lease,
         resolved=case.resolved,
@@ -729,6 +776,31 @@ def test_runtime_argv_is_exact_closed_and_mount_minimal(tmp_path: Path) -> None:
         session_protocol="reference",
     )
     assert "--env=OPTIMA_SESSION_PROTOCOL=reference" in reference_argv
+    assert not any("OPTIMA_DISCOVERY_" in row for row in reference_argv)
+    with pytest.raises(OCIBackendError, match="ordinary runtime publication"):
+        build_runtime_argv(
+            lease=lease,
+            resolved=case.resolved,
+            preflight=case.preflight,
+            model_root=case.model,
+            publication=discovery_publication,
+            cache_root=cache,
+            seccomp_path=lease.stage_paths[0],
+            runtime=case.runtime,
+        )
+    with pytest.raises(OCIBackendError, match="reference runtime"):
+        build_runtime_argv(
+            lease=lease,
+            resolved=case.resolved,
+            preflight=case.preflight,
+            model_root=case.model,
+            publication=discovery_publication,
+            cache_root=cache,
+            seccomp_path=lease.stage_paths[0],
+            runtime=case.runtime,
+            session_protocol="reference",
+            discovery_overlay_identity_digest=identity,
+        )
     with pytest.raises(OCIBackendError, match="protocol"):
         build_runtime_argv(
             lease=lease,
@@ -740,6 +812,87 @@ def test_runtime_argv_is_exact_closed_and_mount_minimal(tmp_path: Path) -> None:
             seccomp_path=lease.stage_paths[0],
             runtime=case.runtime,
             session_protocol="candidate-chosen",
+        )
+
+
+def test_launch_validation_requires_discovery_tree_plan_parity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    case = _case(tmp_path)
+    executor = OCIEngineExecutor(
+        case.config, case.device_policy, manager=_manager(case)
+    )
+    discovery_plan = replace(
+        case.plan,
+        expected_discovery_overlay_identity_digest=_digest("discovery-overlay"),
+    )
+    marker = SimpleNamespace(path="metadata/optima_discovery.json")
+    discovery_resolved = replace(
+        case.resolved,
+        materialized_tree=SimpleNamespace(root=case.tree, files=(marker,)),
+    )
+
+    monkeypatch.setattr(
+        backend, "resolve_engine_launch", lambda _launch, _binding: case.resolved
+    )
+    with pytest.raises(OCIBackendError, match="discovery requirement"):
+        executor._validate_launch(
+            case.launch, case.binding, case.mount, discovery_plan
+        )
+
+    monkeypatch.setattr(
+        backend,
+        "resolve_engine_launch",
+        lambda _launch, _binding: discovery_resolved,
+    )
+    with pytest.raises(OCIBackendError, match="discovery requirement"):
+        executor._validate_launch(
+            case.launch, case.binding, case.mount, case.plan
+        )
+    assert executor._validate_launch(
+        case.launch, case.binding, case.mount, discovery_plan
+    )[0] is discovery_resolved
+
+
+@pytest.mark.parametrize(
+    ("planned", "built"),
+    (
+        (_digest("planned-discovery"), None),
+        (None, _digest("unexpected-discovery")),
+    ),
+)
+def test_runtime_prebuild_discovery_digest_must_match_session_plan(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    planned: str | None,
+    built: str | None,
+) -> None:
+    case = _case(tmp_path)
+    executor = OCIEngineExecutor(
+        case.config, case.device_policy, manager=_manager(case)
+    )
+    prebuild = OCIPrebuildResult(
+        case.launch.digest,
+        case.native.digest,
+        case.publication,
+        1.0,
+        _digest("prebuild-argv"),
+        built,
+    )
+    monkeypatch.setattr(backend, "run_oci_prebuild", lambda *args, **kwargs: prebuild)
+
+    with pytest.raises(OCIBackendError, match="prebuild discovery result"):
+        executor._execute_runtime(
+            case.launch,
+            case.binding,
+            case.mount,
+            absolute=200.0,
+            resolved=case.resolved,
+            preflight=case.preflight,
+            model_root=case.model,
+            session_protocol="ordinary",
+            discovery_overlay_identity_digest=planned,
+            run=lambda *_args: None,
         )
 
 
@@ -952,7 +1105,12 @@ def test_execute_reference_selects_reference_transport_and_binds_plan(
     observed = []
 
     def execute_runtime(*_args, **kwargs):
-        observed.append(kwargs["session_protocol"])
+        observed.append(
+            (
+                kwargs["session_protocol"],
+                kwargs["discovery_overlay_identity_digest"],
+            )
+        )
         value = kwargs["run"](
             SimpleNamespace(), kwargs["absolute"] - 2.0, "runtime-" + "1" * 32
         )
@@ -976,7 +1134,7 @@ def test_execute_reference_selects_reference_transport_and_binds_plan(
         plan,
         deadline=200.0,
     )
-    assert observed == ["reference"]
+    assert observed == [("reference", None)]
     assert result.session == session
     assert tuple(row.phase for row in result.device_receipts) == ("pre", "post")
 

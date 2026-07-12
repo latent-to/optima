@@ -36,6 +36,8 @@ from optima.eval.oci_backend import (
 )
 from optima.eval.oci_outer_session import SessionExecutionPlan
 from optima.eval.runtime_preflight import RuntimePreflightReceipt
+from optima.discovery import DiscoveryArmPlan, reopen_discovery_engine_binding
+from optima.discovery_overlay import DiscoveryActivationReceipt
 from optima.stack_identity import require_sha256_hex
 from optima.stack_manifest import (
     EvaluationStackContext,
@@ -52,6 +54,10 @@ _TREE_METADATA = "metadata/optima_engine_tree.json"
 
 class MarginalRuntimeError(ValueError):
     """A marginal plan cannot be bound to one exact runtime lifecycle."""
+
+
+ExecutableArm = MarginalArmPlan | DiscoveryArmPlan
+RuntimeSource = MarginalArmPlan | CohortPlan | DiscoveryArmPlan
 
 
 class EngineExecutor(Protocol):
@@ -178,14 +184,14 @@ class MaterializedArmBinding:
 class PreparedCandidateRuntime:
     """One C arm bound to a mechanically derived launch and common workload."""
 
-    arm: MarginalArmPlan
+    arm: ExecutableArm
     binding: MaterializedArmBinding
     launch: EngineLaunchSpec
     session_plan: SessionExecutionPlan
 
     def __post_init__(self) -> None:
-        if type(self.arm) is not MarginalArmPlan:
-            raise MarginalRuntimeError("candidate arm is not a MarginalArmPlan")
+        if type(self.arm) not in {MarginalArmPlan, DiscoveryArmPlan}:
+            raise MarginalRuntimeError("candidate arm has an unsupported type")
         if type(self.binding) is not MaterializedArmBinding:
             raise MarginalRuntimeError("candidate binding has the wrong type")
         if type(self.launch) is not EngineLaunchSpec:
@@ -203,15 +209,15 @@ class PreparedCandidateRuntime:
 class PreparedMarginalRuntime:
     """A completely validated B,C1..Ck,B-prime runtime lifecycle."""
 
-    source: MarginalArmPlan | CohortPlan
+    source: RuntimeSource
     incumbent_binding: MaterializedArmBinding
     baseline_launch: EngineLaunchSpec
     baseline_session_plan: SessionExecutionPlan
     candidates: tuple[PreparedCandidateRuntime, ...]
 
     def __post_init__(self) -> None:
-        if not isinstance(self.source, (MarginalArmPlan, CohortPlan)):
-            raise MarginalRuntimeError("runtime source must be a marginal arm or cohort")
+        if type(self.source) not in {MarginalArmPlan, CohortPlan, DiscoveryArmPlan}:
+            raise MarginalRuntimeError("runtime source has an unsupported type")
         if type(self.incumbent_binding) is not MaterializedArmBinding:
             raise MarginalRuntimeError("incumbent binding has the wrong type")
         if type(self.baseline_launch) is not EngineLaunchSpec:
@@ -226,7 +232,7 @@ class PreparedMarginalRuntime:
             raise MarginalRuntimeError("prepared runtime requires typed candidates")
         expected = (
             (self.source,)
-            if type(self.source) is MarginalArmPlan
+            if type(self.source) in {MarginalArmPlan, DiscoveryArmPlan}
             else self.source.execution_arms
         )
         if tuple(candidate.arm for candidate in self.candidates) != expected:
@@ -258,7 +264,7 @@ class CandidateLifecycleEvidence:
             raise MarginalRuntimeError("candidate evidence launch binding is invalid")
 
     @property
-    def arm(self) -> MarginalArmPlan:
+    def arm(self) -> ExecutableArm:
         return self.candidate.arm
 
 @dataclass(frozen=True)
@@ -291,7 +297,7 @@ class MarginalLifecycleEvidence:
             raise MarginalRuntimeError("lifecycle evidence was relabeled or reordered")
 
     @property
-    def source(self) -> MarginalArmPlan | CohortPlan:
+    def source(self) -> RuntimeSource:
         return self.prepared.source
 
 def _require_context(
@@ -313,18 +319,10 @@ def _require_context(
         raise MarginalRuntimeError("baseline launch differs from the frozen stack context")
 
 
-def _resolve_materialized_binding(
+def _require_resolved_tree(
     launch: EngineLaunchSpec,
     binding: MaterializedArmBinding,
-    stack: EvaluationStackManifest,
-    *,
-    expected_tree_digest: str,
 ) -> None:
-    _require_tree_stack(
-        binding.tree,
-        stack,
-        expected_tree_digest=expected_tree_digest,
-    )
     try:
         resolved = resolve_engine_launch(launch, binding.launch_binding)
     except (EngineLaunchError, OSError, TypeError, ValueError) as exc:
@@ -350,6 +348,61 @@ def _resolve_materialized_binding(
         )
 
 
+def _resolve_materialized_binding(
+    launch: EngineLaunchSpec,
+    binding: MaterializedArmBinding,
+    stack: EvaluationStackManifest,
+    *,
+    expected_tree_digest: str,
+) -> None:
+    _require_tree_stack(
+        binding.tree,
+        stack,
+        expected_tree_digest=expected_tree_digest,
+    )
+    _require_resolved_tree(launch, binding)
+
+
+def _require_discovery_tree(
+    launch: EngineLaunchSpec,
+    binding: MaterializedArmBinding,
+    arm: DiscoveryArmPlan,
+) -> None:
+    tree = binding.tree
+    if (
+        tree.stack_digest != arm.candidate_stack_digest
+        or tree.tree_digest != arm.candidate_tree_digest
+    ):
+        raise MarginalRuntimeError("discovery tree differs from its candidate arm")
+    try:
+        discovery = reopen_discovery_engine_binding(tree)
+    except (OSError, TypeError, ValueError) as exc:
+        raise MarginalRuntimeError(
+            f"discovery engine tree failed to reopen: {exc}"
+        ) from None
+    if (
+        discovery.materialized_tree != tree
+        or discovery.incumbent_stack_digest != arm.incumbent.digest
+        or discovery.incumbent_tree_digest != arm.incumbent_tree_digest
+        or discovery.discovery.proposal_digest != arm.proposal_digest
+        or discovery.policy.digest != arm.policy_digest
+        or discovery.build_profile.digest != arm.build_profile_digest
+    ):
+        raise MarginalRuntimeError("discovery tree metadata differs from its arm")
+    metadata = _tree_metadata(tree)
+    expected_manifest = "manifest.toml" if arm.incumbent.entries else None
+    if (
+        metadata.get("stack_digest") != arm.candidate_stack_digest
+        or metadata.get("contributions") != _expected_contributions(arm.incumbent)
+        or metadata.get("runtime_manifest") != expected_manifest
+        or tree.runtime_manifest != expected_manifest
+    ):
+        raise MarginalRuntimeError(
+            "discovery tree changed the incumbent contribution inventory"
+        )
+    _require_resolved_tree(launch, binding)
+
+
 def _require_baseline_session(
     launch: EngineLaunchSpec,
     binding: TrustedLaunchBinding,
@@ -367,12 +420,13 @@ def _require_baseline_session(
         or plan.engine_config.digest != launch.engine_config_digest
         or plan.engine_config.tp_size != launch.hardware.tp_size
         or plan.expected_preflight != expected
+        or plan.expected_discovery_overlay_identity_digest is not None
     ):
         raise MarginalRuntimeError("baseline session plan differs from its launch")
 
 
 def _candidate_runtime(
-    arm: MarginalArmPlan,
+    arm: ExecutableArm,
     *,
     baseline_launch: EngineLaunchSpec,
     baseline_binding: MaterializedArmBinding,
@@ -398,12 +452,15 @@ def _candidate_runtime(
         tree_digest=arm.challenger.tree_digest,
         native_build_spec_digest=candidate_local.native_build_spec.digest,
     )
-    _resolve_materialized_binding(
-        candidate_launch,
-        candidate_binding,
-        arm.candidate,
-        expected_tree_digest=arm.challenger.tree_digest,
-    )
+    if type(arm) is MarginalArmPlan:
+        _resolve_materialized_binding(
+            candidate_launch,
+            candidate_binding,
+            arm.candidate,
+            expected_tree_digest=arm.challenger.tree_digest,
+        )
+    else:
+        _require_discovery_tree(candidate_launch, candidate_binding, arm)
     receipt = candidate_local.runtime_preflight_receipt
     if type(receipt) is not RuntimePreflightReceipt:
         raise MarginalRuntimeError("candidate lacks a typed runtime preflight")
@@ -412,6 +469,11 @@ def _candidate_runtime(
         baseline_session,
         launch_digest=candidate_launch.digest,
         expected_preflight=candidate_preflight,
+        expected_discovery_overlay_identity_digest=(
+            arm.overlay_identity_digest
+            if type(arm) is DiscoveryArmPlan
+            else None
+        ),
     )
     return PreparedCandidateRuntime(
         arm,
@@ -449,8 +511,8 @@ def _validate_prepared_runtime(prepared: PreparedMarginalRuntime) -> None:
 
 
 def _prepare(
-    source: MarginalArmPlan | CohortPlan,
-    arms: tuple[MarginalArmPlan, ...],
+    source: RuntimeSource,
+    arms: tuple[ExecutableArm, ...],
     *,
     expected_context: EvaluationStackContext,
     incumbent_launch: EngineLaunchSpec,
@@ -555,6 +617,36 @@ def prepare_cohort_runtime(
     )
 
 
+def prepare_discovery_runtime(
+    arm: DiscoveryArmPlan,
+    *,
+    expected_context: EvaluationStackContext,
+    incumbent_launch: EngineLaunchSpec,
+    incumbent_binding: MaterializedArmBinding,
+    candidate_binding: MaterializedArmBinding,
+    baseline_session_plan: SessionExecutionPlan,
+) -> PreparedMarginalRuntime:
+    """Bind one resolved discovery arm without admitting it to the catalog."""
+
+    if type(arm) is not DiscoveryArmPlan:
+        raise MarginalRuntimeError("discovery arm has the wrong type")
+    try:
+        arm.incumbent.validate_against(expected_context)
+    except (TypeError, ValueError) as exc:
+        raise MarginalRuntimeError(
+            f"discovery arm is stale for this stack context: {exc}"
+        ) from None
+    return _prepare(
+        arm,
+        (arm,),
+        expected_context=expected_context,
+        incumbent_launch=incumbent_launch,
+        incumbent_binding=incumbent_binding,
+        candidate_bindings={arm.selected_delta_digest: candidate_binding},
+        baseline_session_plan=baseline_session_plan,
+    )
+
+
 def _require_execution(
     execution: object,
     *,
@@ -605,6 +697,22 @@ def _require_execution(
         != tuple(range(len(plan.prompt_batches)))
     ):
         raise MarginalRuntimeError("session evidence differs from the common workload")
+    expected_discovery = plan.expected_discovery_overlay_identity_digest
+    activation = session.discovery_activation
+    if expected_discovery is None:
+        if activation is not None:
+            raise MarginalRuntimeError(
+                "ordinary session acquired discovery activation evidence"
+            )
+    elif (
+        type(activation) is not DiscoveryActivationReceipt
+        or activation.overlay_identity_digest != expected_discovery
+        or activation.tp_size != plan.engine_config.tp_size
+        or activation.driver_origin.version != plan.expected_preflight.sglang_version
+    ):
+        raise MarginalRuntimeError(
+            "discovery session activation differs from its launch policy"
+        )
     if session.session_id in seen_sessions:
         raise MarginalRuntimeError("executor replayed a prior session identity")
     request_ids = tuple(row.request_id for row in session.batches)
@@ -739,6 +847,7 @@ __all__ = [
     "PreparedCandidateRuntime",
     "PreparedMarginalRuntime",
     "prepare_cohort_runtime",
+    "prepare_discovery_runtime",
     "prepare_marginal_runtime",
     "run_marginal_lifecycle",
 ]

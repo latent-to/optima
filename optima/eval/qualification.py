@@ -1,8 +1,8 @@
-"""Content-addressed graph-verification veto for later qualification.
+"""Content-addressed execution vetoes and evidence binding for qualification.
 
 This pure module cannot score, crown, settle, or grade model quality.  It only
-recomputes whether one exact marginal candidate has complete eager and graph
-replay evidence.  PASS is necessary for later qualification, never sufficient.
+recomputes validator-owned execution and quality-evidence prerequisites.  PASS
+is necessary for later qualification, never sufficient.
 """
 
 from __future__ import annotations
@@ -14,7 +14,7 @@ import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, fields, is_dataclass
 from enum import Enum
-from typing import ClassVar
+from typing import TYPE_CHECKING, ClassVar
 
 from optima.stack_identity import (
     StackIdentityError,
@@ -22,6 +22,9 @@ from optima.stack_identity import (
     canonical_json_bytes,
     require_sha256_hex,
 )
+
+if TYPE_CHECKING:
+    from optima.discovery_overlay import DiscoveryActivationReceipt
 
 
 GRAPH_QUALIFICATION_SCHEMA_VERSION = 1
@@ -637,6 +640,385 @@ def reopen_graph_verification(
 
 
 @dataclass(frozen=True)
+class DiscoveryExecutionRequirement(_Canonical):
+    """Exact non-catalog authority required for one discovery C arm."""
+
+    _domain: ClassVar[str] = "optima.qualification.discovery-execution-requirement"
+    arm_digest: str
+    proposal_digest: str
+    selected_delta_digest: str
+    candidate_stack_digest: str
+    candidate_tree_digest: str
+    candidate_launch_digest: str
+    native_build_spec_digest: str
+    discovery_policy_digest: str
+    build_profile_digest: str
+    worker_distribution_digest: str
+    engine_config_digest: str
+    activation_policy_digest: str
+    expected_tp_size: int
+    graphs_required: bool
+    policy_version: str = "discovery-execution.v1"
+    schema_version: int = 1
+
+    def __post_init__(self) -> None:
+        from optima.discovery_overlay import activation_policy_digest
+
+        for item in fields(self):
+            if item.name.endswith("_digest"):
+                object.__setattr__(self, item.name, _digest(getattr(self, item.name), item.name))
+        object.__setattr__(self, "expected_tp_size", _integer(self.expected_tp_size, "TP size", 1))
+        if _boolean(self.graphs_required, "graphs required") is not True:
+            raise QualificationError("discovery execution requires CUDA graphs")
+        if self.activation_policy_digest != activation_policy_digest():
+            raise QualificationError("discovery activation policy is not the fixed policy")
+        if (self.policy_version, self.schema_version) != ("discovery-execution.v1", 1):
+            raise QualificationError("unsupported discovery execution policy/schema")
+
+    @classmethod
+    def from_dict(cls, value: object) -> "DiscoveryExecutionRequirement":
+        return _load(cls, value, "discovery execution requirement")
+
+
+@dataclass(frozen=True)
+class DiscoveryExecutionGrade(_Canonical):
+    """Recomputed discovery execution veto; never a score or crown."""
+
+    _domain: ClassVar[str] = "optima.qualification.discovery-execution-grade"
+    decision: QualificationDecision
+    reason: str
+    requirement_digest: str
+    candidate_lifecycle_digest: str
+    candidate_launch_digest: str
+    native_build_spec_digest: str
+    overlay_identity_digest: str
+    native_publication_digest: str
+    runtime_preflight_receipt_sha256: str
+    runtime_argv_sha256: str
+    session_id: str
+    activation_receipt: DiscoveryActivationReceipt | None
+
+    def __post_init__(self) -> None:
+        if type(self.decision) is not QualificationDecision:
+            raise QualificationError("discovery execution decision is not typed")
+        object.__setattr__(self, "reason", _id(self.reason, "discovery grade reason"))
+        for item in fields(self):
+            if item.name.endswith("_digest") or item.name.endswith("_sha256"):
+                value = getattr(self, item.name)
+                if value is not None:
+                    object.__setattr__(self, item.name, _digest(value, item.name))
+        object.__setattr__(self, "session_id", _id(self.session_id, "session ID"))
+        from optima.discovery_overlay import DiscoveryActivationReceipt
+
+        if self.activation_receipt is not None and type(
+            self.activation_receipt
+        ) is not DiscoveryActivationReceipt:
+            raise QualificationError("discovery grade activation receipt is not typed")
+        if self.decision is QualificationDecision.PASS and self.activation_receipt is None:
+            raise QualificationError("passing discovery grade lacks activation evidence")
+
+    @property
+    def execution_passed(self) -> bool:
+        return self.decision is QualificationDecision.PASS
+
+    @property
+    def activation_receipt_digest(self) -> str | None:
+        if self.activation_receipt is None:
+            return None
+        return canonical_digest(
+            "optima.discovery.activation-receipt", self.activation_receipt.to_dict()
+        )
+
+    @classmethod
+    def from_dict(cls, value: object) -> "DiscoveryExecutionGrade":
+        def decision(item: object) -> QualificationDecision:
+            try:
+                return QualificationDecision(item)
+            except (TypeError, ValueError) as exc:
+                raise QualificationError("discovery execution decision is unsupported") from exc
+
+        from optima.discovery_overlay import (
+            DiscoveryActivationReceipt,
+            DiscoveryOverlayActivationError,
+        )
+
+        def receipt(item: object) -> DiscoveryActivationReceipt | None:
+            if item is None:
+                return None
+            try:
+                return DiscoveryActivationReceipt.from_dict(item)
+            except DiscoveryOverlayActivationError as exc:
+                raise QualificationError(
+                    f"discovery grade activation receipt is invalid: {exc}"
+                ) from None
+
+        return _load(
+            cls,
+            value,
+            "discovery execution grade",
+            decision=decision,
+            activation_receipt=receipt,
+        )
+
+
+def _discovery_requirement_matches(
+    requirement: DiscoveryExecutionRequirement, arm: object, prepared: object
+) -> bool:
+    launch = prepared.launch
+    native = prepared.binding.launch_binding.native_build_spec
+    return (
+        arm.digest, arm.proposal_digest, arm.selected_delta_digest,
+        arm.candidate_stack_digest, arm.candidate_tree_digest, launch.digest,
+        native.digest, arm.policy_digest, arm.build_profile_digest,
+        launch.worker_distribution_digest, launch.engine_config_digest,
+        launch.hardware.tp_size,
+    ) == (
+        requirement.arm_digest, requirement.proposal_digest,
+        requirement.selected_delta_digest, requirement.candidate_stack_digest,
+        requirement.candidate_tree_digest, requirement.candidate_launch_digest,
+        requirement.native_build_spec_digest, requirement.discovery_policy_digest,
+        requirement.build_profile_digest, requirement.worker_distribution_digest,
+        requirement.engine_config_digest, requirement.expected_tp_size,
+    )
+
+
+def grade_discovery_execution(
+    requirement: DiscoveryExecutionRequirement,
+    lifecycle: object,
+) -> DiscoveryExecutionGrade:
+    """Recompute discovery execution from the retained C lifecycle."""
+
+    from optima.discovery import DiscoveryArmPlan, reopen_discovery_overlay
+    from optima.discovery_overlay import DiscoveryActivationReceipt
+    from optima.eval.marginal_runtime import MarginalLifecycleEvidence
+    from optima.eval.native_artifact import (
+        NativeArtifactError,
+        NativeArtifactPublication,
+        reopen_native_artifact,
+    )
+    from optima.eval.oci_backend import runtime_identity_from_preflight
+    from optima.eval.oci_outer_session import SessionExecutionEvidence
+    from optima.eval.oci_prebuild import OCIPrebuildResult
+
+    if type(requirement) is not DiscoveryExecutionRequirement:
+        raise QualificationError("discovery execution requirement is not typed")
+    if type(lifecycle) is not MarginalLifecycleEvidence:
+        raise QualificationError("discovery lifecycle is not typed")
+    if type(lifecycle.source) is not DiscoveryArmPlan or len(lifecycle.candidates) != 1:
+        raise QualificationError("discovery lifecycle does not contain exactly one discovery arm")
+    candidate = lifecycle.candidates[0]
+    arm, prepared, execution = candidate.arm, candidate.candidate, candidate.execution
+    prebuild, session = execution.prebuild, execution.session
+    if type(prebuild) is not OCIPrebuildResult or type(
+        session
+    ) is not SessionExecutionEvidence or type(
+        prebuild.publication
+    ) is not NativeArtifactPublication or any(
+        type(row.session) is not SessionExecutionEvidence
+        for row in (lifecycle.baseline_before, lifecycle.baseline_after)
+    ):
+        raise QualificationError("discovery execution evidence is not typed")
+    publication = prebuild.publication
+    activation = session.discovery_activation
+    lifecycle_digest = candidate_lifecycle_digest(
+        lifecycle, selected_delta_digest=arm.selected_delta_digest
+    )
+    retained_activation = activation if type(activation) is DiscoveryActivationReceipt else None
+
+    def result(decision: QualificationDecision, reason: str) -> DiscoveryExecutionGrade:
+        return DiscoveryExecutionGrade(
+            decision, reason, requirement.digest, lifecycle_digest,
+            prepared.launch.digest, prepared.binding.launch_binding.native_build_spec.digest,
+            arm.overlay_identity_digest, execution.native_publication_digest,
+            execution.runtime_preflight_receipt_sha256, execution.runtime_argv_sha256,
+            execution.session.session_id, retained_activation,
+        )
+
+    if not _discovery_requirement_matches(requirement, arm, prepared) or lifecycle.source != arm:
+        return result(QualificationDecision.NO_DECISION, "discovery_identity_mismatch")
+    baseline_config = lifecycle.prepared.baseline_session_plan.engine_config
+    candidate_config = prepared.session_plan.engine_config
+    if baseline_config.disable_cuda_graph or candidate_config.disable_cuda_graph:
+        return result(QualificationDecision.FAIL, "discovery_graphs_disabled")
+    if any(
+        row.session.discovery_activation is not None
+        for row in (lifecycle.baseline_before, lifecycle.baseline_after)
+    ):
+        return result(QualificationDecision.NO_DECISION, "discovery_baseline_activation_present")
+    binding = prepared.binding.launch_binding
+    execution_rows = (
+        lifecycle.baseline_before,
+        execution,
+        lifecycle.baseline_after,
+    )
+    if (
+        prepared.session_plan.expected_engine_config_digest != requirement.engine_config_digest
+        or candidate_config.digest != requirement.engine_config_digest
+        or candidate_config.tp_size != requirement.expected_tp_size
+        or prepared.session_plan.expected_discovery_overlay_identity_digest
+        != arm.overlay_identity_digest
+        or any(row.schema != "optima.oci-engine-execution.v1" for row in execution_rows)
+        or execution.launch_digest != requirement.candidate_launch_digest
+        or execution.runtime_identity
+        != runtime_identity_from_preflight(binding.runtime_preflight_receipt)
+        or len({row.runtime_identity for row in execution_rows}) != 1
+        or {row.runtime_preflight_receipt_sha256 for row in execution_rows}
+        != {binding.runtime_preflight_receipt.sha256}
+        or len({row.resource_policy_digest for row in execution_rows}) != 1
+        or len({row.arena_model_receipt_digest for row in execution_rows}) != 1
+        or prebuild.launch_digest != requirement.candidate_launch_digest
+        or prebuild.build_spec_digest != requirement.native_build_spec_digest
+        or prebuild.discovery_overlay_identity_digest != arm.overlay_identity_digest
+        or publication.build_spec_digest != requirement.native_build_spec_digest
+        or execution.native_publication_digest != publication.publication_digest
+        or execution.runtime_preflight_receipt_sha256
+        != binding.runtime_preflight_receipt.sha256
+        or session.launch_digest != requirement.candidate_launch_digest
+        or session.preflight != prepared.session_plan.expected_preflight
+        or session.warmup_count != prepared.session_plan.warmup_count
+        or session.conditioning_count != prepared.session_plan.conditioning_count
+        or len(session.batches) != len(prepared.session_plan.prompt_batches)
+        or tuple(row.batch_index for row in session.batches)
+        != tuple(range(len(prepared.session_plan.prompt_batches)))
+        or not session.batches
+        or session.ready_completed_at > min(row.request_started_at for row in session.batches)
+        or session.session_completed_at < max(row.response_completed_at for row in session.batches)
+    ):
+        return result(QualificationDecision.NO_DECISION, "discovery_execution_mismatch")
+    if activation is None:
+        return result(QualificationDecision.NO_DECISION, "discovery_activation_missing")
+    if type(activation) is not DiscoveryActivationReceipt:
+        raise QualificationError("discovery activation receipt is not typed")
+    if (
+        activation.overlay_identity_digest != arm.overlay_identity_digest
+        or activation.tp_size != requirement.expected_tp_size
+        or activation.driver_origin.version != session.preflight.sglang_version
+        or activation.activation_policy_digest != requirement.activation_policy_digest
+    ):
+        return result(QualificationDecision.NO_DECISION, "discovery_activation_mismatch")
+    try:
+        publication = reopen_native_artifact(
+            publication.root,
+            expected_build_spec_digest=requirement.native_build_spec_digest,
+            expected_publication_digest=execution.native_publication_digest,
+        )
+        overlay = reopen_discovery_overlay(
+            publication, expected_identity_digest=arm.overlay_identity_digest
+        )
+    except (NativeArtifactError, OSError, TypeError, ValueError):
+        return result(QualificationDecision.NO_DECISION, "discovery_overlay_unreopenable")
+    if (
+        overlay.identity_digest != arm.overlay_identity_digest
+        or overlay.identity.proposal_digest != requirement.proposal_digest
+        or overlay.identity.policy_digest != requirement.discovery_policy_digest
+        or overlay.identity.build_profile_digest != requirement.build_profile_digest
+    ):
+        return result(QualificationDecision.NO_DECISION, "discovery_overlay_mismatch")
+    return result(QualificationDecision.PASS, "discovery_execution_pass")
+
+
+def reopen_discovery_execution(
+    requirement: DiscoveryExecutionRequirement,
+    grade: DiscoveryExecutionGrade,
+    lifecycle: object,
+) -> DiscoveryExecutionGrade:
+    """Independently recompute one retained discovery execution grade."""
+
+    if type(grade) is not DiscoveryExecutionGrade:
+        raise QualificationError("discovery execution grade is not typed")
+    reopened = grade_discovery_execution(requirement, lifecycle)
+    if reopened != grade:
+        raise QualificationError("discovery execution grade differs from retained evidence")
+    return grade
+
+
+def reopen_discovery_execution_binding(
+    requirement: DiscoveryExecutionRequirement,
+    grade: DiscoveryExecutionGrade,
+    prepared_candidate: object,
+    *,
+    candidate_lifecycle_digest: str,
+    session_id: str,
+) -> DiscoveryExecutionGrade:
+    """Rebind a durable grade after its complete lifecycle object is released.
+
+    The caller must first authenticate the grade through its enclosing artifact.
+    The full-lifecycle reopener remains the authority that originally reads the
+    native publication and runtime argv.  This path only proves that the retained
+    grade still names the same raw lifecycle and prepared discovery C arm.
+    """
+
+    from optima.discovery import DiscoveryArmPlan, reopen_discovery_engine_binding
+    from optima.discovery_overlay import DiscoveryActivationReceipt
+    from optima.eval.marginal_runtime import PreparedCandidateRuntime
+
+    if type(requirement) is not DiscoveryExecutionRequirement or type(
+        grade
+    ) is not DiscoveryExecutionGrade or type(
+        prepared_candidate
+    ) is not PreparedCandidateRuntime:
+        raise QualificationError("durable discovery execution binding is not typed")
+    arm = prepared_candidate.arm
+    if type(arm) is not DiscoveryArmPlan or not _discovery_requirement_matches(
+        requirement, arm, prepared_candidate
+    ):
+        raise QualificationError("durable discovery arm differs from its requirement")
+    lifecycle_digest = _digest(candidate_lifecycle_digest, "candidate lifecycle")
+    retained_session_id = _id(session_id, "session ID")
+    launch = prepared_candidate.launch
+    binding = prepared_candidate.binding.launch_binding
+    native = binding.native_build_spec
+    plan = prepared_candidate.session_plan
+    if (
+        grade.requirement_digest != requirement.digest
+        or grade.candidate_lifecycle_digest != lifecycle_digest
+        or grade.candidate_launch_digest != launch.digest
+        or grade.native_build_spec_digest != native.digest
+        or grade.overlay_identity_digest != arm.overlay_identity_digest
+        or grade.runtime_preflight_receipt_sha256
+        != binding.runtime_preflight_receipt.sha256
+        or grade.session_id != retained_session_id
+        or prepared_candidate.binding.tree.stack_digest != arm.candidate_stack_digest
+        or prepared_candidate.binding.tree.tree_digest != arm.candidate_tree_digest
+        or plan.expected_discovery_overlay_identity_digest != arm.overlay_identity_digest
+        or plan.expected_engine_config_digest != requirement.engine_config_digest
+        or plan.engine_config.digest != requirement.engine_config_digest
+        or plan.engine_config.tp_size != requirement.expected_tp_size
+        or launch.hardware.tp_size != requirement.expected_tp_size
+        or launch.worker_distribution_digest != requirement.worker_distribution_digest
+    ):
+        raise QualificationError("durable discovery grade differs from its retained binding")
+    try:
+        reopened = reopen_discovery_engine_binding(prepared_candidate.binding.tree)
+    except (OSError, TypeError, ValueError) as exc:
+        raise QualificationError(f"durable discovery tree cannot reopen: {exc}") from None
+    if (
+        reopened.materialized_tree != prepared_candidate.binding.tree
+        or reopened.incumbent_stack_digest != arm.incumbent.digest
+        or reopened.incumbent_tree_digest != arm.incumbent_tree_digest
+        or reopened.discovery.proposal_digest != requirement.proposal_digest
+        or reopened.policy.digest != requirement.discovery_policy_digest
+        or reopened.build_profile.digest != requirement.build_profile_digest
+    ):
+        raise QualificationError("durable discovery tree differs from its grade")
+    receipt = grade.activation_receipt
+    if grade.execution_passed:
+        if (
+            grade.reason != "discovery_execution_pass"
+            or type(receipt) is not DiscoveryActivationReceipt
+            or receipt.overlay_identity_digest != grade.overlay_identity_digest
+            or receipt.activation_policy_digest != requirement.activation_policy_digest
+            or receipt.tp_size != requirement.expected_tp_size
+            or receipt.driver_origin.version != plan.expected_preflight.sglang_version
+            or plan.engine_config.disable_cuda_graph
+        ):
+            raise QualificationError("passing durable discovery grade is not authoritative")
+    elif grade.reason == "discovery_execution_pass":
+        raise QualificationError("non-passing durable discovery grade claims success")
+    return grade
+
+
+@dataclass(frozen=True)
 class ReferenceManifest(_Canonical):
     """Exact candidate-free engine and hidden authority used by pristine T."""
 
@@ -802,6 +1184,58 @@ class QualificationProfile(_Canonical):
             cls,
             value,
             "qualification profile",
+            reference=ReferenceManifest.from_dict,
+            required_quality_metrics=lambda rows: tuple(_array(rows, "quality metrics")),
+        )
+
+
+@dataclass(frozen=True)
+class DiscoveryQualificationProfile(_Canonical):
+    """Validator-owned quality policy for one discovery execution authority."""
+
+    _domain: ClassVar[str] = "optima.qualification.discovery-profile"
+    reference: ReferenceManifest
+    calibration_context_digest: str
+    calibration_digest: str
+    execution_requirement_digest: str
+    required_quality_metrics: tuple[str, ...]
+    nll_tail_threshold: str
+    tokens_per_prompt: int
+    topk_width: int
+    hidden_tasks_per_prompt: int
+    support_policy_digest: str
+    hidden_task_policy_digest: str
+    runtime_resource_policy_digest: str
+    hidden_tasks_required: bool
+    minimum_prompt_count: int
+    policy_version: str = "discovery-qualification.v1"
+    schema_version: int = 1
+
+    def __post_init__(self) -> None:
+        proxy = QualificationProfile(
+            self.reference, self.calibration_context_digest, self.calibration_digest,
+            self.execution_requirement_digest, self.required_quality_metrics,
+            self.nll_tail_threshold, self.tokens_per_prompt, self.topk_width,
+            self.hidden_tasks_per_prompt, self.support_policy_digest,
+            self.hidden_task_policy_digest, self.runtime_resource_policy_digest,
+            self.hidden_tasks_required, self.minimum_prompt_count,
+        )
+        for item in fields(proxy):
+            if item.name not in {"graph_requirement_digest", "policy_version", "schema_version"}:
+                object.__setattr__(self, item.name, getattr(proxy, item.name))
+        object.__setattr__(
+            self, "execution_requirement_digest",
+            _digest(self.execution_requirement_digest, "execution requirement"),
+        )
+        if (self.policy_version, self.schema_version) != ("discovery-qualification.v1", 1):
+            raise QualificationError("unsupported discovery qualification policy/schema")
+
+    @classmethod
+    def from_dict(cls, value: object) -> "DiscoveryQualificationProfile":
+        return _load(
+            cls,
+            value,
+            "discovery qualification profile",
             reference=ReferenceManifest.from_dict,
             required_quality_metrics=lambda rows: tuple(_array(rows, "quality metrics")),
         )
@@ -1149,9 +1583,9 @@ def candidate_lifecycle_digest(
 
 
 def qualification_identity_digest(
-    profile: QualificationProfile,
+    profile: QualificationProfile | DiscoveryQualificationProfile,
     *,
-    graph_requirement: GraphVerificationRequirement,
+    graph_requirement: GraphVerificationRequirement | DiscoveryExecutionRequirement,
     selection: SelectionReceipt,
     calibration: object,
     candidate_lifecycle: str,
@@ -1164,30 +1598,38 @@ def qualification_identity_digest(
     from optima.eval.calibration import CalibrationManifest
     from optima.eval.oci_reference_session import ReferenceSessionEvidence
 
+    registered = (
+        type(profile) is QualificationProfile
+        and type(graph_requirement) is GraphVerificationRequirement
+    )
+    discovery = (
+        type(profile) is DiscoveryQualificationProfile
+        and type(graph_requirement) is DiscoveryExecutionRequirement
+    )
     if (
-        type(profile) is not QualificationProfile
-        or type(graph_requirement) is not GraphVerificationRequirement
+        not (registered or discovery)
         or type(selection) is not SelectionReceipt
         or type(calibration) is not CalibrationManifest
         or type(t_session) is not ReferenceSessionEvidence
     ):
         raise QualificationError("qualification identity inputs are not typed")
+    common = {
+        "calibration_digest": calibration.digest,
+        "candidate_lifecycle_digest": _digest(candidate_lifecycle, "candidate lifecycle"),
+        "profile_digest": profile.digest,
+        "selected_delta_digest": _digest(selected_delta_digest, "selected delta"),
+        "selection_digest": selection.digest,
+        "t_session_digest": t_session.digest,
+        "t_request_sha256": _digest(t_request_sha256, "T request SHA-256"),
+    }
+    if registered:
+        return canonical_digest(
+            "optima.qualification.candidate-identity",
+            {**common, "graph_requirement_digest": graph_requirement.digest},
+        )
     return canonical_digest(
-        "optima.qualification.candidate-identity",
-        {
-            "calibration_digest": calibration.digest,
-            "candidate_lifecycle_digest": _digest(
-                candidate_lifecycle, "candidate lifecycle"
-            ),
-            "graph_requirement_digest": graph_requirement.digest,
-            "profile_digest": profile.digest,
-            "selected_delta_digest": _digest(
-                selected_delta_digest, "selected delta"
-            ),
-            "selection_digest": selection.digest,
-            "t_session_digest": t_session.digest,
-            "t_request_sha256": _digest(t_request_sha256, "T request SHA-256"),
-        },
+        "optima.qualification.discovery-candidate-identity",
+        {**common, "execution_requirement_digest": graph_requirement.digest},
     )
 
 
@@ -1279,11 +1721,12 @@ def selected_trajectory_projection_digest(
 
 
 def derived_hidden_task_plan_digest(
-    profile: QualificationProfile, selected_prompt_digests: tuple[str, ...]
+    profile: QualificationProfile | DiscoveryQualificationProfile,
+    selected_prompt_digests: tuple[str, ...],
 ) -> str:
     """Derive opaque task identities from validator-owned corpus/judge policy."""
 
-    if type(profile) is not QualificationProfile:
+    if type(profile) not in {QualificationProfile, DiscoveryQualificationProfile}:
         raise QualificationError("hidden-task profile is not typed")
     prompts = tuple(selected_prompt_digests)
     if prompts != tuple(sorted(set(prompts))):
@@ -1391,7 +1834,7 @@ def _validate_teacher_source(
 
 
 def validate_quality_binding(
-    profile: QualificationProfile,
+    profile: QualificationProfile | DiscoveryQualificationProfile,
     raw_artifact: object,
     lifecycle: object,
     *,
@@ -1400,7 +1843,7 @@ def validate_quality_binding(
     entropy: SelectionEntropyReceipt,
     selection: SelectionReceipt,
     calibration: object,
-    graph_requirement: GraphVerificationRequirement,
+    graph_requirement: GraphVerificationRequirement | DiscoveryExecutionRequirement,
     reference_execution: object,
     reference_request_sha256: str,
 ):
@@ -1413,11 +1856,18 @@ def validate_quality_binding(
         retained_support_policy_digest,
     )
 
+    registered = (
+        type(profile) is QualificationProfile
+        and type(graph_requirement) is GraphVerificationRequirement
+    )
+    discovery = (
+        type(profile) is DiscoveryQualificationProfile
+        and type(graph_requirement) is DiscoveryExecutionRequirement
+    )
     if (
-        type(profile) is not QualificationProfile
+        not (registered or discovery)
         or type(raw_artifact) is not ReferenceQualityRawArtifact
         or type(calibration) is not CalibrationManifest
-        or type(graph_requirement) is not GraphVerificationRequirement
         or type(reference_execution) is not PristineReferenceExecutionEvidence
     ):
         raise QualificationError("quality profile/binding is not typed")
@@ -1433,24 +1883,88 @@ def validate_quality_binding(
         raise QualificationError("quality candidate lifecycle is absent or ambiguous")
     candidate = candidates[0]
     arm = candidate.arm
-    expected_graph_binding = (
-        arm.digest,
-        candidate.candidate.launch.digest,
-        arm.transition.replacement.digest,
-        arm.selected_delta_digest,
-        arm.transition.target_id,
-        arm.transition.target_spec_digest,
-        arm.candidate.catalog_digest,
-    )
-    actual_graph_binding = (
-        graph_requirement.binding.marginal_arm_digest,
-        graph_requirement.binding.candidate_launch_digest,
-        graph_requirement.binding.contribution_ref_digest,
-        graph_requirement.binding.selected_delta_digest,
-        graph_requirement.binding.target_id,
-        graph_requirement.binding.target_spec_digest,
-        graph_requirement.binding.catalog_digest,
-    )
+    if registered:
+        assert type(profile) is QualificationProfile
+        assert type(graph_requirement) is GraphVerificationRequirement
+        expected_requirement_binding = (
+            arm.digest, candidate.candidate.launch.digest,
+            arm.transition.replacement.digest, arm.selected_delta_digest,
+            arm.transition.target_id, arm.transition.target_spec_digest,
+            arm.candidate.catalog_digest,
+        )
+        actual_requirement_binding = (
+            graph_requirement.binding.marginal_arm_digest,
+            graph_requirement.binding.candidate_launch_digest,
+            graph_requirement.binding.contribution_ref_digest,
+            graph_requirement.binding.selected_delta_digest,
+            graph_requirement.binding.target_id,
+            graph_requirement.binding.target_spec_digest,
+            graph_requirement.binding.catalog_digest,
+        )
+        calibration_policy = graph_requirement.binding.verification_policy_digest
+        profile_requirement_digest = profile.graph_requirement_digest
+    else:
+        from optima.discovery import DiscoveryArmPlan
+        from optima.eval.scoring import marginal_workload_digest
+
+        assert type(profile) is DiscoveryQualificationProfile
+        assert type(graph_requirement) is DiscoveryExecutionRequirement
+        if type(arm) is not DiscoveryArmPlan:
+            raise QualificationError("discovery quality lifecycle has another arm type")
+        launch = candidate.candidate.launch
+        expected_requirement_binding = (
+            arm.digest, arm.proposal_digest, arm.selected_delta_digest,
+            arm.candidate_stack_digest, arm.candidate_tree_digest, launch.digest,
+            candidate.candidate.binding.launch_binding.native_build_spec.digest,
+            arm.policy_digest, arm.build_profile_digest,
+            launch.worker_distribution_digest, launch.engine_config_digest,
+            launch.hardware.tp_size,
+        )
+        actual_requirement_binding = (
+            graph_requirement.arm_digest, graph_requirement.proposal_digest,
+            graph_requirement.selected_delta_digest,
+            graph_requirement.candidate_stack_digest,
+            graph_requirement.candidate_tree_digest,
+            graph_requirement.candidate_launch_digest,
+            graph_requirement.native_build_spec_digest,
+            graph_requirement.discovery_policy_digest,
+            graph_requirement.build_profile_digest,
+            graph_requirement.worker_distribution_digest,
+            graph_requirement.engine_config_digest,
+            graph_requirement.expected_tp_size,
+        )
+        calibration_policy = graph_requirement.activation_policy_digest
+        profile_requirement_digest = profile.execution_requirement_digest
+        reference_binding = (
+            profile.reference.runtime_digest,
+            profile.reference.base_engine_digest,
+            profile.reference.arena_digest,
+            profile.reference.catalog_digest,
+            profile.reference.controller_distribution_digest,
+            profile.reference.worker_distribution_digest,
+            profile.reference.model_revision_digest,
+            profile.reference.model_manifest_digest,
+            profile.reference.model_content_digest,
+            profile.reference.logical_hardware_digest,
+            profile.reference.workload_digest,
+        )
+        lifecycle_binding = (
+            arm.incumbent.runtime_digest,
+            arm.incumbent.base_engine_digest,
+            arm.incumbent.arena_digest,
+            arm.incumbent.catalog_digest,
+            launch.controller_distribution_digest,
+            launch.worker_distribution_digest,
+            launch.model_revision_digest,
+            launch.model_manifest_digest,
+            launch.model_content_digest,
+            launch.hardware.digest,
+            marginal_workload_digest(plan),
+        )
+        if reference_binding != lifecycle_binding:
+            raise QualificationError("discovery reference differs from its lifecycle")
+        if not grade_discovery_execution(graph_requirement, lifecycle).execution_passed:
+            raise QualificationError("discovery execution authority did not pass")
     expected_calibration_context = CalibrationContext(
         profile.reference.digest,
         profile.reference.arena_digest,
@@ -1461,7 +1975,7 @@ def validate_quality_binding(
         profile.reference.model_content_digest,
         profile.reference.logical_hardware_digest,
         profile.reference.workload_digest,
-        graph_requirement.binding.verification_policy_digest,
+        calibration_policy,
         profile.reference.controller_distribution_digest,
     )
     lifecycle_digest = candidate_lifecycle_digest(
@@ -1514,8 +2028,23 @@ def validate_quality_binding(
         or calibration.context.digest != profile.calibration_context_digest
         or tuple(row.name for row in calibration.quality_metrics)
         != profile.required_quality_metrics
-        or graph_requirement.digest != profile.graph_requirement_digest
-        or actual_graph_binding != expected_graph_binding
+        or (
+            discovery
+            and (
+                reference_execution.resource_policy_digest
+                != profile.runtime_resource_policy_digest
+                or any(
+                    row.resource_policy_digest != profile.runtime_resource_policy_digest
+                    for row in (
+                        lifecycle.baseline_before,
+                        candidate.execution,
+                        lifecycle.baseline_after,
+                    )
+                )
+            )
+        )
+        or graph_requirement.digest != profile_requirement_digest
+        or actual_requirement_binding != expected_requirement_binding
         or binding.selection_digest != selection.digest
         or (binding.tokens_per_prompt, binding.topk_width, binding.hidden_tasks_per_prompt)
         != (profile.tokens_per_prompt, profile.topk_width, profile.hidden_tasks_per_prompt)
@@ -1542,6 +2071,9 @@ __all__ = [
     "GRAPH_EVIDENCE_SCHEMA",
     "GRAPH_QUALIFICATION_POLICY_VERSION",
     "GRAPH_QUALIFICATION_SCHEMA_VERSION",
+    "DiscoveryExecutionGrade",
+    "DiscoveryExecutionRequirement",
+    "DiscoveryQualificationProfile",
     "GraphMemberEvidence",
     "GraphShapeEvidence",
     "GraphVariantEvidence",
@@ -1562,8 +2094,11 @@ __all__ = [
     "candidate_lifecycle_digest",
     "cohort_trajectory_digest",
     "derived_hidden_task_plan_digest",
+    "grade_discovery_execution",
     "lifecycle_prompt_digests",
     "qualification_identity_digest",
+    "reopen_discovery_execution",
+    "reopen_discovery_execution_binding",
     "reopen_graph_verification",
     "regrade_graph_verification",
     "selected_trajectory_digest",

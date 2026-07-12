@@ -12,6 +12,11 @@ from pathlib import Path
 import pytest
 
 import optima.eval.oci_session_protocol as protocol
+from optima.discovery_overlay import (
+    DiscoveryActivationReceipt,
+    DiscoveryDriverOrigin,
+    DiscoverySchedulerMember,
+)
 from optima.seams import (
     SEAM_ADAPTERS,
     SEAM_BINDINGS,
@@ -63,6 +68,26 @@ SESSION = "1" * 32
 REQUEST = "2" * 32
 NONCE = "3" * 32
 LAUNCH = _digest("launch")
+
+
+def _discovery_receipt(**changes: object) -> DiscoveryActivationReceipt:
+    values: dict[str, object] = {
+        "schema": "optima.discovery-driver-activation.v1",
+        "overlay_identity_digest": _digest("discovery-overlay"),
+        "driver_pid": 100,
+        "driver_origin": DiscoveryDriverOrigin(
+            "sglang", "0.0.0.dev1+g56e290315", "sglang/__init__.py"
+        ),
+        "scheduler_target_module": "sglang.srt.managers.scheduler",
+        "scheduler_target_qualname": "run_scheduler_process",
+        "tp_size": 2,
+        "members": (
+            DiscoverySchedulerMember(201, 0, 0, 0, 0, 0, 0, None),
+            DiscoverySchedulerMember(202, 1, 1, 1, 0, 1, 0, None),
+        ),
+    }
+    values.update(changes)
+    return DiscoveryActivationReceipt(**values)  # type: ignore[arg-type]
 
 
 def _config(**changes: object) -> EngineSessionConfig:
@@ -400,12 +425,97 @@ def test_preflight_accept_is_bound_to_exact_accepted_facts() -> None:
 
 def test_ready_is_only_an_exact_bound_marker() -> None:
     message = ready_message(session_id=SESSION, launch_digest=LAUNCH)
-    validate_ready(message, session_id=SESSION, launch_digest=LAUNCH)
+    expected_payload = (
+        b'{"launch_digest":"' + LAUNCH.encode("ascii")
+        + b'","schema":"optima-isolated-engine-session-v1","session_id":"'
+        + SESSION.encode("ascii") + b'","type":"ready"}'
+    )
+    assert encode_message(message, max_bytes=MAX_CONTROL_BYTES) == expected_payload
+    assert frame_message(message, max_bytes=MAX_CONTROL_BYTES) == (
+        CONTROL_MAGIC + struct.pack(">I", len(expected_payload)) + expected_payload
+    )
+    assert validate_ready(
+        message, session_id=SESSION, launch_digest=LAUNCH
+    ) is None
     with pytest.raises(SessionProtocolError, match="stale"):
         validate_ready(message, session_id="4" * 32, launch_digest=LAUNCH)
     changed = dict(message, engine_seconds=1.0)
     with pytest.raises(SessionProtocolError, match="stale"):
         validate_ready(changed, session_id=SESSION, launch_digest=LAUNCH)
+
+
+def test_discovery_ready_is_strictly_bound_and_never_accepted_by_ordinary() -> None:
+    receipt = _discovery_receipt()
+    message = ready_message(
+        session_id=SESSION,
+        launch_digest=LAUNCH,
+        discovery_activation=receipt,
+    )
+    assert validate_ready(
+        message,
+        session_id=SESSION,
+        launch_digest=LAUNCH,
+        expected_discovery_identity_digest=receipt.overlay_identity_digest,
+        expected_discovery_tp_size=receipt.tp_size,
+        expected_discovery_sglang_version=receipt.driver_origin.version,
+    ) == receipt
+    with pytest.raises(SessionProtocolError, match="stale|malformed"):
+        validate_ready(message, session_id=SESSION, launch_digest=LAUNCH)
+    with pytest.raises(SessionProtocolError, match="fields"):
+        validate_ready(
+            ready_message(session_id=SESSION, launch_digest=LAUNCH),
+            session_id=SESSION,
+            launch_digest=LAUNCH,
+            expected_discovery_identity_digest=receipt.overlay_identity_digest,
+            expected_discovery_tp_size=receipt.tp_size,
+            expected_discovery_sglang_version=receipt.driver_origin.version,
+        )
+
+    for changes in (
+        {"expected_discovery_identity_digest": _digest("other-overlay")},
+        {"expected_discovery_tp_size": 3},
+        {"expected_discovery_sglang_version": "9.9.9"},
+    ):
+        expected = {
+            "expected_discovery_identity_digest": receipt.overlay_identity_digest,
+            "expected_discovery_tp_size": receipt.tp_size,
+            "expected_discovery_sglang_version": receipt.driver_origin.version,
+            **changes,
+        }
+        with pytest.raises(SessionProtocolError, match="host policy"):
+            validate_ready(
+                message,
+                session_id=SESSION,
+                launch_digest=LAUNCH,
+                **expected,
+            )
+
+
+def test_discovery_ready_rejects_partial_expectation_and_extra_receipt_fields() -> None:
+    receipt = _discovery_receipt()
+    message = ready_message(
+        session_id=SESSION,
+        launch_digest=LAUNCH,
+        discovery_activation=receipt,
+    )
+    with pytest.raises(SessionProtocolError, match="expectation is incomplete"):
+        validate_ready(
+            message,
+            session_id=SESSION,
+            launch_digest=LAUNCH,
+            expected_discovery_identity_digest=receipt.overlay_identity_digest,
+        )
+    changed = copy.deepcopy(message)
+    changed["discovery_activation"]["candidate_claim"] = True
+    with pytest.raises(SessionProtocolError, match="malformed"):
+        validate_ready(
+            changed,
+            session_id=SESSION,
+            launch_digest=LAUNCH,
+            expected_discovery_identity_digest=receipt.overlay_identity_digest,
+            expected_discovery_tp_size=receipt.tp_size,
+            expected_discovery_sglang_version=receipt.driver_origin.version,
+        )
 
 
 def test_batch_request_discloses_only_one_exact_bounded_batch() -> None:

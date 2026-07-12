@@ -33,11 +33,15 @@ from optima.eval.oci_process import OCIQuiescenceReceipt
 from optima.eval.oci_reference_session import ReferenceSessionPlan
 from optima.eval.oci_session_protocol import EngineSessionConfig, RuntimePreflightFacts
 from optima.eval.qualification import (
+    DiscoveryExecutionGrade, DiscoveryExecutionRequirement,
+    DiscoveryQualificationProfile,
     GraphVerificationEvidenceRef, GraphVerificationGrade, GraphVerificationRequirement,
     QualificationDecision, QualificationProfile, SelectionCommitment,
     SelectionEntropyReceipt, SelectionReceipt, _selected_prompt_texts, _trajectory_rows,
     candidate_lifecycle_digest, cohort_trajectory_digest, derived_hidden_task_plan_digest,
-    qualification_identity_digest, reopen_graph_verification, selected_trajectory_digest,
+    grade_discovery_execution, qualification_identity_digest,
+    reopen_discovery_execution_binding, reopen_graph_verification,
+    selected_trajectory_digest,
     selected_trajectory_projection_digest, validate_quality_binding,
 )
 from optima.eval.reference_protocol import (
@@ -65,6 +69,8 @@ class QualificationRunnerError(RuntimeError):
 
 ATTEMPT_DOMAIN = "qualification.cohort-attempt"
 ATTEMPT_SCHEMA = "optima.qualification.cohort-attempt.v1"
+DISCOVERY_ATTEMPT_DOMAIN = "qualification.discovery-attempt"
+DISCOVERY_ATTEMPT_SCHEMA = "optima.qualification.discovery-attempt.v1"
 
 def _strict(value: object, fields: set[str], label: str) -> dict[str, object]:
     if type(value) is not dict or set(value) != fields:
@@ -197,11 +203,43 @@ class CandidateQualificationAuthority:
         ):
             raise QualificationRunnerError("candidate graph/profile authority is mismatched")
 
+
+@dataclass(frozen=True)
+class DiscoveryCandidateQualificationAuthority:
+    """Pre-execution authority for one non-catalog discovery arm."""
+
+    selected_delta_digest: str
+    profile: DiscoveryQualificationProfile
+    execution_requirement: DiscoveryExecutionRequirement
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "selected_delta_digest",
+            require_sha256_hex(self.selected_delta_digest, field="selected delta"),
+        )
+        if (
+            type(self.profile) is not DiscoveryQualificationProfile
+            or type(self.execution_requirement) is not DiscoveryExecutionRequirement
+            or self.profile.execution_requirement_digest
+            != self.execution_requirement.digest
+            or self.execution_requirement.selected_delta_digest
+            != self.selected_delta_digest
+        ):
+            raise QualificationRunnerError(
+                "discovery execution/profile authority is mismatched"
+            )
+
+
+CandidateAuthority = (
+    CandidateQualificationAuthority | DiscoveryCandidateQualificationAuthority
+)
+
 @dataclass(frozen=True)
 class CausalQualificationInput:
     prepared: PreparedMarginalRuntime
     model_mount: TrustedArenaModelMountReceipt
-    candidates: tuple[CandidateQualificationAuthority, ...]
+    candidates: tuple[CandidateAuthority, ...]
     commitment: SelectionCommitment
     selection_secret: bytes
     evidence_root: Path
@@ -242,9 +280,18 @@ class CausalQualificationInput:
         object.__setattr__(self, "evidence_root", root)
         candidates = tuple(self.candidates)
         expected = tuple(row.arm.selected_delta_digest for row in self.prepared.candidates)
+        from optima.discovery import DiscoveryArmPlan
+
+        discovery = type(self.prepared.source) is DiscoveryArmPlan
+        allowed = (
+            {DiscoveryCandidateQualificationAuthority}
+            if discovery
+            else {CandidateQualificationAuthority}
+        )
         if (
             not candidates
-            or any(type(row) is not CandidateQualificationAuthority for row in candidates)
+            or (discovery and len(candidates) != 1)
+            or any(type(row) not in allowed for row in candidates)
             or tuple(row.selected_delta_digest for row in candidates) != expected
         ):
             raise QualificationRunnerError("candidate authority order differs from the sealed cohort")
@@ -255,6 +302,20 @@ class CausalQualificationInput:
             "expected_device_policy_digest",
         ):
             object.__setattr__(self, field, require_sha256_hex(getattr(self, field), field=field))
+
+
+def _profile(authority: CandidateAuthority) -> QualificationProfile | DiscoveryQualificationProfile:
+    return authority.profile
+
+
+def _requirement(
+    authority: CandidateAuthority,
+) -> GraphVerificationRequirement | DiscoveryExecutionRequirement:
+    if type(authority) is CandidateQualificationAuthority:
+        return authority.graph_requirement
+    if type(authority) is DiscoveryCandidateQualificationAuthority:
+        return authority.execution_requirement
+    raise QualificationRunnerError("candidate authority has an unsupported type")
 
 def _decision(value: str | QualificationDecision) -> QualificationDecision:
     try:
@@ -432,6 +493,99 @@ class CandidateQualificationReport:
             **raw,
             "raw_quality_artifact": EvidenceArtifactRef.from_dict(raw["raw_quality_artifact"]),
             "raw_quality_binding": ReferenceQualityRawBinding.from_dict(raw["raw_quality_binding"]),
+            "speed_witness": SpeedWitness.from_dict(raw["speed_witness"]),
+        })  # type: ignore[arg-type]
+
+    @property
+    def digest(self) -> str:
+        return canonical_digest(self._domain, self.to_dict())
+
+
+@dataclass(frozen=True)
+class DiscoveryCandidateQualificationReport:
+    _domain: ClassVar[str] = "optima.qualification.discovery-candidate-report.v1"
+    selected_delta_digest: str
+    discovery_arm_digest: str
+    proposal_digest: str
+    candidate_launch_digest: str
+    profile_digest: str
+    calibration_digest: str
+    execution_grade: DiscoveryExecutionGrade
+    speed_evidence_digest: str
+    speed_decision: QualificationDecision
+    speedup: str
+    quality_evidence_digest: str
+    quality_decision: QualificationDecision
+    candidate_mean_teacher_nll: str
+    raw_quality_artifact: EvidenceArtifactRef
+    raw_quality_binding: ReferenceQualityRawBinding
+    speed_witness: SpeedWitness
+    t_request_sha256: str
+    decision: QualificationDecision
+    reason: str
+    retryable: bool
+
+    def __post_init__(self) -> None:
+        for field in (
+            "selected_delta_digest", "discovery_arm_digest", "proposal_digest",
+            "candidate_launch_digest", "profile_digest", "calibration_digest",
+            "speed_evidence_digest",
+            "quality_evidence_digest", "t_request_sha256",
+        ):
+            object.__setattr__(
+                self, field, require_sha256_hex(getattr(self, field), field=field)
+            )
+        for field in ("speed_decision", "quality_decision", "decision"):
+            object.__setattr__(self, field, _decision(getattr(self, field)))
+        if (
+            type(self.execution_grade) is not DiscoveryExecutionGrade
+            or type(self.raw_quality_artifact) is not EvidenceArtifactRef
+            or type(self.raw_quality_binding) is not ReferenceQualityRawBinding
+            or type(self.speed_witness) is not SpeedWitness
+        ):
+            raise QualificationRunnerError("discovery evidence witness is not typed")
+        expected = _aggregate_decision(
+            self.execution_grade.decision, self.speed_decision, self.quality_decision
+        )
+        if (
+            self.decision is not expected
+            or type(self.retryable) is not bool
+            or self.retryable != (expected is QualificationDecision.NO_DECISION)
+            or not isinstance(self.reason, str)
+            or not self.reason
+        ):
+            raise QualificationRunnerError(
+                "discovery candidate aggregate headline is inconsistent"
+            )
+        for field in ("speedup", "candidate_mean_teacher_nll"):
+            try:
+                value = float(getattr(self, field))
+            except (TypeError, ValueError) as exc:
+                raise QualificationRunnerError(f"{field} is not numeric") from exc
+            if not math.isfinite(value) or value < 0:
+                raise QualificationRunnerError(f"{field} is nonfinite or negative")
+
+    def to_dict(self) -> dict[str, object]:
+        return _record_dict(self)
+
+    @classmethod
+    def from_dict(cls, value: object) -> "DiscoveryCandidateQualificationReport":
+        raw = _strict(
+            value,
+            set(cls.__dataclass_fields__) - {"_domain"},
+            "discovery candidate report",
+        )
+        return cls(**{
+            **raw,
+            "execution_grade": DiscoveryExecutionGrade.from_dict(
+                raw["execution_grade"]
+            ),
+            "raw_quality_artifact": EvidenceArtifactRef.from_dict(
+                raw["raw_quality_artifact"]
+            ),
+            "raw_quality_binding": ReferenceQualityRawBinding.from_dict(
+                raw["raw_quality_binding"]
+            ),
             "speed_witness": SpeedWitness.from_dict(raw["speed_witness"]),
         })  # type: ignore[arg-type]
 
@@ -626,6 +780,106 @@ class CohortQualificationAttempt:
     def digest(self) -> str:
         return canonical_digest(self._domain, self.to_dict())
 
+
+@dataclass(frozen=True)
+class DiscoveryQualificationAttempt:
+    _domain: ClassVar[str] = "optima.qualification.discovery-attempt.v1"
+    authority_digest: str
+    source_digest: str
+    cohort_trajectory_digest: str
+    commitment: SelectionCommitment
+    teardown_before_t: OCIQuiescenceReceipt
+    entropy: SelectionEntropyReceipt
+    entropy_observed_monotonic_s: float
+    selection: SelectionReceipt
+    reference_execution: ReferenceExecutionWitness
+    teardown_after_t: OCIQuiescenceReceipt
+    reports: tuple[DiscoveryCandidateQualificationReport, ...]
+
+    def __post_init__(self) -> None:
+        for field in (
+            "authority_digest", "source_digest", "cohort_trajectory_digest"
+        ):
+            object.__setattr__(
+                self, field, require_sha256_hex(getattr(self, field), field=field)
+            )
+        if (
+            type(self.commitment) is not SelectionCommitment
+            or type(self.teardown_before_t) is not OCIQuiescenceReceipt
+            or type(self.entropy) is not SelectionEntropyReceipt
+            or type(self.selection) is not SelectionReceipt
+            or type(self.reference_execution) is not ReferenceExecutionWitness
+            or type(self.teardown_after_t) is not OCIQuiescenceReceipt
+            or type(self.entropy_observed_monotonic_s) is not float
+            or not math.isfinite(self.entropy_observed_monotonic_s)
+        ):
+            raise QualificationRunnerError(
+                "discovery attempt authority is not typed"
+            )
+        reports = tuple(self.reports)
+        if len(reports) != 1 or type(reports[0]) is not DiscoveryCandidateQualificationReport:
+            raise QualificationRunnerError(
+                "discovery attempt requires exactly one typed report"
+            )
+        object.__setattr__(self, "reports", reports)
+        before, after = self.teardown_before_t, self.teardown_after_t
+        if (
+            (before.executor_id, before.manager_instance_id, before.namespace_digest)
+            != (after.executor_id, after.manager_instance_id, after.namespace_digest)
+            or after.sequence != before.sequence + 1
+            or not before.observed_monotonic_s <= self.entropy_observed_monotonic_s
+            <= after.observed_monotonic_s
+            or self.selection.commitment_digest != self.commitment.digest
+            or self.selection.entropy_receipt_digest != self.entropy.digest
+        ):
+            raise QualificationRunnerError(
+                "discovery causal ordering or executor identity differs"
+            )
+
+    def to_dict(self) -> dict[str, object]:
+        return _record_dict(self)
+
+    @classmethod
+    def from_dict(cls, value: object) -> "DiscoveryQualificationAttempt":
+        raw = _strict(
+            value,
+            set(cls.__dataclass_fields__) - {"_domain"},
+            "discovery attempt",
+        )
+        return cls(**{
+            **raw,
+            "commitment": SelectionCommitment.from_dict(raw["commitment"]),
+            "entropy": SelectionEntropyReceipt.from_dict(raw["entropy"]),
+            "entropy_observed_monotonic_s": float(
+                raw["entropy_observed_monotonic_s"]
+            ),
+            "selection": SelectionReceipt.from_dict(raw["selection"]),
+            "reference_execution": ReferenceExecutionWitness.from_dict(
+                raw["reference_execution"]
+            ),
+            "teardown_before_t": _quiescence_from_dict(raw["teardown_before_t"]),
+            "teardown_after_t": _quiescence_from_dict(raw["teardown_after_t"]),
+            "reports": tuple(
+                DiscoveryCandidateQualificationReport.from_dict(row)
+                for row in raw["reports"]
+            ),
+        })  # type: ignore[arg-type]
+
+    @property
+    def reference_plan_digest(self) -> str:
+        return self.reference_execution.plan_digest
+
+    @property
+    def reference_session_digest(self) -> str:
+        return self.reference_execution.session_digest
+
+    @property
+    def digest(self) -> str:
+        return canonical_digest(self._domain, self.to_dict())
+
+
+QualificationAttempt = CohortQualificationAttempt | DiscoveryQualificationAttempt
+
 def _planned_prompt_digests(prepared: PreparedMarginalRuntime) -> tuple[str, ...]:
     plan = prepared.baseline_session_plan
     workload = marginal_workload_digest(plan)
@@ -643,7 +897,9 @@ def _planned_prompt_digests(prepared: PreparedMarginalRuntime) -> tuple[str, ...
             ))
     return tuple(sorted(rows))
 
-def _validate_pre_execution(value: CausalQualificationInput) -> tuple[CalibrationManifest, dict[str, GraphVerificationGrade]]:
+def _validate_pre_execution(
+    value: CausalQualificationInput,
+) -> tuple[CalibrationManifest, dict[str, GraphVerificationGrade]]:
     if type(value) is not CausalQualificationInput:
         raise QualificationRunnerError("qualification input has the wrong type")
     reference = value.candidates[0].profile.reference
@@ -674,7 +930,9 @@ def _validate_pre_execution(value: CausalQualificationInput) -> tuple[Calibratio
         expected_context=value.calibration_context,
     )
     grades: dict[str, GraphVerificationGrade] = {}
-    for authority in value.candidates:
+    for prepared, authority in zip(
+        value.prepared.candidates, value.candidates, strict=True
+    ):
         profile = authority.profile
         if (
             profile.reference != reference
@@ -689,12 +947,59 @@ def _validate_pre_execution(value: CausalQualificationInput) -> tuple[Calibratio
             )
         ):
             raise QualificationRunnerError("candidate qualification profile differs from cohort")
-        grades[authority.selected_delta_digest] = reopen_graph_verification(
-            value.evidence_root,
-            authority.graph_artifact_ref,
-            authority.graph_requirement,
-            authority.graph_evidence_ref,
+        if type(authority) is CandidateQualificationAuthority:
+            grades[authority.selected_delta_digest] = reopen_graph_verification(
+                value.evidence_root,
+                authority.graph_artifact_ref,
+                authority.graph_requirement,
+                authority.graph_evidence_ref,
+            )
+            continue
+        from optima.discovery import DiscoveryArmPlan
+
+        if type(authority) is not DiscoveryCandidateQualificationAuthority or type(
+            prepared.arm
+        ) is not DiscoveryArmPlan:
+            raise QualificationRunnerError("discovery pre-execution authority is mismatched")
+        requirement = authority.execution_requirement
+        arm, launch = prepared.arm, prepared.launch
+        expected = (
+            arm.digest,
+            arm.proposal_digest,
+            arm.selected_delta_digest,
+            arm.candidate_stack_digest,
+            arm.candidate_tree_digest,
+            launch.digest,
+            prepared.binding.launch_binding.native_build_spec.digest,
+            arm.policy_digest,
+            arm.build_profile_digest,
+            launch.worker_distribution_digest,
+            launch.engine_config_digest,
+            launch.hardware.tp_size,
         )
+        actual = (
+            requirement.arm_digest,
+            requirement.proposal_digest,
+            requirement.selected_delta_digest,
+            requirement.candidate_stack_digest,
+            requirement.candidate_tree_digest,
+            requirement.candidate_launch_digest,
+            requirement.native_build_spec_digest,
+            requirement.discovery_policy_digest,
+            requirement.build_profile_digest,
+            requirement.worker_distribution_digest,
+            requirement.engine_config_digest,
+            requirement.expected_tp_size,
+        )
+        if (
+            expected != actual
+            or profile.execution_requirement_digest != requirement.digest
+            or value.calibration_context.verification_policy_digest
+            != requirement.activation_policy_digest
+        ):
+            raise QualificationRunnerError(
+                "discovery requirement differs from the prepared runtime"
+            )
     return calibration, grades
 
 def _selected_frames(
@@ -718,7 +1023,7 @@ def _selected_frames(
 
 def _reference_request(
     lifecycle: MarginalLifecycleEvidence,
-    authority: CandidateQualificationAuthority,
+    authority: CandidateAuthority,
     selection: SelectionReceipt,
     *,
     session_id: str,
@@ -751,7 +1056,10 @@ def _reference_request(
         tuple(prompts),
     )
 
-def _task_digests(profile: QualificationProfile, prompt_digest: str) -> tuple[str, ...]:
+def _task_digests(
+    profile: QualificationProfile | DiscoveryQualificationProfile,
+    prompt_digest: str,
+) -> tuple[str, ...]:
     return tuple(sorted(canonical_digest(
         "optima.qualification.hidden-task",
         {
@@ -763,7 +1071,9 @@ def _task_digests(profile: QualificationProfile, prompt_digest: str) -> tuple[st
         },
     ) for index in range(profile.hidden_tasks_per_prompt)))
 
-def _hidden_judge_binding(profile: QualificationProfile) -> HiddenJudgeBinding:
+def _hidden_judge_binding(
+    profile: QualificationProfile | DiscoveryQualificationProfile,
+) -> HiddenJudgeBinding:
     return HiddenJudgeBinding(
         profile.reference.hidden_corpus_commitment,
         profile.reference.hidden_judge_digest,
@@ -772,7 +1082,7 @@ def _hidden_judge_binding(profile: QualificationProfile) -> HiddenJudgeBinding:
 
 def _rollout(
     *,
-    profile: QualificationProfile,
+    profile: QualificationProfile | DiscoveryQualificationProfile,
     prompt_digest: str,
     frame: dict[str, object],
     role_input: ReferenceRoleInput,
@@ -833,7 +1143,7 @@ def _rollout(
 
 def _raw_artifact(
     lifecycle: MarginalLifecycleEvidence,
-    authority: CandidateQualificationAuthority,
+    authority: CandidateAuthority,
     calibration: CalibrationManifest,
     selection: SelectionReceipt,
     reference_execution: PristineReferenceExecutionEvidence,
@@ -868,7 +1178,7 @@ def _raw_artifact(
     )
     identity = qualification_identity_digest(
         profile,
-        graph_requirement=authority.graph_requirement,
+        graph_requirement=_requirement(authority),
         selection=selection,
         calibration=calibration,
         candidate_lifecycle=lifecycle_digest,
@@ -926,10 +1236,29 @@ def _report_reason(
         return "quality_overlap"
     return "qualified"
 
+
+def _discovery_report_reason(
+    execution: DiscoveryExecutionGrade,
+    speed: QualificationDecision,
+    quality: ReferenceQualityVerdict,
+) -> str:
+    if execution.decision is not QualificationDecision.PASS:
+        return execution.reason
+    if speed is QualificationDecision.NO_DECISION:
+        return "speed_noise"
+    if speed is QualificationDecision.FAIL:
+        return "speed_regression"
+    if quality.decision == "FAIL":
+        return "quality_regression"
+    if quality.decision == "NO_DECISION":
+        return "quality_overlap"
+    return "qualified"
+
 def qualification_authority_digest(value: CausalQualificationInput) -> str:
     """Bind the durable attempt to all validator-owned inputs available before B."""
 
-    return canonical_digest("optima.qualification.causal-authority", {
+    if all(type(row) is CandidateQualificationAuthority for row in value.candidates):
+        return canonical_digest("optima.qualification.causal-authority", {
         "calibration": [value.calibration_threshold_policy.digest, value.calibration_manifest.digest,
                         value.calibration_context.digest, value.calibration_artifact_ref.to_dict()],
         "candidates": [{
@@ -952,10 +1281,48 @@ def qualification_authority_digest(value: CausalQualificationInput) -> str:
                       value.pristine_binding.runtime_preflight_receipt.sha256,
                       value.reference_engine_config.digest, value.reference_preflight.digest],
         "source": value.prepared.source.digest,
+        })
+    if len(value.candidates) != 1 or type(
+        value.candidates[0]
+    ) is not DiscoveryCandidateQualificationAuthority:
+        raise QualificationRunnerError("qualification authority mode is inconsistent")
+    authority = value.candidates[0]
+    prepared = value.prepared.candidates[0]
+    return canonical_digest("optima.qualification.discovery-causal-authority", {
+        "calibration": [value.calibration_threshold_policy.digest,
+                        value.calibration_manifest.digest,
+                        value.calibration_context.digest,
+                        value.calibration_artifact_ref.to_dict()],
+        "candidate": {
+            "arm": prepared.arm.digest,
+            "delta": authority.selected_delta_digest,
+            "execution_requirement": authority.execution_requirement.digest,
+            "launch": prepared.launch.digest,
+            "native": prepared.binding.launch_binding.native_build_spec.digest,
+            "preflight": prepared.binding.launch_binding.runtime_preflight_receipt.sha256,
+            "profile": authority.profile.digest,
+            "proposal": authority.execution_requirement.proposal_digest,
+        },
+        "commitment": value.commitment.digest,
+        "model_mount": value.model_mount.digest,
+        "incumbent_preflight": (
+            value.prepared.incumbent_binding.launch_binding
+            .runtime_preflight_receipt.sha256
+        ),
+        "policies": [value.expected_launch_resource_policy_digest,
+                     value.expected_runtime_resource_policy_digest,
+                     value.expected_device_policy_digest],
+        "reference": [value.pristine_stack.digest, value.pristine_launch.digest,
+                      value.pristine_binding.native_build_spec.digest,
+                      value.pristine_binding.controller_distribution_digest,
+                      value.pristine_binding.runtime_preflight_receipt.sha256,
+                      value.reference_engine_config.digest,
+                      value.reference_preflight.digest],
+        "source": value.prepared.source.digest,
     })
 
 def _validate_reference_execution(
-    attempt: CohortQualificationAttempt, expected: CausalQualificationInput
+    attempt: QualificationAttempt, expected: CausalQualificationInput
 ) -> None:
     witness = attempt.reference_execution
     identity = runtime_identity_from_preflight(expected.pristine_binding.runtime_preflight_receipt)
@@ -1004,24 +1371,49 @@ def _validate_reference_execution(
     ):
         raise QualificationRunnerError("pristine T execution witness differs from causal authority")
 
-def publish_causal_qualification(root: Path, attempt: CohortQualificationAttempt) -> EvidenceArtifactRef:
-    if type(attempt) is not CohortQualificationAttempt:
+def publish_causal_qualification(
+    root: Path, attempt: QualificationAttempt
+) -> EvidenceArtifactRef:
+    if type(attempt) is CohortQualificationAttempt:
+        domain, schema = ATTEMPT_DOMAIN, ATTEMPT_SCHEMA
+    elif type(attempt) is DiscoveryQualificationAttempt:
+        domain, schema = DISCOVERY_ATTEMPT_DOMAIN, DISCOVERY_ATTEMPT_SCHEMA
+    else:
         raise QualificationRunnerError("qualification attempt is not typed")
-    return publish_evidence(root, canonical_json_bytes(attempt.to_dict()), domain=ATTEMPT_DOMAIN,
-                            media_type="application/json", schema=ATTEMPT_SCHEMA)
+    return publish_evidence(
+        root,
+        canonical_json_bytes(attempt.to_dict()),
+        domain=domain,
+        media_type="application/json",
+        schema=schema,
+    )
 
 def reopen_causal_qualification(
     root: Path, reference: EvidenceArtifactRef, *, expected: CausalQualificationInput
-) -> CohortQualificationAttempt:
+) -> QualificationAttempt:
     """Authenticate and independently regrade one durable cohort attempt."""
 
     try:
+        discovery_mode = (
+            len(expected.candidates) == 1
+            and type(expected.candidates[0])
+            is DiscoveryCandidateQualificationAuthority
+        )
+        artifact_type = (
+            (DISCOVERY_ATTEMPT_DOMAIN, "application/json", DISCOVERY_ATTEMPT_SCHEMA)
+            if discovery_mode
+            else (ATTEMPT_DOMAIN, "application/json", ATTEMPT_SCHEMA)
+        )
         if type(reference) is not EvidenceArtifactRef or (
             reference.domain, reference.media_type, reference.schema
-        ) != (ATTEMPT_DOMAIN, "application/json", ATTEMPT_SCHEMA):
+        ) != artifact_type:
             raise QualificationRunnerError("qualification artifact type is not authoritative")
         payload = _canonical_payload(reopen_evidence(root, reference))
-        attempt = CohortQualificationAttempt.from_dict(payload)
+        attempt = (
+            DiscoveryQualificationAttempt.from_dict(payload)
+            if discovery_mode
+            else CohortQualificationAttempt.from_dict(payload)
+        )
         if attempt.to_dict() != payload:
             raise QualificationRunnerError("qualification artifact is not semantically canonical")
         if attempt.authority_digest != qualification_authority_digest(expected):
@@ -1045,8 +1437,6 @@ def reopen_causal_qualification(
         for report, authority, prepared in zip(
             attempt.reports, expected.candidates, expected.prepared.candidates, strict=True
         ):
-            graph = reopen_graph_verification(root, authority.graph_artifact_ref,
-                                              authority.graph_requirement, authority.graph_evidence_ref)
             raw = report.raw_quality_binding
             quality = score_reference_quality(
                 reopen_reference_quality_evidence(root, report.raw_quality_artifact,
@@ -1069,18 +1459,106 @@ def reopen_causal_qualification(
             speed_grade, speedup = speed.regrade(
                 calibration, expected.calibration_context
             )
-            identity = canonical_digest("optima.qualification.candidate-identity", {
+            identity_common = {
                 "calibration_digest": calibration.digest,
                 "candidate_lifecycle_digest": raw.candidate_lifecycle_digest,
-                "graph_requirement_digest": authority.graph_requirement.digest,
                 "profile_digest": authority.profile.digest,
                 "selected_delta_digest": authority.selected_delta_digest,
                 "selection_digest": attempt.selection.digest,
                 "t_request_sha256": report.t_request_sha256,
                 "t_session_digest": attempt.reference_session_digest,
-            })
+            }
             quality_grade = _decision(quality.decision)
-            decision = _aggregate_decision(graph.decision, speed_grade, quality_grade)
+            if type(authority) is CandidateQualificationAuthority:
+                if type(report) is not CandidateQualificationReport:
+                    raise QualificationRunnerError(
+                        "registered qualification report type differs"
+                    )
+                graph = reopen_graph_verification(
+                    root,
+                    authority.graph_artifact_ref,
+                    authority.graph_requirement,
+                    authority.graph_evidence_ref,
+                )
+                identity = canonical_digest(
+                    "optima.qualification.candidate-identity",
+                    {
+                        **identity_common,
+                        "graph_requirement_digest": authority.graph_requirement.digest,
+                    },
+                )
+                decision = _aggregate_decision(
+                    graph.decision, speed_grade, quality_grade
+                )
+                headline = (
+                    report.marginal_arm_digest, report.candidate_launch_digest,
+                    report.target_id, report.profile_digest,
+                    report.calibration_digest, report.graph_grade_digest,
+                    report.graph_decision, report.speed_evidence_digest,
+                    report.speed_decision, report.speedup,
+                    report.quality_evidence_digest, report.quality_decision,
+                    report.candidate_mean_teacher_nll, report.decision,
+                    report.reason, report.retryable,
+                )
+                expected_headline = (
+                    prepared.arm.digest, prepared.launch.digest,
+                    prepared.arm.transition.target_id, authority.profile.digest,
+                    calibration.digest, graph.digest, graph.decision,
+                    report.speed_witness.evidence_digest, speed_grade, speedup,
+                    quality.evidence_digest, quality_grade,
+                    quality.candidate_mean_teacher_nll, decision,
+                    _report_reason(graph, speed_grade, quality),
+                    decision is QualificationDecision.NO_DECISION,
+                )
+            elif type(authority) is DiscoveryCandidateQualificationAuthority:
+                if type(report) is not DiscoveryCandidateQualificationReport:
+                    raise QualificationRunnerError(
+                        "discovery qualification report type differs"
+                    )
+                execution = report.execution_grade
+                reopen_discovery_execution_binding(
+                    authority.execution_requirement,
+                    execution,
+                    prepared,
+                    candidate_lifecycle_digest=raw.candidate_lifecycle_digest,
+                    session_id=rates[1].session_id,
+                )
+                identity = canonical_digest(
+                    "optima.qualification.discovery-candidate-identity",
+                    {
+                        **identity_common,
+                        "execution_requirement_digest": (
+                            authority.execution_requirement.digest
+                        ),
+                    },
+                )
+                decision = _aggregate_decision(
+                    execution.decision, speed_grade, quality_grade
+                )
+                headline = (
+                    report.discovery_arm_digest, report.proposal_digest,
+                    report.candidate_launch_digest, report.profile_digest,
+                    report.calibration_digest, report.execution_grade,
+                    report.speed_evidence_digest, report.speed_decision,
+                    report.speedup, report.quality_evidence_digest,
+                    report.quality_decision, report.candidate_mean_teacher_nll,
+                    report.decision, report.reason, report.retryable,
+                )
+                expected_headline = (
+                    prepared.arm.digest,
+                    authority.execution_requirement.proposal_digest,
+                    prepared.launch.digest, authority.profile.digest,
+                    calibration.digest, execution,
+                    report.speed_witness.evidence_digest, speed_grade, speedup,
+                    quality.evidence_digest, quality_grade,
+                    quality.candidate_mean_teacher_nll, decision,
+                    _discovery_report_reason(execution, speed_grade, quality),
+                    decision is QualificationDecision.NO_DECISION,
+                )
+            else:
+                raise QualificationRunnerError(
+                    "qualification authority has an unsupported type"
+                )
             binding = (
                 raw.qualification_identity_digest, raw.reference_manifest_digest,
                 raw.calibration_digest, raw.selection_digest, raw.selected_prompt_digests,
@@ -1097,20 +1575,7 @@ def reopen_causal_qualification(
                 authority.profile.nll_tail_threshold, authority.profile.tokens_per_prompt,
                 authority.profile.topk_width, authority.profile.hidden_tasks_per_prompt,
             )
-            if binding != expected_binding or (
-                report.marginal_arm_digest, report.candidate_launch_digest, report.target_id,
-                report.profile_digest, report.calibration_digest, report.graph_grade_digest,
-                report.graph_decision, report.speed_evidence_digest, report.speed_decision,
-                report.speedup, report.quality_evidence_digest, report.quality_decision,
-                report.candidate_mean_teacher_nll, report.decision, report.reason, report.retryable,
-            ) != (
-                prepared.arm.digest, prepared.launch.digest, prepared.arm.transition.target_id,
-                authority.profile.digest, calibration.digest, graph.digest, graph.decision,
-                report.speed_witness.evidence_digest, speed_grade, speedup,
-                quality.evidence_digest, quality_grade, quality.candidate_mean_teacher_nll,
-                decision, _report_reason(graph, speed_grade, quality),
-                decision is QualificationDecision.NO_DECISION,
-            ):
+            if binding != expected_binding or headline != expected_headline:
                 raise QualificationRunnerError("candidate qualification does not independently regrade")
         return attempt
     except QualificationRunnerError:
@@ -1166,6 +1631,14 @@ def run_causal_qualification(
             model_mount=value.model_mount,
             deadline=float(deadline),
         )
+        discovery_grades: dict[str, DiscoveryExecutionGrade] = {}
+        for authority in value.candidates:
+            if type(authority) is DiscoveryCandidateQualificationAuthority:
+                discovery_grades[authority.selected_delta_digest] = (
+                    grade_discovery_execution(
+                        authority.execution_requirement, lifecycle
+                    )
+                )
         teardown_before = executor.prove_quiescent()
         last_post = lifecycle.baseline_after.device_receipts[-1].completed_monotonic_s
         if teardown_before.observed_monotonic_s < last_post:
@@ -1254,7 +1727,7 @@ def run_causal_qualification(
             entropy=entropy,
             selection=selection,
             calibration=calibration,
-            graph_requirement=authority.graph_requirement,
+            graph_requirement=_requirement(authority),
             reference_execution=reference_execution,
             reference_request_sha256=exchange.request_sha256,
         )
@@ -1285,41 +1758,82 @@ def run_causal_qualification(
             expected_runtime_resource_policy_digest=value.expected_runtime_resource_policy_digest,
             expected_device_policy_digest=value.expected_device_policy_digest,
         )
-        graph = graph_grades[authority.selected_delta_digest]
         speed_witness = SpeedWitness.from_projection(
             speed, value.expected_runtime_resource_policy_digest
         )
         speed_grade = _speed_decision(speed)
         quality_grade = _decision(quality.decision)
-        decision = _aggregate_decision(graph.decision, speed_grade, quality_grade)
         candidate = next(
             row for row in lifecycle.candidates
             if row.arm.selected_delta_digest == authority.selected_delta_digest
         )
-        reports.append(CandidateQualificationReport(
-            authority.selected_delta_digest,
-            candidate.arm.digest,
-            candidate.candidate.launch.digest,
-            candidate.arm.transition.target_id,
-            authority.profile.digest,
-            calibration.digest,
-            graph.digest,
-            graph.decision,
-            speed.evidence_digest,
-            speed_grade,
-            format(speed.verdict.speedup, ".17g"),
-            quality.evidence_digest,
-            quality_grade,
-            quality.candidate_mean_teacher_nll,
-            raw_ref,
-            raw.binding,
-            speed_witness,
-            exchange.request_sha256,
-            decision,
-            _report_reason(graph, speed_grade, quality),
-            decision is QualificationDecision.NO_DECISION,
-        ))
-    attempt = CohortQualificationAttempt(
+        if type(authority) is CandidateQualificationAuthority:
+            graph = graph_grades[authority.selected_delta_digest]
+            decision = _aggregate_decision(
+                graph.decision, speed_grade, quality_grade
+            )
+            reports.append(CandidateQualificationReport(
+                authority.selected_delta_digest,
+                candidate.arm.digest,
+                candidate.candidate.launch.digest,
+                candidate.arm.transition.target_id,
+                authority.profile.digest,
+                calibration.digest,
+                graph.digest,
+                graph.decision,
+                speed.evidence_digest,
+                speed_grade,
+                format(speed.verdict.speedup, ".17g"),
+                quality.evidence_digest,
+                quality_grade,
+                quality.candidate_mean_teacher_nll,
+                raw_ref,
+                raw.binding,
+                speed_witness,
+                exchange.request_sha256,
+                decision,
+                _report_reason(graph, speed_grade, quality),
+                decision is QualificationDecision.NO_DECISION,
+            ))
+        else:
+            if type(authority) is not DiscoveryCandidateQualificationAuthority:
+                raise QualificationRunnerError(
+                    "candidate authority has an unsupported type"
+                )
+            execution = discovery_grades[authority.selected_delta_digest]
+            decision = _aggregate_decision(
+                execution.decision, speed_grade, quality_grade
+            )
+            reports.append(DiscoveryCandidateQualificationReport(
+                authority.selected_delta_digest,
+                candidate.arm.digest,
+                authority.execution_requirement.proposal_digest,
+                candidate.candidate.launch.digest,
+                authority.profile.digest,
+                calibration.digest,
+                execution,
+                speed.evidence_digest,
+                speed_grade,
+                format(speed.verdict.speedup, ".17g"),
+                quality.evidence_digest,
+                quality_grade,
+                quality.candidate_mean_teacher_nll,
+                raw_ref,
+                raw.binding,
+                speed_witness,
+                exchange.request_sha256,
+                decision,
+                _discovery_report_reason(execution, speed_grade, quality),
+                decision is QualificationDecision.NO_DECISION,
+            ))
+    attempt_type = (
+        DiscoveryQualificationAttempt
+        if all(
+            type(row) is DiscoveryCandidateQualificationReport for row in reports
+        )
+        else CohortQualificationAttempt
+    )
+    attempt = attempt_type(
         qualification_authority_digest(value),
         value.prepared.source.digest,
         cohort_trajectory_digest(lifecycle),
@@ -1338,6 +1852,8 @@ def run_causal_qualification(
 
 __all__ = [
     "CandidateQualificationAuthority", "CandidateQualificationReport",
+    "DiscoveryCandidateQualificationAuthority",
+    "DiscoveryCandidateQualificationReport", "DiscoveryQualificationAttempt",
     "CausalQualificationInput", "CohortQualificationAttempt", "EntropyProvider",
     "HiddenJudge", "HiddenJudgeBinding", "HiddenJudgeReceipt", "QualificationRunnerError",
     "ReferenceExecutionWitness", "SpeedWitness", "hidden_judge_output_digest",

@@ -14,10 +14,20 @@ import pytest
 
 import optima.engine_tree as engine_tree
 from optima.bundle_hash import content_hash
+from optima.discovery import (
+    DEFAULT_DISCOVERY_POLICY,
+    DISCOVERY_ABI_VERSION,
+    DiscoveryArmPlan,
+    DiscoveryBuildProfile,
+    discovery_candidate_stack_digest,
+    inspect_discovery,
+    reopen_discovery_engine_binding,
+)
 from optima.engine_tree import (
     EngineTreeError,
     inspect_contribution,
     integrated_source_tree_digest,
+    materialize_discovery_engine_tree,
     materialize_engine_tree,
     reopen_materialized_engine_tree,
 )
@@ -139,6 +149,53 @@ def _write_moe_fixture(root: Path, target: str, entry: str) -> Path:
         'cuda_sources = ["kernels/fused_epilogue_sm103.cu"]\n'
     )
     return root
+
+
+def _write_discovery_fixture(root: Path) -> Path:
+    (root / "patches").mkdir(parents=True)
+    (root / "manifest.toml").write_text(
+        'bundle_id = "engine-tree-discovery"\n'
+        f'abi_version = "{DISCOVERY_ABI_VERSION}"\n'
+        'build_profile = "engine-tree-sm120-tp8"\n'
+        'patches = ["patches/change.patch"]\n'
+        'dependencies = ["cuda13"]\n'
+        'conflicts = []\n'
+        'requested_promotion = "new_singleton"\n'
+        "\n[applicability]\n"
+        'arenas = ["minimax-m3-rtx-tp8-v1"]\n'
+        'models = ["minimax-m3-nvfp4"]\n'
+        'architectures = ["sm120"]\n'
+        "tensor_parallel_sizes = [8]\n"
+    )
+    (root / "patches" / "change.patch").write_text(
+        "--- a/sglang/srt/layers/activation.py\n"
+        "+++ b/sglang/srt/layers/activation.py\n"
+        "@@ -1 +1 @@\n"
+        "-VALUE = 1\n"
+        "+VALUE = 2\n"
+    )
+    return root
+
+
+def _discovery_profile() -> DiscoveryBuildProfile:
+    return DiscoveryBuildProfile(
+        profile_id="engine-tree-sm120-tp8",
+        sglang_version=DEFAULT_DISCOVERY_POLICY.sglang_version,
+        arena="minimax-m3-rtx-tp8-v1",
+        model="minimax-m3-nvfp4",
+        architecture="sm120",
+        tensor_parallel_size=8,
+        features=("cuda13",),
+        build_inputs=(("image", _digest("discovery-image")),),
+    )
+
+
+def _tree_snapshot(root: Path) -> dict[str, tuple[bytes, int]]:
+    return {
+        path.relative_to(root).as_posix(): (path.read_bytes(), path.stat().st_mode)
+        for path in sorted(root.rglob("*"))
+        if path.is_file()
+    }
 
 
 def test_singleton_materialization_projects_metadata_and_reopens(tmp_path: Path) -> None:
@@ -294,6 +351,199 @@ def test_stock_only_stack_has_no_runtime_bundle(tmp_path: Path) -> None:
     assert result.runtime_manifest is None
     assert not (result.root / "manifest.toml").exists()
     assert [row.path for row in result.files] == ["metadata/optima_engine_tree.json"]
+
+
+def test_discovery_materialization_preserves_incumbent_and_binds_source_intent(
+    tmp_path: Path,
+) -> None:
+    catalog = default_target_catalog()
+    context = _evaluation_context(catalog)
+    ref = _proposal_ref(MSA, catalog)
+    stack = _evaluation_stack(catalog, context, ref)
+    incumbent = materialize_engine_tree(
+        stack,
+        context=context,
+        catalog=catalog,
+        resolver=_sources((ref, MSA)),
+        destination=tmp_path / "incumbent",
+    )
+    incumbent_snapshot = _tree_snapshot(incumbent.root)
+    proposal_root = _write_discovery_fixture(tmp_path / "proposal")
+    proposal = inspect_discovery(proposal_root)
+    profile = _discovery_profile()
+
+    result = materialize_discovery_engine_tree(
+        incumbent.root,
+        proposal,
+        policy=DEFAULT_DISCOVERY_POLICY,
+        build_profile=profile,
+        destination=tmp_path / "candidate",
+    )
+
+    expected_stack = discovery_candidate_stack_digest(
+        incumbent_stack_digest=incumbent.stack_digest,
+        incumbent_tree_digest=incumbent.tree_digest,
+        proposal_digest=proposal.proposal_digest,
+        policy_digest=DEFAULT_DISCOVERY_POLICY.digest,
+        build_profile_digest=profile.digest,
+    )
+    assert result.stack_digest == expected_stack
+    assert result.stack_digest != incumbent.stack_digest
+    assert result.tree_digest != incumbent.tree_digest
+    assert result.runtime_manifest == incumbent.runtime_manifest
+    binding = reopen_discovery_engine_binding(result)
+    assert binding.materialized_tree == result
+    assert binding.discovery.proposal_digest == proposal.proposal_digest
+    assert binding.policy == DEFAULT_DISCOVERY_POLICY
+    assert binding.build_profile == profile
+    assert binding.incumbent_stack_digest == incumbent.stack_digest
+    assert binding.incumbent_tree_digest == incumbent.tree_digest
+
+    incumbent_rows = {
+        row.path: (row.sha256, row.size, row.mode)
+        for row in incumbent.files
+        if row.path != "metadata/optima_engine_tree.json"
+    }
+    candidate_rows = {
+        row.path: (row.sha256, row.size, row.mode) for row in result.files
+    }
+    assert all(candidate_rows[path] == identity for path, identity in incumbent_rows.items())
+    assert {
+        row.path.removeprefix("discovery/"): (row.sha256, row.size)
+        for row in result.files
+        if row.path.startswith("discovery/")
+    } == {row.path: (row.sha256, row.size) for row in proposal.files}
+    for row in proposal.files:
+        assert (result.root / "discovery" / row.path).read_bytes() == (
+            proposal.root / row.path
+        ).read_bytes()
+
+    incumbent_metadata = json.loads(
+        (incumbent.root / "metadata/optima_engine_tree.json").read_text()
+    )
+    candidate_metadata = json.loads(
+        (result.root / "metadata/optima_engine_tree.json").read_text()
+    )
+    discovery_metadata = json.loads(
+        (result.root / "metadata/optima_discovery.json").read_text()
+    )
+    assert candidate_metadata["contributions"] == incumbent_metadata["contributions"]
+    assert discovery_metadata == {
+        "build_profile": profile.to_dict(),
+        "build_profile_digest": profile.digest,
+        "incumbent_stack_digest": incumbent.stack_digest,
+        "incumbent_tree_digest": incumbent.tree_digest,
+        "policy": DEFAULT_DISCOVERY_POLICY.to_dict(),
+        "policy_digest": DEFAULT_DISCOVERY_POLICY.digest,
+        "proposal_digest": proposal.proposal_digest,
+        "proposal_files": [row.to_dict() for row in proposal.files],
+        "schema": "optima.discovery-engine-tree.v1",
+    }
+    assert reopen_materialized_engine_tree(incumbent.root) == incumbent
+    assert _tree_snapshot(incumbent.root) == incumbent_snapshot
+
+
+def test_discovery_candidate_stack_precedes_post_build_overlay_identity(
+    tmp_path: Path,
+) -> None:
+    catalog = default_target_catalog()
+    context = _evaluation_context(catalog)
+    stack = _evaluation_stack(catalog, context)
+    incumbent = materialize_engine_tree(
+        stack,
+        context=context,
+        catalog=catalog,
+        resolver={},
+        destination=tmp_path / "incumbent",
+    )
+    proposal = inspect_discovery(_write_discovery_fixture(tmp_path / "proposal"))
+    profile = _discovery_profile()
+    candidate = materialize_discovery_engine_tree(
+        incumbent.root,
+        proposal,
+        policy=DEFAULT_DISCOVERY_POLICY,
+        build_profile=profile,
+        destination=tmp_path / "candidate",
+    )
+
+    first = DiscoveryArmPlan.create(
+        incumbent=stack,
+        incumbent_tree_digest=incumbent.tree_digest,
+        candidate_tree_digest=candidate.tree_digest,
+        proposal_digest=proposal.proposal_digest,
+        policy_digest=DEFAULT_DISCOVERY_POLICY.digest,
+        build_profile_digest=profile.digest,
+        overlay_identity_digest=_digest("overlay-result-one"),
+    )
+    second = replace(first, overlay_identity_digest=_digest("overlay-result-two"))
+
+    assert first.candidate_stack_digest == candidate.stack_digest
+    assert second.candidate_stack_digest == candidate.stack_digest
+    assert first.selected_delta_digest == second.selected_delta_digest
+    assert first.digest != second.digest
+
+
+def test_discovery_materialization_rejects_changed_proposal_without_output(
+    tmp_path: Path,
+) -> None:
+    catalog = default_target_catalog()
+    context = _evaluation_context(catalog)
+    incumbent = materialize_engine_tree(
+        _evaluation_stack(catalog, context),
+        context=context,
+        catalog=catalog,
+        resolver={},
+        destination=tmp_path / "incumbent",
+    )
+    incumbent_snapshot = _tree_snapshot(incumbent.root)
+    proposal_root = _write_discovery_fixture(tmp_path / "proposal")
+    proposal = inspect_discovery(proposal_root)
+    with (proposal_root / "patches" / "change.patch").open("a") as handle:
+        handle.write("\n")
+    destination = tmp_path / "candidate"
+
+    with pytest.raises(EngineTreeError, match="proposal changed after inspection"):
+        materialize_discovery_engine_tree(
+            incumbent.root,
+            proposal,
+            policy=DEFAULT_DISCOVERY_POLICY,
+            build_profile=_discovery_profile(),
+            destination=destination,
+        )
+
+    assert not destination.exists()
+    assert reopen_materialized_engine_tree(incumbent.root) == incumbent
+    assert _tree_snapshot(incumbent.root) == incumbent_snapshot
+
+
+@pytest.mark.parametrize("destination_source", ("incumbent", "proposal"))
+def test_discovery_materialization_rejects_destination_overlap(
+    tmp_path: Path, destination_source: str,
+) -> None:
+    catalog = default_target_catalog()
+    context = _evaluation_context(catalog)
+    incumbent = materialize_engine_tree(
+        _evaluation_stack(catalog, context),
+        context=context,
+        catalog=catalog,
+        resolver={},
+        destination=tmp_path / "incumbent",
+    )
+    incumbent_snapshot = _tree_snapshot(incumbent.root)
+    proposal = inspect_discovery(_write_discovery_fixture(tmp_path / "proposal"))
+    source = incumbent.root if destination_source == "incumbent" else proposal.root
+
+    with pytest.raises(EngineTreeError, match="overlaps an immutable input tree"):
+        materialize_discovery_engine_tree(
+            incumbent.root,
+            proposal,
+            policy=DEFAULT_DISCOVERY_POLICY,
+            build_profile=_discovery_profile(),
+            destination=source / "nested-output",
+        )
+
+    assert reopen_materialized_engine_tree(incumbent.root) == incumbent
+    assert _tree_snapshot(incumbent.root) == incumbent_snapshot
 
 
 def test_independent_contributions_compose_without_source_name_collisions(

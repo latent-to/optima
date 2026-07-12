@@ -2,10 +2,12 @@
 
 The host controller and the in-container worker exchange strict JSON control
 frames and fixed-width binary token evidence.  The protocol carries no Python
-objects, worker timing, verdict, score, scheduling role, hidden quality input,
-or model-generated text.  It is deliberately independent of the evaluator and
-chain packages so importing it cannot pull candidate or inference-runtime code
-into the trusted controller.
+objects, worker timing, verdict, score, hidden quality input, or model-generated
+text.  A discovery-only ready frame may carry the bounded
+stock-driver scheduler-membership proof required to identify the activated
+overlay.  The module remains independent of evaluator and chain packages so
+importing it cannot pull candidate or inference-runtime code into the trusted
+controller.
 """
 
 from __future__ import annotations
@@ -16,10 +18,13 @@ import re
 import struct
 from dataclasses import dataclass, field
 from types import MappingProxyType
-from typing import Any, Iterable, Mapping, Sequence
+from typing import TYPE_CHECKING, Any, Iterable, Mapping, Sequence
 
 from optima.seams import normalize_seam_bindings
 from optima.stack_identity import canonical_digest
+
+if TYPE_CHECKING:
+    from optima.discovery_overlay import DiscoveryActivationReceipt
 
 
 SESSION_SCHEMA = "optima-isolated-engine-session-v1"
@@ -656,18 +661,101 @@ def validate_preflight_accept(
         raise SessionProtocolError("preflight acceptance is stale or malformed")
 
 
-def ready_message(*, session_id: str, launch_digest: str) -> dict[str, object]:
-    return {
+def ready_message(
+    *,
+    session_id: str,
+    launch_digest: str,
+    discovery_activation: DiscoveryActivationReceipt | None = None,
+) -> dict[str, object]:
+    message: dict[str, object] = {
         "launch_digest": _digest(launch_digest, field_name="launch_digest"),
         "schema": SESSION_SCHEMA,
         "session_id": _binding_id(session_id, field_name="session_id"),
         "type": "ready",
     }
+    if discovery_activation is not None:
+        from optima.discovery_overlay import DiscoveryActivationReceipt
+
+        if type(discovery_activation) is not DiscoveryActivationReceipt:
+            raise SessionProtocolError(
+                "discovery ready activation is not a typed receipt"
+            )
+        message["discovery_activation"] = discovery_activation.to_dict()
+    return message
 
 
-def validate_ready(message: object, *, session_id: str, launch_digest: str) -> None:
-    if message != ready_message(session_id=session_id, launch_digest=launch_digest):
+def validate_ready(
+    message: object,
+    *,
+    session_id: str,
+    launch_digest: str,
+    expected_discovery_identity_digest: str | None = None,
+    expected_discovery_tp_size: int | None = None,
+    expected_discovery_sglang_version: str | None = None,
+) -> DiscoveryActivationReceipt | None:
+    expected_values = (
+        expected_discovery_identity_digest,
+        expected_discovery_tp_size,
+        expected_discovery_sglang_version,
+    )
+    if all(value is None for value in expected_values):
+        if message != ready_message(
+            session_id=session_id, launch_digest=launch_digest
+        ):
+            raise SessionProtocolError(
+                "worker ready marker is early, stale, or malformed"
+            )
+        return None
+    if any(value is None for value in expected_values):
+        raise SessionProtocolError(
+            "discovery ready expectation is incomplete"
+        )
+    identity = _digest(
+        expected_discovery_identity_digest,
+        field_name="expected_discovery_identity_digest",
+    )
+    tp_size = _bounded_int(
+        expected_discovery_tp_size,
+        field_name="expected_discovery_tp_size",
+        minimum=1,
+        maximum=64,
+    )
+    version = expected_discovery_sglang_version
+    if not isinstance(version, str) or _TOKEN.fullmatch(version) is None:
+        raise SessionProtocolError(
+            "expected discovery SGLang version is invalid"
+        )
+    fields = frozenset(
+        "discovery_activation launch_digest schema session_id type".split()
+    )
+    row = _exact_object(message, fields=fields, label="discovery ready")
+    expected_envelope = ready_message(
+        session_id=session_id, launch_digest=launch_digest
+    )
+    if any(row[name] != value for name, value in expected_envelope.items()):
         raise SessionProtocolError("worker ready marker is early, stale, or malformed")
+    from optima.discovery_overlay import (
+        DiscoveryActivationReceipt,
+        DiscoveryOverlayActivationError,
+    )
+
+    try:
+        receipt = DiscoveryActivationReceipt.from_dict(
+            row["discovery_activation"]
+        )
+    except DiscoveryOverlayActivationError as exc:
+        raise SessionProtocolError(
+            f"discovery ready activation is malformed: {exc}"
+        ) from None
+    if (
+        receipt.overlay_identity_digest != identity
+        or receipt.tp_size != tp_size
+        or receipt.driver_origin.version != version
+    ):
+        raise SessionProtocolError(
+            "discovery ready activation differs from host policy"
+        )
+    return receipt
 
 
 _BATCH_REQUEST_FIELDS = frozenset("""

@@ -14,6 +14,9 @@ from optima.eval.qualification import (
     GRAPH_EVIDENCE_DOMAIN,
     GRAPH_EVIDENCE_MEDIA_TYPE,
     GRAPH_EVIDENCE_SCHEMA,
+    DiscoveryExecutionGrade,
+    DiscoveryExecutionRequirement,
+    DiscoveryQualificationProfile,
     GraphMemberEvidence,
     GraphShapeEvidence,
     GraphVariantEvidence,
@@ -34,8 +37,11 @@ from optima.eval.qualification import (
     candidate_lifecycle_digest,
     cohort_trajectory_digest,
     derived_hidden_task_plan_digest,
+    grade_discovery_execution,
     lifecycle_prompt_digests,
     qualification_identity_digest,
+    reopen_discovery_execution,
+    reopen_discovery_execution_binding,
     reopen_graph_verification,
     regrade_graph_verification,
     selected_trajectory_digest,
@@ -43,7 +49,7 @@ from optima.eval.qualification import (
     validate_quality_binding,
 )
 from optima.eval.evidence_store import publish_evidence
-from optima.stack_identity import canonical_json_bytes
+from optima.stack_identity import canonical_digest, canonical_json_bytes
 
 
 def _d(label: str) -> str:
@@ -52,6 +58,168 @@ def _d(label: str) -> str:
 
 def _reference() -> ReferenceManifest:
     return ReferenceManifest(*(_d(f"reference:{index}") for index in range(18)))
+
+
+def _discovery_execution(tmp_path: Path):
+    from types import SimpleNamespace
+
+    from optima.discovery import (
+        DEFAULT_DISCOVERY_POLICY,
+        DiscoveryArmPlan,
+        DiscoveryBuildProfile,
+        build_discovery_overlay_stage,
+        inspect_discovery,
+    )
+    from optima.discovery_overlay import (
+        DiscoveryActivationReceipt,
+        DiscoveryDriverOrigin,
+        DiscoverySchedulerMember,
+        activation_policy_digest,
+    )
+    from optima.engine_tree import materialize_discovery_engine_tree
+    from optima.eval.marginal_runtime import (
+        CandidateLifecycleEvidence,
+        MarginalLifecycleEvidence,
+        prepare_discovery_runtime,
+    )
+    from optima.eval.native_artifact import publish_native_artifact
+    from optima.eval.oci_prebuild import OCIPrebuildResult
+    from tests.test_engine_tree import _write_discovery_fixture
+    from tests.test_marginal_runtime import _case, _execution, _local_binding, _native
+
+    case_root = tmp_path / "case"
+    case_root.mkdir()
+    case = _case(case_root)
+    proposal_root = _write_discovery_fixture(tmp_path / "proposal")
+    manifest = (proposal_root / "manifest.toml").read_text()
+    (proposal_root / "manifest.toml").write_text(
+        manifest.replace("engine-tree-sm120-tp8", "qualification-sm120-tp1")
+        .replace("minimax-m3-rtx-tp8-v1", "minimax-m3-rtx-tp1-v1")
+        .replace("tensor_parallel_sizes = [8]", "tensor_parallel_sizes = [1]")
+    )
+    proposal = inspect_discovery(proposal_root)
+    build_profile = DiscoveryBuildProfile(
+        "qualification-sm120-tp1",
+        DEFAULT_DISCOVERY_POLICY.sglang_version,
+        "minimax-m3-rtx-tp1-v1",
+        "minimax-m3-nvfp4",
+        "sm120",
+        1,
+        ("cuda13",),
+        (("image", _d("discovery-image")),),
+    )
+    candidate_tree = materialize_discovery_engine_tree(
+        case.baseline_tree.root,
+        proposal,
+        policy=DEFAULT_DISCOVERY_POLICY,
+        build_profile=build_profile,
+        destination=tmp_path / "candidate",
+    )
+    native = _native(candidate_tree.tree_digest, case.preflight)
+    stage = tmp_path / "native-stage"
+    stock = tmp_path / "stock-site"
+    (stock / "sglang/srt/layers").mkdir(parents=True)
+    (stock / "sglang/srt/layers/activation.py").write_text("VALUE = 1\n")
+    stage.mkdir()
+    overlay = build_discovery_overlay_stage(
+        proposal,
+        stock_site_root=stock,
+        native_stage_root=stage,
+        policy=DEFAULT_DISCOVERY_POLICY,
+        build_profile=build_profile,
+    )
+    publication = publish_native_artifact(
+        stage, tmp_path / "publications", build_spec_digest=native.digest
+    )
+    arm = DiscoveryArmPlan.create(
+        incumbent=case.incumbent,
+        incumbent_tree_digest=case.baseline_tree.tree_digest,
+        candidate_tree_digest=candidate_tree.tree_digest,
+        proposal_digest=proposal.proposal_digest,
+        policy_digest=DEFAULT_DISCOVERY_POLICY.digest,
+        build_profile_digest=build_profile.digest,
+        overlay_identity_digest=overlay.digest,
+    )
+    binding = _local_binding(candidate_tree, native, case.launch, case.preflight)
+    prepared = prepare_discovery_runtime(
+        arm,
+        expected_context=case.context,
+        incumbent_launch=case.launch,
+        incumbent_binding=case.baseline_binding,
+        candidate_binding=binding,
+        baseline_session_plan=case.session,
+    )
+    candidate = prepared.candidates[0]
+
+    def execution(launch, launch_binding, plan, label):
+        result = _execution(launch, launch_binding, case.mount, plan, label=label)
+        return replace(
+            result,
+            device_receipts=tuple(
+                SimpleNamespace(launch_id=row.launch_id, sequence=index)
+                for index, row in enumerate(result.device_receipts)
+            ),
+        )
+
+    before = execution(
+        prepared.baseline_launch,
+        prepared.incumbent_binding.launch_binding,
+        prepared.baseline_session_plan,
+        "discovery-before",
+    )
+    after = execution(
+        prepared.baseline_launch,
+        prepared.incumbent_binding.launch_binding,
+        prepared.baseline_session_plan,
+        "discovery-after",
+    )
+    candidate_execution = execution(
+        candidate.launch,
+        candidate.binding.launch_binding,
+        candidate.session_plan,
+        "discovery-candidate",
+    )
+    activation = DiscoveryActivationReceipt(
+        "optima.discovery-driver-activation.v1",
+        overlay.digest,
+        100,
+        DiscoveryDriverOrigin("sglang", case.preflight.sglang_version, "sglang/__init__.py"),
+        "sglang.srt.managers.scheduler",
+        "run_scheduler_process",
+        1,
+        (DiscoverySchedulerMember(101, 0, 0, 0, 0, 0, 0, None),),
+    )
+    candidate_execution = replace(
+        candidate_execution,
+        prebuild=OCIPrebuildResult(
+            candidate.launch.digest, native.digest, publication, None, None, overlay.digest
+        ),
+        native_publication_digest=publication.publication_digest,
+        session=replace(candidate_execution.session, discovery_activation=activation),
+    )
+    lifecycle = MarginalLifecycleEvidence(
+        prepared,
+        before,
+        (CandidateLifecycleEvidence(candidate, candidate_execution),),
+        after,
+    )
+    requirement = DiscoveryExecutionRequirement(
+        arm.digest,
+        arm.proposal_digest,
+        arm.selected_delta_digest,
+        arm.candidate_stack_digest,
+        arm.candidate_tree_digest,
+        candidate.launch.digest,
+        native.digest,
+        arm.policy_digest,
+        arm.build_profile_digest,
+        candidate.launch.worker_distribution_digest,
+        candidate.launch.engine_config_digest,
+        activation_policy_digest(),
+        candidate.launch.hardware.tp_size,
+        True,
+    )
+    return requirement, lifecycle
 
 
 def _member(slot: str) -> GraphVerificationMemberBinding:
@@ -397,6 +565,13 @@ def test_reference_profile_and_precommitted_selection_round_trip():
     )
     assert ReferenceManifest.from_dict(reference.to_dict()) == reference
     assert QualificationProfile.from_dict(profile.to_dict()) == profile
+    assert set(profile.to_dict()) == set(
+        "reference calibration_context_digest calibration_digest graph_requirement_digest "
+        "required_quality_metrics nll_tail_threshold tokens_per_prompt topk_width "
+        "hidden_tasks_per_prompt support_policy_digest hidden_task_policy_digest "
+        "runtime_resource_policy_digest hidden_tasks_required minimum_prompt_count "
+        "policy_version schema_version".split()
+    )
 
     prompts = tuple(sorted(_d(f"prompt:{index}") for index in range(8)))
     secret = b"pre-result secret" * 4
@@ -430,6 +605,159 @@ def test_reference_profile_and_precommitted_selection_round_trip():
         sealed_cohort_trajectory_digest=_d("different-sealed-trajectories"),
     )
     assert rebound.selected_prompt_digests == receipt.selected_prompt_digests
+
+
+def test_discovery_execution_reopens_exact_native_overlay_and_activation(tmp_path: Path):
+    requirement, lifecycle = _discovery_execution(tmp_path)
+    grade = grade_discovery_execution(requirement, lifecycle)
+
+    assert (grade.decision, grade.reason) == (
+        QualificationDecision.PASS,
+        "discovery_execution_pass",
+    )
+    assert grade.execution_passed
+    assert (
+        grade.activation_receipt
+        == lifecycle.candidates[0].execution.session.discovery_activation
+    )
+    assert grade.activation_receipt_digest == canonical_digest(
+        "optima.discovery.activation-receipt", grade.activation_receipt.to_dict()
+    )
+    assert "activation_receipt" in grade.to_dict()
+    assert "activation_receipt_digest" not in grade.to_dict()
+    assert DiscoveryExecutionRequirement.from_dict(requirement.to_dict()) == requirement
+    assert DiscoveryExecutionGrade.from_dict(grade.to_dict()) == grade
+    malformed = grade.to_dict()
+    malformed_receipt = dict(malformed["activation_receipt"])
+    malformed_receipt.pop("activation_policy_digest")
+    malformed["activation_receipt"] = malformed_receipt
+    with pytest.raises(QualificationError, match="activation receipt is invalid"):
+        DiscoveryExecutionGrade.from_dict(malformed)
+    assert reopen_discovery_execution(requirement, grade, lifecycle) == grade
+    assert reopen_discovery_execution_binding(
+        requirement,
+        grade,
+        lifecycle.candidates[0].candidate,
+        candidate_lifecycle_digest=grade.candidate_lifecycle_digest,
+        session_id=grade.session_id,
+    ) == grade
+    assert not {
+        "catalog_digest",
+        "contribution_ref_digest",
+        "target_id",
+        "target_spec_digest",
+    } & set(requirement.to_dict())
+    assert not {"graph_proof", "score", "crown"} & set(grade.to_dict())
+
+
+def test_discovery_execution_fails_closed_on_missing_or_relabelled_evidence(tmp_path: Path):
+    requirement, lifecycle = _discovery_execution(tmp_path)
+    candidate = lifecycle.candidates[0]
+    missing = replace(
+        candidate.execution,
+        session=replace(candidate.execution.session, discovery_activation=None),
+    )
+    missing_lifecycle = replace(
+        lifecycle, candidates=(replace(candidate, execution=missing),)
+    )
+    grade = grade_discovery_execution(requirement, missing_lifecycle)
+    assert (grade.decision, grade.reason) == (
+        QualificationDecision.NO_DECISION,
+        "discovery_activation_missing",
+    )
+    assert grade.activation_receipt is None
+    assert DiscoveryExecutionGrade.from_dict(grade.to_dict()) == grade
+
+    baseline_armed = replace(
+        lifecycle.baseline_before,
+        session=replace(
+            lifecycle.baseline_before.session,
+            discovery_activation=candidate.execution.session.discovery_activation,
+        ),
+    )
+    grade = grade_discovery_execution(
+        requirement, replace(lifecycle, baseline_before=baseline_armed)
+    )
+    assert (grade.decision, grade.reason) == (
+        QualificationDecision.NO_DECISION,
+        "discovery_baseline_activation_present",
+    )
+
+    grade = grade_discovery_execution(
+        replace(requirement, proposal_digest=_d("other-proposal")), lifecycle
+    )
+    assert (grade.decision, grade.reason) == (
+        QualificationDecision.NO_DECISION,
+        "discovery_identity_mismatch",
+    )
+    passed = grade_discovery_execution(requirement, lifecycle)
+    with pytest.raises(QualificationError, match="differs from retained evidence"):
+        reopen_discovery_execution(
+            requirement, replace(passed, reason="discovery_execution_mismatch"), lifecycle
+        )
+    candidate_runtime = lifecycle.candidates[0].candidate
+    with pytest.raises(QualificationError, match="retained binding"):
+        reopen_discovery_execution_binding(
+            requirement,
+            passed,
+            candidate_runtime,
+            candidate_lifecycle_digest=_d("other-lifecycle"),
+            session_id=passed.session_id,
+        )
+    with pytest.raises(QualificationError, match="retained binding"):
+        reopen_discovery_execution_binding(
+            requirement,
+            passed,
+            candidate_runtime,
+            candidate_lifecycle_digest=passed.candidate_lifecycle_digest,
+            session_id="1" * 32,
+        )
+    altered_receipt = replace(
+        passed.activation_receipt, overlay_identity_digest=_d("other-overlay")
+    )
+    with pytest.raises(QualificationError, match="not authoritative"):
+        reopen_discovery_execution_binding(
+            requirement,
+            replace(passed, activation_receipt=altered_receipt),
+            candidate_runtime,
+            candidate_lifecycle_digest=passed.candidate_lifecycle_digest,
+            session_id=passed.session_id,
+        )
+    with pytest.raises(QualificationError, match="lacks activation"):
+        replace(passed, activation_receipt=None)
+
+
+def test_discovery_profile_is_distinct_and_requires_fixed_graphs_on_authority(tmp_path: Path):
+    from optima.discovery_overlay import activation_policy_digest
+
+    requirement, _lifecycle = _discovery_execution(tmp_path)
+    profile = DiscoveryQualificationProfile(
+        _reference(),
+        _d("discovery-calibration-context"),
+        _d("discovery-calibration"),
+        requirement.digest,
+        ("mean_nll", "task_score", "topk_kl"),
+        "2",
+        10,
+        2,
+        2,
+        _d("support-policy"),
+        _d("hidden-task-policy"),
+        _d("runtime-resource-policy"),
+        True,
+        2,
+    )
+    assert DiscoveryQualificationProfile.from_dict(profile.to_dict()) == profile
+    assert "graph_requirement_digest" not in profile.to_dict()
+    prompts = tuple(sorted((_d("discovery-prompt-a"), _d("discovery-prompt-b"))))
+    assert derived_hidden_task_plan_digest(profile, prompts) == derived_hidden_task_plan_digest(
+        DiscoveryQualificationProfile.from_dict(profile.to_dict()), prompts
+    )
+    with pytest.raises(QualificationError, match="requires CUDA graphs"):
+        replace(requirement, graphs_required=False)
+    with pytest.raises(QualificationError, match="fixed policy"):
+        replace(requirement, activation_policy_digest=_d("other-activation-policy"))
+    assert requirement.activation_policy_digest == activation_policy_digest()
 
 
 def test_selection_rejects_late_substitution_or_forged_result():
@@ -857,6 +1185,19 @@ def test_quality_binding_projects_exact_lifecycle_coverage(tmp_path: Path):
         t_session=t_session,
         t_request_sha256=reference_request_sha256,
         selected_delta_digest=delta,
+    )
+    assert identity_digest == canonical_digest(
+        "optima.qualification.candidate-identity",
+        {
+            "calibration_digest": calibration.digest,
+            "candidate_lifecycle_digest": lifecycle_digest,
+            "graph_requirement_digest": requirement.digest,
+            "profile_digest": profile.digest,
+            "selected_delta_digest": delta,
+            "selection_digest": selection.digest,
+            "t_session_digest": t_session.digest,
+            "t_request_sha256": reference_request_sha256,
+        },
     )
     binding = ReferenceQualityRawBinding(
         identity_digest, reference.digest, calibration.digest, selection.digest,

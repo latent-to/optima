@@ -33,7 +33,14 @@ from optima.stack_identity import (
 
 _SCHEMA = "optima.native-artifact-publication.v1"
 _MANIFEST = ".optima-native-artifact.json"
-_COMPONENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+@=-]{0,254}$")
+# SGLang ships declarative tuning tables whose canonical filenames contain
+# commas, brackets, and spaces (for example ``block_shape=[128, 128].json``).
+# Keep a finite ASCII alphabet: path separators, dotfiles, quotes, shell
+# metacharacters, controls, and non-ASCII remain inadmissible.
+_COMPONENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+@=,\-\[\] ]{0,254}$")
+_PRIVATE_PYTHON_MODULE_RE = re.compile(
+    r"^_{1,2}[A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z0-9_+-]+)*\.(?:py|so)$"
+)
 _STAGE_RE = re.compile(r"^\.stage-[0-9a-f]{16}-[0-9a-f]{32}$")
 _FILE_KEYS = frozenset({"path", "sha256", "size"})
 _MANIFEST_KEYS = frozenset(
@@ -103,7 +110,9 @@ class NativeArtifactFile:
     size: int
 
     def __post_init__(self) -> None:
-        _validate_relative_path(self.path, limits=NativeArtifactLimits())
+        _validate_relative_path(
+            self.path, limits=NativeArtifactLimits(), allow_python_leaf=True
+        )
         _require_digest(self.sha256, field="native artifact file sha256")
         if isinstance(self.size, bool) or not isinstance(self.size, int) or self.size < 0:
             raise NativeArtifactError("native artifact file size must be a nonnegative integer")
@@ -188,8 +197,16 @@ def _require_digest(value: object, *, field: str) -> str:
         raise NativeArtifactError(str(exc)) from None
 
 
-def _validate_component(component: str) -> None:
-    if not isinstance(component, str) or _COMPONENT_RE.fullmatch(component) is None:
+def _validate_component(
+    component: str, *, allow_python_module: bool = False
+) -> None:
+    if not isinstance(component, str) or (
+        not (
+            allow_python_module
+            and _PRIVATE_PYTHON_MODULE_RE.fullmatch(component) is not None
+        )
+        and _COMPONENT_RE.fullmatch(component) is None
+    ):
         raise NativeArtifactError(f"native artifact path component is unsafe: {component!r}")
     try:
         component.encode("ascii", "strict")
@@ -197,21 +214,39 @@ def _validate_component(component: str) -> None:
         raise NativeArtifactError("native artifact paths must be canonical ASCII") from None
 
 
-def _validate_relative_path(path: object, *, limits: NativeArtifactLimits) -> str:
+def _validate_relative_path(
+    path: object,
+    *,
+    limits: NativeArtifactLimits,
+    allow_python_leaf: bool = False,
+) -> str:
     if not isinstance(path, str) or not path or path.startswith("/") or "\\" in path:
         raise NativeArtifactError(f"native artifact path is not canonical: {path!r}")
     parts = path.split("/")
     if len(parts) > limits.max_depth:
         raise NativeArtifactError(f"native artifact path exceeds depth bound: {path!r}")
-    for component in parts:
-        _validate_component(component)
+    for index, component in enumerate(parts):
+        _validate_component(
+            component,
+            allow_python_module=allow_python_leaf and index == len(parts) - 1,
+        )
     if len(path.encode("ascii")) > limits.max_path_bytes:
         raise NativeArtifactError(f"native artifact path exceeds byte bound: {path!r}")
     return path
 
 
-def _relative(prefix: str, name: str, *, limits: NativeArtifactLimits) -> str:
-    return _validate_relative_path(f"{prefix}/{name}" if prefix else name, limits=limits)
+def _relative(
+    prefix: str,
+    name: str,
+    *,
+    limits: NativeArtifactLimits,
+    allow_python_leaf: bool = False,
+) -> str:
+    return _validate_relative_path(
+        f"{prefix}/{name}" if prefix else name,
+        limits=limits,
+        allow_python_leaf=allow_python_leaf,
+    )
 
 
 def _required_directories(paths: Any) -> tuple[str, ...]:
@@ -371,14 +406,22 @@ def _copy_directory(
     if len(names) != len(set(names)):
         raise NativeArtifactError("native artifact directory has duplicate names")
     for name in names:
-        _validate_component(name)
-        relative = _relative(prefix, name, limits=state.limits)
         if not prefix and name == _MANIFEST:
             raise NativeArtifactError("native artifact stage contains the reserved host manifest")
         try:
             info = os.stat(name, dir_fd=source_fd, follow_symlinks=False)
         except OSError as exc:
-            raise NativeArtifactRaceError(f"native artifact entry vanished: {relative}: {exc}") from None
+            raise NativeArtifactRaceError(
+                f"native artifact entry vanished: {name}: {exc}"
+            ) from None
+        is_file = stat.S_ISREG(info.st_mode)
+        _validate_component(name, allow_python_module=is_file)
+        relative = _relative(
+            prefix,
+            name,
+            limits=state.limits,
+            allow_python_leaf=is_file,
+        )
         if stat.S_ISLNK(info.st_mode):
             raise NativeArtifactError(f"native artifact contains a symlink: {relative}")
         if stat.S_ISDIR(info.st_mode):
@@ -620,12 +663,20 @@ def _scan_published_directory(
     for name in names:
         if not prefix and name == _MANIFEST:
             continue
-        _validate_component(name)
-        relative = _relative(prefix, name, limits=limits)
         try:
             info = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
         except OSError as exc:
-            raise NativeArtifactRaceError(f"published native artifact entry vanished: {relative}: {exc}") from None
+            raise NativeArtifactRaceError(
+                f"published native artifact entry vanished: {name}: {exc}"
+            ) from None
+        is_file = stat.S_ISREG(info.st_mode)
+        _validate_component(name, allow_python_module=is_file)
+        relative = _relative(
+            prefix,
+            name,
+            limits=limits,
+            allow_python_leaf=is_file,
+        )
         if stat.S_ISLNK(info.st_mode):
             raise NativeArtifactError(f"published native artifact contains a symlink: {relative}")
         if stat.S_ISDIR(info.st_mode):
@@ -692,7 +743,9 @@ def _parse_manifest(raw: bytes, *, limits: NativeArtifactLimits) -> tuple[str, s
     for row in raw_files:
         if not isinstance(row, dict) or set(row) != _FILE_KEYS:
             raise NativeArtifactError("native artifact manifest file row is malformed")
-        path = _validate_relative_path(row.get("path"), limits=limits)
+        path = _validate_relative_path(
+            row.get("path"), limits=limits, allow_python_leaf=True
+        )
         digest = _require_digest(row.get("sha256"), field="native artifact file sha256")
         size = row.get("size")
         if isinstance(size, bool) or not isinstance(size, int) or size < 0:

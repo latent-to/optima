@@ -511,6 +511,7 @@ def build_runtime_argv(
     seccomp_path: Path,
     runtime: OCIRuntimeResourcePolicy,
     session_protocol: str = "ordinary",
+    discovery_overlay_identity_digest: str | None = None,
 ) -> tuple[str, ...]:
     """Construct the exact runtime argv from trusted, already-reopened inputs."""
     launch = resolved.spec
@@ -555,6 +556,33 @@ def build_runtime_argv(
         "TRITON_CACHE_DIR": f"{CONTAINER_CACHE}/triton",
         "XDG_CACHE_HOME": f"{CONTAINER_CACHE}/xdg",
     }
+    discovery_rows = tuple(
+        row
+        for row in publication.files
+        if row.path.startswith("dep_overlays/discovery/")
+    )
+    if discovery_overlay_identity_digest is None:
+        if discovery_rows:
+            raise OCIBackendError(
+                "ordinary runtime publication contains a discovery overlay"
+            )
+    else:
+        if session_protocol != "ordinary":
+            raise OCIBackendError("reference runtime cannot activate discovery")
+        from optima.discovery import DiscoveryError, reopen_discovery_overlay
+        from optima.discovery_overlay import ARMED, EXPECTED_IDENTITY
+
+        try:
+            reopen_discovery_overlay(
+                publication,
+                expected_identity_digest=discovery_overlay_identity_digest,
+            )
+        except (DiscoveryError, OSError, TypeError, ValueError) as exc:
+            raise OCIBackendError(
+                f"discovery runtime publication cannot reopen: {exc}"
+            ) from None
+        environment[ARMED] = "1"
+        environment[EXPECTED_IDENTITY] = discovery_overlay_identity_digest
     gpu_csv = ",".join(resolved.physical_hardware.physical_gpu_ids)
     # Docker parses --gpus with a CSV decoder. A multi-device request must be one
     # quoted CSV field even though argv is passed directly without a shell;
@@ -924,6 +952,16 @@ class OCIEngineExecutor:
         )
         if plan.launch_digest != launch.digest:
             raise OCIBackendError("outer session plan names another launch")
+        has_discovery_tree = any(
+            row.path == "metadata/optima_discovery.json"
+            for row in validated[0].materialized_tree.files
+        )
+        if has_discovery_tree != (
+            plan.expected_discovery_overlay_identity_digest is not None
+        ):
+            raise OCIBackendError(
+                "session discovery requirement differs from its engine tree"
+            )
         return validated
 
     def _validate_reference_launch(
@@ -984,6 +1022,7 @@ class OCIEngineExecutor:
         preflight: RuntimePreflightReceipt,
         model_root: Path,
         session_protocol: str,
+        discovery_overlay_identity_digest: str | None,
         run: Callable[[AttachedSessionTransport, float, str], object],
     ) -> _RawRuntimeExecution:
         """Own the common prebuild/lease/mount/teardown shell for ordinary and T."""
@@ -996,6 +1035,13 @@ class OCIEngineExecutor:
             limits=self.config.native_limits,
             deadline=absolute,
         )
+        if (
+            prebuild.discovery_overlay_identity_digest
+            != discovery_overlay_identity_digest
+        ):
+            raise OCIBackendError(
+                "native prebuild discovery result differs from the session plan"
+            )
         publication = reopen_native_artifact(
             prebuild.publication.root,
             expected_build_spec_digest=resolved.native_build_spec.digest,
@@ -1069,6 +1115,9 @@ class OCIEngineExecutor:
                 seccomp_path=seccomp_copy,
                 runtime=self.config.runtime,
                 session_protocol=session_protocol,
+                discovery_overlay_identity_digest=(
+                    discovery_overlay_identity_digest
+                ),
             )
             argv_digest = hashlib.sha256(
                 json.dumps(argv, separators=(",", ":")).encode("utf-8")
@@ -1184,6 +1233,9 @@ class OCIEngineExecutor:
                 preflight=preflight,
                 model_root=model_root,
                 session_protocol="ordinary",
+                discovery_overlay_identity_digest=(
+                    plan.expected_discovery_overlay_identity_digest
+                ),
                 run=run,
             )
             if (
@@ -1263,6 +1315,7 @@ class OCIEngineExecutor:
                 preflight=preflight,
                 model_root=model_root,
                 session_protocol="reference",
+                discovery_overlay_identity_digest=None,
                 run=run,
             )
             if (

@@ -13,8 +13,20 @@ from types import SimpleNamespace
 import pytest
 
 from optima.bundle_hash import content_hash
+from optima.discovery import (
+    DEFAULT_DISCOVERY_POLICY,
+    DiscoveryArmPlan,
+    DiscoveryBuildProfile,
+    inspect_discovery,
+)
+from optima.discovery_overlay import (
+    DiscoveryActivationReceipt,
+    DiscoveryDriverOrigin,
+    DiscoverySchedulerMember,
+)
 from optima.engine_tree import (
     inspect_contribution,
+    materialize_discovery_engine_tree,
     materialize_engine_tree,
     reopen_materialized_engine_tree,
 )
@@ -32,6 +44,7 @@ from optima.eval.marginal_runtime import (
     MarginalRuntimeError,
     MaterializedArmBinding,
     prepare_cohort_runtime,
+    prepare_discovery_runtime,
     prepare_marginal_runtime,
     run_marginal_lifecycle,
 )
@@ -59,6 +72,7 @@ from optima.stack_manifest import (
 )
 from optima.stack_plan import CohortPlan, MarginalArmPlan, plan_candidate_stack, plan_marginal_arm
 from optima.target_catalog import TargetCatalog, default_target_catalog
+from tests.test_engine_tree import _write_discovery_fixture
 
 
 ROOT = Path(__file__).parents[1]
@@ -355,6 +369,89 @@ def _prepared(case: Case):
     )
 
 
+def _discovery_case(tmp_path: Path) -> SimpleNamespace:
+    case_root = tmp_path / "case"
+    case_root.mkdir()
+    case = _case(case_root)
+    proposal_root = _write_discovery_fixture(tmp_path / "proposal")
+    manifest = (proposal_root / "manifest.toml").read_text()
+    (proposal_root / "manifest.toml").write_text(
+        manifest.replace("engine-tree-sm120-tp8", "marginal-sm120-tp1")
+        .replace("minimax-m3-rtx-tp8-v1", "minimax-m3-rtx-tp1-v1")
+        .replace("tensor_parallel_sizes = [8]", "tensor_parallel_sizes = [1]")
+    )
+    proposal = inspect_discovery(proposal_root)
+    profile = DiscoveryBuildProfile(
+        "marginal-sm120-tp1",
+        DEFAULT_DISCOVERY_POLICY.sglang_version,
+        "minimax-m3-rtx-tp1-v1",
+        "minimax-m3-nvfp4",
+        "sm120",
+        1,
+        ("cuda13",),
+        (("image", case.preflight.image_digest),),
+    )
+    candidate_tree = materialize_discovery_engine_tree(
+        case.baseline_tree.root,
+        proposal,
+        policy=DEFAULT_DISCOVERY_POLICY,
+        build_profile=profile,
+        destination=tmp_path / "discovery-candidate",
+    )
+    arm = DiscoveryArmPlan.create(
+        incumbent=case.incumbent,
+        incumbent_tree_digest=case.baseline_tree.tree_digest,
+        candidate_tree_digest=candidate_tree.tree_digest,
+        proposal_digest=proposal.proposal_digest,
+        policy_digest=DEFAULT_DISCOVERY_POLICY.digest,
+        build_profile_digest=profile.digest,
+        overlay_identity_digest=_digest("discovery-overlay"),
+    )
+    binding = _local_binding(
+        candidate_tree,
+        _native(candidate_tree.tree_digest, case.preflight),
+        case.launch,
+        case.preflight,
+    )
+    prepared = prepare_discovery_runtime(
+        arm,
+        expected_context=case.context,
+        incumbent_launch=case.launch,
+        incumbent_binding=case.baseline_binding,
+        candidate_binding=binding,
+        baseline_session_plan=case.session,
+    )
+    return SimpleNamespace(
+        case=case,
+        proposal=proposal,
+        profile=profile,
+        arm=arm,
+        candidate_tree=candidate_tree,
+        candidate_binding=binding,
+        prepared=prepared,
+    )
+
+
+def _discovery_activation(
+    case: Case,
+    arm: DiscoveryArmPlan,
+    *,
+    overlay_identity_digest: str | None = None,
+) -> DiscoveryActivationReceipt:
+    return DiscoveryActivationReceipt(
+        "optima.discovery-driver-activation.v1",
+        overlay_identity_digest or arm.overlay_identity_digest,
+        100,
+        DiscoveryDriverOrigin(
+            "sglang", case.preflight.sglang_version, "sglang/__init__.py"
+        ),
+        "sglang.srt.managers.scheduler",
+        "run_scheduler_process",
+        1,
+        (DiscoverySchedulerMember(101, 0, 0, 0, 0, 0, 0, None),),
+    )
+
+
 def _batch_evidence(
     plan: SessionExecutionPlan, index: int, *, label: str
 ) -> BatchExecutionEvidence:
@@ -488,6 +585,170 @@ def test_singleton_derives_exact_launch_session_and_lifecycle(tmp_path: Path) ->
     assert result.source is case.arm
     assert result.candidates[0].arm is case.arm
     assert result.baseline_before.session.session_id != result.baseline_after.session.session_id
+
+
+def test_discovery_prepare_binds_incumbent_tree_source_intent_and_c_only_policy(
+    tmp_path: Path,
+) -> None:
+    discovery = _discovery_case(tmp_path)
+    case = discovery.case
+    arm = discovery.arm
+    prepared = discovery.prepared
+    candidate = prepared.candidates[0]
+
+    assert prepared.source is arm
+    assert prepared.baseline_launch is case.launch
+    assert prepared.incumbent_binding is case.baseline_binding
+    assert prepared.baseline_launch.stack_digest == case.incumbent.digest
+    assert prepared.baseline_launch.tree_digest == case.baseline_tree.tree_digest
+    assert prepared.baseline_session_plan.expected_discovery_overlay_identity_digest is None
+    assert candidate.arm is arm
+    assert candidate.binding is discovery.candidate_binding
+    assert candidate.launch.stack_digest == arm.candidate_stack_digest
+    assert candidate.launch.tree_digest == discovery.candidate_tree.tree_digest
+    assert (
+        candidate.session_plan.expected_discovery_overlay_identity_digest
+        == arm.overlay_identity_digest
+    )
+    launch_diff = {
+        key
+        for key, value in case.launch.to_dict().items()
+        if candidate.launch.to_dict()[key] != value
+    }
+    assert launch_diff == {
+        "stack_digest",
+        "tree_digest",
+        "native_build_spec_digest",
+    }
+    session_diff = {
+        field.name
+        for field in fields(case.session)
+        if getattr(case.session, field.name)
+        != getattr(candidate.session_plan, field.name)
+    }
+    assert session_diff == {
+        "launch_digest",
+        "expected_preflight",
+        "expected_discovery_overlay_identity_digest",
+    }
+
+    other_overlay = replace(
+        arm, overlay_identity_digest=_digest("other discovery overlay")
+    )
+    assert other_overlay.selected_delta_digest == arm.selected_delta_digest
+    assert other_overlay.candidate_stack_digest == arm.candidate_stack_digest
+    assert other_overlay.digest != arm.digest
+
+    wrong_incumbent = DiscoveryArmPlan.create(
+        incumbent=arm.incumbent,
+        incumbent_tree_digest=_digest("another incumbent tree"),
+        candidate_tree_digest=arm.candidate_tree_digest,
+        proposal_digest=arm.proposal_digest,
+        policy_digest=arm.policy_digest,
+        build_profile_digest=arm.build_profile_digest,
+        overlay_identity_digest=arm.overlay_identity_digest,
+    )
+    with pytest.raises(MarginalRuntimeError, match="frozen baseline arm"):
+        prepare_discovery_runtime(
+            wrong_incumbent,
+            expected_context=case.context,
+            incumbent_launch=case.launch,
+            incumbent_binding=case.baseline_binding,
+            candidate_binding=discovery.candidate_binding,
+            baseline_session_plan=case.session,
+        )
+
+    wrong_source_intent = DiscoveryArmPlan.create(
+        incumbent=arm.incumbent,
+        incumbent_tree_digest=arm.incumbent_tree_digest,
+        candidate_tree_digest=arm.candidate_tree_digest,
+        proposal_digest=_digest("another proposal"),
+        policy_digest=arm.policy_digest,
+        build_profile_digest=arm.build_profile_digest,
+        overlay_identity_digest=arm.overlay_identity_digest,
+    )
+    with pytest.raises(MarginalRuntimeError, match="discovery tree differs"):
+        prepare_discovery_runtime(
+            wrong_source_intent,
+            expected_context=case.context,
+            incumbent_launch=case.launch,
+            incumbent_binding=case.baseline_binding,
+            candidate_binding=discovery.candidate_binding,
+            baseline_session_plan=case.session,
+        )
+
+
+def test_discovery_lifecycle_accepts_activation_only_for_candidate(
+    tmp_path: Path,
+) -> None:
+    discovery = _discovery_case(tmp_path)
+    activation = _discovery_activation(discovery.case, discovery.arm)
+
+    def candidate_only(index: int, row: EngineExecutionEvidence):
+        if index != 1:
+            return row
+        return replace(
+            row,
+            session=replace(row.session, discovery_activation=activation),
+        )
+
+    executor = FakeExecutor(mutate=candidate_only)
+    result = run_marginal_lifecycle(
+        discovery.prepared,
+        executor=executor,
+        model_mount=discovery.case.mount,
+        deadline=100.0,
+    )
+    assert result.baseline_before.session.discovery_activation is None
+    assert result.candidates[0].execution.session.discovery_activation == activation
+    assert result.baseline_after.session.discovery_activation is None
+    assert len(executor.calls) == 3
+
+
+@pytest.mark.parametrize(
+    ("mode", "message", "call_count"),
+    (
+        ("missing-c", "discovery session activation", 2),
+        ("unexpected-b", "ordinary session acquired", 1),
+        ("unexpected-b-prime", "ordinary session acquired", 3),
+        ("wrong-c", "discovery session activation", 2),
+    ),
+)
+def test_discovery_lifecycle_rejects_missing_mismatched_or_baseline_activation(
+    tmp_path: Path, mode: str, message: str, call_count: int
+) -> None:
+    discovery = _discovery_case(tmp_path)
+    activation = _discovery_activation(discovery.case, discovery.arm)
+    wrong_activation = _discovery_activation(
+        discovery.case,
+        discovery.arm,
+        overlay_identity_digest=_digest("wrong discovery overlay"),
+    )
+
+    def mutate(index: int, row: EngineExecutionEvidence):
+        selected = None
+        if mode == "unexpected-b" and index == 0:
+            selected = activation
+        elif mode == "unexpected-b-prime" and index in {1, 2}:
+            selected = activation
+        elif mode == "wrong-c" and index == 1:
+            selected = wrong_activation
+        if selected is None:
+            return row
+        return replace(
+            row,
+            session=replace(row.session, discovery_activation=selected),
+        )
+
+    executor = FakeExecutor(mutate=mutate)
+    with pytest.raises(MarginalRuntimeError, match=message):
+        run_marginal_lifecycle(
+            discovery.prepared,
+            executor=executor,
+            model_mount=discovery.case.mount,
+            deadline=100.0,
+        )
+    assert len(executor.calls) == call_count
 
 
 @pytest.mark.parametrize("fixture", (MSA, FUSED), ids=("msa-singleton", "fused-atomic"))

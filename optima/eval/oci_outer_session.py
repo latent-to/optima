@@ -17,6 +17,7 @@ import time
 from dataclasses import dataclass
 from typing import Callable, Protocol, Sequence
 
+from optima.discovery_overlay import DiscoveryActivationReceipt
 from optima.eval.oci_process import (
     OCIAttachedClient,
     OCILease,
@@ -48,6 +49,7 @@ from optima.eval.oci_session_protocol import (
     validate_preflight,
     validate_ready,
 )
+from optima.stack_identity import require_sha256_hex
 
 
 class OuterSessionError(RuntimeError):
@@ -272,12 +274,25 @@ class SessionExecutionPlan:
     max_new_tokens: int
     top_logprobs_num: int
     temperature: float
+    expected_discovery_overlay_identity_digest: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.engine_config, EngineSessionConfig):
             raise OuterSessionInfrastructureError("engine_config is not typed")
         if self.engine_config.digest != self.expected_engine_config_digest:
             raise OuterSessionInfrastructureError("engine config digest differs from plan")
+        if self.expected_discovery_overlay_identity_digest is not None:
+            try:
+                identity = require_sha256_hex(
+                    self.expected_discovery_overlay_identity_digest,
+                    field="expected discovery overlay identity",
+                )
+            except ValueError as exc:
+                raise OuterSessionInfrastructureError(str(exc)) from None
+            if identity == "0" * 64:
+                raise OuterSessionInfrastructureError(
+                    "expected discovery overlay identity must not be all zero"
+                )
         if (
             not isinstance(self.expected_preflight, RuntimePreflightFacts)
             or self.expected_preflight.launch_digest != self.launch_digest
@@ -368,6 +383,7 @@ class SessionExecutionEvidence:
     first_timed_completed_at: float
     conditioning_token_numerator: int
     session_completed_at: float
+    discovery_activation: DiscoveryActivationReceipt | None = None
 
     @property
     def conditioning_interval_seconds(self) -> float:
@@ -507,7 +523,21 @@ def run_outer_session(
             deadline=init_deadline,
         )
         try:
-            validate_ready(ready, session_id=session_id, launch_digest=plan.launch_digest)
+            expected_identity = plan.expected_discovery_overlay_identity_digest
+            discovery_activation = validate_ready(
+                ready,
+                session_id=session_id,
+                launch_digest=plan.launch_digest,
+                expected_discovery_identity_digest=expected_identity,
+                expected_discovery_tp_size=(
+                    plan.engine_config.tp_size if expected_identity is not None else None
+                ),
+                expected_discovery_sglang_version=(
+                    plan.expected_preflight.sglang_version
+                    if expected_identity is not None
+                    else None
+                ),
+            )
         except SessionProtocolError as exc:
             raise OuterSessionProtocolError(str(exc)) from None
         ready_completed_at = _now(clock, previous=started_at)
@@ -603,4 +633,5 @@ def run_outer_session(
         first_timed_completed_at=first_timed_completed_at,
         conditioning_token_numerator=conditioning_tokens,
         session_completed_at=session_completed_at,
+        discovery_activation=discovery_activation,
     )

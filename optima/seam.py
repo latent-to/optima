@@ -141,7 +141,10 @@ def _load_bundle_into_registry(bundle: str) -> None:
     # failure raises out to activate() -> load_failed receipt -> the eval refuses.
     from optima.rebuild import apply_rebuild_plan
 
-    apply_rebuild_plan(bundle)
+    # The trusted prebuild worker already compiled and materialized every native
+    # product.  Scheduler ranks may validate/load that sealed product, but must
+    # never compile or repair it as a fallback.
+    apply_rebuild_plan(bundle, phase="load")
     # ONE module instance per SOURCE FILE, shared across ops: two slots declared on
     # the same source (e.g. the shallow + deep fused-epilogue entries sharing one IPC
     # workspace in module globals) must not get two module instances — each would

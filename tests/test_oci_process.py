@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -56,7 +58,7 @@ class FakeProcess:
         self.kwargs = kwargs
         self.pid = FakeProcess.next_pid
         FakeProcess.next_pid += 1
-        self.returncode = 0
+        self.returncode = None
         self.input = None
         self.waits = []
         self.terminated = False
@@ -65,16 +67,39 @@ class FakeProcess:
     def communicate(self, *, input, timeout):
         self.input = input
         self.waits.append(timeout)
+        self.returncode = 0
 
     def wait(self, timeout):
         self.waits.append(timeout)
+        if self.returncode is None:
+            self.returncode = -9 if self.killed else -15 if self.terminated else 0
         return self.returncode
 
     def terminate(self):
         self.terminated = True
+        self.returncode = -15
 
     def kill(self):
         self.killed = True
+        self.returncode = -9
+
+    def poll(self):
+        return self.returncode
+
+
+class FakeStream:
+    next_fd = 80
+
+    def __init__(self) -> None:
+        self.closed = False
+        self.fd = FakeStream.next_fd
+        FakeStream.next_fd += 1
+
+    def fileno(self) -> int:
+        return self.fd
+
+    def close(self) -> None:
+        self.closed = True
 
 
 def _manager(tmp_path: Path, commands: Commands | None = None) -> OCIProcessManager:
@@ -163,6 +188,222 @@ def test_run_rejects_argv_without_exact_lease_prefix(tmp_path: Path) -> None:
     lease = manager.register(lease_id="lease-1", container_name="container-1")
     with pytest.raises(OCIProcessError, match="exact lease"):
         manager.run(lease, ("/usr/bin/docker", "run", "image"), timeout_s=1)
+
+
+def test_attached_client_spawn_and_normal_finalize_use_manager_cleanup(
+    tmp_path: Path, monkeypatch
+) -> None:
+    commands = Commands()
+    manager = _manager(tmp_path, commands)
+    lease = manager.register(lease_id="lease-1", container_name="container-1")
+    process = FakeProcess(())
+    process.stdin = FakeStream()
+    process.stdout = FakeStream()
+    process.stderr = None
+    monkeypatch.setattr(process_mod.subprocess, "Popen", lambda *args, **kwargs: process)
+    events = []
+    original_remove = manager.force_remove_container
+
+    def remove(observed_lease):
+        events.append("remove")
+        return original_remove(observed_lease)
+
+    def terminate(observed_process):
+        events.append("terminate")
+        observed_process.terminate()
+        observed_process.wait(timeout=10)
+
+    monkeypatch.setattr(manager, "force_remove_container", remove)
+    monkeypatch.setattr(manager, "_terminate_client", terminate)
+    argv = (*lease.run_prefix(manager.docker_binary), "--network=none", "image@sha256:x")
+
+    client = manager.spawn_attached(lease, argv)
+    assert client.stdin is process.stdin and client.stdout is process.stdout
+    commands.present.add("container-1")
+    client.finalize()
+
+    assert events == ["remove", "terminate", "remove"]
+    assert client.closed and process.terminated
+    assert process.stdin.closed and process.stdout.closed
+    assert "container-1" not in commands.present
+    # Teardown is idempotent for a defensive finally: abort after finalize cannot
+    # revive or remove a different resource.
+    client.abort()
+    assert events == ["remove", "terminate", "remove"]
+
+
+def test_attached_spawn_uses_pipes_no_shell_and_new_process_group(
+    tmp_path: Path, monkeypatch
+) -> None:
+    manager = _manager(tmp_path)
+    lease = manager.register(lease_id="lease-1", container_name="container-1")
+    created = []
+
+    def popen(argv, **kwargs):
+        process = FakeProcess(argv, **kwargs)
+        process.stdin = FakeStream()
+        process.stdout = FakeStream()
+        process.stderr = None
+        created.append(process)
+        return process
+
+    monkeypatch.setattr(process_mod.subprocess, "Popen", popen)
+    argv = (*lease.run_prefix(manager.docker_binary), "image@sha256:x")
+    client = manager.spawn_attached(lease, argv)
+
+    assert created[0].kwargs == {
+        "stdin": subprocess.PIPE,
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.DEVNULL,
+        "bufsize": 0,
+        "close_fds": True,
+        "start_new_session": True,
+        "shell": False,
+    }
+    client.abort()
+
+
+def test_attached_abort_rechecks_container_after_client_death(
+    tmp_path: Path, monkeypatch
+) -> None:
+    commands = Commands()
+    manager = _manager(tmp_path, commands)
+    lease = manager.register(lease_id="lease-1", container_name="container-1")
+    process = FakeProcess(())
+    process.stdin = FakeStream()
+    process.stdout = FakeStream()
+    process.stderr = None
+    monkeypatch.setattr(process_mod.subprocess, "Popen", lambda *args, **kwargs: process)
+    client = manager.spawn_attached(
+        lease, (*lease.run_prefix(manager.docker_binary), "image@sha256:x")
+    )
+
+    def terminate_then_late_create(observed_process):
+        observed_process.terminate()
+        commands.present.add("container-1")
+
+    monkeypatch.setattr(manager, "_terminate_client", terminate_then_late_create)
+    client.abort()
+
+    assert client.closed
+    assert "container-1" not in commands.present
+    assert any(row[1:3] == ("rm", "--force") for row in commands.rows)
+
+
+def test_attached_finalize_never_signals_an_already_reaped_process_group(
+    tmp_path: Path, monkeypatch
+) -> None:
+    manager = _manager(tmp_path)
+    lease = manager.register(lease_id="lease-1", container_name="container-1")
+    process = FakeProcess(())
+    process.stdin = FakeStream()
+    process.stdout = FakeStream()
+    process.stderr = None
+    process.returncode = 0
+    monkeypatch.setattr(process_mod.subprocess, "Popen", lambda *args, **kwargs: process)
+    client = manager.spawn_attached(
+        lease, (*lease.run_prefix(manager.docker_binary), "image@sha256:x")
+    )
+    monkeypatch.setattr(
+        process_mod.os,
+        "killpg",
+        lambda *_args: (_ for _ in ()).throw(AssertionError("reaped PID was signalled")),
+    )
+
+    client.finalize()
+
+    assert client.closed
+    assert not process.terminated and not process.killed
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="process-group residue proof uses /proc")
+def test_attached_finalize_kills_descendant_after_unreaped_leader_exit(
+    tmp_path: Path, monkeypatch
+) -> None:
+    manager = _manager(tmp_path)
+    lease = manager.register(lease_id="lease-1", container_name="container-1")
+    child_pid_path = tmp_path / "descendant.pid"
+    script = (
+        "import pathlib,subprocess; "
+        f"p=subprocess.Popen(['sleep','60']); pathlib.Path({str(child_pid_path)!r}).write_text(str(p.pid))"
+    )
+    real_popen = subprocess.Popen
+
+    def spawn(_argv, **kwargs):
+        return real_popen([sys.executable, "-c", script], **kwargs)
+
+    monkeypatch.setattr(process_mod.subprocess, "Popen", spawn)
+    client = manager.spawn_attached(
+        lease, (*lease.run_prefix(manager.docker_binary), "image@sha256:x")
+    )
+    for _ in range(200):
+        if child_pid_path.exists():
+            break
+        time.sleep(0.01)
+    assert child_pid_path.exists()
+    descendant = int(child_pid_path.read_text())
+
+    # The short-lived leader may already be a zombie, but the manager has not
+    # reaped it. Its process group still identifies the surviving descendant.
+    client.finalize()
+    for _ in range(200):
+        try:
+            os.kill(descendant, 0)
+        except ProcessLookupError:
+            break
+        try:
+            state = Path(f"/proc/{descendant}/stat").read_text().split()[2]
+        except OSError:
+            break
+        if state == "Z":
+            break
+        time.sleep(0.01)
+    else:
+        pytest.fail(f"attached cleanup left descendant process {descendant} alive")
+
+
+def test_attached_cleanup_failure_still_terminates_and_runs_second_proof(
+    tmp_path: Path, monkeypatch
+) -> None:
+    manager = _manager(tmp_path)
+    lease = manager.register(lease_id="lease-1", container_name="container-1")
+    process = FakeProcess(())
+    process.stdin = FakeStream()
+    process.stdout = FakeStream()
+    process.stderr = None
+    monkeypatch.setattr(process_mod.subprocess, "Popen", lambda *args, **kwargs: process)
+    client = manager.spawn_attached(
+        lease, (*lease.run_prefix(manager.docker_binary), "image@sha256:x")
+    )
+    proofs = []
+
+    def remove(_lease):
+        proofs.append("proof")
+        if len(proofs) == 1:
+            raise OCIProcessError("first absence proof unavailable")
+
+    monkeypatch.setattr(manager, "force_remove_container", remove)
+    monkeypatch.setattr(process_mod.os, "killpg", lambda *_args: (_ for _ in ()).throw(OSError()))
+    with pytest.raises(OCIProcessError, match="could not prove"):
+        client.abort()
+
+    assert proofs == ["proof", "proof"]
+    assert process.terminated
+    assert not client.closed
+
+
+def test_attached_spawn_rejects_wrong_prefix_and_occupied_name(tmp_path: Path) -> None:
+    commands = Commands()
+    manager = _manager(tmp_path, commands)
+    lease = manager.register(lease_id="lease-1", container_name="container-1")
+    with pytest.raises(OCIProcessError, match="exact lease"):
+        manager.spawn_attached(lease, ("/usr/bin/docker", "run", "image"))
+
+    commands.present.add("container-1")
+    with pytest.raises(OCIProcessError, match="already occupied"):
+        manager.spawn_attached(
+            lease, (*lease.run_prefix(manager.docker_binary), "image@sha256:x")
+        )
 
 
 def test_timeout_force_removes_container_and_terminates_client(tmp_path: Path, monkeypatch) -> None:

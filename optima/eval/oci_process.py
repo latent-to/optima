@@ -20,7 +20,7 @@ import time
 import secrets
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Callable, Iterable, Protocol
+from typing import BinaryIO, Callable, Iterable, Protocol
 
 
 LEASE_SCHEMA = "optima.oci-process-lease.v1"
@@ -115,6 +115,53 @@ class OCILease:
 class OCIProcessResult:
     returncode: int
     elapsed_seconds: float
+
+
+class OCIAttachedClient:
+    """One foreground OCI client whose teardown remains manager-owned.
+
+    The transport layer may use only the byte streams; pipe EOF is its liveness
+    signal. It cannot replace the lease-aware cleanup sequence. ``finalize`` and ``abort``
+    intentionally have identical host cleanup semantics; protocol success is owned
+    by the caller, not this process primitive.
+    """
+
+    def __init__(
+        self,
+        manager: OCIProcessManager,
+        lease: OCILease,
+        process: subprocess.Popen[bytes],
+    ) -> None:
+        self._manager = manager
+        self._lease = lease
+        self._process = process
+        self._closed = False
+
+    @property
+    def lease(self) -> OCILease:
+        return self._lease
+
+    @property
+    def stdin(self) -> BinaryIO:
+        if self._closed or self._process.stdin is None:
+            raise OCIProcessError("attached OCI client stdin is unavailable")
+        return self._process.stdin
+
+    @property
+    def stdout(self) -> BinaryIO:
+        if self._closed or self._process.stdout is None:
+            raise OCIProcessError("attached OCI client stdout is unavailable")
+        return self._process.stdout
+
+    @property
+    def closed(self) -> bool:
+        return self._closed
+
+    def finalize(self) -> None:
+        self._manager.finalize_attached(self)
+
+    def abort(self) -> None:
+        self._manager.abort_attached(self)
 
 
 def _canonical_json(value: object) -> bytes:
@@ -429,6 +476,11 @@ class OCIProcessManager:
 
     @staticmethod
     def _terminate_client(process: subprocess.Popen[bytes]) -> None:
+        # The attached-client API deliberately exposes no reaping poll.  A non-null
+        # cached return code therefore means another manager path already waited;
+        # avoid signalling a PID/process-group identifier that may have been reused.
+        if process.returncode is not None:
+            return
         try:
             os.killpg(process.pid, signal.SIGTERM)
         except OSError:
@@ -467,6 +519,80 @@ class OCIProcessManager:
             raise OCIProcessError(
                 "OCI failure cleanup could not prove both client and container removal"
             ) from failures[0]
+
+    def spawn_attached(
+        self,
+        lease: OCILease,
+        argv: tuple[str, ...],
+    ) -> OCIAttachedClient:
+        """Spawn one foreground byte-stream client under a durable OCI lease."""
+        if not isinstance(lease, OCILease) or lease.executor_id != self.executor_id:
+            raise OCIProcessError("OCI lease does not belong to this executor")
+        prefix = lease.run_prefix(self.docker_binary)
+        if tuple(argv[: len(prefix)]) != prefix:
+            raise OCIProcessError("OCI attached argv lacks the exact lease prefix")
+        if self._listed_container_id(lease) is not None:
+            raise OCIProcessError("OCI lease container name is already occupied")
+        try:
+            process = subprocess.Popen(
+                list(argv),
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                bufsize=0,
+                close_fds=True,
+                start_new_session=True,
+                shell=False,
+            )
+        except OSError as exc:
+            self.force_remove_container(lease)
+            raise OCIProcessError(f"could not start attached OCI client: {exc}") from None
+        if process.stdin is None or process.stdout is None:
+            self._reap_failed_process(lease, process)
+            raise OCIProcessError("attached OCI client did not expose byte streams")
+        return OCIAttachedClient(self, lease, process)
+
+    def _close_attached(self, client: OCIAttachedClient) -> None:
+        if not isinstance(client, OCIAttachedClient) or client._manager is not self:
+            raise OCIProcessError("attached OCI client belongs to another manager")
+        if client.closed:
+            return
+        process = client._process
+        failures: list[BaseException] = []
+        try:
+            self.force_remove_container(client.lease)
+        except BaseException as exc:
+            failures.append(exc)
+        try:
+            self._terminate_client(process)
+        except BaseException as exc:
+            failures.append(exc)
+        for stream in (process.stdin, process.stdout, process.stderr):
+            if stream is None or stream.closed:
+                continue
+            try:
+                stream.close()
+            except BaseException as exc:
+                failures.append(exc)
+        # A foreground Docker client can create the named container after the first
+        # absence proof.  Only this proof after process-group death closes that race.
+        try:
+            self.force_remove_container(client.lease)
+        except BaseException as exc:
+            failures.append(exc)
+        if failures:
+            raise OCIProcessError(
+                "attached OCI cleanup could not prove both client and container removal"
+            ) from failures[0]
+        client._closed = True
+
+    def finalize_attached(self, client: OCIAttachedClient) -> None:
+        """Normal host teardown after the caller consumed its final exact response."""
+        self._close_attached(client)
+
+    def abort_attached(self, client: OCIAttachedClient) -> None:
+        """Exceptional host teardown; cleanup authority is identical to finalize."""
+        self._close_attached(client)
 
     def run(
         self,

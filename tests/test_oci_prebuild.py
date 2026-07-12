@@ -398,6 +398,149 @@ def test_run_builds_publishes_reopens_and_then_reuses(
     assert second.publication.publication_digest == first.publication.publication_digest
 
 
+@pytest.mark.parametrize("deadline", (float("nan"), float("inf"), -float("inf"), True, "10"))
+def test_prebuild_rejects_nonfinite_or_non_numeric_deadline_before_work(
+    tmp_path: Path, deadline
+) -> None:
+    _tree_row, launch, binding, _preflight_row, config = _case(tmp_path)
+    with pytest.raises(OCIPrebuildError, match="deadline must be a finite"):
+        run_oci_prebuild(launch, binding, config, deadline=deadline)
+    assert not config.recovery_root.exists()
+
+
+def test_prebuild_rejects_expired_deadline_before_binding_or_lease(
+    tmp_path: Path,
+) -> None:
+    _tree_row, launch, binding, _preflight_row, config = _case(tmp_path)
+    manager = OCIProcessManager(
+        docker_binary=DOCKER,
+        recovery_root=config.recovery_root,
+        executor_id=config.executor_id,
+        runner=_Controls(),
+        clock=lambda: 10.0,
+    )
+    with pytest.raises(OCIPrebuildError, match="deadline expired during binding"):
+        run_oci_prebuild(launch, binding, config, manager=manager, deadline=10.0)
+    assert list(manager.leases_root.iterdir()) == []
+
+
+def test_prebuild_rechecks_deadline_after_binding_work(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import optima.eval.oci_prebuild as prebuild_mod
+
+    _tree_row, launch, binding, _preflight_row, config = _case(tmp_path)
+    now = {"value": 100.0}
+    manager = OCIProcessManager(
+        docker_binary=DOCKER,
+        recovery_root=config.recovery_root,
+        executor_id=config.executor_id,
+        runner=_Controls(),
+        clock=lambda: now["value"],
+    )
+    real_validate = prebuild_mod._validate_binding
+
+    def validate(*args, **kwargs):
+        result = real_validate(*args, **kwargs)
+        now["value"] = 106.0
+        return result
+
+    monkeypatch.setattr(prebuild_mod, "_validate_binding", validate)
+    with pytest.raises(OCIPrebuildError, match="deadline expired during binding"):
+        run_oci_prebuild(launch, binding, config, manager=manager, deadline=105.0)
+    assert list(manager.leases_root.iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    "deadline,expected_timeout",
+    ((105.0, 5.0), (10_000.0, 7_200.0)),
+)
+def test_prebuild_container_timeout_is_capped_by_absolute_deadline_and_policy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    deadline: float,
+    expected_timeout: float,
+) -> None:
+    _tree_row, launch, binding, _preflight_row, config = _case(tmp_path)
+    manager = OCIProcessManager(
+        docker_binary=DOCKER,
+        recovery_root=config.recovery_root,
+        executor_id=config.executor_id,
+        runner=_Controls(),
+        clock=lambda: 100.0,
+    )
+    observed = []
+
+    def mount(_lease, path, **_kwargs):
+        Path(path).mkdir(parents=True)
+        return Path(path)
+
+    def run(_lease, _argv, *, timeout_s, stdin_bytes=b""):
+        observed.append((timeout_s, stdin_bytes))
+        return OCIProcessResult(9, 0.1)
+
+    monkeypatch.setattr(manager, "mount_tmpfs", mount)
+    monkeypatch.setattr(manager, "run", run)
+    with pytest.raises(OCIPrebuildError, match="container exited 9"):
+        run_oci_prebuild(
+            launch, binding, config, manager=manager, deadline=deadline
+        )
+    assert observed == [(expected_timeout, b"")]
+    assert list(manager.leases_root.iterdir()) == []
+
+
+def test_prebuild_expiry_after_container_prevents_publication_and_releases_lease(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _tree_row, launch, binding, _preflight_row, config = _case(tmp_path)
+    manager = OCIProcessManager(
+        docker_binary=DOCKER,
+        recovery_root=config.recovery_root,
+        executor_id=config.executor_id,
+        runner=_Controls(),
+    )
+    now = {"value": 100.0}
+    monkeypatch.setattr(manager, "clock", lambda: now["value"])
+    stage_holder: list[Path] = []
+
+    def mount(_lease, path, **_kwargs):
+        Path(path).mkdir(parents=True)
+        stage_holder.append(Path(path))
+        return Path(path)
+
+    def run(_lease, _argv, *, timeout_s, stdin_bytes=b""):
+        assert timeout_s == 5.0 and stdin_bytes == b""
+        _write_receipt(
+            stage_holder[-1], launch=launch, native=binding.native_build_spec
+        )
+        now["value"] = 106.0
+        return OCIProcessResult(0, 1.0)
+
+    monkeypatch.setattr(manager, "mount_tmpfs", mount)
+    monkeypatch.setattr(manager, "run", run)
+    with pytest.raises(OCIPrebuildError, match="deadline expired during container"):
+        run_oci_prebuild(
+            launch, binding, config, manager=manager, deadline=105.0
+        )
+    assert not (config.publication_root / binding.native_build_spec.digest[:2]).exists()
+    assert list(manager.leases_root.iterdir()) == []
+
+
+def test_prebuild_deadline_fails_closed_on_nonfinite_manager_clock(
+    tmp_path: Path,
+) -> None:
+    _tree_row, launch, binding, _preflight_row, config = _case(tmp_path)
+    manager = OCIProcessManager(
+        docker_binary=DOCKER,
+        recovery_root=config.recovery_root,
+        executor_id=config.executor_id,
+        runner=_Controls(),
+        clock=lambda: float("nan"),
+    )
+    with pytest.raises(OCIPrebuildError, match="clock returned a non-finite"):
+        run_oci_prebuild(launch, binding, config, manager=manager, deadline=105.0)
+
+
 @pytest.mark.parametrize(
     "mutator,match",
     (

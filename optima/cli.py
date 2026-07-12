@@ -559,7 +559,7 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
     b, c = report.baseline, report.candidate
     bmin, bmax, bsd = b.spread
     cmin, cmax, csd = c.spread
-    print("\n=== Optima end-to-end report ===")
+    print("\n=== Optima development diagnostic: end-to-end report ===")
     print(f"bundle: {m.bundle_id}")
     print(f"baseline   {b.tok_per_s:8.1f} tok/s  (median of {len(b.tok_per_s_samples)}; "
           f"range {bmin:.0f}-{bmax:.0f}, sd {bsd:.1f})")
@@ -588,20 +588,7 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
               f"argmax_disagree={report.kl.argmax_disagreements}/{report.kl.num_positions}  "
               f"token_match={report.token_match:.4f}{' (GATE)' if cfg.framework_mode else ''} -> "
               f"{'PASS' if report.passed_quality else 'FAIL'}")
-    print(f"SCORE      {report.score:.3f}  (crownable speedup, else 0.0)")
-
-    if getattr(args, "ledger", None) and getattr(args, "hotkey", None):
-        from optima.bundle_hash import content_hash
-        from optima.commit_reveal import Ledger
-        from optima.compat import PINNED_SGLANG
-
-        ch = content_hash(args.bundle)
-        led = Ledger.load(args.ledger)
-        led.record_score(args.hotkey, ch, args.round, report.score, report.kl.mean_kl,
-                         report.passed_quality, sglang_version=PINNED_SGLANG, slot=m.ops[0].slot)
-        led.save(args.ledger)
-        print(f"recorded -> {args.ledger} (hotkey={args.hotkey}, round={args.round}, "
-              f"slot={m.ops[0].slot}, sglang={PINNED_SGLANG})")
+    print(f"diagnostic score {report.score:.3f}  (not authoritative; not recorded)")
     return 0 if report.passed_quality else 3
 
 
@@ -676,7 +663,7 @@ def cmd_bench(args: argparse.Namespace) -> int:
         max_new_tokens=args.max_new_tokens,
     )
 
-    print("\n=== Optima capability report ===")
+    print("\n=== Optima development diagnostic: capability report ===")
     print(f"bundle: {m.bundle_id}")
     for bs in report.benchmarks:
         flag = "" if bs.delta >= -args.acc_tolerance else "  <-- REGRESSION"
@@ -706,21 +693,7 @@ def cmd_bench(args: argparse.Namespace) -> int:
           f"({kl.argmax_disagree_rate:.2%}{rate_note}), "
           f"token_match={report.token_match:.4f}{' (GATE)' if cfg.framework_mode else ''} -> "
           f"{'PASS' if report.passed_quality else 'FAIL'}")
-    print(f"SCORE      {report.score:.3f}")
-
-    if getattr(args, "ledger", None) and getattr(args, "hotkey", None):
-        from optima.bundle_hash import content_hash
-        from optima.commit_reveal import Ledger
-
-        from optima.compat import PINNED_SGLANG
-
-        ch = content_hash(args.bundle)
-        led = Ledger.load(args.ledger)
-        led.record_score(args.hotkey, ch, args.round, report.score, report.kl.mean_kl,
-                         report.passed_quality, sglang_version=PINNED_SGLANG, slot=m.ops[0].slot)
-        led.save(args.ledger)
-        print(f"recorded -> {args.ledger} (hotkey={args.hotkey}, round={args.round}, "
-              f"slot={m.ops[0].slot}, sglang={PINNED_SGLANG})")
+    print(f"diagnostic score {report.score:.3f}  (not authoritative; not recorded)")
     return 0 if report.passed_quality else 3
 
 
@@ -967,7 +940,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.set_defaults(func=cmd_verify)
 
     sp = sub.add_parser(
-        "evaluate", help="end-to-end throughput + KL on a model",
+        "evaluate", help="development diagnostic: end-to-end throughput + KL on a model",
         epilog=("examples (always launch via `python -m optima.cli` on GPU —\n"
                 "sglang spawns the scheduler with mp spawn):\n"
                 "  # quick smoke on a small model\n"
@@ -1047,10 +1020,6 @@ def build_parser() -> argparse.ArgumentParser:
                     help="JSON object merged into both SGLang Engine kwargs")
     sp.add_argument("--candidate-engine-kwargs-json", default=None,
                     help="JSON object merged into candidate SGLang Engine kwargs")
-    # optional: record the result into a commit-reveal ledger
-    sp.add_argument("--ledger", default=None, help="ledger json to record the score into")
-    sp.add_argument("--hotkey", default=None, help="miner hotkey (with --ledger)")
-    sp.add_argument("--round", type=int, default=0, help="round id (with --ledger)")
     sp.add_argument("--framework-mode", action="store_true",
                     help="miner may patch the engine (setup()); gate on token-match vs the stock baseline, not in-process KL")
     sp.add_argument("--token-match-threshold", type=float, default=0.99,
@@ -1063,7 +1032,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = sub.add_parser(
         "bench",
-        help="realistic eval: throughput on real benchmark prompts, gated by task accuracy + KL",
+        help="development diagnostic: real-task accuracy, KL, and noisy throughput",
         epilog=("examples:\n"
                 "  # capability floor on a real task (start small, then raise --samples)\n"
                 "  python -m optima.cli bench my_bundle --model Qwen/Qwen2.5-1.5B-Instruct \\\n"
@@ -1123,9 +1092,6 @@ def build_parser() -> argparse.ArgumentParser:
                     help="run the candidate in a no-egress network namespace (auto-on with --framework-mode); needs root")
     sp.add_argument("--allow-unsafe-no-isolation", action="store_true",
                     help="DEV ONLY: continue if candidate no-egress isolation is unavailable")
-    sp.add_argument("--ledger", default=None)
-    sp.add_argument("--hotkey", default=None)
-    sp.add_argument("--round", type=int, default=0)
     sp.set_defaults(func=cmd_bench)
 
     # ---- commit-reveal / scoring ledger ----

@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 import os
 from contextlib import contextmanager
+from pathlib import Path
 from typing import Any, Optional
 
 logger = logging.getLogger("optima.eval")
@@ -33,6 +34,101 @@ def env(**overrides: str):
                 os.environ[k] = v
 
 
+def _truthy_env(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _loopback_is_up() -> bool:
+    import fcntl
+    import socket
+    import struct
+
+    request = struct.Struct("16sH14s")
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            response = fcntl.ioctl(
+                sock.fileno(), 0x8913, request.pack(b"lo", 0, b"")
+            )
+        _name, flags, _padding = request.unpack(response)
+        return bool(flags & 0x1)
+    except (OSError, ValueError, struct.error):
+        return False
+
+
+def _network_namespace_is_loopback_only() -> bool:
+    """Prove the current Linux network namespace exposes only loopback."""
+
+    try:
+        interfaces = {
+            line.split(":", 1)[0].strip()
+            for line in Path("/proc/net/dev").read_text().splitlines()[2:]
+            if ":" in line
+        }
+        if interfaces != {"lo"}:
+            return False
+        ipv4 = Path("/proc/net/route").read_text().splitlines()[1:]
+        if any(line.split()[0] != "lo" for line in ipv4 if line.split()):
+            return False
+        ipv6 = Path("/proc/net/ipv6_route").read_text().splitlines()
+        if any(line.split()[-1] != "lo" for line in ipv6 if line.split()):
+            return False
+    except (OSError, IndexError):
+        return False
+    return True
+
+
+def _egress_is_blocked() -> bool:
+    import socket
+
+    try:
+        socket.create_connection(("1.1.1.1", 443), timeout=2).close()
+        return False
+    except OSError:
+        return True
+
+
+def _process_sandbox_is_hardened() -> bool:
+    """Verify the live worker has no capabilities and cannot gain privileges."""
+
+    try:
+        status: dict[str, str] = {}
+        for line in Path("/proc/self/status").read_text().splitlines():
+            key, separator, value = line.partition(":")
+            if separator:
+                status[key] = value.strip()
+        effective = int(status["CapEff"], 16)
+        bounding = int(status["CapBnd"], 16)
+        no_new_privileges = int(status["NoNewPrivs"])
+        seccomp_mode = int(status["Seccomp"])
+        seccomp_filters = int(status["Seccomp_filters"])
+        ptrace_scope = int(Path("/proc/sys/kernel/yama/ptrace_scope").read_text())
+        root_options = None
+        for line in Path("/proc/mounts").read_text().splitlines():
+            fields = line.split()
+            if len(fields) >= 4 and fields[1] == "/":
+                root_options = set(fields[3].split(","))
+                break
+    except (OSError, KeyError, ValueError):
+        return False
+    return (
+        effective == 0
+        and bounding == 0
+        and no_new_privileges == 1
+        and seccomp_mode == 2
+        and seccomp_filters >= 1
+        and ptrace_scope >= 1
+        and root_options is not None
+        and "ro" in root_options
+    )
+
+
+def _path_mount_is_read_only(path: str) -> bool:
+    try:
+        return bool(os.statvfs(path).f_flag & getattr(os, "ST_RDONLY", 1))
+    except OSError:
+        return False
+
+
 def isolate_network() -> bool:
     """Put THIS process (and every child it spawns) into a fresh network namespace with
     NO egress, so untrusted miner code can't reach an external API to fake the output.
@@ -45,6 +141,24 @@ def isolate_network() -> bool:
     GPU box privileged; chain/cloud secrets live on a separate CPU control box). Returns
     True iff the candidate is confirmed no-egress; logs loudly and returns False if not.
     """
+    if _truthy_env("OPTIMA_EXTERNAL_NO_EGRESS"):
+        checks = (
+            (_loopback_is_up(), "loopback is down"),
+            (
+                _network_namespace_is_loopback_only(),
+                "network namespace is not loopback-only",
+            ),
+            (_egress_is_blocked(), "egress remains reachable"),
+            (_process_sandbox_is_hardened(), "process sandbox is not hardened"),
+        )
+        for passed, detail in checks:
+            if not passed:
+                logger.error("optima: external isolation check failed: %s", detail)
+                return False
+        _offline_env()
+        logger.warning("optima: verified externally isolated engine worker")
+        return True
+
     import subprocess
 
     clone_newnet = getattr(os, "CLONE_NEWNET", None)
@@ -89,6 +203,7 @@ def prepare_candidate_environment(cfg, *, bundle_path: str, active: bool) -> Non
     framework_mode = getattr(cfg, "framework_mode", False)
     isolate = getattr(cfg, "isolate", False)
     allow_unsafe = getattr(cfg, "allow_unsafe_no_isolation", False)
+    externally_isolated = _truthy_env("OPTIMA_EXTERNAL_NO_EGRESS")
     has_setup = False
     if bundle_path:
         from optima.manifest import load_manifest
@@ -99,6 +214,38 @@ def prepare_candidate_environment(cfg, *, bundle_path: str, active: bool) -> Non
             raise IsolationError(
                 "bundle declares setup() but framework_mode is not enabled. "
                 "Engine-wide mutation requires external token fidelity and isolation."
+            )
+    if externally_isolated:
+        if not isolate:
+            raise IsolationError(
+                "external engine worker must keep isolation enabled"
+            )
+        if not _truthy_env("OPTIMA_ENGINE_WORKER"):
+            raise IsolationError(
+                "external isolation marker requires a trusted engine worker"
+            )
+        immutable_inputs = [bundle_path, str(getattr(cfg, "model_path", "") or "")]
+        artifact_root = os.environ.get("OPTIMA_NATIVE_ARTIFACT_ROOT", "").strip()
+        immutable_inputs.append(artifact_root)
+        mutable = [
+            path
+            for path in immutable_inputs
+            if path and not _path_mount_is_read_only(path)
+        ]
+        if mutable:
+            raise IsolationError(
+                "engine tree, model, and native artifacts must be mounted read-only: "
+                + ", ".join(mutable)
+            )
+        required_prebuild = (
+            "OPTIMA_PREBUILT_ARTIFACTS",
+            "OPTIMA_NATIVE_BUILD_SPEC_DIGEST",
+            "OPTIMA_NATIVE_ARTIFACT_ROOT",
+            "OPTIMA_NATIVE_ARTIFACT_PUBLICATION_DIGEST",
+        )
+        if any(not os.environ.get(name, "").strip() for name in required_prebuild):
+            raise IsolationError(
+                "external engine worker lacks its sealed native prebuild binding"
             )
     if framework_mode and not isolate:
         if has_setup:
@@ -138,7 +285,11 @@ def prepare_candidate_environment(cfg, *, bundle_path: str, active: bool) -> Non
     if bundle_path:
         from optima.rebuild import apply_rebuild_plan
 
-        if apply_rebuild_plan(bundle_path):
+        if externally_isolated:
+            logger.info(
+                "optima: consuming sealed native products for %s", bundle_path
+            )
+        elif apply_rebuild_plan(bundle_path):
             logger.warning("optima: applied rebuild plan for %s", bundle_path)
         _dep_overlay_env(bundle_path)
 

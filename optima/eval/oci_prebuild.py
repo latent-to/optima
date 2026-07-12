@@ -355,6 +355,36 @@ def _prepare_publication_root_for_lease(
         )
 
 
+def _absolute_deadline(value: float | None) -> float | None:
+    if value is None:
+        return None
+    if type(value) not in (int, float) or not math.isfinite(float(value)):
+        raise OCIPrebuildError("prebuild deadline must be a finite monotonic timestamp")
+    return float(value)
+
+
+def _remaining_deadline(
+    manager: OCIProcessManager | None,
+    deadline: float | None,
+    *,
+    stage: str,
+) -> float | None:
+    if deadline is None:
+        return None
+    if manager is None:  # Internal invariant: a deadline always selects one clock.
+        raise OCIPrebuildError("prebuild deadline has no OCI manager clock")
+    try:
+        now = float(manager.clock())
+    except Exception as exc:
+        raise OCIPrebuildError(f"prebuild monotonic clock failed: {exc}") from None
+    if not math.isfinite(now):
+        raise OCIPrebuildError("prebuild monotonic clock returned a non-finite value")
+    remaining = deadline - now
+    if not math.isfinite(remaining) or remaining <= 0:
+        raise OCIPrebuildError(f"prebuild deadline expired during {stage}")
+    return remaining
+
+
 def build_prebuild_argv(
     *,
     lease: OCILease,
@@ -472,18 +502,38 @@ def run_oci_prebuild(
     *,
     manager: OCIProcessManager | None = None,
     limits: NativeArtifactLimits | None = None,
+    deadline: float | None = None,
 ) -> OCIPrebuildResult:
     """Build, seal, publish, and reopen one native artifact tree."""
     if not isinstance(config, OCIPrebuildConfig):
         raise OCIPrebuildError("config must be OCIPrebuildConfig")
+    deadline = _absolute_deadline(deadline)
+    # A caller-owned deadline and every phase timeout must read the same monotonic
+    # clock.  Construct the manager before identity work only when that deadline is
+    # present; the legacy no-deadline cache-hit path remains side-effect free.
+    if deadline is not None and manager is None:
+        manager = OCIProcessManager(
+            docker_binary=config.docker_binary,
+            recovery_root=config.recovery_root,
+            executor_id=config.executor_id,
+        )
+    if manager is not None and (
+        manager.docker_binary != config.docker_binary
+        or manager.executor_id != config.executor_id
+    ):
+        raise OCIPrebuildError("OCI process manager does not match prebuild config")
+    _remaining_deadline(manager, deadline, stage="binding validation")
     resolved, preflight = _validate_binding(launch, binding, config)
+    _remaining_deadline(manager, deadline, stage="binding validation")
     digest = resolved.native_build_spec.digest
     existing = config.publication_root / digest[:2] / digest
     if existing.exists() or existing.is_symlink():
+        _remaining_deadline(manager, deadline, stage="cached artifact reopen")
         publication = reopen_native_artifact(
             existing, expected_build_spec_digest=digest, limits=limits
         )
         _read_prebuild_receipt(publication.root, resolved=resolved)
+        _remaining_deadline(manager, deadline, stage="cached artifact validation")
         return OCIPrebuildResult(launch.digest, digest, publication, None, None)
 
     if manager is None:
@@ -492,11 +542,11 @@ def run_oci_prebuild(
             recovery_root=config.recovery_root,
             executor_id=config.executor_id,
         )
-    if manager.docker_binary != config.docker_binary or manager.executor_id != config.executor_id:
-        raise OCIPrebuildError("OCI process manager does not match prebuild config")
+    _remaining_deadline(manager, deadline, stage="publication-root preparation")
     _prepare_publication_root_for_lease(
         config.publication_root, recovery_resources_root=manager.resources_root
     )
+    _remaining_deadline(manager, deadline, stage="lease registration")
     lease_id = "prebuild-" + secrets.token_hex(10)
     lease = manager.register(
         lease_id=lease_id,
@@ -508,11 +558,13 @@ def run_oci_prebuild(
     seccomp_copy = lease.stage_paths[0]
     publication_work = lease.stage_paths[1]
     try:
+        _remaining_deadline(manager, deadline, stage="seccomp staging")
         _copy_seccomp(
             config.seccomp_profile,
             seccomp_copy,
             expected_digest=launch.seccomp_policy_digest,
         )
+        _remaining_deadline(manager, deadline, stage="native-stage mount")
         manager.mount_tmpfs(
             lease,
             stage_path,
@@ -522,6 +574,7 @@ def run_oci_prebuild(
             gid=config.policy.gid,
             executable=False,
         )
+        _remaining_deadline(manager, deadline, stage="launch-tree reopen")
         # Reopen immediately before passing the host path to Docker; the container
         # independently reopens and hashes the mounted tree as well.
         reopen_launch_tree(launch, resolved.materialized_tree_root)
@@ -533,15 +586,23 @@ def run_oci_prebuild(
             stage_path=stage_path,
             seccomp_path=seccomp_copy,
         )
-        execution = manager.run(
-            lease, argv, timeout_s=float(config.policy.timeout_seconds)
+        remaining = _remaining_deadline(
+            manager, deadline, stage="native prebuild container"
         )
+        container_timeout = float(config.policy.timeout_seconds)
+        if remaining is not None:
+            container_timeout = min(container_timeout, remaining)
+        execution = manager.run(
+            lease, argv, timeout_s=container_timeout
+        )
+        _remaining_deadline(manager, deadline, stage="container completion")
         if execution.returncode != 0:
             raise OCIPrebuildError(
                 f"native prebuild container exited {execution.returncode}"
             )
         reopen_launch_tree(launch, resolved.materialized_tree_root)
         _read_prebuild_receipt(stage_path, resolved=resolved)
+        _remaining_deadline(manager, deadline, stage="artifact publication")
         publication_work.mkdir(mode=0o700)
         publication = publish_native_artifact(
             stage_path,
@@ -551,9 +612,11 @@ def run_oci_prebuild(
             limits=limits,
         )
         _read_prebuild_receipt(publication.root, resolved=resolved)
+        _remaining_deadline(manager, deadline, stage="published artifact validation")
         argv_digest = hashlib.sha256(
             json.dumps(argv, separators=(",", ":")).encode("utf-8")
         ).hexdigest()
+        _remaining_deadline(manager, deadline, stage="prebuild result assembly")
         return OCIPrebuildResult(
             launch.digest,
             digest,

@@ -998,38 +998,6 @@ class SelectionReceipt(_Canonical):
         )
 
 
-def _validated_topk_position(position: object) -> list[list[object]]:
-    """Validate one retained distribution while accepting legitimate ties.
-
-    Quantized inference can emit bit-identical log-probabilities for more than
-    one token.  A tie is a valid distribution, not missing evidence.  Preserve
-    the runtime's retained order because its first row is the rollout's observed
-    top-one identity; lower-rank ties already had this meaning in v1 artifacts.
-    """
-
-    if not isinstance(position, (tuple, list)) or not position:
-        raise QualificationError("trajectory top-k position is malformed")
-    entries: list[tuple[float, int]] = []
-    for entry in position:
-        if not isinstance(entry, (tuple, list)) or len(entry) != 2:
-            raise QualificationError("trajectory top-k entry is malformed")
-        logprob, token_id = entry
-        if (
-            isinstance(logprob, bool)
-            or not isinstance(logprob, (int, float))
-            or not math.isfinite(float(logprob))
-            or type(token_id) is not int
-            or token_id < 0
-        ):
-            raise QualificationError("trajectory top-k entry is invalid")
-        entries.append((float(logprob), token_id))
-    if len({token_id for _logprob, token_id in entries}) != len(entries):
-        raise QualificationError("trajectory top-k contains duplicate tokens")
-    if any(left[0] < right[0] for left, right in zip(entries, entries[1:])):
-        raise QualificationError("trajectory top-k order is invalid")
-    return [[format(logprob, ".17g"), token_id] for logprob, token_id in entries]
-
-
 def _trajectory_rows(lifecycle: object):
     from optima.eval.marginal_runtime import MarginalLifecycleEvidence
     from optima.eval.oci_session_protocol import PromptEvidence
@@ -1067,7 +1035,18 @@ def _trajectory_rows(lifecycle: object):
                     raise QualificationError("trajectory token/top-k coverage differs from workload")
                 topk = []
                 for position in evidence.top_logprobs:
-                    topk.append(_validated_topk_position(position))
+                    clean = []
+                    for logprob, token_id in position:
+                        if not math.isfinite(logprob) or type(token_id) is not int or token_id < 0:
+                            raise QualificationError("trajectory top-k entry is invalid")
+                        clean.append([format(logprob, ".17g"), token_id])
+                    if (
+                        len({row[1] for row in clean}) != len(clean)
+                        or any(left[0] < right[0] for left, right in zip(position, position[1:]))
+                        or (len(position) > 1 and position[0][0] == position[1][0])
+                    ):
+                        raise QualificationError("trajectory top-k order/argmax is ambiguous")
+                    topk.append(clean)
                 frames.append({"output_ids": list(evidence.output_ids), "top_logprobs": topk})
             rows.append((occurrence, frames))
     return workload, tuple(rows)

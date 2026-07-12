@@ -20,6 +20,7 @@ import json
 import multiprocessing
 import multiprocessing.process
 import os
+import pickle
 import re
 import sys
 import threading
@@ -51,8 +52,12 @@ DISCOVERY_ENVIRONMENT_KEYS = (
 _SCHEDULER_ROLE = "scheduler"
 _SCHEDULER_MODULE = "sglang.srt.managers.scheduler"
 _SCHEDULER_QUALNAME = "run_scheduler_process"
+_SERVER_ARGS_MODULE = "sglang.srt.server_args"
 _TRAMPOLINE_MODULE = "optima.discovery_overlay"
 _TRAMPOLINE_QUALNAME = "_scheduler_overlay_entry"
+_SCHEDULER_ARGUMENT_SCHEMA = "optima.discovery-scheduler-arguments.v1"
+_SCHEDULER_PICKLE_PROTOCOL = 5
+_MAX_SCHEDULER_ARGUMENT_BYTES = 1 << 20
 _DRIVER_MODULE = "sglang/__init__.py"
 _ACTIVATION_SCHEMA = "optima.discovery-driver-activation.v1"
 _ACTIVATION_POLICY_SCHEMA = "optima.discovery-activation-policy.v1"
@@ -82,6 +87,16 @@ def activation_policy_digest() -> str:
             "version_bound_by_requirement": True,
         },
         "scheduler": {
+            "argument_transport": {
+                "custom_sigquit_handler": None,
+                "max_pickle_bytes": _MAX_SCHEDULER_ARGUMENT_BYTES,
+                "parent_types": [
+                    f"{_SERVER_ARGS_MODULE}.PortArgs",
+                    f"{_SERVER_ARGS_MODULE}.ServerArgs",
+                ],
+                "pickle_protocol": _SCHEDULER_PICKLE_PROTOCOL,
+                "schema": _SCHEDULER_ARGUMENT_SCHEMA,
+            },
             "dp_rank": None,
             "dp_size": 1,
             "module": _SCHEDULER_MODULE,
@@ -566,6 +581,134 @@ def _scheduler_member_before_start(
     )
 
 
+def _scheduler_argument_blob(value: object, *, field: str) -> tuple[bytes, str]:
+    try:
+        raw = pickle.dumps(value, protocol=_SCHEDULER_PICKLE_PROTOCOL)
+    except (
+        pickle.PickleError,
+        AttributeError,
+        OSError,
+        RecursionError,
+        TypeError,
+        ValueError,
+    ) as exc:
+        raise DiscoveryOverlayActivationError(
+            f"discovery scheduler {field} cannot be sealed: {exc}"
+        ) from None
+    if not raw or len(raw) > _MAX_SCHEDULER_ARGUMENT_BYTES:
+        raise DiscoveryOverlayActivationError(
+            f"discovery scheduler {field} pickle exceeds its hard bound"
+        )
+    return raw, hashlib.sha256(raw).hexdigest()
+
+
+def _scheduler_argument_envelope(arguments: object) -> tuple[object, ...]:
+    """Hide SGLang-owned arguments from ``spawn`` until overlay activation."""
+
+    if not isinstance(arguments, tuple) or len(arguments) != 10:
+        raise DiscoveryOverlayActivationError(
+            "pinned discovery scheduler signature changed"
+        )
+    module = sys.modules.get(_SERVER_ARGS_MODULE)
+    server_type = getattr(module, "ServerArgs", None)
+    port_type = getattr(module, "PortArgs", None)
+    server_args, port_args = arguments[:2]
+    if (
+        not isinstance(server_type, type)
+        or not isinstance(port_type, type)
+        or type(server_args) is not server_type
+        or type(port_args) is not port_type
+    ):
+        raise DiscoveryOverlayActivationError(
+            "discovery scheduler arguments are not exact pinned SGLang types"
+        )
+    if (
+        not hasattr(server_args, "custom_sigquit_handler")
+        or server_args.custom_sigquit_handler is not None
+    ):
+        raise DiscoveryOverlayActivationError(
+            "discovery scheduler custom SIGQUIT handlers are unsupported"
+        )
+    server_blob, server_digest = _scheduler_argument_blob(
+        server_args, field="ServerArgs"
+    )
+    port_blob, port_digest = _scheduler_argument_blob(port_args, field="PortArgs")
+    return (
+        _SCHEDULER_ARGUMENT_SCHEMA,
+        server_blob,
+        server_digest,
+        port_blob,
+        port_digest,
+        *arguments[2:],
+    )
+
+
+def _open_scheduler_argument_blob(
+    raw: object, digest: object, *, field: str, expected_type: type
+) -> object:
+    if (
+        not isinstance(raw, bytes)
+        or not raw
+        or len(raw) > _MAX_SCHEDULER_ARGUMENT_BYTES
+        or not isinstance(digest, str)
+        or _DIGEST.fullmatch(digest) is None
+        or hashlib.sha256(raw).hexdigest() != digest
+    ):
+        raise DiscoveryOverlayActivationError(
+            f"discovery scheduler {field} envelope is malformed or changed"
+        )
+    try:
+        value = pickle.loads(raw)
+    except (
+        pickle.PickleError,
+        AttributeError,
+        EOFError,
+        ImportError,
+        IndexError,
+        RecursionError,
+        TypeError,
+        ValueError,
+    ) as exc:
+        raise DiscoveryOverlayActivationError(
+            f"discovery scheduler {field} cannot be reopened: {exc}"
+        ) from None
+    if type(value) is not expected_type:
+        raise DiscoveryOverlayActivationError(
+            f"discovery scheduler {field} did not reopen as the exact overlay type"
+        )
+    return value
+
+
+def _open_scheduler_argument_envelope(
+    arguments: tuple[object, ...],
+) -> tuple[object, ...]:
+    if len(arguments) != 13 or arguments[0] != _SCHEDULER_ARGUMENT_SCHEMA:
+        raise DiscoveryOverlayActivationError(
+            "discovery scheduler argument envelope schema or shape changed"
+        )
+    module = importlib.import_module(_SERVER_ARGS_MODULE)
+    server_type = getattr(module, "ServerArgs", None)
+    port_type = getattr(module, "PortArgs", None)
+    if not isinstance(server_type, type) or not isinstance(port_type, type):
+        raise DiscoveryOverlayActivationError(
+            "discovery overlay lacks exact scheduler argument classes"
+        )
+    server_args = _open_scheduler_argument_blob(
+        arguments[1], arguments[2], field="ServerArgs", expected_type=server_type
+    )
+    port_args = _open_scheduler_argument_blob(
+        arguments[3], arguments[4], field="PortArgs", expected_type=port_type
+    )
+    if (
+        not hasattr(server_args, "custom_sigquit_handler")
+        or server_args.custom_sigquit_handler is not None
+    ):
+        raise DiscoveryOverlayActivationError(
+            "discovery overlay reopened a custom SIGQUIT handler"
+        )
+    return (server_args, port_args, *arguments[5:])
+
+
 def _with_started_pid(
     member: _PendingScheduler, process: object
 ) -> DiscoverySchedulerMember:
@@ -686,13 +829,13 @@ def require_stock_driver_origin(
     return DiscoveryDriverOrigin("sglang", installed_version, _DRIVER_MODULE)
 
 
-def _scheduler_overlay_entry(*args, **kwargs):
+def _scheduler_overlay_entry(*args):
     """Activate the sealed overlay before importing the scheduler target.
 
-    ``multiprocessing.spawn`` otherwise imports the stock scheduler module while
-    unpickling its target, which is already too late to switch package roots.
-    The stock driver verifies the original target before substituting this
-    validator-owned entry point.
+    ``multiprocessing.spawn`` otherwise imports stock SGLang while unpickling
+    both the target and its ``ServerArgs``/``PortArgs`` values, which is already
+    too late to switch package roots.  The stock driver verifies and seals those
+    values before substituting this validator-owned entry point.
     """
 
     install()
@@ -711,7 +854,8 @@ def _scheduler_overlay_entry(*args, **kwargs):
         raise DiscoveryOverlayActivationError(
             "discovery scheduler trampoline did not activate the sealed overlay"
         )
-    return target(*args, **kwargs)
+    reopened = _open_scheduler_argument_envelope(args)
+    return target(*reopened)
 
 
 def install_process_role_hook() -> None:
@@ -754,6 +898,8 @@ def install_process_role_hook() -> None:
                     f"observed {method!r}"
                 )
             pending = _scheduler_member_before_start(process, state)
+            original_arguments = getattr(process, "_args", None)
+            sealed_arguments = _scheduler_argument_envelope(original_arguments)
             if (
                 any(
                     row.member.tp_rank == pending.tp_rank
@@ -773,6 +919,7 @@ def install_process_role_hook() -> None:
             os.environ[PROCESS_ROLE] = role
             os.environ[ROLE_PARENT_PID] = str(os.getpid())
             process._target = _scheduler_overlay_entry
+            process._args = sealed_arguments
             try:
                 result = original(process, *args, **kwargs)
                 member = _with_started_pid(pending, process)
@@ -791,6 +938,7 @@ def install_process_role_hook() -> None:
                     os.environ.pop(ROLE_PARENT_PID, None)
                 else:
                     os.environ[ROLE_PARENT_PID] = saved_parent
+                process._args = original_arguments
                 process._target = original_target
 
     start.__optima_discovery_role_hook__ = True

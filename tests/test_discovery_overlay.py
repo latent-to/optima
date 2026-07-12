@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import multiprocessing.process
 import os
+import pickle
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -35,11 +38,17 @@ def _h(label: str) -> str:
     return hashlib.sha256(label.encode()).hexdigest()
 
 
-def test_activation_policy_identity_is_fixed_and_content_addressed() -> None:
+def test_activation_policy_identity_is_fixed_and_content_addressed(monkeypatch) -> None:
     digest = activation_policy_digest()
     assert digest == activation_policy_digest()
     assert len(digest) == 64
     assert set(digest) <= set("0123456789abcdef")
+    monkeypatch.setattr(
+        overlay_module,
+        "_SCHEDULER_ARGUMENT_SCHEMA",
+        "optima.discovery-scheduler-arguments.v2",
+    )
+    assert activation_policy_digest() != digest
 
 
 def _scheduler_target() -> None:
@@ -48,6 +57,24 @@ def _scheduler_target() -> None:
 
 _scheduler_target.__module__ = "sglang.srt.managers.scheduler"
 _scheduler_target.__qualname__ = "run_scheduler_process"
+
+
+class _FakeServerArgs:
+    def __init__(self, tp_size: int, **overrides: object) -> None:
+        values = {
+            "custom_sigquit_handler": None,
+            "dp_size": 1,
+            "nnodes": 1,
+            "node_rank": 0,
+            "pp_size": 1,
+            "tp_size": tp_size,
+        }
+        values.update(overrides)
+        self.__dict__.update(values)
+
+
+class _FakePortArgs:
+    pass
 
 
 class _Distribution:
@@ -74,7 +101,7 @@ class _FakeProcess:
         self._target = _scheduler_target
         self._args = (
             server_args,
-            object(),
+            _FakePortArgs(),
             gpu_id,
             tp_rank,
             tp_rank,
@@ -95,22 +122,19 @@ class _FakeProcess:
 
 
 @pytest.fixture(autouse=True)
-def _clear_activation_state():
+def _clear_activation_state(monkeypatch):
+    monkeypatch.setitem(
+        sys.modules,
+        "sglang.srt.server_args",
+        SimpleNamespace(ServerArgs=_FakeServerArgs, PortArgs=_FakePortArgs),
+    )
     clear_driver_activation()
     yield
     clear_driver_activation()
 
 
-def _server_args(tp_size: int, **overrides: int) -> object:
-    values = {
-        "dp_size": 1,
-        "nnodes": 1,
-        "node_rank": 0,
-        "pp_size": 1,
-        "tp_size": tp_size,
-    }
-    values.update(overrides)
-    return SimpleNamespace(**values)
+def _server_args(tp_size: int, **overrides: object) -> object:
+    return _FakeServerArgs(tp_size, **overrides)
 
 
 def _stock_module(tmp_path: Path, *, version: str = "0.0.0.dev1"):
@@ -164,10 +188,12 @@ def test_scheduler_spawn_substitutes_trampoline_then_restores_target(
     root = _overlay_root(tmp_path)
     _arm_environment(monkeypatch, root, identity, 1)
     observed: list[tuple[str, str]] = []
+    observed_arguments: list[tuple[object, ...]] = []
 
     def original(process, *args, **kwargs):
         target = process._target
         observed.append((target.__module__, target.__qualname__))
+        observed_arguments.append(process._args)
         return "started"
 
     monkeypatch.setattr(multiprocessing.process.BaseProcess, "start", original)
@@ -175,10 +201,34 @@ def test_scheduler_spawn_substitutes_trampoline_then_restores_target(
     process = _FakeProcess(
         server_args=_server_args(1), pid=351, gpu_id=0, tp_rank=0
     )
+    original_arguments = process._args
     assert multiprocessing.process.BaseProcess.start(process) == "started"
     assert observed == [
         ("optima.discovery_overlay", "_scheduler_overlay_entry")
     ]
+    assert observed_arguments[0][0] == overlay_module._SCHEDULER_ARGUMENT_SCHEMA
+    assert isinstance(observed_arguments[0][1], bytes)
+    assert isinstance(observed_arguments[0][3], bytes)
+    assert all(
+        type(value) not in {_FakeServerArgs, _FakePortArgs}
+        for value in observed_arguments[0]
+    )
+
+    class TrackingUnpickler(pickle.Unpickler):
+        modules: list[str] = []
+
+        def find_class(self, module, name):
+            self.modules.append(module)
+            return super().find_class(module, name)
+
+    TrackingUnpickler(
+        io.BytesIO(pickle.dumps(observed_arguments[0], protocol=5))
+    ).load()
+    assert not any(
+        module == "sglang" or module.startswith("sglang.")
+        for module in TrackingUnpickler.modules
+    )
+    assert process._args is original_arguments
     assert process._target is _scheduler_target
 
 
@@ -196,18 +246,164 @@ def test_scheduler_trampoline_requires_active_overlay_before_calling_target(
     target.__module__ = "sglang.srt.managers.scheduler"
     target.__qualname__ = "run_scheduler_process"
     module = SimpleNamespace(run_scheduler_process=target)
+    argument_module = SimpleNamespace(
+        ServerArgs=_FakeServerArgs, PortArgs=_FakePortArgs
+    )
     monkeypatch.setattr(
-        overlay_module.importlib, "import_module", lambda name: module
+        overlay_module.importlib,
+        "import_module",
+        lambda name: (
+            module
+            if name == "sglang.srt.managers.scheduler"
+            else argument_module
+        ),
     )
     monkeypatch.setattr(overlay_module, "install", lambda: None)
+    process = _FakeProcess(
+        server_args=_server_args(1), pid=352, gpu_id=0, tp_rank=0
+    )
+    envelope = overlay_module._scheduler_argument_envelope(process._args)
 
     with pytest.raises(DiscoveryOverlayActivationError, match="did not activate"):
-        overlay_module._scheduler_overlay_entry("first")
+        overlay_module._scheduler_overlay_entry(*envelope)
     assert calls == []
 
     monkeypatch.setenv(ACTIVE_IDENTITY, identity)
-    assert overlay_module._scheduler_overlay_entry("first", rank=2) == "ran"
-    assert calls == [(('first',), {"rank": 2})]
+    assert overlay_module._scheduler_overlay_entry(*envelope) == "ran"
+    assert len(calls) == 1
+    reopened, keywords = calls[0]
+    assert keywords == {}
+    assert type(reopened[0]) is _FakeServerArgs
+    assert type(reopened[1]) is _FakePortArgs
+    assert reopened[0].tp_size == 1
+    assert reopened[2:] == process._args[2:]
+
+
+def test_scheduler_spawn_restores_target_and_arguments_after_start_failure(
+    tmp_path, monkeypatch
+):
+    identity = _h("overlay")
+    root = _overlay_root(tmp_path)
+    _arm_environment(monkeypatch, root, identity, 1)
+
+    def original(process, *args, **kwargs):
+        assert process._target is overlay_module._scheduler_overlay_entry
+        assert process._args[0] == overlay_module._SCHEDULER_ARGUMENT_SCHEMA
+        raise RuntimeError("spawn failed")
+
+    monkeypatch.setattr(multiprocessing.process.BaseProcess, "start", original)
+    install_process_role_hook()
+    process = _FakeProcess(
+        server_args=_server_args(1), pid=353, gpu_id=0, tp_rank=0
+    )
+    original_arguments = process._args
+
+    with pytest.raises(RuntimeError, match="spawn failed"):
+        multiprocessing.process.BaseProcess.start(process)
+    assert process._target is _scheduler_target
+    assert process._args is original_arguments
+
+
+def test_scheduler_spawn_requires_exact_argument_types_and_default_sigquit(
+    tmp_path, monkeypatch
+):
+    identity = _h("overlay")
+    root = _overlay_root(tmp_path)
+    _arm_environment(monkeypatch, root, identity, 1)
+    start = _install_fake_start(monkeypatch, [])
+
+    wrong = _FakeProcess(
+        server_args=SimpleNamespace(
+            custom_sigquit_handler=None,
+            dp_size=1,
+            nnodes=1,
+            node_rank=0,
+            pp_size=1,
+            tp_size=1,
+        ),
+        pid=354,
+        gpu_id=0,
+        tp_rank=0,
+    )
+    with pytest.raises(DiscoveryOverlayActivationError, match="exact pinned"):
+        start(wrong)
+
+    wrong_port = _FakeProcess(
+        server_args=_server_args(1), pid=355, gpu_id=0, tp_rank=0
+    )
+    wrong_port._args = (
+        wrong_port._args[0],
+        object(),
+        *wrong_port._args[2:],
+    )
+    with pytest.raises(DiscoveryOverlayActivationError, match="exact pinned"):
+        start(wrong_port)
+
+    custom = _FakeProcess(
+        server_args=_server_args(1, custom_sigquit_handler=object()),
+        pid=356,
+        gpu_id=0,
+        tp_rank=0,
+    )
+    with pytest.raises(DiscoveryOverlayActivationError, match="SIGQUIT"):
+        start(custom)
+
+    oversized = _FakeProcess(
+        server_args=_server_args(
+            1, payload=b"x" * overlay_module._MAX_SCHEDULER_ARGUMENT_BYTES
+        ),
+        pid=357,
+        gpu_id=0,
+        tp_rank=0,
+    )
+    with pytest.raises(DiscoveryOverlayActivationError, match="hard bound"):
+        start(oversized)
+
+
+def test_scheduler_argument_envelope_rejects_changed_oversize_and_corrupt_blobs(
+    monkeypatch,
+):
+    process = _FakeProcess(
+        server_args=_server_args(1), pid=358, gpu_id=0, tp_rank=0
+    )
+    envelope = list(overlay_module._scheduler_argument_envelope(process._args))
+
+    changed = list(envelope)
+    changed[1] += b"changed"
+    with pytest.raises(DiscoveryOverlayActivationError, match="malformed or changed"):
+        overlay_module._open_scheduler_argument_envelope(tuple(changed))
+
+    oversize = list(envelope)
+    oversize[1] = b"x" * (overlay_module._MAX_SCHEDULER_ARGUMENT_BYTES + 1)
+    oversize[2] = hashlib.sha256(oversize[1]).hexdigest()
+    with pytest.raises(DiscoveryOverlayActivationError, match="malformed or changed"):
+        overlay_module._open_scheduler_argument_envelope(tuple(oversize))
+
+    monkeypatch.setattr(
+        overlay_module.pickle,
+        "loads",
+        lambda _raw: (_ for _ in ()).throw(RecursionError("nested")),
+    )
+    with pytest.raises(DiscoveryOverlayActivationError, match="cannot be reopened"):
+        overlay_module._open_scheduler_argument_envelope(tuple(envelope))
+
+
+def test_scheduler_argument_envelope_requires_exact_overlay_classes(monkeypatch):
+    process = _FakeProcess(
+        server_args=_server_args(1), pid=359, gpu_id=0, tp_rank=0
+    )
+    envelope = overlay_module._scheduler_argument_envelope(process._args)
+
+    class DifferentServerArgs:
+        pass
+
+    monkeypatch.setitem(
+        sys.modules,
+        "sglang.srt.server_args",
+        SimpleNamespace(ServerArgs=DifferentServerArgs, PortArgs=_FakePortArgs),
+    )
+    with pytest.raises(DiscoveryOverlayActivationError, match="exact overlay type"):
+        overlay_module._open_scheduler_argument_envelope(envelope)
 
 
 def test_launch_environment_clears_every_inactive_marker(tmp_path):

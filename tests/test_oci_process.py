@@ -165,6 +165,14 @@ def test_quiescence_receipt_requires_empty_executor_namespace(tmp_path: Path) ->
         manager.prove_quiescent()
 
 
+def test_transaction_lock_reenters_for_one_controller_thread(tmp_path: Path) -> None:
+    manager = _manager(tmp_path)
+    assert manager.transaction_lock.acquire(blocking=False)
+    assert manager.transaction_lock.acquire(blocking=False)
+    manager.transaction_lock.release()
+    manager.transaction_lock.release()
+
+
 def test_executor_namespace_has_one_live_manager_owner(tmp_path: Path) -> None:
     manager = _manager(tmp_path)
     with pytest.raises(OCIProcessError, match="already owned"):

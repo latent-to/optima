@@ -266,6 +266,7 @@ def _raw_binding(
         selected_trajectory_projection_digest=raw_trajectory_projection_digest(prompts),
         selected_prompt_digests=tuple(row.prompt_digest for row in prompts),
         t_session_digest=_digest("9"),
+        t_request_sha256=_digest("c"),
         support_policy_digest=_digest("b"),
         hidden_task_plan_digest=hidden_task_plan_digest(prompts),
         nll_tail_threshold="2",

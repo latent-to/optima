@@ -306,7 +306,9 @@ class OCIProcessManager:
         self.resources_root.mkdir(mode=0o700, parents=True, exist_ok=True)
         self.runner = runner
         self.clock = clock
-        self.transaction_lock = threading.Lock()
+        # A trusted controller may reserve the complete B/C/B-prime/T
+        # transaction while re-entering for each individual engine lifetime.
+        self.transaction_lock = threading.RLock()
         self._quiescence_sequence = 0
 
     def _require_namespace_owner(self) -> None:

@@ -798,8 +798,9 @@ def test_quality_binding_projects_exact_lifecycle_coverage(tmp_path: Path):
         request_sha256(request), request.request_id, request.nonce, 0, 32_000,
         tuple(evidence_prompts),
     )
+    reference_request_sha256 = request_sha256(request)
     exchange = ReferenceExchangeEvidence(
-        0, request, request_sha256(request),
+        0, request, reference_request_sha256,
         sha256_hex(encode_reference_evidence(teacher_evidence, request)),
         1.0, 2.0, teacher_evidence,
     )
@@ -834,6 +835,7 @@ def test_quality_binding_projects_exact_lifecycle_coverage(tmp_path: Path):
         calibration=calibration,
         candidate_lifecycle=lifecycle_digest,
         t_session=t_session,
+        t_request_sha256=reference_request_sha256,
         selected_delta_digest=delta,
     )
     binding = ReferenceQualityRawBinding(
@@ -846,7 +848,7 @@ def test_quality_binding_projects_exact_lifecycle_coverage(tmp_path: Path):
             lifecycle, selected_delta_digest=delta,
             selected_prompt_digests=selection.selected_prompt_digests,
         ), selection.selected_prompt_digests,
-        t_session.digest, profile.support_policy_digest,
+        t_session.digest, reference_request_sha256, profile.support_policy_digest,
         derived_hidden_task_plan_digest(profile, selection.selected_prompt_digests),
         profile.nll_tail_threshold, 10, 1, 2,
     )
@@ -856,6 +858,7 @@ def test_quality_binding_projects_exact_lifecycle_coverage(tmp_path: Path):
         commitment=commitment, entropy=entropy, selection=selection,
         calibration=calibration, graph_requirement=requirement,
         reference_execution=reference_execution,
+        reference_request_sha256=reference_request_sha256,
     ) == raw_artifact
     with pytest.raises(QualificationError, match="frozen workload"):
         validate_quality_binding(
@@ -864,6 +867,7 @@ def test_quality_binding_projects_exact_lifecycle_coverage(tmp_path: Path):
             commitment=commitment, entropy=entropy, selection=selection,
             calibration=calibration, graph_requirement=requirement,
             reference_execution=reference_execution,
+            reference_request_sha256=reference_request_sha256,
         )
     with pytest.raises(QualificationError, match="frozen workload"):
         validate_quality_binding(
@@ -872,6 +876,7 @@ def test_quality_binding_projects_exact_lifecycle_coverage(tmp_path: Path):
             entropy=entropy, selection=selection, calibration=calibration,
             graph_requirement=requirement,
             reference_execution=reference_execution,
+            reference_request_sha256=reference_request_sha256,
         )
     forged = replace(
         raw_artifact.prompts[0].candidate.tokens[0],
@@ -892,4 +897,5 @@ def test_quality_binding_projects_exact_lifecycle_coverage(tmp_path: Path):
             commitment=commitment, entropy=entropy, selection=selection,
             calibration=calibration, graph_requirement=requirement,
             reference_execution=reference_execution,
+            reference_request_sha256=reference_request_sha256,
         )

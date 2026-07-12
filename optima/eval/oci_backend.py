@@ -8,6 +8,7 @@ client, inference runtime import, or candidate execution.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import math
@@ -19,7 +20,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Callable, Protocol
+from typing import Callable, Iterator, Protocol
 
 from optima.eval.device_state import (
     CommandRunner as DeviceCommandRunner,
@@ -801,6 +802,17 @@ class OCIEngineExecutor:
             raise OCIBackendError("cannot prove quiescence during an active session")
         try:
             return self.manager.prove_quiescent()
+        finally:
+            self._lock.release()
+
+    @contextlib.contextmanager
+    def exclusive_transaction(self) -> Iterator["OCIEngineExecutor"]:
+        """Reserve this manager across one causal multi-engine qualification."""
+
+        if not self._lock.acquire(blocking=False):
+            raise OCIBackendError("executor manager already has an active transaction")
+        try:
+            yield self
         finally:
             self._lock.release()
 

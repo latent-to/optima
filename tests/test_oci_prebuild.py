@@ -949,6 +949,42 @@ def test_stock_sglang_distribution_must_match_version_and_pinned_root(
         )
 
 
+def test_stock_sglang_distribution_resolves_pinned_editable_install(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import importlib.metadata
+    import importlib.util
+    from types import SimpleNamespace
+
+    import optima.eval.oci_prebuild as prebuild_mod
+
+    source_site = _stock_sglang(tmp_path)
+    metadata_site = tmp_path / "site-packages"
+    metadata_site.mkdir()
+
+    class Distribution:
+        version = DEFAULT_DISCOVERY_POLICY.sglang_version
+
+        @staticmethod
+        def locate_file(_path: str) -> Path:
+            return metadata_site / "sglang"
+
+    monkeypatch.setattr(importlib.metadata, "distribution", lambda name: Distribution())
+    monkeypatch.setattr(
+        importlib.util,
+        "find_spec",
+        lambda name: SimpleNamespace(
+            origin=str(source_site / "sglang" / "__init__.py"),
+            submodule_search_locations=(str(source_site / "sglang"),),
+        ),
+    )
+
+    assert prebuild_mod._stock_sglang_site_root(
+        expected_version=DEFAULT_DISCOVERY_POLICY.sglang_version,
+        pinned_build_roots=(str(source_site.resolve()),),
+    ) == source_site.resolve()
+
+
 def test_seccomp_bytes_and_existing_publication_fail_closed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

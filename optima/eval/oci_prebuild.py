@@ -784,6 +784,7 @@ def _stock_sglang_site_root(
     """Locate image-owned SGLang as data without importing its package."""
 
     import importlib.metadata
+    import importlib.util
 
     try:
         distribution = importlib.metadata.distribution("sglang")
@@ -795,11 +796,41 @@ def _stock_sglang_site_root(
         )
     try:
         requested_package = Path(distribution.locate_file("sglang"))
-        if requested_package.is_symlink():
-            raise OCIPrebuildError("image SGLang package must not be a symlink")
+        if not requested_package.exists():
+            # Editable image installs keep distribution metadata in
+            # site-packages while the package itself remains under a pinned
+            # source root. Resolving the top-level spec does not import or run
+            # SGLang; the package initializer remains unopened data.
+            spec = importlib.util.find_spec("sglang")
+            locations = (
+                ()
+                if spec is None
+                else tuple(spec.submodule_search_locations or ())
+            )
+            if (
+                spec is None
+                or len(locations) != 1
+                or spec.origin is None
+                or Path(spec.origin) != Path(locations[0]) / "__init__.py"
+            ):
+                raise OCIPrebuildError(
+                    "image SGLang editable package cannot be resolved exactly"
+                )
+            requested_package = Path(locations[0])
+        initializer = requested_package / "__init__.py"
+        if requested_package.is_symlink() or initializer.is_symlink():
+            raise OCIPrebuildError(
+                "image SGLang package and initializer must not be symlinks"
+            )
         package = requested_package.resolve(strict=True)
+        resolved_initializer = initializer.resolve(strict=True)
         site = package.parent
-        if package.name != "sglang" or not package.is_dir():
+        if (
+            package.name != "sglang"
+            or not package.is_dir()
+            or resolved_initializer != package / "__init__.py"
+            or not resolved_initializer.is_file()
+        ):
             raise OCIPrebuildError("image SGLang distribution has no package tree")
         roots = tuple(Path(value).resolve(strict=True) for value in pinned_build_roots)
     except OCIPrebuildError:

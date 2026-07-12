@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import concurrent.futures
 import hashlib
 import os
 from dataclasses import fields, replace
@@ -867,12 +868,12 @@ def test_executors_sharing_manager_share_transaction_lock(tmp_path: Path) -> Non
     first = OCIEngineExecutor(case.config, case.device_policy, manager=manager)
     second = OCIEngineExecutor(case.config, case.device_policy, manager=manager)
     assert first._lock is second._lock is manager.transaction_lock
-    assert first._lock.acquire(blocking=False)
-    try:
-        with pytest.raises(OCIBackendError, match="active session"):
-            second.prove_quiescent()
-    finally:
-        first._lock.release()
+    with first.exclusive_transaction():
+        first.prove_quiescent()
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            blocked = pool.submit(second.prove_quiescent)
+            with pytest.raises(OCIBackendError, match="active session"):
+                blocked.result()
 
 
 def test_trusted_backend_has_no_economic_fields_or_runtime_authority() -> None:

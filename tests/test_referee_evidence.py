@@ -94,6 +94,20 @@ def test_pr47_retains_exact_github_check_receipt() -> None:
     }
 
 
+def test_pr48_retains_exact_github_check_receipt() -> None:
+    record = load_json(EVIDENCE / "records/pr-0048.json")
+    validate_record(record, ROOT, "pr48")
+    artifact = next(item for item in record["artifacts"] if item["id"] == "github.referee-evidence")
+    assert artifact["availability"] == "repository"
+    receipt = load_json(ROOT / artifact["locator"])
+    assert receipt["pull_request"] == 48
+    assert receipt["total_count"] == 4
+    assert {item["conclusion"] for item in receipt["check_runs"]} == {"success"}
+    assert {item["head_sha"] for item in receipt["check_runs"]} == {
+        "a5797e00b3ba46902a88a7f83f6a734af2a4a2d1"
+    }
+
+
 def test_pr4b_contract_closes_scope_budget_and_required_replacements() -> None:
     contract = load_json(EVIDENCE / "contracts/pr4b.json")
     validate_contract_document(contract)
@@ -126,11 +140,31 @@ def test_pr4b_contract_closes_scope_budget_and_required_replacements() -> None:
         if row.get("properties", {}).get("record_type", {}).get("const")
         == "scope_contract"
     )
-    scope["properties"]["allowed_paths"]["const"]["production"].append(
-        "optima/eval/qualification_runner.py"
-    )
-    with pytest.raises(EvidenceError, match="scope constant differs"):
+    scope["properties"]["allowed_paths"]["const"] = contract["allowed_paths"]
+    with pytest.raises(EvidenceError, match="must be generic"):
         validate_v2_schema_contract(stale, contract)
+
+
+def test_pr4c_contract_closes_causal_runner_scope() -> None:
+    contract = load_json(EVIDENCE / "contracts/pr4c.json")
+    validate_contract_document(contract)
+    changes = {
+        item["path"]: ({"add": "A", "modify": "M"}[item["change"]], 1, 0)
+        for item in contract["required_in_place"]
+    }
+    validate_scope(contract, changes)
+    schema = load_json(EVIDENCE / "schema-v2.json")
+    validate_v2_schema_contract(schema, contract)
+
+    outside = dict(changes)
+    outside["optima/chain/validator_loop.py"] = ("M", 1, 0)
+    with pytest.raises(EvidenceError, match="outside frozen pr4c"):
+        validate_scope(contract, outside)
+
+    over_budget = dict(changes)
+    over_budget["optima/eval/qualification_runner.py"] = ("A", 1401, 0)
+    with pytest.raises(EvidenceError, match="pr4c line budget"):
+        validate_scope(contract, over_budget)
 
 
 def test_authority_boundary_walks_transitive_and_relative_repo_imports(tmp_path: Path) -> None:

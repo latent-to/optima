@@ -1,0 +1,154 @@
+{
+  "architectural_unit": "4b",
+  "artifacts": [
+    {
+      "availability": "repository",
+      "id": "github.referee-evidence",
+      "kind": "github-check-receipt",
+      "locator": "evidence/referee-hardening/artifacts/pr-0048-github-checks.json",
+      "reason": null,
+      "sha256": "441f84d7360e9511cfe924e7ab4ad6b7979bc82819e74ed0f8e3075f527c3e3c",
+      "size_bytes": 1844
+    },
+    {
+      "availability": "digest_only",
+      "id": "gpu.pristine-reference-api",
+      "kind": "gpu-receipt",
+      "locator": null,
+      "reason": "The exact TP8 receipt remains in the private campaign ledger and is not committed to the repository.",
+      "sha256": "a31e32a9a294a35997882c133490c1562a209e0bc5e25f81067a7ffe3d224c9b",
+      "size_bytes": null
+    },
+    {
+      "availability": "unavailable",
+      "id": "tests.local-full",
+      "kind": "test-log",
+      "locator": null,
+      "reason": "The 1353-pass and 19-skip local summary was reported without retaining the raw log.",
+      "sha256": null,
+      "size_bytes": null
+    },
+    {
+      "availability": "unavailable",
+      "id": "review.pristine-reference",
+      "kind": "review-report",
+      "locator": null,
+      "reason": "The implementation, adversarial, and confirmation reviews were reported without retaining their raw bytes.",
+      "sha256": null,
+      "size_bytes": null
+    }
+  ],
+  "claims": [
+    {
+      "artifact_ids": [],
+      "id": "scope.pristine-reference-infrastructure",
+      "statement": "The implementation adds candidate-free pristine-reference protocol, worker, lifecycle, and independently regraded quality primitives.",
+      "status": "verified"
+    },
+    {
+      "artifact_ids": [
+        "github.referee-evidence"
+      ],
+      "id": "tests.github-referee-evidence",
+      "statement": "The retained GitHub receipt records successful evidence and CodeQL checks for the implementation head.",
+      "status": "verified"
+    },
+    {
+      "artifact_ids": [
+        "gpu.pristine-reference-api"
+      ],
+      "id": "gpu.tp8-reference-api",
+      "statement": "A digest-retained TP8 RTX receipt reports canonical teacher evidence with candidate activation disabled and zero GPU residue.",
+      "status": "digest_only"
+    },
+    {
+      "artifact_ids": [],
+      "id": "authority.nonaggregate",
+      "statement": "The implementation emits no aggregate qualification, score, crown, or settlement decision.",
+      "status": "verified"
+    }
+  ],
+  "classified_diff": {
+    "documentation": {
+      "added": 0,
+      "deleted": 0
+    },
+    "evidence": {
+      "added": 737,
+      "deleted": 0
+    },
+    "production": {
+      "added": 3133,
+      "deleted": 428
+    },
+    "test": {
+      "added": 1749,
+      "deleted": 19
+    },
+    "tooling": {
+      "added": 458,
+      "deleted": 33
+    },
+    "vendor": {
+      "added": 0,
+      "deleted": 0
+    }
+  },
+  "exit_criteria": [
+    {
+      "artifact_ids": [],
+      "id": "authority.pristine-reference",
+      "statement": "Exact ORQ1 and ORE1 bytes bind a separately launched empty-stack reference session to the selected lifecycle trajectories.",
+      "status": "verified"
+    },
+    {
+      "artifact_ids": [],
+      "id": "authority.aggregate-deferred",
+      "statement": "Causal cohort execution and aggregate qualification remain outside this architectural unit.",
+      "status": "not_applicable"
+    },
+    {
+      "artifact_ids": [
+        "github.referee-evidence"
+      ],
+      "id": "ci.evidence-check",
+      "statement": "The repository-retained GitHub receipt binds successful evidence checks to the implementation head.",
+      "status": "verified"
+    }
+  ],
+  "github_pr": 48,
+  "identity": {
+    "base_commit": "9a34b68a58ff53a0c04273a21f86de9e9467db80",
+    "implementation_commit": "a5797e00b3ba46902a88a7f83f6a734af2a4a2d1",
+    "implementation_tree": "e37c742ed7c668bd2bb93e5d2cfed6632434653c",
+    "merge_commit": "f4a68d1a7ecf9c21f3ee6e765e1ad596f108764e"
+  },
+  "nonclaims": [
+    "aggregate.qualification",
+    "causal.cohort",
+    "crown.authority",
+    "settlement.authority"
+  ],
+  "record_type": "pr_evidence",
+  "reviews": [
+    {
+      "artifact_id": "review.pristine-reference",
+      "phase": "implementation",
+      "status": "reported_unretained",
+      "summary": "Implementation review was reported during development; no report bytes were retained."
+    },
+    {
+      "artifact_id": "review.pristine-reference",
+      "phase": "adversarial",
+      "status": "reported_unretained",
+      "summary": "Adversarial review was reported during development; no report bytes were retained."
+    },
+    {
+      "artifact_id": "review.pristine-reference",
+      "phase": "confirmation",
+      "status": "reported_unretained",
+      "summary": "Confirmation review was reported during development; no report bytes were retained."
+    }
+  ],
+  "schema_version": 2
+}

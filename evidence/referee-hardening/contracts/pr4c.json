@@ -1,0 +1,71 @@
+{
+  "allowed_paths": {
+    "control_exact": [
+      ".github/workflows/referee-evidence.yml",
+      "scripts/check_referee_evidence.py",
+      "tests/test_referee_evidence.py"
+    ],
+    "control_prefixes": [
+      "evidence/referee-hardening/"
+    ],
+    "production": [
+      "optima/eval/oci_backend.py",
+      "optima/eval/oci_process.py",
+      "optima/eval/qualification.py",
+      "optima/eval/qualification_runner.py",
+      "optima/eval/reference_quality.py"
+    ],
+    "test": [
+      "tests/test_oci_backend.py",
+      "tests/test_oci_process.py",
+      "tests/test_qualification.py",
+      "tests/test_qualification_runner.py",
+      "tests/test_reference_quality.py"
+    ]
+  },
+  "architectural_unit": "4c",
+  "authority_boundary": {
+    "forbidden_modules": [
+      "optima.audit",
+      "optima.chain.validator_loop",
+      "optima.cli",
+      "optima.eval._launch",
+      "optima.eval.capability",
+      "optima.eval.throughput_kl"
+    ],
+    "roots": [
+      "optima.eval.qualification_runner"
+    ]
+  },
+  "base_commit": "f4a68d1a7ecf9c21f3ee6e765e1ad596f108764e",
+  "budget": {
+    "exemption_policy": "none",
+    "production_additions_max": 1400,
+    "test_additions_max": 1800
+  },
+  "contract_id": "pr4c",
+  "record_type": "scope_contract",
+  "required_in_place": [
+    {
+      "change": "modify",
+      "path": "optima/eval/oci_backend.py"
+    },
+    {
+      "change": "modify",
+      "path": "optima/eval/oci_process.py"
+    },
+    {
+      "change": "modify",
+      "path": "optima/eval/qualification.py"
+    },
+    {
+      "change": "add",
+      "path": "optima/eval/qualification_runner.py"
+    },
+    {
+      "change": "modify",
+      "path": "optima/eval/reference_quality.py"
+    }
+  ],
+  "schema_version": 2
+}

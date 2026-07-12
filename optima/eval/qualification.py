@@ -1136,6 +1136,7 @@ def qualification_identity_digest(
     calibration: object,
     candidate_lifecycle: str,
     t_session: object,
+    t_request_sha256: str,
     selected_delta_digest: str,
 ) -> str:
     """Derive the raw-quality identity from typed validator authority."""
@@ -1165,6 +1166,7 @@ def qualification_identity_digest(
             ),
             "selection_digest": selection.digest,
             "t_session_digest": t_session.digest,
+            "t_request_sha256": _digest(t_request_sha256, "T request SHA-256"),
         },
     )
 
@@ -1300,7 +1302,13 @@ def _selected_prompt_texts(lifecycle: object) -> dict[str, str]:
     return result
 
 
-def _validate_teacher_source(raw: object, execution: object, lifecycle: object) -> None:
+def _validate_teacher_source(
+    raw: object,
+    execution: object,
+    lifecycle: object,
+    *,
+    reference_request_sha256: str,
+) -> None:
     from optima.eval.oci_backend import PristineReferenceExecutionEvidence
     from optima.eval.reference_quality import (
         ReferenceQualityRawArtifact,
@@ -1314,14 +1322,21 @@ def _validate_teacher_source(raw: object, execution: object, lifecycle: object) 
         or execution.schema != "optima.oci-pristine-reference-execution.v1"
     ):
         raise QualificationError("raw quality or pristine execution is not authoritative")
+    request_digest = _digest(reference_request_sha256, "T request SHA-256")
+    exchanges = tuple(
+        row for row in execution.session.exchanges
+        if row.request_sha256 == request_digest
+    )
+    if len(exchanges) != 1:
+        raise QualificationError("pristine T request is absent or ambiguous")
+    exchange = exchanges[0]
     by_prompt = {}
-    for exchange in execution.session.exchanges:
-        for request, evidence in zip(
-            exchange.request.prompts, exchange.evidence.prompts, strict=True
-        ):
-            if request.prompt_digest in by_prompt:
-                raise QualificationError("pristine T repeated a selected prompt")
-            by_prompt[request.prompt_digest] = (request, evidence)
+    for request, evidence in zip(
+        exchange.request.prompts, exchange.evidence.prompts, strict=True
+    ):
+        if request.prompt_digest in by_prompt:
+            raise QualificationError("pristine T repeated a selected prompt")
+        by_prompt[request.prompt_digest] = (request, evidence)
     expected_text = _selected_prompt_texts(lifecycle)
     if set(by_prompt) != set(raw.binding.selected_prompt_digests):
         raise QualificationError("pristine T prompt coverage differs from selection")
@@ -1367,6 +1382,7 @@ def validate_quality_binding(
     calibration: object,
     graph_requirement: GraphVerificationRequirement,
     reference_execution: object,
+    reference_request_sha256: str,
 ):
     """Project frozen workload/trajectory coverage onto one raw T binding."""
 
@@ -1438,6 +1454,7 @@ def validate_quality_binding(
         calibration=calibration,
         candidate_lifecycle=lifecycle_digest,
         t_session=t_session,
+        t_request_sha256=reference_request_sha256,
         selected_delta_digest=selected_delta_digest,
     )
     if (
@@ -1466,6 +1483,8 @@ def validate_quality_binding(
         or binding.candidate_lifecycle_digest
         != lifecycle_digest
         or binding.t_session_digest != t_session.digest
+        or binding.t_request_sha256
+        != _digest(reference_request_sha256, "T request SHA-256")
         or t_session.reference_manifest_digest != profile.reference.digest
         or t_session.launch_digest != profile.reference.pristine_launch_digest
         or binding.reference_manifest_digest != profile.reference.digest
@@ -1488,7 +1507,12 @@ def validate_quality_binding(
         or commitment.select_count < profile.minimum_prompt_count
     ):
         raise QualificationError("quality binding differs from frozen workload/trajectories")
-    _validate_teacher_source(raw_artifact, reference_execution, lifecycle)
+    _validate_teacher_source(
+        raw_artifact,
+        reference_execution,
+        lifecycle,
+        reference_request_sha256=reference_request_sha256,
+    )
     return raw_artifact
 
 

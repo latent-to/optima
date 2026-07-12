@@ -292,124 +292,128 @@
       "additionalProperties": false,
       "properties": {
         "allowed_paths": {
-          "const": {
-            "control_exact": [
-              ".github/workflows/referee-evidence.yml",
-              "scripts/check_referee_evidence.py",
-              "tests/test_referee_evidence.py"
-            ],
-            "control_prefixes": [
-              "evidence/referee-hardening/"
-            ],
-            "production": [
-              "optima/eval/_launch.py",
-              "optima/eval/calibration.py",
-              "optima/eval/engine_worker.py",
-              "optima/eval/oci_backend.py",
-              "optima/eval/oci_process.py",
-              "optima/eval/oci_reference_session.py",
-              "optima/eval/oci_session_worker.py",
-              "optima/eval/qualification.py",
-              "optima/eval/reference_protocol.py",
-              "optima/eval/reference_quality.py"
-            ],
-            "test": [
-              "tests/test_calibration.py",
-              "tests/test_isolation.py",
-              "tests/test_launch_execution_receipts.py",
-              "tests/test_oci_backend.py",
-              "tests/test_oci_process.py",
-              "tests/test_oci_reference_session.py",
-              "tests/test_oci_session_worker_order.py",
-              "tests/test_qualification.py",
-              "tests/test_reference_protocol.py",
-              "tests/test_reference_quality.py"
-            ]
-          }
+          "additionalProperties": false,
+          "properties": {
+            "control_exact": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array",
+              "uniqueItems": true
+            },
+            "control_prefixes": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array",
+              "uniqueItems": true
+            },
+            "production": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array",
+              "uniqueItems": true
+            },
+            "test": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array",
+              "uniqueItems": true
+            }
+          },
+          "required": [
+            "control_exact",
+            "control_prefixes",
+            "production",
+            "test"
+          ],
+          "type": "object"
         },
         "architectural_unit": {
-          "const": "4b"
+          "$ref": "#/$defs/identifier"
         },
         "authority_boundary": {
-          "const": {
-            "forbidden_modules": [
-              "optima.audit",
-              "optima.eval._launch",
-              "optima.eval.capability",
-              "optima.eval.throughput_kl"
-            ],
-            "roots": [
-              "optima.eval.calibration",
-              "optima.eval.marginal_runtime",
-              "optima.eval.oci_backend",
-              "optima.eval.oci_process",
-              "optima.eval.oci_reference_session",
-              "optima.eval.qualification",
-              "optima.eval.reference_protocol",
-              "optima.eval.reference_quality",
-              "optima.eval.scoring"
-            ]
-          }
+          "additionalProperties": false,
+          "properties": {
+            "forbidden_modules": {
+              "items": {
+                "$ref": "#/$defs/identifier"
+              },
+              "minItems": 1,
+              "type": "array",
+              "uniqueItems": true
+            },
+            "roots": {
+              "items": {
+                "$ref": "#/$defs/identifier"
+              },
+              "minItems": 1,
+              "type": "array",
+              "uniqueItems": true
+            }
+          },
+          "required": [
+            "forbidden_modules",
+            "roots"
+          ],
+          "type": "object"
         },
         "base_commit": {
-          "const": "9a34b68a58ff53a0c04273a21f86de9e9467db80"
+          "$ref": "#/$defs/git_oid"
         },
         "budget": {
-          "const": {
-            "exemption_policy": "none",
-            "production_additions_max": 3300,
-            "test_additions_max": 2600
-          }
+          "additionalProperties": false,
+          "properties": {
+            "exemption_policy": {
+              "const": "none"
+            },
+            "production_additions_max": {
+              "minimum": 1,
+              "type": "integer"
+            },
+            "test_additions_max": {
+              "minimum": 1,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "exemption_policy",
+            "production_additions_max",
+            "test_additions_max"
+          ],
+          "type": "object"
         },
         "contract_id": {
-          "const": "pr4b"
+          "$ref": "#/$defs/identifier"
         },
         "record_type": {
           "const": "scope_contract"
         },
         "required_in_place": {
-          "const": [
-            {
-              "change": "modify",
-              "path": "optima/eval/_launch.py"
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "change": {
+                "enum": [
+                  "add",
+                  "modify"
+                ]
+              },
+              "path": {
+                "type": "string"
+              }
             },
-            {
-              "change": "modify",
-              "path": "optima/eval/calibration.py"
-            },
-            {
-              "change": "add",
-              "path": "optima/eval/engine_worker.py"
-            },
-            {
-              "change": "modify",
-              "path": "optima/eval/oci_backend.py"
-            },
-            {
-              "change": "modify",
-              "path": "optima/eval/oci_process.py"
-            },
-            {
-              "change": "add",
-              "path": "optima/eval/oci_reference_session.py"
-            },
-            {
-              "change": "modify",
-              "path": "optima/eval/oci_session_worker.py"
-            },
-            {
-              "change": "modify",
-              "path": "optima/eval/qualification.py"
-            },
-            {
-              "change": "add",
-              "path": "optima/eval/reference_protocol.py"
-            },
-            {
-              "change": "modify",
-              "path": "optima/eval/reference_quality.py"
-            }
-          ]
+            "required": [
+              "change",
+              "path"
+            ],
+            "type": "object"
+          },
+          "minItems": 1,
+          "type": "array",
+          "uniqueItems": true
         },
         "schema_version": {
           "const": 2

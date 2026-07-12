@@ -69,6 +69,30 @@ PR4B_FORBIDDEN_MODULES = [
     "optima.eval.capability",
     "optima.eval.throughput_kl",
 ]
+PR4C_BASE = "f4a68d1a7ecf9c21f3ee6e765e1ad596f108764e"
+PR4C_PRODUCTION = [
+    "optima/eval/oci_backend.py",
+    "optima/eval/oci_process.py",
+    "optima/eval/qualification.py",
+    "optima/eval/qualification_runner.py",
+    "optima/eval/reference_quality.py",
+]
+PR4C_TESTS = [
+    "tests/test_oci_backend.py",
+    "tests/test_oci_process.py",
+    "tests/test_qualification.py",
+    "tests/test_qualification_runner.py",
+    "tests/test_reference_quality.py",
+]
+PR4C_AUTHORITY_ROOTS = ["optima.eval.qualification_runner"]
+PR4C_FORBIDDEN_MODULES = [
+    "optima.audit",
+    "optima.chain.validator_loop",
+    "optima.cli",
+    "optima.eval._launch",
+    "optima.eval.capability",
+    "optima.eval.throughput_kl",
+]
 
 
 class EvidenceError(ValueError):
@@ -277,102 +301,122 @@ def validate_record(record: dict[str, Any], root: Path, where: str) -> None:
         for item in record["claims"]
     ):
         raise EvidenceError("PR 43 must preserve the invalid exact-head full-suite claim")
-    if record["github_pr"] == 47:
+    if record["github_pr"] in {47, 48}:
         if schema_version != 2:
-            raise EvidenceError("PR 47 must use the retained-artifact evidence schema")
+            raise EvidenceError("retained referee PR evidence must use schema v2")
         retained = {
             item["id"] for item in artifacts
             if item["availability"] == "repository"
         }
         if "github.referee-evidence" not in retained:
-            raise EvidenceError("PR 47 must retain the GitHub referee-evidence check receipt")
+            raise EvidenceError("referee PR must retain the GitHub evidence check receipt")
 
 
 def validate_contract_document(contract: dict[str, Any], where: str = "contract") -> None:
     schema_version = contract.get("schema_version")
+    if schema_version not in {1, 2}:
+        raise EvidenceError(f"{where} has an unsupported schema")
     expected_keys = CONTRACT_KEYS_V1 if schema_version == 1 else CONTRACT_KEYS_V2
     _keys(contract, expected_keys, where)
-    if schema_version not in {1, 2} or contract["record_type"] != "scope_contract":
+    if contract["record_type"] != "scope_contract":
         raise EvidenceError(f"{where} has an unsupported schema")
     _ident(contract["contract_id"], f"{where}.contract_id")
     _ident(contract["architectural_unit"], f"{where}.architectural_unit")
     _git_oid(contract["base_commit"], f"{where}.base_commit")
-    expected_identity = (
-        {
+    control_exact = [
+        ".github/workflows/referee-evidence.yml",
+        "scripts/check_referee_evidence.py",
+        "tests/test_referee_evidence.py",
+    ]
+    specs = {
+        "pr4a": {
+            "schema_version": 1,
             "architectural_unit": "4a",
             "base_commit": "17ecdeb5213d03771964939d80da9343618a7e86",
-            "contract_id": "pr4a",
-        }
-        if schema_version == 1
-        else {
+            "budget": {"exemption_policy": "none", "production_additions_max": 3200, "test_additions_max": 2400},
+            "production": ["optima/eval/calibration.py", "optima/eval/evidence_store.py", "optima/eval/qualification.py", "optima/eval/reference_quality.py", "optima/eval/scoring.py"],
+            "test": ["tests/test_calibration.py", "tests/test_evidence_store.py", "tests/test_qualification.py", "tests/test_reference_quality.py", "tests/test_scoring.py"],
+            "required": [{"change": "modify", "path": "optima/eval/scoring.py"}],
+            "authority": None,
+        },
+        "pr4b": {
+            "schema_version": 2,
             "architectural_unit": "4b",
             "base_commit": PR4B_BASE,
-            "contract_id": "pr4b",
-        }
-    )
+            "budget": {"exemption_policy": "none", "production_additions_max": 3300, "test_additions_max": 2600},
+            "production": PR4B_PRODUCTION,
+            "test": PR4B_TESTS,
+            "required": [
+                {"change": "modify", "path": "optima/eval/_launch.py"},
+                {"change": "modify", "path": "optima/eval/calibration.py"},
+                {"change": "add", "path": "optima/eval/engine_worker.py"},
+                {"change": "modify", "path": "optima/eval/oci_backend.py"},
+                {"change": "modify", "path": "optima/eval/oci_process.py"},
+                {"change": "add", "path": "optima/eval/oci_reference_session.py"},
+                {"change": "modify", "path": "optima/eval/oci_session_worker.py"},
+                {"change": "modify", "path": "optima/eval/qualification.py"},
+                {"change": "add", "path": "optima/eval/reference_protocol.py"},
+                {"change": "modify", "path": "optima/eval/reference_quality.py"},
+            ],
+            "authority": {"forbidden_modules": PR4B_FORBIDDEN_MODULES, "roots": PR4B_AUTHORITY_ROOTS},
+        },
+        "pr4c": {
+            "schema_version": 2,
+            "architectural_unit": "4c",
+            "base_commit": PR4C_BASE,
+            "budget": {"exemption_policy": "none", "production_additions_max": 1400, "test_additions_max": 1800},
+            "production": PR4C_PRODUCTION,
+            "test": PR4C_TESTS,
+            "required": [
+                {"change": "modify", "path": "optima/eval/oci_backend.py"},
+                {"change": "modify", "path": "optima/eval/oci_process.py"},
+                {"change": "modify", "path": "optima/eval/qualification.py"},
+                {"change": "add", "path": "optima/eval/qualification_runner.py"},
+                {"change": "modify", "path": "optima/eval/reference_quality.py"},
+            ],
+            "authority": {"forbidden_modules": PR4C_FORBIDDEN_MODULES, "roots": PR4C_AUTHORITY_ROOTS},
+        },
+    }
+    spec = specs.get(contract["contract_id"])
+    if spec is None or schema_version != spec["schema_version"]:
+        raise EvidenceError(f"{where}.contract_id or schema changed")
+    expected_identity = {
+        "architectural_unit": spec["architectural_unit"],
+        "base_commit": spec["base_commit"],
+        "contract_id": contract["contract_id"],
+    }
     for field, expected in expected_identity.items():
         if contract[field] != expected:
             raise EvidenceError(f"{where}.{field} changed")
     budget = contract["budget"]
     _keys(budget, {"exemption_policy", "production_additions_max", "test_additions_max"}, f"{where}.budget")
-    expected_budget = (
-        {"exemption_policy": "none", "production_additions_max": 3200, "test_additions_max": 2400}
-        if schema_version == 1
-        else {"exemption_policy": "none", "production_additions_max": 3300, "test_additions_max": 2600}
-    )
-    if budget != expected_budget:
+    if budget != spec["budget"]:
         raise EvidenceError(f"{where} budget or exemption policy changed")
     paths = contract["allowed_paths"]
     _keys(paths, {"control_exact", "control_prefixes", "production", "test"}, f"{where}.allowed_paths")
-    expected_paths_v1 = {
-        "control_exact": [".github/workflows/referee-evidence.yml", "scripts/check_referee_evidence.py", "tests/test_referee_evidence.py"],
+    expected_paths = {
+        "control_exact": control_exact,
         "control_prefixes": ["evidence/referee-hardening/"],
-        "production": ["optima/eval/calibration.py", "optima/eval/evidence_store.py", "optima/eval/qualification.py", "optima/eval/reference_quality.py", "optima/eval/scoring.py"],
-        "test": ["tests/test_calibration.py", "tests/test_evidence_store.py", "tests/test_qualification.py", "tests/test_reference_quality.py", "tests/test_scoring.py"],
+        "production": spec["production"],
+        "test": spec["test"],
     }
-    expected_paths_v2 = {
-        "control_exact": [".github/workflows/referee-evidence.yml", "scripts/check_referee_evidence.py", "tests/test_referee_evidence.py"],
-        "control_prefixes": ["evidence/referee-hardening/"],
-        "production": PR4B_PRODUCTION,
-        "test": PR4B_TESTS,
-    }
-    expected_paths = expected_paths_v1 if schema_version == 1 else expected_paths_v2
     if paths != expected_paths:
         raise EvidenceError(f"{where} allowed paths changed")
     for field, values in paths.items():
         if type(values) is not list or values != sorted(set(values)) or any(not isinstance(v, str) or v.startswith("/") or ".." in v for v in values):
             raise EvidenceError(f"{where}.allowed_paths.{field} must be sorted unique relative paths")
     required = contract["required_in_place"]
-    expected_required = (
-        [{"change": "modify", "path": "optima/eval/scoring.py"}]
-        if schema_version == 1
-        else [
-            {"change": "modify", "path": "optima/eval/_launch.py"},
-            {"change": "modify", "path": "optima/eval/calibration.py"},
-            {"change": "add", "path": "optima/eval/engine_worker.py"},
-            {"change": "modify", "path": "optima/eval/oci_backend.py"},
-            {"change": "modify", "path": "optima/eval/oci_process.py"},
-            {"change": "add", "path": "optima/eval/oci_reference_session.py"},
-            {"change": "modify", "path": "optima/eval/oci_session_worker.py"},
-            {"change": "modify", "path": "optima/eval/qualification.py"},
-            {"change": "add", "path": "optima/eval/reference_protocol.py"},
-            {"change": "modify", "path": "optima/eval/reference_quality.py"},
-        ]
-    )
-    if required != expected_required:
+    if required != spec["required"]:
         raise EvidenceError(f"{where} required replacements changed")
     if schema_version == 2:
         authority = contract["authority_boundary"]
         _keys(authority, {"forbidden_modules", "roots"}, f"{where}.authority_boundary")
-        if authority != {
-            "forbidden_modules": PR4B_FORBIDDEN_MODULES,
-            "roots": PR4B_AUTHORITY_ROOTS,
-        }:
+        if authority != spec["authority"]:
             raise EvidenceError(f"{where} authority boundary changed")
 
 
 def validate_v2_schema_contract(schema: dict[str, Any], contract: dict[str, Any]) -> None:
-    """Require the tracked v2 schema's scope-branch constants to match PR4b."""
+    """Require one generic v2 scope branch; exact values live in frozen contracts."""
 
     branches = schema.get("oneOf")
     if not isinstance(branches, list):
@@ -387,9 +431,13 @@ def validate_v2_schema_contract(schema: dict[str, Any], contract: dict[str, Any]
     if len(matches) != 1:
         raise EvidenceError("schema-v2 scope-contract branch is absent or ambiguous")
     properties = matches[0]
-    for field in contract:
-        if properties.get(field, {}).get("const") != contract[field]:
-            raise EvidenceError(f"schema-v2 scope constant differs: {field}")
+    if set(properties) != CONTRACT_KEYS_V2 or any(
+        field not in properties for field in contract
+    ):
+        raise EvidenceError("schema-v2 scope fields differ")
+    for field in CONTRACT_KEYS_V2 - {"record_type", "schema_version"}:
+        if "const" in properties[field]:
+            raise EvidenceError(f"schema-v2 scope field must be generic: {field}")
 
 
 def _scope_kind(path: str, contract: dict[str, Any]) -> str | None:
@@ -670,7 +718,7 @@ def validate_repository(root: Path, *, records_only: bool = False, pr_base: str 
     evidence = root / "evidence/referee-hardening"
     load_json(evidence / "schema-v1.json")
     schema_v2 = load_json(evidence / "schema-v2.json")
-    expected = set(range(40, 48))
+    expected = set(range(40, 49))
     seen: set[int] = set()
     for path in sorted((evidence / "records").glob("pr-*.json")):
         record = load_json(path)
@@ -689,7 +737,7 @@ def validate_repository(root: Path, *, records_only: bool = False, pr_base: str 
             raise EvidenceError(f"duplicate scope contract: {contract['contract_id']}")
         contract_ids.add(contract["contract_id"])
         contracts.append((contract_path, contract))
-    if contract_ids != {"pr4a", "pr4b"}:
+    if contract_ids != {"pr4a", "pr4b", "pr4c"}:
         raise EvidenceError(f"scope contract set differs: {sorted(contract_ids)}")
     if records_only:
         return
@@ -735,7 +783,7 @@ def validate_repository(root: Path, *, records_only: bool = False, pr_base: str 
         raise EvidenceError(f"the {contract['contract_id']} contract was frozen after implementation began")
     if contract["schema_version"] == 2:
         for path in freeze_status:
-            _require_frozen_bytes(root, freeze, path, "PR4b control file")
+            _require_frozen_bytes(root, freeze, path, "referee control file")
     counts, statuses = diff_facts(root, base, head)
     changes = {
         path: (status, counts[classify(path)]["added"], counts[classify(path)]["deleted"])

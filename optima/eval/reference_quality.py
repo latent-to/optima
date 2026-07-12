@@ -290,6 +290,7 @@ class ReferenceQualityRawBinding(_Record):
     selected_trajectory_projection_digest: str
     selected_prompt_digests: tuple[str, ...]
     t_session_digest: str
+    t_request_sha256: str
     support_policy_digest: str
     hidden_task_plan_digest: str
     nll_tail_threshold: str
@@ -298,7 +299,7 @@ class ReferenceQualityRawBinding(_Record):
     hidden_tasks_per_prompt: int
     def __post_init__(self) -> None:
         for field in fields(self):
-            if field.name.endswith("_digest"):
+            if field.name.endswith("_digest") or field.name == "t_request_sha256":
                 object.__setattr__(self, field.name, _digest(getattr(self, field.name), field.name))
         prompts = tuple(_digest(value, "selected prompt") for value in self.selected_prompt_digests)
         _ordered(prompts, prompts, "selected prompts", _MAX_PROMPTS)

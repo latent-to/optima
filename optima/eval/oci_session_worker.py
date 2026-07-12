@@ -22,7 +22,10 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Iterator
 
-from optima.eval.engine_worker import _path_mount_is_read_only as _path_is_read_only
+from optima.eval.engine_worker import (
+    _environment,
+    _path_mount_is_read_only as _path_is_read_only,
+)
 from optima.eval.oci_session_protocol import (
     CONTROL_MAGIC,
     CONTAINER_MODEL_PATH,
@@ -46,6 +49,7 @@ from optima.eval.oci_session_protocol import (
     validate_init,
     validate_preflight_accept,
 )
+from optima.seams import seam_binding_environment
 
 
 CONTAINER_TREE_PATH = "/optima/engine-tree"
@@ -409,15 +413,23 @@ def _engine_session(config: EngineSessionConfig, tree: object) -> Iterator[objec
     """Construct one content-selected engine without any scheduling role."""
 
     reference_mode = os.environ.get("OPTIMA_SESSION_PROTOCOL") == "reference"
-    if reference_mode:
-        os.environ["PYTHONPATH"] = ""
-    else:
-        _prepare_descendant_bootstrap()
-    from optima.manifest import load_manifest
+    if reference_mode and config.seam_bindings:
+        raise SessionWorkerError(
+            "pristine reference engine config must not select seam bindings"
+        )
+    gate_environment = seam_binding_environment(
+        () if reference_mode else config.seam_bindings
+    )
+    with _environment(**gate_environment):
+        if reference_mode:
+            os.environ["PYTHONPATH"] = ""
+        else:
+            _prepare_descendant_bootstrap()
+        from optima.manifest import load_manifest
 
-    tree_root = Path(getattr(tree, "root"))
-    runtime_manifest = getattr(tree, "runtime_manifest", None)
-    manifest = load_manifest(tree_root) if runtime_manifest is not None else None
+        tree_root = Path(getattr(tree, "root"))
+        runtime_manifest = getattr(tree, "runtime_manifest", None)
+        manifest = load_manifest(tree_root) if runtime_manifest is not None else None
     active = bool(manifest is not None and manifest.ops)
     framework_mode = bool(
         manifest is not None and any(operation.setup for operation in manifest.ops)
@@ -435,6 +447,7 @@ def _engine_session(config: EngineSessionConfig, tree: object) -> Iterator[objec
         moe_runner_backend=config.moe_runner_backend,
         disable_custom_all_reduce=config.disable_custom_all_reduce,
         extra_engine_kwargs=dict(config.engine_kwargs),
+        seam_bindings=config.seam_bindings,
         seed=0,
         framework_mode=framework_mode,
         isolate=True,

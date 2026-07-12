@@ -12,6 +12,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from optima.eval import engine_worker as engine_policy
 from optima.eval import oci_session_worker as worker
 from optima.eval.oci_session_protocol import (
     CONTROL_MAGIC,
@@ -38,6 +39,7 @@ from optima.eval.reference_protocol import (
     decode_reference_evidence,
     encode_reference_request,
 )
+from optima.seams import seam_binding_environment
 
 
 def _digest(character: str) -> str:
@@ -253,6 +255,97 @@ def test_importing_worker_loads_no_torch_sglang_or_candidate(tmp_path):
         check=False,
     )
     assert result.returncode == 0, result.stderr
+
+
+def test_session_worker_transports_closed_seam_bindings_and_clears_reference(
+    monkeypatch, tmp_path
+):
+    config = replace(_config(), seam_bindings=("collective",))
+    gate_names = tuple(seam_binding_environment(()))
+    observed = []
+    bootstrap_gates = []
+    manifest_gates = []
+
+    class Engine:
+        def __init__(self, **_kwargs):
+            observed.append(
+                {
+                    "active": os.environ.get("OPTIMA_ACTIVE"),
+                    "gates": {name: os.environ.get(name) for name in gate_names},
+                    "plugins": os.environ.get("SGLANG_PLUGINS"),
+                }
+            )
+
+        def shutdown(self):
+            return None
+
+    monkeypatch.setitem(sys.modules, "sglang", SimpleNamespace(Engine=Engine))
+    monkeypatch.setenv("OPTIMA_EXTERNAL_NO_EGRESS", "1")
+    monkeypatch.setenv("OPTIMA_ENGINE_WORKER", "1")
+    for name in gate_names:
+        monkeypatch.setenv(name, "1")
+    for name in (
+        "_loopback_is_up",
+        "_network_namespace_is_loopback_only",
+        "_egress_is_blocked",
+        "_process_sandbox_is_hardened",
+    ):
+        monkeypatch.setattr(engine_policy, name, lambda: True)
+    monkeypatch.setattr(
+        worker,
+        "_prepare_descendant_bootstrap",
+        lambda: bootstrap_gates.append(
+            {name: os.environ.get(name) for name in gate_names}
+        ),
+    )
+
+    from optima import manifest as manifest_module
+    from optima import receipts, seam
+
+    monkeypatch.setattr(seam, "mark_driver", lambda: None)
+    monkeypatch.setattr(
+        receipts,
+        "require",
+        lambda *_args, **_kwargs: [
+            {"pid": 1, "slots": ["collective.all_reduce"]}
+        ],
+    )
+
+    def load_manifest(_root):
+        manifest_gates.append(
+            {name: os.environ.get(name) for name in gate_names}
+        )
+        return SimpleNamespace(
+            ops=(SimpleNamespace(setup=None),), dep_patches=()
+        )
+
+    monkeypatch.setattr(manifest_module, "load_manifest", load_manifest)
+
+    baseline = SimpleNamespace(root=tmp_path / "baseline", runtime_manifest=None)
+    candidate = SimpleNamespace(
+        root=tmp_path / "candidate", runtime_manifest="manifest.toml"
+    )
+    monkeypatch.delenv("OPTIMA_SESSION_PROTOCOL", raising=False)
+    with worker._engine_session(config, baseline):
+        pass
+    with worker._engine_session(config, candidate):
+        pass
+    monkeypatch.setenv("OPTIMA_SESSION_PROTOCOL", "reference")
+    with pytest.raises(worker.SessionWorkerError, match="reference.*seam bindings"):
+        with worker._engine_session(config, baseline):
+            pass
+    with worker._engine_session(replace(config, seam_bindings=()), baseline):
+        pass
+
+    selected = seam_binding_environment(("collective",))
+    cleared = seam_binding_environment(())
+    assert observed == [
+        {"active": "0", "gates": selected, "plugins": "optima"},
+        {"active": "1", "gates": selected, "plugins": "optima"},
+        {"active": "0", "gates": cleared, "plugins": ""},
+    ]
+    assert bootstrap_gates == [selected, selected]
+    assert manifest_gates == [selected]
 
 
 def test_preflight_frame_is_published_before_engine_candidate_or_native_entry(

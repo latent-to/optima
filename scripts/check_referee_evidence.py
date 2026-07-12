@@ -98,11 +98,13 @@ PR4D_PRODUCTION = [
     "optima/eval/engine_worker.py",
     "optima/eval/oci_session_protocol.py",
     "optima/eval/oci_session_worker.py",
+    "optima/eval/qualification.py",
     "optima/seams.py",
 ]
 PR4D_TESTS = [
     "tests/test_oci_session_protocol.py",
     "tests/test_oci_session_worker_order.py",
+    "tests/test_qualification.py",
 ]
 PR4D_AUTHORITY_ROOTS = ["optima.eval.oci_session_protocol"]
 PR4D_FORBIDDEN_MODULES = PR4C_FORBIDDEN_MODULES
@@ -400,6 +402,7 @@ def validate_contract_document(contract: dict[str, Any], where: str = "contract"
                 {"change": "modify", "path": "optima/eval/engine_worker.py"},
                 {"change": "modify", "path": "optima/eval/oci_session_protocol.py"},
                 {"change": "modify", "path": "optima/eval/oci_session_worker.py"},
+                {"change": "modify", "path": "optima/eval/qualification.py"},
                 {"change": "modify", "path": "optima/seams.py"},
             ],
             "authority": {"forbidden_modules": PR4D_FORBIDDEN_MODULES, "roots": PR4D_AUTHORITY_ROOTS},

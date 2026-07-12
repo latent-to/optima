@@ -543,6 +543,7 @@ def test_reference_reopens_control_receipt_then_rejects_added_native_file(
             preflight=case.preflight,
             model_root=case.model,
             session_protocol="reference",
+            discovery_overlay_identity_digest=None,
             run=lambda *_args: object(),
         )
     assert executor.device_guard.deadlines == [  # type: ignore[attr-defined]
@@ -592,6 +593,7 @@ def test_reference_runtime_accepts_control_receipt_through_both_reopens(
         preflight=case.preflight,
         model_root=case.model,
         session_protocol="reference",
+        discovery_overlay_identity_digest=None,
         run=lambda *_args: marker,
     )
     assert raw.value is marker

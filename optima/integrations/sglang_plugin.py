@@ -15,6 +15,7 @@ from __future__ import annotations
 
 def register() -> None:
     """Entry-point target invoked by sglang.load_plugins() in each process."""
-    from optima import seam
+    from optima import bootstrap, seam
 
+    bootstrap.install()
     seam.activate()

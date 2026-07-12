@@ -852,7 +852,14 @@ def test_sglang_plugin_resolves_only_materialized_namespace_after_spawn(
     module = tree / ("optima_c_" + "a" * 64) / "kernels"
     module.mkdir(parents=True)
     trusted.mkdir()
-    (trusted / "torch.py").write_text("origin = 'installed'\n")
+    target = trusted / "sglang/srt/layers"
+    target.mkdir(parents=True)
+    for package in (trusted / "sglang", trusted / "sglang/srt", target):
+        (package / "__init__.py").write_text("")
+    (target / "activation.py").write_text("""class SiluAndMul:
+    def forward_cuda(self, *args): pass
+    def forward_native(self, *args): pass
+""")
     (tree / "torch.py").write_text("origin = 'candidate'\n")
     (module / "kernel.py").write_text("loaded = True\n")
     for path in sorted(tree.rglob("*"), reverse=True):
@@ -866,18 +873,23 @@ TREE, NAMESPACE = {str(tree)!r}, {namespace!r}
 def child(send, bundle):
     import optima.integrations.sglang_plugin as plugin
     from optima import seam, seams
-    seam._ENGINE_TREE = TREE; seams.SEAM_ADAPTERS = ()
+    seam._ENGINE_TREE = TREE
+    seams.SEAM_ADAPTERS = tuple(a for a in seams.SEAM_ADAPTERS if a.integration == 'sglang_silu')
     os.environ.update(OPTIMA_ENGINE_WORKER='1', OPTIMA_BUNDLE_PATH=bundle,
         OPTIMA_ENGINE_TREE_DIGEST='1' * 64, OPTIMA_STACK_DIGEST='2' * 64,
         OPTIMA_ACTIVE='0')
     plugin.register()
+    importlib.import_module('sglang.srt.layers.activation')
+    from optima.integrations import sglang_silu
     found = importlib.util.find_spec(NAMESPACE)
     if bundle == TREE:
         import torch
         kernel = importlib.import_module(NAMESPACE + '.kernels.kernel')
-        send.send((TREE in sys.path, torch.origin, kernel.loaded, found is not None))
+        shadowed = os.path.realpath(torch.__file__) == os.path.join(TREE, 'torch.py')
+        send.send((TREE in sys.path, shadowed, kernel.loaded, found is not None,
+            sglang_silu.is_installed()))
     else:
-        send.send(found is None)
+        send.send((found is None, sglang_silu.is_installed()))
 if __name__ == '__main__':
     results = []
     for bundle in (TREE, '/raw/miner/bundle'):
@@ -886,7 +898,7 @@ if __name__ == '__main__':
         process.start(); process.join(10)
         assert process.exitcode == 0
         results.append(receive.recv())
-    assert results == [(False, 'installed', True, True), True]
+    assert results == [(False, False, True, True, True), (True, True)]
 """)
     completed = subprocess.run(
         [sys.executable, "-I", str(script)],

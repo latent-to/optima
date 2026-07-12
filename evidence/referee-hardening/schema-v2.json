@@ -1,0 +1,432 @@
+{
+  "$id": "https://optima.invalid/schemas/referee-hardening-v2.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$defs": {
+    "artifact": {
+      "additionalProperties": false,
+      "properties": {
+        "availability": {
+          "enum": [
+            "repository",
+            "digest_only",
+            "unavailable"
+          ]
+        },
+        "id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "kind": {
+          "$ref": "#/$defs/identifier"
+        },
+        "locator": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "sha256": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/sha256"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "size_bytes": {
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "availability",
+        "id",
+        "kind",
+        "locator",
+        "reason",
+        "sha256",
+        "size_bytes"
+      ],
+      "type": "object"
+    },
+    "claim": {
+      "additionalProperties": false,
+      "properties": {
+        "artifact_ids": {
+          "items": {
+            "$ref": "#/$defs/identifier"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
+        "id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "statement": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "status": {
+          "enum": [
+            "verified",
+            "digest_only",
+            "reported_unretained",
+            "invalidated",
+            "not_applicable"
+          ]
+        }
+      },
+      "required": [
+        "artifact_ids",
+        "id",
+        "statement",
+        "status"
+      ],
+      "type": "object"
+    },
+    "counts": {
+      "additionalProperties": false,
+      "properties": {
+        "added": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "deleted": {
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "added",
+        "deleted"
+      ],
+      "type": "object"
+    },
+    "identifier": {
+      "pattern": "^[a-z0-9][a-z0-9._-]*$",
+      "type": "string"
+    },
+    "git_oid": {
+      "pattern": "^[0-9a-f]{40}$",
+      "type": "string"
+    },
+    "review": {
+      "additionalProperties": false,
+      "properties": {
+        "artifact_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/identifier"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "phase": {
+          "enum": [
+            "implementation",
+            "adversarial",
+            "confirmation"
+          ]
+        },
+        "status": {
+          "enum": [
+            "reported_unretained",
+            "not_reported",
+            "invalidated"
+          ]
+        },
+        "summary": {
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "artifact_id",
+        "phase",
+        "status",
+        "summary"
+      ],
+      "type": "object"
+    },
+    "sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "type": "string"
+    }
+  },
+  "oneOf": [
+    {
+      "additionalProperties": false,
+      "properties": {
+        "architectural_unit": {
+          "$ref": "#/$defs/identifier"
+        },
+        "artifacts": {
+          "items": {
+            "$ref": "#/$defs/artifact"
+          },
+          "type": "array"
+        },
+        "claims": {
+          "items": {
+            "$ref": "#/$defs/claim"
+          },
+          "type": "array"
+        },
+        "classified_diff": {
+          "additionalProperties": false,
+          "properties": {
+            "documentation": {
+              "$ref": "#/$defs/counts"
+            },
+            "evidence": {
+              "$ref": "#/$defs/counts"
+            },
+            "production": {
+              "$ref": "#/$defs/counts"
+            },
+            "test": {
+              "$ref": "#/$defs/counts"
+            },
+            "tooling": {
+              "$ref": "#/$defs/counts"
+            },
+            "vendor": {
+              "$ref": "#/$defs/counts"
+            }
+          },
+          "required": [
+            "documentation",
+            "evidence",
+            "production",
+            "test",
+            "tooling",
+            "vendor"
+          ],
+          "type": "object"
+        },
+        "exit_criteria": {
+          "items": {
+            "$ref": "#/$defs/claim"
+          },
+          "type": "array"
+        },
+        "github_pr": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "identity": {
+          "additionalProperties": false,
+          "properties": {
+            "base_commit": {
+              "$ref": "#/$defs/git_oid"
+            },
+            "implementation_commit": {
+              "$ref": "#/$defs/git_oid"
+            },
+            "implementation_tree": {
+              "$ref": "#/$defs/git_oid"
+            },
+            "merge_commit": {
+              "$ref": "#/$defs/git_oid"
+            }
+          },
+          "required": [
+            "base_commit",
+            "implementation_commit",
+            "implementation_tree",
+            "merge_commit"
+          ],
+          "type": "object"
+        },
+        "nonclaims": {
+          "items": {
+            "$ref": "#/$defs/identifier"
+          },
+          "minItems": 1,
+          "type": "array",
+          "uniqueItems": true
+        },
+        "record_type": {
+          "const": "pr_evidence"
+        },
+        "reviews": {
+          "items": {
+            "$ref": "#/$defs/review"
+          },
+          "maxItems": 3,
+          "minItems": 3,
+          "type": "array"
+        },
+        "schema_version": {
+          "const": 2
+        }
+      },
+      "required": [
+        "architectural_unit",
+        "artifacts",
+        "claims",
+        "classified_diff",
+        "exit_criteria",
+        "github_pr",
+        "identity",
+        "nonclaims",
+        "record_type",
+        "reviews",
+        "schema_version"
+      ],
+      "type": "object"
+    },
+    {
+      "additionalProperties": false,
+      "properties": {
+        "allowed_paths": {
+          "const": {
+            "control_exact": [
+              ".github/workflows/referee-evidence.yml",
+              "scripts/check_referee_evidence.py",
+              "tests/test_referee_evidence.py"
+            ],
+            "control_prefixes": [
+              "evidence/referee-hardening/"
+            ],
+            "production": [
+              "optima/eval/_launch.py",
+              "optima/eval/calibration.py",
+              "optima/eval/engine_worker.py",
+              "optima/eval/oci_backend.py",
+              "optima/eval/oci_process.py",
+              "optima/eval/oci_reference_session.py",
+              "optima/eval/oci_session_worker.py",
+              "optima/eval/qualification.py",
+              "optima/eval/reference_protocol.py",
+              "optima/eval/reference_quality.py"
+            ],
+            "test": [
+              "tests/test_calibration.py",
+              "tests/test_isolation.py",
+              "tests/test_launch_execution_receipts.py",
+              "tests/test_oci_backend.py",
+              "tests/test_oci_process.py",
+              "tests/test_oci_reference_session.py",
+              "tests/test_oci_session_worker_order.py",
+              "tests/test_qualification.py",
+              "tests/test_reference_protocol.py",
+              "tests/test_reference_quality.py"
+            ]
+          }
+        },
+        "architectural_unit": {
+          "const": "4b"
+        },
+        "authority_boundary": {
+          "const": {
+            "forbidden_modules": [
+              "optima.audit",
+              "optima.eval._launch",
+              "optima.eval.capability",
+              "optima.eval.throughput_kl"
+            ],
+            "roots": [
+              "optima.eval.calibration",
+              "optima.eval.marginal_runtime",
+              "optima.eval.oci_backend",
+              "optima.eval.oci_process",
+              "optima.eval.oci_reference_session",
+              "optima.eval.qualification",
+              "optima.eval.reference_protocol",
+              "optima.eval.reference_quality",
+              "optima.eval.scoring"
+            ]
+          }
+        },
+        "base_commit": {
+          "const": "9a34b68a58ff53a0c04273a21f86de9e9467db80"
+        },
+        "budget": {
+          "const": {
+            "exemption_policy": "none",
+            "production_additions_max": 3300,
+            "test_additions_max": 2600
+          }
+        },
+        "contract_id": {
+          "const": "pr4b"
+        },
+        "record_type": {
+          "const": "scope_contract"
+        },
+        "required_in_place": {
+          "const": [
+            {
+              "change": "modify",
+              "path": "optima/eval/_launch.py"
+            },
+            {
+              "change": "modify",
+              "path": "optima/eval/calibration.py"
+            },
+            {
+              "change": "add",
+              "path": "optima/eval/engine_worker.py"
+            },
+            {
+              "change": "modify",
+              "path": "optima/eval/oci_backend.py"
+            },
+            {
+              "change": "modify",
+              "path": "optima/eval/oci_process.py"
+            },
+            {
+              "change": "add",
+              "path": "optima/eval/oci_reference_session.py"
+            },
+            {
+              "change": "modify",
+              "path": "optima/eval/oci_session_worker.py"
+            },
+            {
+              "change": "modify",
+              "path": "optima/eval/qualification.py"
+            },
+            {
+              "change": "add",
+              "path": "optima/eval/reference_protocol.py"
+            },
+            {
+              "change": "modify",
+              "path": "optima/eval/reference_quality.py"
+            }
+          ]
+        },
+        "schema_version": {
+          "const": 2
+        }
+      },
+      "required": [
+        "allowed_paths",
+        "architectural_unit",
+        "authority_boundary",
+        "base_commit",
+        "budget",
+        "contract_id",
+        "record_type",
+        "required_in_place",
+        "schema_version"
+      ],
+      "type": "object"
+    }
+  ]
+}

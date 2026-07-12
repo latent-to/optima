@@ -1,0 +1,146 @@
+{
+  "architectural_unit": "4a",
+  "artifacts": [
+    {
+      "availability": "repository",
+      "id": "github.referee-evidence",
+      "kind": "github-check-receipt",
+      "locator": "evidence/referee-hardening/artifacts/pr-0047-github-checks.json",
+      "reason": null,
+      "sha256": "52a42227a8c75b2d8c85d6650f4244b0465d4e69fca6334b90fd41db5b54aedf",
+      "size_bytes": 1844
+    },
+    {
+      "availability": "unavailable",
+      "id": "tests.local-full",
+      "kind": "test-log",
+      "locator": null,
+      "reason": "The local 1288-pass and 19-skip summary was reported without retaining the raw log.",
+      "sha256": null,
+      "size_bytes": null
+    },
+    {
+      "availability": "unavailable",
+      "id": "review.qualification-primitives",
+      "kind": "review-report",
+      "locator": null,
+      "reason": "The implementation, adversarial, and confirmation reviews were not retained as artifacts.",
+      "sha256": null,
+      "size_bytes": null
+    }
+  ],
+  "claims": [
+    {
+      "artifact_ids": [],
+      "id": "scope.qualification-primitives",
+      "statement": "The implementation adds replayable graph, speed, calibration, and pristine-reference quality evidence primitives without an aggregate qualification verdict.",
+      "status": "verified"
+    },
+    {
+      "artifact_ids": [
+        "github.referee-evidence"
+      ],
+      "id": "tests.github-referee-evidence",
+      "statement": "The retained GitHub check receipt records a successful referee-evidence validation job for the implementation head.",
+      "status": "verified"
+    },
+    {
+      "artifact_ids": [
+        "tests.local-full"
+      ],
+      "id": "tests.full",
+      "statement": "The exact-head local suite was reported as 1288 passed and 19 skipped; its raw log is unavailable.",
+      "status": "reported_unretained"
+    },
+    {
+      "artifact_ids": [],
+      "id": "authority.nonaggregate",
+      "statement": "The implementation exports no crownable aggregate qualification PASS and changes no settlement authority.",
+      "status": "verified"
+    }
+  ],
+  "classified_diff": {
+    "documentation": {
+      "added": 0,
+      "deleted": 0
+    },
+    "evidence": {
+      "added": 1472,
+      "deleted": 0
+    },
+    "production": {
+      "added": 3119,
+      "deleted": 72
+    },
+    "test": {
+      "added": 2217,
+      "deleted": 1
+    },
+    "tooling": {
+      "added": 363,
+      "deleted": 0
+    },
+    "vendor": {
+      "added": 0,
+      "deleted": 0
+    }
+  },
+  "exit_criteria": [
+    {
+      "artifact_ids": [],
+      "id": "evidence.replayable-primitives",
+      "statement": "Raw evidence is independently reopened, rebound, and regraded by validator-owned qualification primitives.",
+      "status": "verified"
+    },
+    {
+      "artifact_ids": [],
+      "id": "authority.aggregate-deferred",
+      "statement": "Aggregate qualification and causal pristine-reference session authority are explicitly outside this architectural unit.",
+      "status": "not_applicable"
+    },
+    {
+      "artifact_ids": [
+        "github.referee-evidence"
+      ],
+      "id": "ci.evidence-check",
+      "statement": "The repository-retained GitHub receipt binds a successful evidence check to the implementation head.",
+      "status": "verified"
+    }
+  ],
+  "github_pr": 47,
+  "identity": {
+    "base_commit": "17ecdeb5213d03771964939d80da9343618a7e86",
+    "implementation_commit": "e60fb8561094b6a325107bb838feec4ad35743f7",
+    "implementation_tree": "754174db36ff85310a1b444641c1e1a89d71997e",
+    "merge_commit": "9a34b68a58ff53a0c04273a21f86de9e9467db80"
+  },
+  "nonclaims": [
+    "aggregate.qualification",
+    "crown.authority",
+    "gpu.pristine-reference",
+    "settlement.authority",
+    "t-session.authority"
+  ],
+  "record_type": "pr_evidence",
+  "reviews": [
+    {
+      "artifact_id": "review.qualification-primitives",
+      "phase": "implementation",
+      "status": "reported_unretained",
+      "summary": "Implementation review was reported during development; no report bytes were retained."
+    },
+    {
+      "artifact_id": "review.qualification-primitives",
+      "phase": "adversarial",
+      "status": "reported_unretained",
+      "summary": "Adversarial review was reported during development; no report bytes were retained."
+    },
+    {
+      "artifact_id": "review.qualification-primitives",
+      "phase": "confirmation",
+      "status": "reported_unretained",
+      "summary": "Confirmation review was reported during development; no report bytes were retained."
+    }
+  ],
+  "schema_version": 2
+}

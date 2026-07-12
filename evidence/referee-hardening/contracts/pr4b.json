@@ -1,0 +1,107 @@
+{
+  "allowed_paths": {
+    "control_exact": [
+      ".github/workflows/referee-evidence.yml",
+      "scripts/check_referee_evidence.py",
+      "tests/test_referee_evidence.py"
+    ],
+    "control_prefixes": [
+      "evidence/referee-hardening/"
+    ],
+    "production": [
+      "optima/eval/_launch.py",
+      "optima/eval/calibration.py",
+      "optima/eval/engine_worker.py",
+      "optima/eval/oci_backend.py",
+      "optima/eval/oci_process.py",
+      "optima/eval/oci_reference_session.py",
+      "optima/eval/oci_session_worker.py",
+      "optima/eval/qualification.py",
+      "optima/eval/reference_protocol.py",
+      "optima/eval/reference_quality.py"
+    ],
+    "test": [
+      "tests/test_calibration.py",
+      "tests/test_isolation.py",
+      "tests/test_launch_execution_receipts.py",
+      "tests/test_oci_backend.py",
+      "tests/test_oci_process.py",
+      "tests/test_oci_reference_session.py",
+      "tests/test_oci_session_worker_order.py",
+      "tests/test_qualification.py",
+      "tests/test_reference_protocol.py",
+      "tests/test_reference_quality.py"
+    ]
+  },
+  "architectural_unit": "4b",
+  "authority_boundary": {
+    "forbidden_modules": [
+      "optima.audit",
+      "optima.eval._launch",
+      "optima.eval.capability",
+      "optima.eval.throughput_kl"
+    ],
+    "roots": [
+      "optima.eval.calibration",
+      "optima.eval.marginal_runtime",
+      "optima.eval.oci_backend",
+      "optima.eval.oci_process",
+      "optima.eval.oci_reference_session",
+      "optima.eval.qualification",
+      "optima.eval.reference_protocol",
+      "optima.eval.reference_quality",
+      "optima.eval.scoring"
+    ]
+  },
+  "base_commit": "9a34b68a58ff53a0c04273a21f86de9e9467db80",
+  "budget": {
+    "exemption_policy": "none",
+    "production_additions_max": 3300,
+    "test_additions_max": 2600
+  },
+  "contract_id": "pr4b",
+  "record_type": "scope_contract",
+  "required_in_place": [
+    {
+      "change": "modify",
+      "path": "optima/eval/_launch.py"
+    },
+    {
+      "change": "modify",
+      "path": "optima/eval/calibration.py"
+    },
+    {
+      "change": "add",
+      "path": "optima/eval/engine_worker.py"
+    },
+    {
+      "change": "modify",
+      "path": "optima/eval/oci_backend.py"
+    },
+    {
+      "change": "modify",
+      "path": "optima/eval/oci_process.py"
+    },
+    {
+      "change": "add",
+      "path": "optima/eval/oci_reference_session.py"
+    },
+    {
+      "change": "modify",
+      "path": "optima/eval/oci_session_worker.py"
+    },
+    {
+      "change": "modify",
+      "path": "optima/eval/qualification.py"
+    },
+    {
+      "change": "add",
+      "path": "optima/eval/reference_protocol.py"
+    },
+    {
+      "change": "modify",
+      "path": "optima/eval/reference_quality.py"
+    }
+  ],
+  "schema_version": 2
+}

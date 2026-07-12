@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import hashlib
+import importlib.util
 import json
 import re
 import subprocess
@@ -19,10 +21,54 @@ RECORD_KEYS = {
     "architectural_unit", "artifacts", "claims", "classified_diff", "exit_criteria",
     "github_pr", "identity", "nonclaims", "record_type", "reviews", "schema_version",
 }
-CONTRACT_KEYS = {
+CONTRACT_KEYS_V1 = {
     "allowed_paths", "architectural_unit", "base_commit", "budget", "contract_id",
     "record_type", "required_in_place", "schema_version",
 }
+CONTRACT_KEYS_V2 = CONTRACT_KEYS_V1 | {"authority_boundary"}
+
+PR4B_BASE = "9a34b68a58ff53a0c04273a21f86de9e9467db80"
+PR4B_PRODUCTION = [
+    "optima/eval/_launch.py",
+    "optima/eval/calibration.py",
+    "optima/eval/engine_worker.py",
+    "optima/eval/oci_backend.py",
+    "optima/eval/oci_process.py",
+    "optima/eval/oci_reference_session.py",
+    "optima/eval/oci_session_worker.py",
+    "optima/eval/qualification.py",
+    "optima/eval/reference_protocol.py",
+    "optima/eval/reference_quality.py",
+]
+PR4B_TESTS = [
+    "tests/test_calibration.py",
+    "tests/test_isolation.py",
+    "tests/test_launch_execution_receipts.py",
+    "tests/test_oci_backend.py",
+    "tests/test_oci_process.py",
+    "tests/test_oci_reference_session.py",
+    "tests/test_oci_session_worker_order.py",
+    "tests/test_qualification.py",
+    "tests/test_reference_protocol.py",
+    "tests/test_reference_quality.py",
+]
+PR4B_AUTHORITY_ROOTS = [
+    "optima.eval.calibration",
+    "optima.eval.marginal_runtime",
+    "optima.eval.oci_backend",
+    "optima.eval.oci_process",
+    "optima.eval.oci_reference_session",
+    "optima.eval.qualification",
+    "optima.eval.reference_protocol",
+    "optima.eval.reference_quality",
+    "optima.eval.scoring",
+]
+PR4B_FORBIDDEN_MODULES = [
+    "optima.audit",
+    "optima.eval._launch",
+    "optima.eval.capability",
+    "optima.eval.throughput_kl",
+]
 
 
 class EvidenceError(ValueError):
@@ -117,7 +163,9 @@ def diff_facts(root: Path, base: str, head: str) -> tuple[dict[str, dict[str, in
     return counts, statuses
 
 
-def _validate_artifact(item: dict[str, Any], root: Path, commit: str, where: str) -> None:
+def _validate_artifact(
+    item: dict[str, Any], root: Path, commit: str, schema_version: int, where: str
+) -> None:
     _keys(item, {"availability", "id", "kind", "locator", "reason", "sha256", "size_bytes"}, where)
     _ident(item["id"], f"{where}.id")
     _ident(item["kind"], f"{where}.kind")
@@ -139,7 +187,21 @@ def _validate_artifact(item: dict[str, Any], root: Path, commit: str, where: str
         return
     if type(item["locator"]) is not str or item["locator"].startswith("/"):
         raise EvidenceError(f"{where} repository locator must be relative")
-    raw = bytes(git(root, "show", f"{commit}:{item['locator']}", text=False))
+    if schema_version == 1:
+        raw = bytes(git(root, "show", f"{commit}:{item['locator']}", text=False))
+    else:
+        locator = item["locator"]
+        if not locator.startswith("evidence/referee-hardening/artifacts/"):
+            raise EvidenceError(f"{where} v2 repository artifact must use the evidence artifact directory")
+        candidate = root / locator
+        try:
+            resolved = candidate.resolve(strict=True)
+            resolved.relative_to(root.resolve())
+        except (OSError, ValueError) as exc:
+            raise EvidenceError(f"{where} repository artifact escapes or is absent") from exc
+        if candidate.is_symlink() or not candidate.is_file():
+            raise EvidenceError(f"{where} repository artifact must be a regular file")
+        raw = candidate.read_bytes()
     if hashlib.sha256(raw).hexdigest() != digest or len(raw) != item["size_bytes"]:
         raise EvidenceError(f"{where} repository artifact bytes do not match")
     if item["reason"] is not None:
@@ -148,7 +210,8 @@ def _validate_artifact(item: dict[str, Any], root: Path, commit: str, where: str
 
 def validate_record(record: dict[str, Any], root: Path, where: str) -> None:
     _keys(record, RECORD_KEYS, where)
-    if record["schema_version"] != 1 or record["record_type"] != "pr_evidence":
+    schema_version = record["schema_version"]
+    if schema_version not in {1, 2} or record["record_type"] != "pr_evidence":
         raise EvidenceError(f"{where} has an unsupported schema")
     if type(record["github_pr"]) is not int or record["github_pr"] < 1:
         raise EvidenceError(f"{where}.github_pr is invalid")
@@ -172,7 +235,7 @@ def validate_record(record: dict[str, Any], root: Path, where: str) -> None:
         raise EvidenceError(f"{where}.artifacts must be a list")
     artifact_ids: set[str] = set()
     for index, item in enumerate(artifacts):
-        _validate_artifact(item, root, head, f"{where}.artifacts[{index}]")
+        _validate_artifact(item, root, head, schema_version, f"{where}.artifacts[{index}]")
         if item["id"] in artifact_ids:
             raise EvidenceError(f"{where} repeats artifact {item['id']}")
         artifact_ids.add(item["id"])
@@ -214,35 +277,119 @@ def validate_record(record: dict[str, Any], root: Path, where: str) -> None:
         for item in record["claims"]
     ):
         raise EvidenceError("PR 43 must preserve the invalid exact-head full-suite claim")
+    if record["github_pr"] == 47:
+        if schema_version != 2:
+            raise EvidenceError("PR 47 must use the retained-artifact evidence schema")
+        retained = {
+            item["id"] for item in artifacts
+            if item["availability"] == "repository"
+        }
+        if "github.referee-evidence" not in retained:
+            raise EvidenceError("PR 47 must retain the GitHub referee-evidence check receipt")
 
 
 def validate_contract_document(contract: dict[str, Any], where: str = "contract") -> None:
-    _keys(contract, CONTRACT_KEYS, where)
-    if contract["schema_version"] != 1 or contract["record_type"] != "scope_contract":
+    schema_version = contract.get("schema_version")
+    expected_keys = CONTRACT_KEYS_V1 if schema_version == 1 else CONTRACT_KEYS_V2
+    _keys(contract, expected_keys, where)
+    if schema_version not in {1, 2} or contract["record_type"] != "scope_contract":
         raise EvidenceError(f"{where} has an unsupported schema")
     _ident(contract["contract_id"], f"{where}.contract_id")
     _ident(contract["architectural_unit"], f"{where}.architectural_unit")
     _git_oid(contract["base_commit"], f"{where}.base_commit")
+    expected_identity = (
+        {
+            "architectural_unit": "4a",
+            "base_commit": "17ecdeb5213d03771964939d80da9343618a7e86",
+            "contract_id": "pr4a",
+        }
+        if schema_version == 1
+        else {
+            "architectural_unit": "4b",
+            "base_commit": PR4B_BASE,
+            "contract_id": "pr4b",
+        }
+    )
+    for field, expected in expected_identity.items():
+        if contract[field] != expected:
+            raise EvidenceError(f"{where}.{field} changed")
     budget = contract["budget"]
     _keys(budget, {"exemption_policy", "production_additions_max", "test_additions_max"}, f"{where}.budget")
-    if budget != {"exemption_policy": "none", "production_additions_max": 3200, "test_additions_max": 2400}:
+    expected_budget = (
+        {"exemption_policy": "none", "production_additions_max": 3200, "test_additions_max": 2400}
+        if schema_version == 1
+        else {"exemption_policy": "none", "production_additions_max": 3300, "test_additions_max": 2600}
+    )
+    if budget != expected_budget:
         raise EvidenceError(f"{where} budget or exemption policy changed")
     paths = contract["allowed_paths"]
     _keys(paths, {"control_exact", "control_prefixes", "production", "test"}, f"{where}.allowed_paths")
-    expected_paths = {
+    expected_paths_v1 = {
         "control_exact": [".github/workflows/referee-evidence.yml", "scripts/check_referee_evidence.py", "tests/test_referee_evidence.py"],
         "control_prefixes": ["evidence/referee-hardening/"],
         "production": ["optima/eval/calibration.py", "optima/eval/evidence_store.py", "optima/eval/qualification.py", "optima/eval/reference_quality.py", "optima/eval/scoring.py"],
         "test": ["tests/test_calibration.py", "tests/test_evidence_store.py", "tests/test_qualification.py", "tests/test_reference_quality.py", "tests/test_scoring.py"],
     }
+    expected_paths_v2 = {
+        "control_exact": [".github/workflows/referee-evidence.yml", "scripts/check_referee_evidence.py", "tests/test_referee_evidence.py"],
+        "control_prefixes": ["evidence/referee-hardening/"],
+        "production": PR4B_PRODUCTION,
+        "test": PR4B_TESTS,
+    }
+    expected_paths = expected_paths_v1 if schema_version == 1 else expected_paths_v2
     if paths != expected_paths:
         raise EvidenceError(f"{where} allowed paths changed")
     for field, values in paths.items():
         if type(values) is not list or values != sorted(set(values)) or any(not isinstance(v, str) or v.startswith("/") or ".." in v for v in values):
             raise EvidenceError(f"{where}.allowed_paths.{field} must be sorted unique relative paths")
     required = contract["required_in_place"]
-    if required != [{"change": "modify", "path": "optima/eval/scoring.py"}]:
-        raise EvidenceError(f"{where} must require in-place scoring replacement")
+    expected_required = (
+        [{"change": "modify", "path": "optima/eval/scoring.py"}]
+        if schema_version == 1
+        else [
+            {"change": "modify", "path": "optima/eval/_launch.py"},
+            {"change": "modify", "path": "optima/eval/calibration.py"},
+            {"change": "add", "path": "optima/eval/engine_worker.py"},
+            {"change": "modify", "path": "optima/eval/oci_backend.py"},
+            {"change": "modify", "path": "optima/eval/oci_process.py"},
+            {"change": "add", "path": "optima/eval/oci_reference_session.py"},
+            {"change": "modify", "path": "optima/eval/oci_session_worker.py"},
+            {"change": "modify", "path": "optima/eval/qualification.py"},
+            {"change": "add", "path": "optima/eval/reference_protocol.py"},
+            {"change": "modify", "path": "optima/eval/reference_quality.py"},
+        ]
+    )
+    if required != expected_required:
+        raise EvidenceError(f"{where} required replacements changed")
+    if schema_version == 2:
+        authority = contract["authority_boundary"]
+        _keys(authority, {"forbidden_modules", "roots"}, f"{where}.authority_boundary")
+        if authority != {
+            "forbidden_modules": PR4B_FORBIDDEN_MODULES,
+            "roots": PR4B_AUTHORITY_ROOTS,
+        }:
+            raise EvidenceError(f"{where} authority boundary changed")
+
+
+def validate_v2_schema_contract(schema: dict[str, Any], contract: dict[str, Any]) -> None:
+    """Require the tracked v2 schema's scope-branch constants to match PR4b."""
+
+    branches = schema.get("oneOf")
+    if not isinstance(branches, list):
+        raise EvidenceError("schema-v2 oneOf is absent")
+    matches = []
+    for branch in branches:
+        properties = branch.get("properties", {}) if isinstance(branch, dict) else {}
+        record = properties.get("record_type", {})
+        version = properties.get("schema_version", {})
+        if record.get("const") == "scope_contract" and version.get("const") == 2:
+            matches.append(properties)
+    if len(matches) != 1:
+        raise EvidenceError("schema-v2 scope-contract branch is absent or ambiguous")
+    properties = matches[0]
+    for field in contract:
+        if properties.get(field, {}).get("const") != contract[field]:
+            raise EvidenceError(f"schema-v2 scope constant differs: {field}")
 
 
 def _scope_kind(path: str, contract: dict[str, Any]) -> str | None:
@@ -261,20 +408,269 @@ def validate_scope(contract: dict[str, Any], changes: dict[str, tuple[str, int, 
     for path, (status, added, _deleted) in changes.items():
         kind = _scope_kind(path, contract)
         if kind is None:
-            raise EvidenceError(f"path is outside frozen PR4a scope: {path}")
+            raise EvidenceError(f"path is outside frozen {contract['contract_id']} scope: {path}")
         if kind in totals:
             totals[kind] += added
-    if totals["production"] > 3200 or totals["test"] > 2400:
-        raise EvidenceError(f"PR4a line budget exceeded: {totals}")
+    budget = contract["budget"]
+    if (
+        totals["production"] > budget["production_additions_max"]
+        or totals["test"] > budget["test_additions_max"]
+    ):
+        raise EvidenceError(f"{contract['contract_id']} line budget exceeded: {totals}")
     for item in contract["required_in_place"]:
-        if changes.get(item["path"], (None, 0, 0))[0] != "M":
-            raise EvidenceError(f"required in-place replacement is absent: {item['path']}")
+        expected_status = {"add": "A", "modify": "M"}[item["change"]]
+        if changes.get(item["path"], (None, 0, 0))[0] != expected_status:
+            raise EvidenceError(f"required {item['change']} is absent: {item['path']}")
+
+
+def _repo_modules(root: Path) -> dict[str, tuple[Path, bool]]:
+    package_root = root / "optima"
+    modules: dict[str, tuple[Path, bool]] = {}
+    if not package_root.is_dir():
+        return modules
+    for path in sorted(package_root.rglob("*.py")):
+        relative = path.relative_to(root).with_suffix("")
+        parts = list(relative.parts)
+        is_package = parts[-1] == "__init__"
+        if is_package:
+            parts.pop()
+        if parts:
+            modules[".".join(parts)] = (path, is_package)
+    return modules
+
+
+def _local_imports(
+    module: str,
+    path: Path,
+    is_package: bool,
+    modules: dict[str, tuple[Path, bool]],
+) -> set[str]:
+    try:
+        tree = ast.parse(path.read_bytes(), filename=str(path))
+    except (OSError, SyntaxError) as exc:
+        raise EvidenceError(f"cannot parse authority module {module}: {exc}") from exc
+    package = module if is_package else module.rpartition(".")[0]
+    imported: set[str] = set()
+    import_module_names = {"import_module"}
+    builtin_import_names = {"__import__"}
+    importlib_names = {"importlib"}
+    builtins_names = {"builtins"}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            importlib_names.update(
+                alias.asname or alias.name
+                for alias in node.names
+                if alias.name == "importlib"
+            )
+            builtins_names.update(
+                alias.asname or alias.name
+                for alias in node.names
+                if alias.name == "builtins"
+            )
+        elif isinstance(node, ast.ImportFrom) and node.module == "importlib":
+            import_module_names.update(
+                alias.asname or alias.name
+                for alias in node.names
+                if alias.name == "import_module"
+            )
+        elif isinstance(node, ast.ImportFrom) and node.module == "builtins":
+            builtin_import_names.update(
+                alias.asname or alias.name
+                for alias in node.names
+                if alias.name == "__import__"
+            )
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name in modules:
+                    imported.add(alias.name)
+            continue
+        if not isinstance(node, ast.ImportFrom):
+            continue
+        if node.level:
+            if not package:
+                raise EvidenceError(f"relative import has no package in {module}:{node.lineno}")
+            relative = "." * node.level + (node.module or "")
+            try:
+                base = importlib.util.resolve_name(relative, package)
+            except (ImportError, ValueError) as exc:
+                raise EvidenceError(f"invalid relative import in {module}:{node.lineno}") from exc
+        else:
+            base = node.module or ""
+        if base in modules:
+            imported.add(base)
+        for alias in node.names:
+            if alias.name == "*":
+                continue
+            candidate = f"{base}.{alias.name}" if base else alias.name
+            if candidate in modules:
+                imported.add(candidate)
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        import_module_call = (
+            isinstance(node.func, ast.Name) and node.func.id in import_module_names
+        ) or (
+            isinstance(node.func, ast.Attribute)
+            and node.func.attr == "import_module"
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id in importlib_names
+        )
+        builtin_import_call = (
+            isinstance(node.func, ast.Name) and node.func.id in builtin_import_names
+        ) or (
+            isinstance(node.func, ast.Attribute)
+            and node.func.attr == "__import__"
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id in builtins_names
+        )
+        if not (import_module_call or builtin_import_call):
+            continue
+        if not node.args or not isinstance(node.args[0], ast.Constant) or not isinstance(
+            node.args[0].value, str
+        ):
+            raise EvidenceError(
+                f"authority module has an unresolved dynamic import in {module}:{node.lineno}"
+            )
+        dynamic = node.args[0].value
+        if import_module_call:
+            if len(node.args) > 2 or any(
+                keyword.arg not in {"package"} for keyword in node.keywords
+            ):
+                raise EvidenceError(
+                    f"authority module has an unresolved dynamic import in {module}:{node.lineno}"
+                )
+            package_nodes = [
+                *node.args[1:2],
+                *(keyword.value for keyword in node.keywords if keyword.arg == "package"),
+            ]
+            if len(package_nodes) > 1:
+                raise EvidenceError(
+                    f"authority module has an unresolved dynamic import in {module}:{node.lineno}"
+                )
+            if dynamic.startswith("."):
+                if not package_nodes:
+                    raise EvidenceError(
+                        f"authority module has an unresolved dynamic import in {module}:{node.lineno}"
+                    )
+                package_node = package_nodes[0]
+                if isinstance(package_node, ast.Name) and package_node.id == "__package__":
+                    dynamic_package = package
+                elif isinstance(package_node, ast.Constant) and isinstance(
+                    package_node.value, str
+                ):
+                    dynamic_package = package_node.value
+                else:
+                    raise EvidenceError(
+                        f"authority module has an unresolved dynamic import in {module}:{node.lineno}"
+                    )
+                try:
+                    dynamic = importlib.util.resolve_name(dynamic, dynamic_package)
+                except (ImportError, ValueError) as exc:
+                    raise EvidenceError(
+                        f"invalid dynamic relative import in {module}:{node.lineno}"
+                    ) from exc
+            elif package_nodes and not (
+                isinstance(package_nodes[0], ast.Name)
+                and package_nodes[0].id == "__package__"
+            ) and not (
+                isinstance(package_nodes[0], ast.Constant)
+                and isinstance(package_nodes[0].value, str)
+            ):
+                raise EvidenceError(
+                    f"authority module has an unresolved dynamic import in {module}:{node.lineno}"
+                )
+            candidates = (dynamic,)
+        else:
+            if len(node.args) > 5 or any(
+                keyword.arg not in {"globals", "locals", "fromlist", "level"}
+                for keyword in node.keywords
+            ):
+                raise EvidenceError(
+                    f"authority module has an unresolved dynamic import in {module}:{node.lineno}"
+                )
+            keyword_values = {keyword.arg: keyword.value for keyword in node.keywords}
+            level_node = keyword_values.get(
+                "level", node.args[4] if len(node.args) > 4 else ast.Constant(value=0)
+            )
+            if not isinstance(level_node, ast.Constant) or type(level_node.value) is not int:
+                raise EvidenceError(
+                    f"authority module has an unresolved dynamic import in {module}:{node.lineno}"
+                )
+            if level_node.value:
+                raise EvidenceError(
+                    f"authority module has an unresolved dynamic import in {module}:{node.lineno}"
+                )
+            fromlist_node = keyword_values.get(
+                "fromlist", node.args[3] if len(node.args) > 3 else ast.Tuple(elts=[])
+            )
+            if not isinstance(fromlist_node, (ast.Tuple, ast.List)) or any(
+                not isinstance(item, ast.Constant) or not isinstance(item.value, str)
+                for item in fromlist_node.elts
+            ):
+                raise EvidenceError(
+                    f"authority module has an unresolved dynamic import in {module}:{node.lineno}"
+                )
+            candidates = (dynamic, *(
+                f"{dynamic}.{item.value}" for item in fromlist_node.elts if item.value != "*"
+            ))
+        imported.update(candidate for candidate in candidates if candidate in modules)
+    return imported
+
+
+def validate_authority_boundary(root: Path, contract: dict[str, Any]) -> None:
+    authority = contract.get("authority_boundary")
+    if authority is None:
+        return
+    modules = _repo_modules(root)
+    forbidden = set(authority["forbidden_modules"])
+    cache: dict[str, set[str]] = {}
+    for authority_root in authority["roots"]:
+        if authority_root not in modules:
+            raise EvidenceError(f"authority root is absent: {authority_root}")
+        stack: list[tuple[str, tuple[str, ...]]] = [(authority_root, (authority_root,))]
+        visited: set[str] = set()
+        while stack:
+            module, chain = stack.pop()
+            if module in visited:
+                continue
+            visited.add(module)
+            if module in forbidden:
+                raise EvidenceError(
+                    f"authority root {authority_root} reaches forbidden module {module}: "
+                    + " -> ".join(chain)
+                )
+            if module not in cache:
+                path, is_package = modules[module]
+                cache[module] = _local_imports(module, path, is_package, modules)
+            for dependency in sorted(cache[module], reverse=True):
+                stack.append((dependency, (*chain, dependency)))
+
+
+def _git_path_exists(root: Path, commit: str, relative_path: str) -> bool:
+    return subprocess.run(
+        ["git", "cat-file", "-e", f"{commit}:{relative_path}"],
+        cwd=root,
+        capture_output=True,
+        check=False,
+    ).returncode == 0
+
+
+def _require_frozen_bytes(root: Path, commit: str, relative_path: str, label: str) -> None:
+    path = root / relative_path
+    try:
+        current = path.read_bytes()
+    except OSError as exc:
+        raise EvidenceError(f"{label} is absent: {relative_path}") from exc
+    if bytes(git(root, "show", f"{commit}:{relative_path}", text=False)) != current:
+        raise EvidenceError(f"{label} changed after freeze: {relative_path}")
 
 
 def validate_repository(root: Path, *, records_only: bool = False, pr_base: str | None = None) -> None:
     evidence = root / "evidence/referee-hardening"
     load_json(evidence / "schema-v1.json")
-    expected = set(range(40, 47))
+    schema_v2 = load_json(evidence / "schema-v2.json")
+    expected = set(range(40, 48))
     seen: set[int] = set()
     for path in sorted((evidence / "records").glob("pr-*.json")):
         record = load_json(path)
@@ -282,36 +678,64 @@ def validate_repository(root: Path, *, records_only: bool = False, pr_base: str 
         seen.add(record["github_pr"])
     if seen != expected:
         raise EvidenceError(f"historical evidence set differs: {sorted(seen ^ expected)}")
-    contract_path = evidence / "contracts/pr4a.json"
-    contract = load_json(contract_path)
-    validate_contract_document(contract)
+    contracts: list[tuple[Path, dict[str, Any]]] = []
+    contract_ids: set[str] = set()
+    for contract_path in sorted((evidence / "contracts").glob("*.json")):
+        contract = load_json(contract_path)
+        validate_contract_document(contract, str(contract_path.relative_to(root)))
+        if contract["schema_version"] == 2:
+            validate_v2_schema_contract(schema_v2, contract)
+        if contract["contract_id"] in contract_ids:
+            raise EvidenceError(f"duplicate scope contract: {contract['contract_id']}")
+        contract_ids.add(contract["contract_id"])
+        contracts.append((contract_path, contract))
+    if contract_ids != {"pr4a", "pr4b"}:
+        raise EvidenceError(f"scope contract set differs: {sorted(contract_ids)}")
     if records_only:
         return
-    relative_contract = str(contract_path.relative_to(root))
     if pr_base is not None:
         _git_oid(pr_base, "pull-request base")
-        exists = subprocess.run(
-            ["git", "cat-file", "-e", f"{pr_base}:{relative_contract}"],
-            cwd=root, capture_output=True, check=False,
-        ).returncode == 0
-        if exists:
-            if bytes(git(root, "show", f"{pr_base}:{relative_contract}", text=False)) != contract_path.read_bytes():
-                raise EvidenceError("a closed scope contract cannot change")
-            return
-        if pr_base != contract["base_commit"]:
-            raise EvidenceError("PR4a must retain its frozen base commit")
+
+    active: list[tuple[Path, dict[str, Any]]] = []
+    witness_commits = [contract["base_commit"] for _, contract in contracts]
+    if pr_base is not None:
+        witness_commits.insert(0, pr_base)
+    for contract_path, contract in contracts:
+        relative_contract = str(contract_path.relative_to(root))
+        witnesses = [
+            commit for commit in witness_commits
+            if commit != contract["base_commit"] and _git_path_exists(root, commit, relative_contract)
+        ]
+        if witnesses:
+            for witness in witnesses:
+                _require_frozen_bytes(root, witness, relative_contract, "closed scope contract")
+            continue
+        if pr_base is not None and contract["base_commit"] != pr_base:
+            raise EvidenceError(
+                f"{contract['contract_id']} is neither closed nor based on the pull-request base"
+            )
+        active.append((contract_path, contract))
+    if not active:
+        return
+    if len(active) != 1:
+        raise EvidenceError(f"exactly one scope contract must be active: {[item[1]['contract_id'] for item in active]}")
+    contract_path, contract = active[0]
+    relative_contract = str(contract_path.relative_to(root))
     head = str(git(root, "rev-parse", "HEAD"))
     base = contract["base_commit"]
     commits = str(git(root, "rev-list", "--reverse", f"{base}..{head}", "--", relative_contract)).splitlines()
     if not commits:
-        raise EvidenceError("PR4a scope contract is not committed")
+        raise EvidenceError(f"{contract['contract_id']} scope contract is not committed")
     freeze = commits[0]
     frozen_bytes = bytes(git(root, "show", f"{freeze}:{relative_contract}", text=False))
     if frozen_bytes != contract_path.read_bytes():
         raise EvidenceError("post-freeze contract modification is forbidden")
     _, freeze_status = diff_facts(root, base, freeze)
     if any(_scope_kind(path, contract) != "control" for path in freeze_status):
-        raise EvidenceError("the PR4a contract was frozen after implementation began")
+        raise EvidenceError(f"the {contract['contract_id']} contract was frozen after implementation began")
+    if contract["schema_version"] == 2:
+        for path in freeze_status:
+            _require_frozen_bytes(root, freeze, path, "PR4b control file")
     counts, statuses = diff_facts(root, base, head)
     changes = {
         path: (status, counts[classify(path)]["added"], counts[classify(path)]["deleted"])
@@ -322,6 +746,7 @@ def validate_repository(root: Path, *, records_only: bool = False, pr_base: str 
         added, deleted, path = line.split("\t", 2)
         changes[path] = (statuses[path], int(added), int(deleted))
     validate_scope(contract, changes)
+    validate_authority_boundary(root, contract)
 
 
 def main() -> int:

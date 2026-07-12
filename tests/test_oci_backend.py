@@ -545,6 +545,55 @@ def test_reference_reopens_control_receipt_then_rejects_added_native_file(
     ]
 
 
+def test_reference_runtime_accepts_control_receipt_through_both_reopens(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    case = _case(tmp_path)
+    executor = OCIEngineExecutor(
+        case.config,
+        case.device_policy,
+        manager=_manager(case),
+    )
+    _install_execution_fakes(case, executor, monkeypatch)
+    control = SimpleNamespace(
+        **vars(case.publication),
+        directories=(),
+        files=(SimpleNamespace(path="prebuild.json"),),
+    )
+    monkeypatch.setattr(
+        backend,
+        "reopen_native_artifact",
+        lambda *args, **kwargs: control,
+    )
+
+    class Transport:
+        def __init__(self, *_args, **_kwargs) -> None:
+            self.aborted = False
+
+        def abort(self) -> None:
+            self.aborted = True
+
+    monkeypatch.setattr(backend, "AttachedReferenceTransport", Transport)
+    marker = object()
+    raw = executor._execute_runtime(
+        case.launch,
+        case.binding,
+        case.mount,
+        absolute=200.0,
+        resolved=case.resolved,
+        preflight=case.preflight,
+        model_root=case.model,
+        session_protocol="reference",
+        run=lambda *_args: marker,
+    )
+    assert raw.value is marker
+    assert raw.native_publication_digest == control.publication_digest
+    assert executor.device_guard.deadlines == [  # type: ignore[attr-defined]
+        ("pre", 200.0),
+        ("post", 200.0),
+    ]
+
+
 def test_runtime_identity_and_backend_policy_are_closed(tmp_path: Path) -> None:
     case = _case(tmp_path)
 

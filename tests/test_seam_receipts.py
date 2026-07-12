@@ -157,6 +157,43 @@ def test_completed_and_fallback_are_independently_once(receipt_dir):
     assert fallback[0]["error_type"] == "RuntimeError"
 
 
+def test_scheduler_bundle_load_uses_load_only_rebuild_phase(monkeypatch):
+    """Scheduler activation may load sealed native products, never build them."""
+    from optima import manifest, rebuild, sandbox
+    from optima.registry import REGISTRY
+    from optima.seam import _load_bundle_into_registry
+
+    class EmptyManifest:
+        ops = ()
+
+    class CleanTree:
+        ok = True
+        violations = ()
+
+    calls = []
+    monkeypatch.setattr(manifest, "load_manifest", lambda _bundle: EmptyManifest())
+    monkeypatch.setattr(
+        manifest, "all_declared_cuda_sources", lambda _bundle, _manifest: ()
+    )
+    monkeypatch.setattr(
+        manifest, "all_declared_dep_patches", lambda _bundle, _manifest: ()
+    )
+    monkeypatch.setattr(sandbox, "scan_tree", lambda *_args, **_kwargs: CleanTree())
+    monkeypatch.setattr(
+        rebuild,
+        "apply_rebuild_plan",
+        lambda bundle, *, phase: calls.append((bundle, phase)),
+    )
+
+    REGISTRY.clear()
+    try:
+        _load_bundle_into_registry("/sealed/candidate-tree")
+    finally:
+        REGISTRY.clear()
+
+    assert calls == [("/sealed/candidate-tree", "load")]
+
+
 def test_unprintable_fallback_error_never_breaks_receipt(receipt_dir):
     class BadString(RuntimeError):
         def __str__(self):

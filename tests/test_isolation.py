@@ -1,5 +1,6 @@
 import os
 import sys
+from pathlib import Path
 from types import SimpleNamespace
 from unittest import TestCase, mock
 
@@ -9,7 +10,73 @@ from optima import receipts, seam
 from optima.eval import _launch
 
 
+def _sandbox_proc_reader(*, seccomp: int = 2, filters: int = 1, caps: int = 0):
+    values = {
+        "/proc/self/status": (
+            f"CapEff:\t{caps:x}\n"
+            f"CapBnd:\t{caps:x}\n"
+            "NoNewPrivs:\t1\n"
+            f"Seccomp:\t{seccomp}\n"
+            f"Seccomp_filters:\t{filters}\n"
+        ),
+        "/proc/sys/kernel/yama/ptrace_scope": "1\n",
+        "/proc/mounts": "overlay / overlay ro,relatime 0 0\n",
+    }
+
+    def read_text(path: Path, *args, **kwargs):
+        return values[str(path)]
+
+    return read_text
+
+
 class IsolationTests(TestCase):
+    def test_process_hardening_requires_zero_caps_and_live_seccomp(self):
+        with mock.patch.object(
+            Path, "read_text", autospec=True, side_effect=_sandbox_proc_reader()
+        ):
+            self.assertTrue(_launch._process_sandbox_is_hardened())
+        for kwargs in (
+            {"seccomp": 0},
+            {"filters": 0},
+            {"caps": 1 << 23},
+        ):
+            with mock.patch.object(
+                Path,
+                "read_text",
+                autospec=True,
+                side_effect=_sandbox_proc_reader(**kwargs),
+            ):
+                self.assertFalse(_launch._process_sandbox_is_hardened())
+
+    def test_external_isolation_is_live_verified(self):
+        with mock.patch.dict("os.environ", {"OPTIMA_EXTERNAL_NO_EGRESS": "1"}), \
+             mock.patch.object(_launch, "_loopback_is_up", return_value=True), \
+             mock.patch.object(
+                 _launch, "_network_namespace_is_loopback_only", return_value=True
+             ), \
+             mock.patch.object(_launch, "_egress_is_blocked", return_value=True), \
+             mock.patch.object(
+                 _launch, "_process_sandbox_is_hardened", return_value=True
+             ):
+            self.assertTrue(_launch.isolate_network())
+
+    def test_external_isolation_claim_fails_any_live_check(self):
+        checks = (
+            "_loopback_is_up",
+            "_network_namespace_is_loopback_only",
+            "_egress_is_blocked",
+            "_process_sandbox_is_hardened",
+        )
+        for failed in checks:
+            patches = {
+                name: mock.patch.object(_launch, name, return_value=name != failed)
+                for name in checks
+            }
+            with mock.patch.dict(
+                "os.environ", {"OPTIMA_EXTERNAL_NO_EGRESS": "1"}
+            ), patches[checks[0]], patches[checks[1]], patches[checks[2]], patches[checks[3]]:
+                self.assertFalse(_launch.isolate_network())
+
     def test_requested_isolation_fails_closed(self):
         cfg = SimpleNamespace(
             isolate=True,
@@ -148,6 +215,45 @@ def test_setup_cannot_bypass_failed_isolation(tmp_path):
                 bundle_path=str(bundle),
                 active=True,
             )
+
+
+def test_external_worker_requires_read_only_inputs_and_prebuild_binding(
+    tmp_path, monkeypatch
+):
+    bundle = _setup_bundle(tmp_path)
+    cfg = _isolation_cfg(framework_mode=True)
+    cfg.model_path = "/models/model"
+    external = {
+        "OPTIMA_EXTERNAL_NO_EGRESS": "1",
+        "OPTIMA_ENGINE_WORKER": "1",
+        "OPTIMA_PREBUILT_ARTIFACTS": "1",
+        "OPTIMA_NATIVE_BUILD_SPEC_DIGEST": "a" * 64,
+        "OPTIMA_NATIVE_ARTIFACT_ROOT": "/optima/native",
+        "OPTIMA_NATIVE_ARTIFACT_PUBLICATION_DIGEST": "b" * 64,
+    }
+    monkeypatch.setattr(_launch, "isolate_network", lambda: True)
+    monkeypatch.setattr(_launch, "_dep_overlay_env", lambda _bundle: None)
+    monkeypatch.setenv("OPTIMA_EXTERNAL_NO_EGRESS", "1")
+    monkeypatch.setenv("OPTIMA_ENGINE_WORKER", "1")
+    monkeypatch.setattr(_launch, "_path_mount_is_read_only", lambda _path: False)
+    with pytest.raises(_launch.IsolationError, match="mounted read-only"):
+        _launch.prepare_candidate_environment(
+            cfg, bundle_path=str(bundle), active=True
+        )
+
+    monkeypatch.setattr(_launch, "_path_mount_is_read_only", lambda _path: True)
+    with pytest.raises(_launch.IsolationError, match="prebuild binding"):
+        _launch.prepare_candidate_environment(
+            cfg, bundle_path=str(bundle), active=True
+        )
+
+    for name, value in external.items():
+        monkeypatch.setenv(name, value)
+    with mock.patch("optima.rebuild.apply_rebuild_plan") as rebuild:
+        _launch.prepare_candidate_environment(
+            cfg, bundle_path=str(bundle), active=True
+        )
+    rebuild.assert_not_called()
 
 
 @pytest.mark.parametrize(

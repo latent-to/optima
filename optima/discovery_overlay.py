@@ -15,6 +15,7 @@ import importlib
 import importlib.abc
 import importlib.machinery
 import importlib.metadata
+import importlib.util
 import json
 import multiprocessing
 import multiprocessing.process
@@ -601,9 +602,37 @@ def require_stock_driver_origin(
             else distribution
         )
         installed_version = str(getattr(installed, "version"))
-        expected_file = Path(
+        requested_file = Path(
             installed.locate_file(_DRIVER_MODULE)  # type: ignore[attr-defined]
-        ).resolve(strict=True)
+        )
+        if requested_file.exists():
+            expected_file = requested_file.resolve(strict=True)
+        else:
+            # Editable image installs keep metadata in site-packages and the
+            # package under an image-owned source root. Resolve the already
+            # imported top-level spec without executing another module.
+            live_spec = importlib.util.find_spec("sglang")
+            locations = (
+                ()
+                if live_spec is None
+                else tuple(
+                    Path(value).resolve(strict=True)
+                    for value in (live_spec.submodule_search_locations or ())
+                )
+            )
+            if (
+                live_spec is None
+                or live_spec.origin is None
+                or len(locations) != 1
+            ):
+                raise DiscoveryOverlayActivationError(
+                    "installed editable SGLang origin is not exact"
+                )
+            expected_file = Path(live_spec.origin).resolve(strict=True)
+            if locations != (expected_file.parent,):
+                raise DiscoveryOverlayActivationError(
+                    "installed editable SGLang package root is ambiguous"
+                )
         module_file = Path(getattr(module, "__file__", "")).resolve(strict=True)
         module_spec = getattr(module, "__spec__", None)
         spec_file = Path(getattr(module_spec, "origin", "")).resolve(strict=True)

@@ -403,6 +403,34 @@ def test_stock_driver_origin_requires_distribution_path_version_and_clean_search
         )
 
 
+def test_stock_driver_origin_resolves_pinned_editable_install(
+    tmp_path, monkeypatch
+):
+    import importlib.util
+
+    root = _overlay_root(tmp_path)
+    module, _distribution, stock_root = _stock_module(tmp_path)
+    metadata_root = tmp_path / "site-packages"
+    metadata_root.mkdir()
+    editable = _Distribution(metadata_root, _distribution.version)
+    monkeypatch.setattr(
+        importlib.util,
+        "find_spec",
+        lambda name: SimpleNamespace(
+            origin=module.__file__,
+            submodule_search_locations=(str(stock_root / "sglang"),),
+        ),
+    )
+
+    assert require_stock_driver_origin(
+        module,
+        root,
+        expected_sglang_version=editable.version,
+        distribution=editable,
+        search_path=[str(stock_root)],
+    ).module == "sglang/__init__.py"
+
+
 def test_armed_scheduler_spawn_requires_an_explicit_driver_window(
     tmp_path, monkeypatch
 ):

@@ -23,6 +23,9 @@ committed* and *who won*; the Ledger is the scoring half.
 from __future__ import annotations
 
 import logging
+import operator
+import re
+from collections import Counter
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -31,6 +34,18 @@ logger = logging.getLogger("optima.chain")
 # Yuma-consensus version stamped on set_weights. A coordinated subnet parameter,
 # bumped deliberately (like PINNED_SGLANG) so every validator agrees.
 WEIGHTS_VERSION_KEY = 1
+CHAIN_REVEAL_HISTORY_CAP = 10
+MAX_REVEAL_HISTORY_PAGES = 4_096
+MAX_REVEAL_HISTORY_ROWS = 1_000_000
+MAX_REVEAL_EVENT_BLOCKS = 4_096
+_BLOCK_HASH_RE = re.compile(r"0x[0-9a-fA-F]{64}\Z")
+
+
+class ChainRevealHistoryError(RuntimeError):
+    """Finalized storage and event history cannot prove exact reveal order."""
+
+    validator_fault = True
+    retryable = False
 
 
 @dataclass
@@ -41,13 +56,49 @@ class Commitment:
     block: int = 0
 
 
-@dataclass
+@dataclass(frozen=True)
 class RevealedCommitment:
-    """One revealed (formerly timelock-encrypted) commitment. ``block`` is the reveal
-    block the chain recorded — the consensus anti-copy priority timestamp."""
+    """One reveal bound to its canonical finalized event position."""
+
     hotkey: str
     data: str
     block: int
+    block_hash: str
+    event_index: int
+    extrinsic_index: int | None = None
+
+    @property
+    def priority_key(self) -> tuple[int, int, str, str]:
+        return self.block, self.event_index, self.hotkey, self.data
+
+
+@dataclass(frozen=True)
+class FinalizedRevealSnapshot:
+    finalized_block: int
+    finalized_block_hash: str
+    reveals: tuple[RevealedCommitment, ...]
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.finalized_block) is not int
+            or self.finalized_block < 0
+            or _BLOCK_HASH_RE.fullmatch(self.finalized_block_hash) is None
+            or type(self.reveals) is not tuple
+            or any(type(row) is not RevealedCommitment for row in self.reveals)
+            or tuple(row.priority_key for row in self.reveals)
+            != tuple(sorted(row.priority_key for row in self.reveals))
+            or any(row.block > self.finalized_block for row in self.reveals)
+        ):
+            raise ChainRevealHistoryError("finalized reveal snapshot is malformed")
+
+
+@dataclass(frozen=True)
+class _RevealEventOccurrence:
+    hotkey: str
+    block: int
+    block_hash: str
+    event_index: int
+    extrinsic_index: int | None
 
 
 @dataclass
@@ -140,22 +191,348 @@ def read_commitments(subtensor, netuid: int) -> dict[str, Commitment]:
     return out
 
 
-def read_revealed_commitments(subtensor, netuid: int) -> dict[str, RevealedCommitment]:
-    """Read every hotkey's LATEST revealed commitment (native chain commit-reveal).
+def _chain_uint(value: object, *, field: str) -> int:
+    if isinstance(value, bool):
+        raise ChainRevealHistoryError(f"chain {field} is invalid")
+    try:
+        result = operator.index(value)
+    except (TypeError, OverflowError):
+        raise ChainRevealHistoryError(f"chain {field} is invalid") from None
+    if result < 0:
+        raise ChainRevealHistoryError(f"chain {field} is invalid")
+    return result
 
-    The chain returns each hotkey's reveal history (capped at the 10 most recent);
-    optima's submission protocol takes the newest entry as the hotkey's current
-    submission. Ordering across hotkeys is by reveal block — the caller replays
-    them into the Ledger sorted by ``(block, hotkey)`` so ledger seq = chain priority.
-    """
-    raw = subtensor.get_all_revealed_commitments(netuid=netuid)
-    out: dict[str, RevealedCommitment] = {}
-    for hotkey, history in dict(raw).items():
-        if not history:
+
+def _block_hash(subtensor, block: int) -> str:
+    try:
+        value = str(subtensor.get_block_hash(block))
+    except Exception as exc:
+        raise ChainRevealHistoryError(
+            f"cannot resolve canonical hash for block {block}: {exc}"
+        ) from None
+    if _BLOCK_HASH_RE.fullmatch(value) is None:
+        raise ChainRevealHistoryError(f"chain returned an invalid hash for block {block}")
+    return value.lower()
+
+
+def _finalized_head(subtensor) -> tuple[int, str]:
+    """Resolve one exact canonical finalized height/hash pair."""
+
+    direct = getattr(subtensor, "get_finalized_block_number", None)
+    if callable(direct):
+        try:
+            block = _chain_uint(direct(), field="finalized block")
+        except ChainRevealHistoryError:
+            raise
+        except Exception as exc:
+            raise ChainRevealHistoryError(
+                f"cannot read finalized block number: {exc}"
+            ) from None
+        return block, _block_hash(subtensor, block)
+
+    substrate = getattr(subtensor, "substrate", None)
+    if substrate is None:
+        raise ChainRevealHistoryError("subtensor exposes no finalized-chain API")
+    try:
+        head_hash = str(substrate.get_chain_finalised_head()).lower()
+        if _BLOCK_HASH_RE.fullmatch(head_hash) is None:
+            raise ValueError("invalid finalized hash")
+        number_reader = getattr(substrate, "get_block_number", None)
+        if not callable(number_reader):
+            raise ValueError("missing finalized block-number resolver")
+        block = _chain_uint(number_reader(head_hash), field="finalized block")
+    except ChainRevealHistoryError:
+        raise
+    except Exception as exc:
+        raise ChainRevealHistoryError(f"cannot resolve finalized chain head: {exc}") from None
+    if _block_hash(subtensor, block) != head_hash:
+        raise ChainRevealHistoryError("finalized height/hash pair is inconsistent")
+    return block, head_hash
+
+
+def _unwrap(value: object) -> object:
+    seen: set[int] = set()
+    while not isinstance(value, (str, bytes, bytearray, dict, list, tuple, int)):
+        marker = id(value)
+        if marker in seen or not hasattr(value, "value"):
+            break
+        seen.add(marker)
+        value = getattr(value, "value")
+    return value
+
+
+def _event_text(value: object, *, field: str, allow_hex: bool) -> str:
+    value = _unwrap(value)
+    if isinstance(value, str):
+        if allow_hex and value.startswith("0x"):
+            try:
+                value = bytes.fromhex(value[2:]).decode("utf-8")
+            except (UnicodeDecodeError, ValueError):
+                raise ChainRevealHistoryError(
+                    f"CommitmentRevealed {field} is not UTF-8"
+                ) from None
+        result = value
+    elif allow_hex and isinstance(value, (bytes, bytearray)):
+        try:
+            result = bytes(value).decode("utf-8")
+        except UnicodeDecodeError:
+            raise ChainRevealHistoryError(
+                f"CommitmentRevealed {field} is not UTF-8"
+            ) from None
+    elif allow_hex and isinstance(value, (list, tuple)) and all(
+        type(item) is int and 0 <= item <= 255 for item in value
+    ):
+        try:
+            result = bytes(value).decode("utf-8")
+        except UnicodeDecodeError:
+            raise ChainRevealHistoryError(
+                f"CommitmentRevealed {field} is not UTF-8"
+            ) from None
+    else:
+        raise ChainRevealHistoryError(f"CommitmentRevealed {field} is malformed")
+    if not result or len(result.encode("utf-8")) > 4096 or "\x00" in result:
+        raise ChainRevealHistoryError(f"CommitmentRevealed {field} is malformed")
+    return result
+
+
+def _event_envelope(record: object) -> tuple[str, str, object, int | None]:
+    raw = _unwrap(record)
+    if not isinstance(raw, dict):
+        raise ChainRevealHistoryError("chain event record is not an object")
+    event = _unwrap(raw.get("event"))
+    if not isinstance(event, dict):
+        raise ChainRevealHistoryError("chain event payload is not an object")
+    module = event.get("module_id", event.get("module"))
+    name = event.get("event_id", event.get("event"))
+    if not isinstance(module, str) or not isinstance(name, str):
+        raise ChainRevealHistoryError("chain event identity is malformed")
+    phase = _unwrap(raw.get("phase"))
+    extrinsic_index = None
+    if isinstance(phase, dict) and set(phase) == {"ApplyExtrinsic"}:
+        extrinsic_index = _chain_uint(
+            _unwrap(phase["ApplyExtrinsic"]), field="extrinsic index"
+        )
+    return module, name, _unwrap(event.get("attributes")), extrinsic_index
+
+
+def _attribute(
+    attributes: dict, names: tuple[str, ...], *, field: str
+) -> object:
+    present = [name for name in names if name in attributes]
+    if len(present) != 1:
+        raise ChainRevealHistoryError(
+            f"CommitmentRevealed event has ambiguous/missing {field}"
+        )
+    return _unwrap(attributes[present[0]])
+
+
+def _reveal_events_at(
+    subtensor, *, netuid: int, block: int, block_hash: str
+) -> tuple[_RevealEventOccurrence, ...]:
+    substrate = getattr(subtensor, "substrate", None)
+    get_events = getattr(substrate, "get_events", None)
+    if not callable(get_events):
+        raise ChainRevealHistoryError("subtensor exposes no finalized event API")
+    try:
+        records = list(get_events(block_hash=block_hash))
+    except Exception as exc:
+        raise ChainRevealHistoryError(
+            f"cannot read finalized events for block {block}: {exc}"
+        ) from None
+    rows: list[_RevealEventOccurrence] = []
+    for event_index, record in enumerate(records):
+        module, name, attributes, extrinsic_index = _event_envelope(record)
+        if module != "Commitments" or name != "CommitmentRevealed":
             continue
-        block, data = max(history, key=lambda pair: int(pair[0]))
-        out[hotkey] = RevealedCommitment(hotkey=hotkey, data=str(data), block=int(block))
-    return out
+        if not isinstance(attributes, dict):
+            raise ChainRevealHistoryError(
+                "CommitmentRevealed attributes are not a named object"
+            )
+        event_netuid = _chain_uint(
+            _attribute(attributes, ("netuid", "net_uid"), field="netuid"),
+            field="event netuid",
+        )
+        if event_netuid != netuid:
+            continue
+        hotkey = _event_text(
+            _attribute(attributes, ("hotkey", "who", "account"), field="hotkey"),
+            field="hotkey",
+            allow_hex=False,
+        )
+        rows.append(
+            _RevealEventOccurrence(
+                hotkey,
+                block,
+                block_hash,
+                event_index,
+                extrinsic_index,
+            )
+        )
+    return tuple(rows)
+
+
+def _storage_history(
+    subtensor, netuid: int, *, finalized_block: int, after_block: int | None = None
+) -> Counter[tuple[int, str, str]]:
+    """Recover complete finalized storage history with bounded backwards pages."""
+
+    observed: Counter[tuple[int, str, str]] = Counter()
+    if after_block is not None and (
+        type(after_block) is not int or after_block < 0 or after_block > finalized_block
+    ):
+        raise ChainRevealHistoryError("incremental reveal cursor is invalid")
+    query_block = finalized_block
+    for _page in range(MAX_REVEAL_HISTORY_PAGES):
+        try:
+            raw = subtensor.get_all_revealed_commitments(
+                netuid=netuid, block=query_block
+            )
+            page_items = list(dict(raw).items())
+        except Exception as exc:
+            raise ChainRevealHistoryError(
+                "cannot retrieve complete historical reveal state: "
+                f"{type(exc).__name__}: {exc}"
+            ) from None
+        saturated_oldest: list[int] = []
+        page_counts: Counter[tuple[int, str, str]] = Counter()
+        for hotkey, history in page_items:
+            if not history:
+                continue
+            if (
+                not isinstance(hotkey, str)
+                or not hotkey
+                or len(hotkey) > 256
+                or hotkey.strip() != hotkey
+            ):
+                raise ChainRevealHistoryError("chain reveal history has an invalid hotkey")
+            if not isinstance(history, (list, tuple)):
+                raise ChainRevealHistoryError("chain reveal history has a malformed row set")
+            blocks: list[int] = []
+            for entry in history:
+                if not isinstance(entry, (list, tuple)) or len(entry) != 2:
+                    raise ChainRevealHistoryError("chain reveal history has a malformed row")
+                block = _chain_uint(entry[0], field="reveal block")
+                data = entry[1]
+                if (
+                    block > query_block
+                    or not isinstance(data, str)
+                    or not data
+                    or len(data.encode("utf-8")) > 4096
+                ):
+                    raise ChainRevealHistoryError(
+                        "chain reveal history has invalid block/data provenance"
+                    )
+                if after_block is not None and block <= after_block:
+                    continue
+                blocks.append(block)
+                page_counts[(block, hotkey, data)] += 1
+            if after_block is None and len(history) >= CHAIN_REVEAL_HISTORY_CAP:
+                oldest = min(blocks)
+                saturated_oldest.append(oldest)
+        for key, count in page_counts.items():
+            observed[key] = max(observed[key], count)
+        if len(observed) > MAX_REVEAL_HISTORY_ROWS:
+            raise ChainRevealHistoryError("historical reveal row budget exceeded")
+        if not saturated_oldest:
+            return observed
+        boundary = max(saturated_oldest)
+        if boundary == 0:
+            return observed
+        next_block = boundary - 1
+        if next_block >= query_block:
+            raise ChainRevealHistoryError("historical reveal pagination did not progress")
+        query_block = next_block
+    raise ChainRevealHistoryError("historical reveal page budget exceeded")
+
+
+def read_finalized_reveal_history(
+    subtensor, netuid: int, *, after_block: int | None = None
+) -> FinalizedRevealSnapshot:
+    """Reconcile finalized storage rows with canonical event order.
+
+    Storage history proves membership and event records prove same-block ordering.
+    Missing/pruned/mismatched events fail closed; network fetch never participates
+    in this ordering authority.
+    """
+
+    if type(netuid) is not int or netuid < 0:
+        raise ValueError("netuid must be a non-negative integer")
+    finalized_block, finalized_hash = _finalized_head(subtensor)
+    storage = _storage_history(
+        subtensor, netuid, finalized_block=finalized_block, after_block=after_block
+    )
+    blocks = (
+        tuple(range(after_block + 1, finalized_block + 1))
+        if after_block is not None
+        else tuple(sorted({key[0] for key in storage}))
+    )
+    if len(blocks) > MAX_REVEAL_EVENT_BLOCKS:
+        raise ChainRevealHistoryError("finalized reveal event-block budget exceeded")
+    events: list[_RevealEventOccurrence] = []
+    for block in blocks:
+        block_hash = _block_hash(subtensor, block)
+        events.extend(
+            _reveal_events_at(
+                subtensor, netuid=netuid, block=block, block_hash=block_hash
+            )
+        )
+    storage_by_pair: dict[tuple[int, str], list[str]] = {}
+    for (block, hotkey, data), count in storage.items():
+        storage_by_pair.setdefault((block, hotkey), []).extend([data] * count)
+    events_by_pair: dict[tuple[int, str], list[_RevealEventOccurrence]] = {}
+    for event in events:
+        events_by_pair.setdefault((event.block, event.hotkey), []).append(event)
+    storage_counts = Counter(
+        {pair: len(payloads) for pair, payloads in storage_by_pair.items()}
+    )
+    event_counts = Counter(
+        {pair: len(occurrences) for pair, occurrences in events_by_pair.items()}
+    )
+    if storage_counts != event_counts:
+        missing = storage_counts - event_counts
+        extra = event_counts - storage_counts
+        raise ChainRevealHistoryError(
+            "finalized reveal storage/event mismatch "
+            f"(missing={sum(missing.values())}, extra={sum(extra.values())})"
+        )
+    ordered_rows: list[RevealedCommitment] = []
+    for pair, occurrences in events_by_pair.items():
+        # CommitmentRevealed exposes only (netuid, who) on the pinned chain.
+        # Event indices order different hotkeys. Multiple occurrences for one
+        # hotkey/block are indistinguishable, so payload bytes receive their
+        # sole deterministic lexical sub-order within that exact pair.
+        payloads = sorted(storage_by_pair[pair])
+        occurrences.sort(key=lambda row: row.event_index)
+        for occurrence, data in zip(occurrences, payloads, strict=True):
+            ordered_rows.append(
+                RevealedCommitment(
+                    occurrence.hotkey,
+                    data,
+                    occurrence.block,
+                    occurrence.block_hash,
+                    occurrence.event_index,
+                    occurrence.extrinsic_index,
+                )
+            )
+    ordered = tuple(sorted(ordered_rows, key=lambda row: row.priority_key))
+    return FinalizedRevealSnapshot(finalized_block, finalized_hash, ordered)
+
+
+def read_reveal_history(subtensor, netuid: int) -> tuple[RevealedCommitment, ...]:
+    """Compatibility projection of exact finalized history."""
+
+    return read_finalized_reveal_history(subtensor, netuid).reveals
+
+
+def read_revealed_commitments(subtensor, netuid: int) -> dict[str, RevealedCommitment]:
+    """Latest finalized reveal per hotkey, never a head-state authority."""
+
+    result: dict[str, RevealedCommitment] = {}
+    for row in read_finalized_reveal_history(subtensor, netuid).reveals:
+        previous = result.get(row.hotkey)
+        if previous is None or row.priority_key > previous.priority_key:
+            result[row.hotkey] = row
+    return result
 
 
 def set_weights(subtensor, wallet, netuid: int, weights_by_hotkey: dict[str, float], *,

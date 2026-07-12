@@ -43,6 +43,7 @@ from __future__ import annotations
 import ast
 import hashlib
 import re
+from dataclasses import dataclass
 from pathlib import Path
 
 from optima.manifest import (load_manifest, resolve_cuda_sources, resolve_dep_patches,
@@ -600,3 +601,234 @@ def bundle_fingerprint(bundle_root: str | Path) -> str:
     ``bundle_id`` and the manifest's formatting. "" if any source can't be parsed.
     """
     return _fold(bundle_slot_fingerprints(bundle_root))
+
+
+@dataclass(frozen=True)
+class SubmittedDeltaFingerprint:
+    """Copy/provenance identity for submitted bytes only.
+
+    The immutable incumbent, assembled engine, and validator-owned adapters never enter
+    this product.  ``containment_fingerprints`` are the only relocation/padding signal
+    allowed to auto-demote; shared fragments and structural similarity stay advisory.
+    """
+
+    product_kind: str
+    target_id: str
+    target_spec_digest: str
+    members: tuple[str, ...]
+    exact_payload_digest: str
+    selected_delta_digest: str
+    normalized_delta_digest: str
+    containment_fingerprints: tuple[str, ...]
+    advisory_fingerprints: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        if self.product_kind not in {"component", "discovery"}:
+            raise ValueError("submitted delta product kind is unsupported")
+        if not isinstance(self.target_id, str) or not self.target_id:
+            raise ValueError("submitted delta target is malformed")
+        members = tuple(self.members)
+        containment = tuple(self.containment_fingerprints)
+        advisory = tuple(self.advisory_fingerprints)
+        if (
+            not members
+            or members != tuple(sorted(set(members)))
+            or any(not isinstance(row, str) or not row for row in members)
+            or containment != tuple(sorted(set(containment)))
+            or advisory != tuple(sorted(set(advisory)))
+        ):
+            raise ValueError("submitted delta fingerprint sets are not canonical")
+        digest_fields = (
+            "exact_payload_digest",
+            "selected_delta_digest",
+            "normalized_delta_digest",
+        )
+        if self.product_kind == "component":
+            digest_fields += ("target_spec_digest",)
+        elif self.target_spec_digest:
+            raise ValueError("discovery fingerprint cannot claim a target spec")
+        for field in digest_fields:
+            value = getattr(self, field)
+            if not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None:
+                raise ValueError(f"submitted delta {field} is malformed")
+        for value in containment + advisory:
+            if re.fullmatch(r"[0-9a-f]{64}", value) is None:
+                raise ValueError("submitted delta member fingerprint is malformed")
+        object.__setattr__(self, "members", members)
+        object.__setattr__(self, "containment_fingerprints", containment)
+        object.__setattr__(self, "advisory_fingerprints", advisory)
+
+    @property
+    def reward_namespace(self) -> tuple[str, ...]:
+        return self.members if self.product_kind == "component" else ("discovery",)
+
+    @property
+    def digest(self) -> str:
+        from optima.stack_identity import canonical_digest
+
+        return canonical_digest("optima.copy.submitted-delta", self.to_dict())
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "advisory_fingerprints": list(self.advisory_fingerprints),
+            "containment_fingerprints": list(self.containment_fingerprints),
+            "exact_payload_digest": self.exact_payload_digest,
+            "members": list(self.members),
+            "normalized_delta_digest": self.normalized_delta_digest,
+            "product_kind": self.product_kind,
+            "selected_delta_digest": self.selected_delta_digest,
+            "target_id": self.target_id,
+            "target_spec_digest": self.target_spec_digest,
+        }
+
+    @classmethod
+    def from_dict(cls, value: object) -> "SubmittedDeltaFingerprint":
+        fields = {
+            "advisory_fingerprints", "containment_fingerprints",
+            "exact_payload_digest", "members", "normalized_delta_digest",
+            "product_kind", "selected_delta_digest", "target_id",
+            "target_spec_digest",
+        }
+        if type(value) is not dict or set(value) != fields:
+            raise ValueError("submitted delta fingerprint fields differ")
+        return cls(
+            product_kind=value["product_kind"],  # type: ignore[arg-type]
+            target_id=value["target_id"],  # type: ignore[arg-type]
+            target_spec_digest=value["target_spec_digest"],  # type: ignore[arg-type]
+            members=tuple(value["members"]),  # type: ignore[arg-type]
+            exact_payload_digest=value["exact_payload_digest"],  # type: ignore[arg-type]
+            selected_delta_digest=value["selected_delta_digest"],  # type: ignore[arg-type]
+            normalized_delta_digest=value["normalized_delta_digest"],  # type: ignore[arg-type]
+            containment_fingerprints=tuple(value["containment_fingerprints"]),  # type: ignore[arg-type]
+            advisory_fingerprints=tuple(value["advisory_fingerprints"]),  # type: ignore[arg-type]
+        )
+
+
+@dataclass(frozen=True)
+class DeltaCopyDecision:
+    authoritative: bool
+    reason: str
+    shared_fragments: tuple[str, ...] = ()
+    shared_advisory: tuple[str, ...] = ()
+
+
+def _digest_rows(domain: str, rows: list[str] | tuple[str, ...]) -> str:
+    values = tuple(sorted(rows))
+    if not values:
+        return ""
+    return hashlib.sha256(
+        (domain + "\x00" + "\x1e".join(values)).encode("utf-8")
+    ).hexdigest()
+
+
+def fingerprint_submitted_delta(
+    bundle_root: str | Path,
+    *,
+    catalog=None,
+    discovery: bool = False,
+) -> SubmittedDeltaFingerprint:
+    """Fingerprint one target-owned proposal without canonical stack bytes.
+
+    Normal component intake reuses :func:`inspect_contribution`, the same trusted
+    projection used by stack assembly.  Discovery intake fingerprints only the closed
+    discovery manifest and declared patches.  Callers must choose the lane explicitly;
+    parser failure never silently reclassifies a component as discovery.
+    """
+
+    root = Path(bundle_root)
+    if discovery:
+        from optima.discovery import inspect_discovery
+
+        inspected = inspect_discovery(root)
+        normalized = tuple(
+            sorted(dep_patch_fingerprint(text) for _path, text in inspected.patch_texts)
+        )
+        return SubmittedDeltaFingerprint(
+            product_kind="discovery",
+            target_id="discovery",
+            target_spec_digest="",
+            members=("discovery",),
+            exact_payload_digest=inspected.proposal_digest,
+            selected_delta_digest=inspected.proposal_digest,
+            normalized_delta_digest=_digest_rows(
+                "optima.discovery.normalized-delta.v1", normalized
+            ),
+            containment_fingerprints=normalized,
+            advisory_fingerprints=(),
+        )
+
+    from optima.engine_tree import inspect_contribution
+    from optima.target_catalog import default_target_catalog
+
+    active_catalog = catalog or default_target_catalog()
+    inspected = inspect_contribution(root, catalog=active_catalog)
+    normalized_by_slot = bundle_slot_fingerprints(root)
+    files_by_slot = bundle_slot_file_fingerprints(root)
+    structural_by_slot = bundle_slot_structural_fingerprints(root)
+    members = tuple(sorted({op.slot for op in inspected.manifest.ops}))
+    if members != tuple(sorted(active_catalog.require(inspected.target_id).members)):
+        raise ValueError("submitted delta members differ from the resolved target")
+    normalized_rows = [
+        f"{member}\x00{normalized_by_slot[member]}"
+        for member in members
+        if normalized_by_slot.get(member)
+    ]
+    containment = tuple(sorted({
+        fingerprint
+        for member in members
+        for fingerprint in files_by_slot.get(member, ())
+    }))
+    advisory = tuple(sorted({
+        fingerprint
+        for member in members
+        for fingerprint in (structural_by_slot.get(member),)
+        if fingerprint
+    }))
+    # Tiny but otherwise valid implementations may have no substantial
+    # definition-level containment fragment. Their exact and normalized
+    # whole-delta identities remain authoritative.
+    if not normalized_rows:
+        raise ValueError("submitted component delta produced incomplete fingerprints")
+    return SubmittedDeltaFingerprint(
+        product_kind="component",
+        target_id=inspected.target_id,
+        target_spec_digest=inspected.target_spec_digest,
+        members=members,
+        exact_payload_digest=inspected.selected_payload_digest,
+        selected_delta_digest=inspected.selected_delta_digest,
+        normalized_delta_digest=_digest_rows(
+            "optima.component.normalized-delta.v1", normalized_rows
+        ),
+        containment_fingerprints=containment,
+        advisory_fingerprints=advisory,
+    )
+
+
+def compare_submitted_deltas(
+    earlier: SubmittedDeltaFingerprint,
+    later: SubmittedDeltaFingerprint,
+) -> DeltaCopyDecision:
+    """Compare two chain-ordered deltas without fragment-intersection poisoning."""
+
+    if type(earlier) is not SubmittedDeltaFingerprint or type(later) is not SubmittedDeltaFingerprint:
+        raise TypeError("copy comparison requires typed submitted-delta fingerprints")
+    if earlier.product_kind != later.product_kind:
+        return DeltaCopyDecision(False, "different_product_kind")
+    if not set(earlier.reward_namespace) & set(later.reward_namespace):
+        return DeltaCopyDecision(False, "different_reward_namespace")
+    if earlier.exact_payload_digest == later.exact_payload_digest:
+        return DeltaCopyDecision(True, "exact_delta_identity")
+    if (
+        earlier.normalized_delta_digest
+        and earlier.normalized_delta_digest == later.normalized_delta_digest
+    ):
+        return DeltaCopyDecision(True, "normalized_delta_identity")
+    left = set(earlier.containment_fingerprints)
+    right = set(later.containment_fingerprints)
+    if left and right and (left <= right or right <= left):
+        return DeltaCopyDecision(True, "symmetric_delta_containment")
+    shared = tuple(sorted(left & right))
+    advisory = tuple(sorted(
+        set(earlier.advisory_fingerprints) & set(later.advisory_fingerprints)
+    ))
+    return DeltaCopyDecision(False, "advisory_only", shared, advisory)

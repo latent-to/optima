@@ -1,0 +1,480 @@
+from __future__ import annotations
+
+from types import SimpleNamespace
+
+import pytest
+
+import optima.eval.qualification_intake as intake
+from optima.eval.evidence_store import EvidenceArtifactRef
+from optima.eval.qualification import (
+    GraphVariantRequirement,
+    GraphVerificationBinding,
+    GraphVerificationMemberBinding,
+    GraphVerificationRequirement,
+    QualificationDecision,
+)
+from optima.eval.qualification_runner import QualificationRunnerError
+from optima.eval.scoring import RawSpeedEvidenceError
+from optima.verify import VerifyResult
+
+
+def _d(label: str) -> str:
+    import hashlib
+
+    return hashlib.sha256(label.encode()).hexdigest()
+
+
+def _reservation(index: int, delta: str | None = None) -> intake.QualificationReservation:
+    return intake.QualificationReservation(
+        _d(f"reservation-{index}"),
+        _d(f"submission-{index}"),
+        f"target.{index}",
+        delta or _d(f"delta-{index}"),
+        index,
+    )
+
+
+def _fake_plan(monkeypatch, *, count: int = 2, discovery: bool = False):
+    class FakePlan:
+        pass
+
+    class FakeDiscovery:
+        pass
+
+    monkeypatch.setattr(intake, "CausalQualificationInput", FakePlan)
+    if discovery:
+        monkeypatch.setattr(intake, "DiscoveryArmPlan", FakeDiscovery)
+        source = FakeDiscovery()
+    else:
+        source = SimpleNamespace()
+    source.digest = _d("source")
+    plan = FakePlan()
+    plan.selection_secret = b"s" * 32
+    plan.prepared = SimpleNamespace(source=source)
+    plan.commitment = SimpleNamespace(digest=_d("commitment"))
+    plan.candidates = tuple(
+        SimpleNamespace(selected_delta_digest=_d(f"delta-{index}"))
+        for index in range(count)
+    )
+    plan.evidence_root = SimpleNamespace()
+    monkeypatch.setattr(
+        intake, "qualification_authority_digest", lambda _value: _d("authority")
+    )
+    reservations = tuple(_reservation(index) for index in range(count))
+    manifest = intake.QualificationAuthorityManifest.seal(
+        plan,
+        reservations=reservations,
+        selection_secret_reference=_d("secret-reference"),
+    )
+    return plan, manifest
+
+
+def _factory(plan, manifest):
+    return intake.QualificationPlanFactory(
+        manifest,
+        lambda reference: (
+            plan.selection_secret
+            if reference == manifest.selection_secret_reference
+            else b""
+        ),
+        lambda secret: plan,
+    )
+
+
+def _requirement() -> GraphVerificationRequirement:
+    slot, variant = "collective.all_reduce", "default"
+    descriptors = tuple(sorted((_d("shape-a"), _d("shape-b"))))
+    member = GraphVerificationMemberBinding(
+        slot, _d("target-spec"), _d("contract"), "collective.tp8"
+    )
+    binding = GraphVerificationBinding(
+        _d("arm"),
+        _d("launch"),
+        _d("contribution"),
+        _d("delta"),
+        slot,
+        _d("target-spec"),
+        _d("catalog"),
+        (member,),
+        _d("verification-policy"),
+    )
+    return GraphVerificationRequirement(
+        binding,
+        (
+            GraphVariantRequirement(
+                slot, variant, descriptors, True, descriptors
+            ),
+        ),
+        3,
+    )
+
+
+def _graph_observation(
+    requirement: GraphVerificationRequirement,
+) -> intake.GraphVerificationObservation:
+    variant = requirement.variants[0]
+    shapes = tuple(
+        intake.GraphShapeObservation(
+            descriptor, True, True, True, requirement.expected_graph_replays, True
+        )
+        for descriptor in variant.shape_descriptor_digests
+    )
+    return intake.GraphVerificationObservation(
+        requirement.digest,
+        (
+            intake.GraphMemberObservation(
+                variant.slot_id,
+                (
+                    intake.GraphVariantObservation(
+                        variant.slot_id,
+                        variant.variant_id,
+                        True,
+                        True,
+                        shapes,
+                    ),
+                ),
+            ),
+        ),
+    )
+
+
+def test_authority_manifest_roundtrip_contains_only_private_secret_reference(
+    monkeypatch,
+) -> None:
+    plan, manifest = _fake_plan(monkeypatch)
+
+    encoded = manifest.to_dict()
+    assert intake.QualificationAuthorityManifest.from_dict(encoded) == manifest
+    assert manifest.digest == intake.QualificationAuthorityManifest.from_dict(
+        encoded
+    ).digest
+    assert plan.selection_secret.hex() not in str(encoded)
+    assert encoded["selection_secret_reference"] == _d("secret-reference")
+
+
+def test_plan_factory_reopens_exact_secret_and_public_authority(monkeypatch) -> None:
+    plan, manifest = _fake_plan(monkeypatch)
+    factory = _factory(plan, manifest)
+
+    assert factory.build() is plan
+
+    substituted = intake.QualificationPlanFactory(
+        manifest, lambda _reference: b"x" * 32, lambda _secret: plan
+    )
+    with pytest.raises(intake.QualificationIntakeError, match="substituted"):
+        substituted.build()
+
+    changed = SimpleNamespace(**plan.__dict__)
+    changed.selection_secret = plan.selection_secret
+    with pytest.raises(intake.QualificationIntakeError, match="untyped plan"):
+        intake.QualificationPlanFactory(
+            manifest, lambda _reference: plan.selection_secret, lambda _secret: changed
+        ).build()
+
+
+def test_graph_observation_publishes_and_reopens_canonical_raw_facts(tmp_path) -> None:
+    requirement = _requirement()
+    product = intake.publish_graph_observation(
+        tmp_path / "evidence", requirement, _graph_observation(requirement)
+    )
+
+    assert product.requirement_digest == requirement.digest
+    assert product.evidence_ref.raw_evidence_digest == product.raw_evidence_digest
+    assert product.grade.decision is QualificationDecision.PASS
+    assert product.grade.reason == "graph_verification_pass"
+
+
+def test_graph_regrade_enforces_the_required_replay_count(tmp_path) -> None:
+    requirement = _requirement()
+    observation = _graph_observation(requirement)
+    variant = observation.members[0].variants[0]
+    short = tuple(
+        intake.GraphShapeObservation(
+            row.descriptor_digest, True, True, True, 2, True
+        )
+        for row in variant.shapes
+    )
+    altered = intake.GraphVerificationObservation(
+        requirement.digest,
+        (
+            intake.GraphMemberObservation(
+                variant.slot_id,
+                (
+                    intake.GraphVariantObservation(
+                        variant.slot_id, variant.variant_id, True, True, short
+                    ),
+                ),
+            ),
+        ),
+    )
+
+    product = intake.publish_graph_observation(
+        tmp_path / "evidence", requirement, altered
+    )
+    assert product.grade.decision is QualificationDecision.NO_DECISION
+    assert product.grade.reason == "graph_replay_count_mismatch"
+
+
+@pytest.mark.parametrize(
+    "aggregate",
+    [True, VerifyResult("collective.all_reduce", "bfloat16", True, [])],
+)
+def test_graph_adapter_rejects_aggregate_verdicts(tmp_path, aggregate) -> None:
+    with pytest.raises(
+        intake.QualificationIntakeError, match="not VerifyResult or booleans"
+    ):
+        intake.publish_graph_observation(
+            tmp_path / "evidence", _requirement(), aggregate
+        )
+
+
+def test_graph_observation_requires_causal_eager_capture_replay_facts() -> None:
+    with pytest.raises(intake.QualificationIntakeError, match="causally inconsistent"):
+        intake.GraphShapeObservation(_d("shape"), True, False, True, 1, True)
+    with pytest.raises(intake.QualificationIntakeError, match="exact boolean"):
+        intake.GraphShapeObservation(_d("shape"), 1, True, True, 3, True)  # type: ignore[arg-type]
+
+
+def test_graph_adapter_rejects_missing_descriptor_even_with_passing_facts(
+    tmp_path,
+) -> None:
+    requirement = _requirement()
+    observation = _graph_observation(requirement)
+    variant = observation.members[0].variants[0]
+    missing = intake.GraphVerificationObservation(
+        requirement.digest,
+        (
+            intake.GraphMemberObservation(
+                variant.slot_id,
+                (
+                    intake.GraphVariantObservation(
+                        variant.slot_id,
+                        variant.variant_id,
+                        True,
+                        True,
+                        variant.shapes[:-1],
+                    ),
+                ),
+            ),
+        ),
+    )
+    with pytest.raises(intake.QualificationIntakeError, match="shape observations"):
+        intake.publish_graph_observation(
+            tmp_path / "evidence", requirement, missing
+        )
+
+
+class _FakeReport:
+    def __init__(self, delta: str, decision: QualificationDecision, index: int):
+        self.selected_delta_digest = delta
+        self.decision = decision
+        self.reason = {
+            QualificationDecision.PASS: "qualified",
+            QualificationDecision.FAIL: "speed_regression",
+            QualificationDecision.NO_DECISION: "speed_noise",
+        }[decision]
+        self.retryable = decision is QualificationDecision.NO_DECISION
+        self.digest = _d(f"report-{index}")
+
+
+class _FakeAttempt:
+    pass
+
+
+def _install_success_runner(monkeypatch, manifest, decisions):
+    reference = EvidenceArtifactRef(
+        "qualification.cohort-attempt",
+        _d("attempt-artifact"),
+        1,
+        "application/json",
+        "optima.qualification.cohort-attempt.v1",
+    )
+    reports = tuple(
+        _FakeReport(delta, decision, index)
+        for index, (delta, decision) in enumerate(
+            zip(manifest.candidate_deltas, decisions, strict=True)
+        )
+    )
+    attempt = _FakeAttempt()
+    attempt.authority_digest = manifest.authority_digest
+    attempt.source_digest = manifest.source_digest
+    attempt.reports = reports
+    monkeypatch.setattr(intake, "CohortQualificationAttempt", _FakeAttempt)
+    monkeypatch.setattr(intake, "CandidateQualificationReport", _FakeReport)
+    monkeypatch.setattr(
+        intake, "run_causal_qualification", lambda *_args, **_kwargs: reference
+    )
+    monkeypatch.setattr(
+        intake, "reopen_causal_qualification", lambda *_args, **_kwargs: attempt
+    )
+    return reference
+
+
+def test_batch_service_projects_per_reservation_tristate_and_retry(monkeypatch) -> None:
+    plan, manifest = _fake_plan(monkeypatch, count=3)
+    reference = _install_success_runner(
+        monkeypatch,
+        manifest,
+        (
+            QualificationDecision.PASS,
+            QualificationDecision.FAIL,
+            QualificationDecision.NO_DECISION,
+        ),
+    )
+
+    result = intake.run_qualification_intake(
+        _factory(plan, manifest),
+        executor=object(),
+        entropy_provider=lambda *_args: None,
+        hidden_judge=lambda **_kwargs: None,
+        deadline=100.0,
+    )
+
+    assert [row.decision for row in result.outcomes] == [
+        QualificationDecision.PASS,
+        QualificationDecision.FAIL,
+        QualificationDecision.NO_DECISION,
+    ]
+    assert all(row.attempt_artifact_sha256 == reference.sha256 for row in result.outcomes)
+    assert result.retry_plan is not None
+    assert result.retry_plan.strategy == "requeue"
+    assert result.retry_plan.reservation_groups == (
+        (manifest.reservations[2].reservation_digest,),
+    )
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [RawSpeedEvidenceError("zero throughput"), QualificationRunnerError("T died")],
+)
+def test_cohort_failure_is_no_decision_with_deterministic_bisection(
+    monkeypatch, failure
+) -> None:
+    plan, manifest = _fake_plan(monkeypatch, count=3)
+
+    def fail(*_args, **_kwargs):
+        raise failure
+
+    monkeypatch.setattr(intake, "run_causal_qualification", fail)
+    result = intake.run_qualification_intake(
+        _factory(plan, manifest),
+        executor=object(),
+        entropy_provider=lambda *_args: None,
+        hidden_judge=lambda **_kwargs: None,
+        deadline=100.0,
+    )
+
+    assert {row.decision for row in result.outcomes} == {
+        QualificationDecision.NO_DECISION
+    }
+    assert all(row.retryable and row.report_digest is None for row in result.outcomes)
+    assert result.attempt_ref is None
+    assert result.retry_plan is not None
+    assert result.retry_plan.strategy == "bisect"
+    assert result.retry_plan.reservation_groups == (
+        (manifest.reservations[0].reservation_digest,),
+        tuple(row.reservation_digest for row in manifest.reservations[1:]),
+    )
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        intake.QualificationIntakeError("secret record unavailable"),
+        OSError("private store unavailable"),
+    ],
+)
+def test_factory_infrastructure_failure_is_typed_no_decision(
+    monkeypatch, failure
+) -> None:
+    plan, manifest = _fake_plan(monkeypatch, count=2)
+
+    def fail_secret(_reference):
+        raise failure
+
+    factory = intake.QualificationPlanFactory(manifest, fail_secret, lambda _secret: plan)
+    result = intake.run_qualification_intake(
+        factory,
+        executor=object(),
+        entropy_provider=lambda *_args: None,
+        hidden_judge=lambda **_kwargs: None,
+        deadline=100.0,
+    )
+
+    assert all(
+        row.decision is QualificationDecision.NO_DECISION
+        and row.reason == "qualification_plan"
+        for row in result.outcomes
+    )
+    assert result.retry_plan is not None
+    assert result.retry_plan.strategy == "bisect"
+
+
+def test_discovery_is_singleton_and_shared_failure_requeues_without_bisection(
+    monkeypatch,
+) -> None:
+    plan, manifest = _fake_plan(monkeypatch, count=1, discovery=True)
+    monkeypatch.setattr(
+        intake,
+        "run_causal_qualification",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            QualificationRunnerError("discovery T failed")
+        ),
+    )
+
+    result = intake.run_qualification_intake(
+        _factory(plan, manifest),
+        executor=object(),
+        entropy_provider=lambda *_args: None,
+        hidden_judge=lambda **_kwargs: None,
+        deadline=100.0,
+    )
+    assert manifest.lane == "discovery"
+    assert result.retry_plan is not None
+    assert result.retry_plan.strategy == "requeue"
+    assert result.retry_plan.reservation_groups == (
+        (manifest.reservations[0].reservation_digest,),
+    )
+
+    with pytest.raises(intake.QualificationIntakeError, match="reservations"):
+        intake.QualificationAuthorityManifest(
+            "discovery",
+            manifest.authority_digest,
+            manifest.source_digest,
+            manifest.commitment_digest,
+            manifest.selection_secret_reference,
+            (_d("delta-a"), _d("delta-b")),
+            (_reservation(0, _d("delta-a")), _reservation(1, _d("delta-b"))),
+        )
+
+
+def test_outcomes_and_batches_cannot_claim_evidence_free_pass() -> None:
+    with pytest.raises(intake.QualificationIntakeError, match="PASS/FAIL"):
+        intake.QualificationIntakeOutcome(
+            _d("reservation"),
+            _d("delta"),
+            _d("authority"),
+            QualificationDecision.PASS,
+            "qualified",
+            False,
+        )
+
+    reference = EvidenceArtifactRef(
+        "qualification.cohort-attempt",
+        _d("attempt"),
+        1,
+        "application/json",
+        "optima.qualification.cohort-attempt.v1",
+    )
+    outcome = intake.QualificationIntakeOutcome(
+        _d("reservation"),
+        _d("delta"),
+        _d("authority"),
+        QualificationDecision.FAIL,
+        "quality_failed",
+        False,
+        attempt_artifact_sha256=reference.sha256,
+        report_digest=_d("report"),
+    )
+    with pytest.raises(intake.QualificationIntakeError, match="internally inconsistent"):
+        intake.QualificationIntakeBatch(_d("authority"), (outcome,))

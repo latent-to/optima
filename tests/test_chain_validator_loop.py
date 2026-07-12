@@ -1,253 +1,247 @@
-"""The validator loop end-to-end against a mock subtensor: chain commitments in,
-fetch + copy-detection + evaluation + settlement, weights out. No network, no GPU —
-the evaluator is stubbed; subprocess evaluators get their own contract tests."""
-
 from __future__ import annotations
 
-import json
+import os
+from pathlib import Path
 
-from optima.chain.fetch import package_bundle
+import pytest
+
+import optima.chain.validator_loop as loop
+from optima.bundle_hash import content_hash
+from optima.chain import FinalizedRevealSnapshot, RevealedCommitment
+from optima.chain.intake import FinalizedIntakeStore, IntakeScope
 from optima.chain.payload import encode_payload
-from optima.chain.validator_loop import (
-    EvalOutcome,
-    command_evaluator,
-    run_pass,
-    run_validator,
+from optima.eval.evidence_store import EvidenceArtifactRef
+from optima.eval.qualification import QualificationDecision
+from optima.eval.qualification_intake import (
+    QualificationIntakeBatch, QualificationIntakeOutcome,
 )
-from optima.commit_reveal import Ledger
 
 
-# --------------------------------------------------------------------------- #
-# fixtures: a mock subtensor + real mini-bundles served over file://
-# --------------------------------------------------------------------------- #
-
-class _MockMetagraph:
-    def __init__(self, hotkeys):
-        self.uids = list(range(len(hotkeys)))
-        self.hotkeys = list(hotkeys)
-        self.validator_permit = [True] * len(hotkeys)
+BLOCK = 90
+BLOCK_HASH = "0x" + "9" * 64
+SCOPE = IntakeScope("0x" + "0" * 64, 307)
 
 
-class _MockSubtensor:
-    def __init__(self, *, hotkeys, revealed=None, block=100):
-        self._hotkeys = list(hotkeys)
-        self.revealed = dict(revealed or {})  # hotkey -> ((block, data), ...)
-        self._block = block
-        self.set_weights_calls: list[dict] = []
-
-    def metagraph(self, netuid=None):
-        return _MockMetagraph(self._hotkeys)
-
-    def get_current_block(self):
-        return self._block
-
-    def get_block_hash(self, block):
-        return f"0xhash{block}"
-
-    def get_all_revealed_commitments(self, netuid=None):
-        return dict(self.revealed)
-
-    def set_weights(self, *, wallet, netuid, uids, weights, version_key,
-                    wait_for_inclusion, wait_for_finalization):
-        self.set_weights_calls.append(
-            {"uids": uids, "weights": weights, "version_key": version_key})
-        return True
-
-
-def _mini_bundle(root, name, body):
-    """A minimal VALID bundle (manifest parses, fingerprints compute)."""
-    b = root / name
-    (b / "kernels").mkdir(parents=True)
-    (b / "manifest.toml").write_text(
-        f'bundle_id = "{name}"\n'
+def _bundle(root: Path, body: str) -> Path:
+    (root / "kernels").mkdir(parents=True)
+    (root / "manifest.toml").write_text(
+        'bundle_id = "test"\n'
         'abi_version = "optima-op-abi-v0"\n\n'
-        "[[ops]]\n"
+        '[[ops]]\n'
         'slot = "activation.silu_and_mul"\n'
         'source = "kernels/k.py"\n'
-        'entry = "k"\n'
+        'entry = "silu_and_mul"\n'
         'dtypes = ["float32"]\n'
     )
-    (b / "kernels" / "k.py").write_text(body)
-    return b
+    (root / "kernels/k.py").write_text(body)
+    for directory in (root, root / "kernels"):
+        directory.chmod(0o700)
+    for file in (root / "manifest.toml", root / "kernels/k.py"):
+        file.chmod(0o600)
+    return root
 
 
-def _submission(root, name, body):
-    """Package a mini-bundle; return (hotkey-agnostic) payload pieces."""
-    bundle = _mini_bundle(root / "src", name, body)
-    archive, ch = package_bundle(bundle, root / "hosted" / f"{name}.tar.gz")
-    return ch, archive.as_uri()
+def _snapshot(rows: list[tuple[str, str]]) -> FinalizedRevealSnapshot:
+    reveals = tuple(
+        RevealedCommitment(hotkey, payload, BLOCK, BLOCK_HASH, index)
+        for index, (hotkey, payload) in enumerate(rows)
+    )
+    return FinalizedRevealSnapshot(BLOCK, BLOCK_HASH, reveals)
 
 
-def _loop_env(tmp_path, revealed, hotkeys):
-    st = _MockSubtensor(hotkeys=hotkeys, revealed=revealed, block=400)
-    return st, dict(ledger_path=str(tmp_path / "ledger.json"),
-                    bundles_dir=str(tmp_path / "cache"))
+class _NoWeightsSubtensor:
+    def get_block_hash(self, block):
+        assert block == 0
+        return SCOPE.genesis_hash
 
 
-def _pass_all(bundle_dir):
-    return EvalOutcome(True, 1.05)
+def _run(tmp_path, monkeypatch, snapshot, sources, **changes):
+    monkeypatch.setattr(
+        loop.chain,
+        "read_finalized_reveal_history",
+        lambda *_, **__: snapshot,
+    )
+    calls = []
+
+    def fetcher(_url, expected, _root):
+        calls.append(expected)
+        return sources[expected]
+
+    monkeypatch.setattr(loop, "fetch_bundle", fetcher)
+
+    options = dict(
+        intake_db=tmp_path / "state" / "intake.sqlite3",
+        private_root=tmp_path / "private-cache",
+        publication_root=tmp_path / "worker",
+    )
+    options.update(changes)
+    return loop.run_pass(_NoWeightsSubtensor(), 307, **options), calls, options
 
 
-# --------------------------------------------------------------------------- #
-# the referee cycle
-# --------------------------------------------------------------------------- #
+def test_finalized_reveal_publishes_once_and_restart_reopens(tmp_path, monkeypatch):
+    source = _bundle(
+        tmp_path / "source",
+        "def silu_and_mul(x, out):\n    out.copy_(x)\n",
+    )
+    digest = content_hash(source)
+    snapshot = _snapshot([("miner", encode_payload(digest, "https://example.com/a"))])
+    result, calls, options = _run(tmp_path, monkeypatch, snapshot, {digest: source})
 
-def test_full_pass_crowns_and_pushes_weights(tmp_path):
-    ch, url = _submission(tmp_path, "m1", "def k(x):\n    return x\n")
-    st, env = _loop_env(tmp_path, {"miner1": ((5, encode_payload(ch, url)),)},
-                        hotkeys=["val", "miner1"])
-    res = run_pass(st, object(), 1, evaluator=_pass_all, **env)
-    assert res.seen == 1 and res.new == [ch]
-    assert res.evaluated == {ch: True}
-    assert res.weights == {"miner1": 1.0}
-    assert res.weights_pushed and len(st.set_weights_calls) == 1
-    assert st.set_weights_calls[0]["uids"] == [1]
+    assert result.seen == 1 and len(result.reserved) == 1
+    assert len(result.published) == 1 and result.decisions == {}
+    assert calls == [digest]
+    with FinalizedIntakeStore(options["intake_db"], scope=SCOPE) as store:
+        row = store.all()[0]
+        assert row.status == "published"
+        assert row.publication_digest == next(iter(result.published.values()))
+        assert row.arrival.content_hash == digest
 
-    # ledger state: score + audit record + champion
-    led = Ledger.load(env["ledger_path"])
-    assert led.is_known("miner1", ch)
-    assert led.champions and led.current_weights() == {"miner1": 1.0}
-
-
-def test_second_pass_is_idempotent(tmp_path):
-    ch, url = _submission(tmp_path, "m1", "def k(x):\n    return x\n")
-    st, env = _loop_env(tmp_path, {"miner1": ((5, encode_payload(ch, url)),)},
-                        hotkeys=["val", "miner1"])
-    calls = {"n": 0}
-
-    def counting(bundle_dir):
-        calls["n"] += 1
-        return EvalOutcome(True, 1.05)
-
-    run_pass(st, object(), 1, evaluator=counting, **env)
-    res2 = run_pass(st, object(), 1, evaluator=counting, **env)
-    assert calls["n"] == 1          # not re-evaluated
-    assert res2.new == []           # nothing new
-    assert len(st.set_weights_calls) == 1  # unchanged weights not re-pushed
+    second, second_calls, _ = _run(
+        tmp_path, monkeypatch, snapshot, {digest: source}
+    )
+    assert second.reserved == [] and second.published == {}
+    assert second_calls == []
 
 
-def test_copy_is_demoted_not_evaluated(tmp_path):
-    body = "def k(x):\n    return x + 1\n"
-    ch, url = _submission(tmp_path, "orig", body)
-    # the copycat commits the SAME content at a LATER block
-    revealed = {
-        "author": ((5, encode_payload(ch, url)),),
-        "copycat": ((9, encode_payload(ch, url)),),
-    }
-    st, env = _loop_env(tmp_path, revealed, hotkeys=["val", "author", "copycat"])
-    evaluated = []
-
-    def tracking(bundle_dir):
-        evaluated.append(bundle_dir)
-        return EvalOutcome(True, 1.05)
-
-    res = run_pass(st, object(), 1, evaluator=tracking, **env)
-    assert len(evaluated) == 1      # only the original ran
-    assert res.copies == [ch]
-    assert res.weights == {"author": 1.0}
-    led = Ledger.load(env["ledger_path"])
-    assert led.eval_for("copycat", ch).dq_reason == "copy"
+def test_malformed_finalized_payload_is_reserved_and_never_fetched(tmp_path, monkeypatch):
+    snapshot = _snapshot([("miner", "not-json")])
+    result, calls, options = _run(tmp_path, monkeypatch, snapshot, {})
+    assert calls == [] and len(result.reserved) == 1
+    assert len(result.rejected) == 1
+    with FinalizedIntakeStore(options["intake_db"], scope=SCOPE) as store:
+        row = store.all()[0]
+        assert row.status == "failed" and row.reason == "invalid_payload"
 
 
-def test_reformatted_copy_is_demoted_by_fingerprint(tmp_path):
-    ch1, url1 = _submission(tmp_path, "orig", "def k(x):\n    return x + 1\n")
-    # different bytes (comment + spacing) -> different content hash, same normalized code
-    ch2, url2 = _submission(tmp_path, "theft",
-                            "# totally my own work\ndef k(x):\n    return (x + 1)\n")
-    assert ch1 != ch2
-    revealed = {
-        "author": ((5, encode_payload(ch1, url1)),),
-        "copycat": ((9, encode_payload(ch2, url2)),),
-    }
-    st, env = _loop_env(tmp_path, revealed, hotkeys=["val", "author", "copycat"])
-    res = run_pass(st, object(), 1, evaluator=_pass_all, **env)
-    assert ch2 in res.copies
-    assert res.weights == {"author": 1.0}
+def test_deterministically_unpublishable_submission_is_not_retried(
+    tmp_path, monkeypatch
+):
+    source = _bundle(
+        tmp_path / "source",
+        "def silu_and_mul(x, out):\n    out.copy_(x)\n",
+    )
+    reserved = source / ".optima-native-artifact.json"
+    reserved.write_text("{}\n")
+    reserved.chmod(0o600)
+    digest = content_hash(source)
+    snapshot = _snapshot(
+        [("miner", encode_payload(digest, "https://example.com/a"))]
+    )
+    result, _calls, options = _run(
+        tmp_path, monkeypatch, snapshot, {digest: source}
+    )
+    assert len(result.rejected) == 1
+    with FinalizedIntakeStore(options["intake_db"], scope=SCOPE) as store:
+        row = store.all()[0]
+        assert row.status == "failed"
+        assert row.reason.startswith("publication_source:")
 
 
-def test_fetch_failure_is_recorded_and_not_retried(tmp_path):
-    ch = "c" * 64
-    revealed = {"miner1": ((5, encode_payload(ch, "file:///nonexistent/x.tar.gz")),)}
-    st, env = _loop_env(tmp_path, revealed, hotkeys=["val", "miner1"])
-    res = run_pass(st, object(), 1, evaluator=_pass_all, **env)
-    assert ch in res.rejected and not res.weights
-    led = Ledger.load(env["ledger_path"])
-    assert led.eval_for("miner1", ch).dq_reason.startswith("fetch:")
-    # second pass skips it entirely (no infinite refetch of a dead URL)
-    res2 = run_pass(st, object(), 1, evaluator=_pass_all, **env)
-    assert res2.new == [] and res2.rejected == {}
+def test_reformatted_later_delta_is_copy_without_any_weight_edge(tmp_path, monkeypatch):
+    first = _bundle(
+        tmp_path / "first",
+        "import torch\n\ndef silu_and_mul(x, out):\n"
+        "    d = x.shape[-1] // 2\n"
+        "    out.copy_(torch.nn.functional.silu(x[..., :d]) * x[..., d:])\n",
+    )
+    second = _bundle(
+        tmp_path / "second",
+        "import torch\n\n# formatting only\ndef silu_and_mul(x, out):\n"
+        "    d = (x.shape[-1] // 2)\n"
+        "    out.copy_((torch.nn.functional.silu(x[..., :d]) * x[..., d:]))\n",
+    )
+    first_hash, second_hash = content_hash(first), content_hash(second)
+    assert first_hash != second_hash
+    snapshot = _snapshot([
+        ("author", encode_payload(first_hash, "https://example.com/a")),
+        ("copycat", encode_payload(second_hash, "https://example.com/b")),
+    ])
+    result, _calls, options = _run(
+        tmp_path,
+        monkeypatch,
+        snapshot,
+        {first_hash: first, second_hash: second},
+    )
+    assert len(result.published) == 1 and len(result.copies) == 1
+    with FinalizedIntakeStore(options["intake_db"], scope=SCOPE) as store:
+        rows = store.all()
+        assert [row.status for row in rows] == ["published", "failed"]
+        assert rows[1].reason.startswith("copy_of:")
 
 
-def test_hash_mismatch_rejects_submission(tmp_path):
-    _, url = _submission(tmp_path, "m1", "def k(x):\n    return x\n")
-    lie = "d" * 64  # committed hash does not match the hosted artifact
-    st, env = _loop_env(tmp_path, {"miner1": ((5, encode_payload(lie, url)),)},
-                        hotkeys=["val", "miner1"])
-    res = run_pass(st, object(), 1, evaluator=_pass_all, **env)
-    assert lie in res.rejected and "mismatch" in res.rejected[lie]
+def test_live_loop_calls_batch_qualification_and_retains_outcome(
+    tmp_path, monkeypatch
+):
+    source = _bundle(
+        tmp_path / "source",
+        "def silu_and_mul(x, out):\n    out.copy_(x)\n",
+    )
+    digest = content_hash(source)
+    snapshot = _snapshot([("miner", encode_payload(digest, "https://example.com/a"))])
+
+    class FakeFactory:
+        def __init__(self, reservations):
+            self.manifest = type("Manifest", (), {
+                "reservations": reservations,
+                "digest": "a" * 64,
+                "to_dict": lambda self: {"digest": self.digest},
+            })()
+
+    monkeypatch.setattr(loop, "QualificationPlanFactory", FakeFactory)
+    calls = []
+
+    def planner(_reservations, _publications, authority_rows):
+        return loop.QualificationWork(
+            FakeFactory(authority_rows), object(), lambda *_: None, lambda **_: None, 30.0
+        )
+
+    def qualify(factory, **_kwargs):
+        calls.append(factory.manifest.digest)
+        authority = factory.manifest.reservations[0]
+        outcome = QualificationIntakeOutcome(
+            authority.reservation_digest,
+            authority.selected_delta_digest,
+            factory.manifest.digest,
+            QualificationDecision.PASS,
+            "qualified",
+            False,
+            attempt_artifact_sha256="b" * 64,
+            report_digest="c" * 64,
+        )
+        ref = EvidenceArtifactRef(
+            "qualification.cohort-attempt", "b" * 64, 1,
+            "application/json", "optima.qualification.cohort-attempt.v1",
+        )
+        return QualificationIntakeBatch(factory.manifest.digest, (outcome,), ref)
+
+    monkeypatch.setattr(loop, "run_qualification_intake", qualify)
+    result, _fetches, options = _run(
+        tmp_path,
+        monkeypatch,
+        snapshot,
+        {digest: source},
+        qualification_planner=planner,
+    )
+    assert calls == ["a" * 64]
+    assert set(result.decisions.values()) == {"PASS"}
+    with FinalizedIntakeStore(options["intake_db"], scope=SCOPE) as store:
+        row = store.all()[0]
+        assert row.status == "qualified" and row.decision == "PASS"
+        assert store.qualification_dispositions(row.reservation_id)[0]["decision"] == "PASS"
 
 
-def test_garbage_payload_is_ignored(tmp_path):
-    st, env = _loop_env(tmp_path, {"miner1": ((5, "not json at all"),)},
-                        hotkeys=["val", "miner1"])
-    res = run_pass(st, object(), 1, evaluator=_pass_all, **env)
-    assert res.seen == 0 and res.new == []
-
-
-def test_failed_gates_earn_no_weight(tmp_path):
-    ch, url = _submission(tmp_path, "m1", "def k(x):\n    return x\n")
-    st, env = _loop_env(tmp_path, {"miner1": ((5, encode_payload(ch, url)),)},
-                        hotkeys=["val", "miner1"])
-    res = run_pass(st, object(), 1,
-                   evaluator=lambda p: EvalOutcome(False, 0.0, detail="verify failed"),
-                   **env)
-    assert res.evaluated == {ch: False}
-    assert res.weights == {} and not st.set_weights_calls
-
-
-def test_dry_run_weights_never_submits(tmp_path):
-    ch, url = _submission(tmp_path, "m1", "def k(x):\n    return x\n")
-    st, env = _loop_env(tmp_path, {"miner1": ((5, encode_payload(ch, url)),)},
-                        hotkeys=["val", "miner1"])
-    res = run_pass(st, None, 1, evaluator=_pass_all, dry_run_weights=True, **env)
-    assert res.weights == {"miner1": 1.0}
-    assert not res.weights_pushed and not st.set_weights_calls
-
-
-def test_weights_repushed_after_refresh_interval(tmp_path):
-    ch, url = _submission(tmp_path, "m1", "def k(x):\n    return x\n")
-    st, env = _loop_env(tmp_path, {"miner1": ((5, encode_payload(ch, url)),)},
-                        hotkeys=["val", "miner1"])
-    run_pass(st, object(), 1, evaluator=_pass_all, **env)
-    st._block += 1000  # well past the refresh cadence
-    run_pass(st, object(), 1, evaluator=_pass_all, **env)
-    assert len(st.set_weights_calls) == 2
-
-
-def test_run_validator_once_returns_pass_result(tmp_path):
-    st, env = _loop_env(tmp_path, {}, hotkeys=["val"])
-    res = run_validator(st, object(), 1, evaluator=_pass_all, once=True, **env)
-    assert res is not None and res.seen == 0
-
-
-# --------------------------------------------------------------------------- #
-# subprocess evaluator contract
-# --------------------------------------------------------------------------- #
-
-def test_command_evaluator_report_and_exit_codes(tmp_path):
-    bundle = tmp_path / "cache" / ("e" * 64)
-    bundle.mkdir(parents=True)
-
-    ok = command_evaluator("true")(bundle)
-    assert ok.passed and ok.score == 1.0
-
-    bad = command_evaluator("exit 3")(bundle)
-    assert not bad.passed and bad.score == 0.0
-
-    report = {"score": 1.07, "kl_mean": 0.002, "slot": "moe.fused_experts"}
-    writer = tmp_path / "write_report.sh"
-    writer.write_text(f"#!/bin/sh\necho '{json.dumps(report)}' > \"$1\"\n")
-    writer.chmod(0o755)
-    rich = command_evaluator(f"sh {writer} {{report}} # {{bundle}}")(bundle)
-    assert rich.passed and rich.score == 1.07
-    assert rich.kl_mean == 0.002 and rich.slot == "moe.fused_experts"
+def test_once_mode_propagates_validator_fault(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        loop,
+        "run_pass",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("finality failed")),
+    )
+    with pytest.raises(RuntimeError, match="finality failed"):
+        loop.run_validator(
+            _NoWeightsSubtensor(),
+            307,
+            intake_db=tmp_path / "state.sqlite3",
+            private_root=tmp_path / "private",
+            publication_root=tmp_path / "worker",
+            once=True,
+        )

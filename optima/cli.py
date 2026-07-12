@@ -177,19 +177,13 @@ def cmd_chain_validate(args: argparse.Namespace) -> int:
     import logging
 
     from optima import chain
-    from optima.chain.validator_loop import (
-        command_evaluator,
-        run_validator,
-        verify_evaluator,
-    )
+    from optima.chain.validator_loop import run_validator
 
-    if args.eval_cmd:
-        evaluator = command_evaluator(args.eval_cmd, timeout_s=args.eval_timeout)
-    else:
-        evaluator = verify_evaluator(device=args.eval_device, timeout_s=args.eval_timeout)
-        print("NOTE: verify-mode evaluator (pass/fail plumbing score of 1.0) — a 1.0 "
-              "never clears the dethrone margin, so crown plumbing runs with "
-              "--margin 0; wire --eval-cmd to the full GPU gate chain for real scoring")
+    if not args.intake_only:
+        raise SystemExit(
+            "chain-validate requires --intake-only until a registered arena service "
+            "supplies the causal qualification planner"
+        )
     subtensor = chain.connect(args.network, retry_forever=not args.once)
     # Daemon-mode observability: between passes the loop reports only through the
     # "optima.chain.*" loggers (--once prints its own summary below). This must run
@@ -210,23 +204,25 @@ def cmd_chain_validate(args: argparse.Namespace) -> int:
         _handler.setFormatter(
             logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
         _chain_lg.addHandler(_handler)
-    wallet = None
-    if not args.dry_run_weights:
-        import bittensor as bt
-
-        wallet = bt.Wallet(name=args.wallet, hotkey=args.hotkey)
-    res = run_validator(subtensor, wallet, args.netuid, ledger_path=args.ledger,
-                        bundles_dir=args.bundles_dir, evaluator=evaluator,
-                        margin=args.margin, interval_s=args.interval, once=args.once,
-                        dry_run_weights=args.dry_run_weights)
+    res = run_validator(
+        subtensor,
+        args.netuid,
+        intake_db=args.intake_db,
+        private_root=args.private_root,
+        publication_root=args.publication_root,
+        interval_s=args.interval,
+        once=args.once,
+    )
     if args.once and res is not None:
-        print(f"pass @block {res.block} (round {res.round_id}): seen={res.seen} "
-              f"new={len(res.new)} copies={len(res.copies)} rejected={len(res.rejected)}")
-        for ch_, ok in res.evaluated.items():
-            print(f"  evaluated {ch_[:16]}… passed={ok}")
-        for ch_, why in res.rejected.items():
-            print(f"  rejected  {ch_[:16]}… {why}")
-        print(f"weights: {res.weights}  pushed={res.weights_pushed}")
+        print(
+            f"intake @finalized {res.finalized_block}: seen={res.seen} "
+            f"reserved={len(res.reserved)} published={len(res.published)} "
+            f"copies={len(res.copies)} rejected={len(res.rejected)} "
+            f"held={len(res.held)}"
+        )
+        for reservation, why in res.rejected.items():
+            print(f"  rejected {reservation[:16]}… {why}")
+        print("settlement/weights: disabled in finalized intake")
     return 0
 
 
@@ -811,7 +807,7 @@ def build_parser() -> argparse.ArgumentParser:
             "  develop a kernel (miner) ... slots, scan, verify, evaluate, bench\n"
             "  submit on-chain (miner) .... hash, chain-register, chain-package,\n"
             "                               chain-submit, chain-status\n"
-            "  score + settle (validator) . chain-validate, settle, ledger, set-weights,\n"
+            "  referee + settlement ....... chain-validate, settle, ledger, set-weights,\n"
             "                               commit, reveal (local-ledger simulation)\n"
             "  environment checks ......... compat, chain-compat\n"
             "\n"
@@ -878,27 +874,18 @@ def build_parser() -> argparse.ArgumentParser:
     sp.set_defaults(func=cmd_chain_status)
 
     sp = sub.add_parser("chain-validate",
-                        help="the validator loop: commitments -> fetch -> evaluate -> "
-                             "settle -> weights")
+                        help="finalized reveal -> private fetch -> immutable worker publication")
     sp.add_argument("--netuid", type=int, required=True)
     sp.add_argument("--network", required=True)
-    sp.add_argument("--wallet", default="default")
-    sp.add_argument("--hotkey", default="default", help="the VALIDATOR hotkey name")
-    sp.add_argument("--ledger", default="chain_ledger.json")
-    sp.add_argument("--bundles-dir", default="chain_bundles",
-                    help="where fetched submissions are cached (keyed by content hash)")
-    sp.add_argument("--eval-cmd", default=None,
-                    help="eval command template with {bundle} and {report} placeholders "
-                         "(exit 0 = passed; JSON report carries score/kl_mean/slot). "
-                         "Default: verify-mode plumbing evaluator (CPU pass/fail)")
-    sp.add_argument("--eval-device", default="cpu",
-                    help="verify-mode device (default cpu)")
-    sp.add_argument("--eval-timeout", type=float, default=3600.0)
-    sp.add_argument("--margin", type=float, default=0.02, help="settle dethrone margin")
+    sp.add_argument("--intake-only", action="store_true",
+                    help="explicitly disable qualification, settlement, signing, and weights")
+    sp.add_argument("--intake-db", default="chain_intake/intake.sqlite3")
+    sp.add_argument("--private-root", default="chain_intake/private",
+                    help="validator-private 0700/0600 fetch storage")
+    sp.add_argument("--publication-root", default="chain_intake/worker",
+                    help="immutable 0555/0444 worker-readable publication storage")
     sp.add_argument("--interval", type=float, default=60.0, help="seconds between passes")
     sp.add_argument("--once", action="store_true", help="single pass, then exit")
-    sp.add_argument("--dry-run-weights", action="store_true",
-                    help="run the full loop but never submit weights")
     sp.set_defaults(func=cmd_chain_validate)
 
     sp = sub.add_parser("chain-register",

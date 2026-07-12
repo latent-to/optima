@@ -12,10 +12,13 @@ import pytest
 
 from optima.commit_reveal import Ledger, make_commitment
 from optima.copy_fingerprint import (
+    SubmittedDeltaFingerprint,
     bundle_fingerprint,
     bundle_slot_file_fingerprints,
     bundle_slot_fingerprints,
     bundle_slot_structural_fingerprints,
+    compare_submitted_deltas,
+    fingerprint_submitted_delta,
     normalized_source,
     source_fingerprint,
     structural_fingerprint,
@@ -83,6 +86,59 @@ def test_bundle_fingerprint_on_a_real_example_is_stable_nonempty():
     fp = bundle_fingerprint(bundle)
     assert fp and len(fp) == 64
     assert bundle_fingerprint(bundle) == fp  # deterministic
+
+
+def _delta(**changes):
+    values = dict(
+        product_kind="component",
+        target_id="activation.silu_and_mul",
+        target_spec_digest="a" * 64,
+        members=("activation.silu_and_mul",),
+        exact_payload_digest="b" * 64,
+        selected_delta_digest="c" * 64,
+        normalized_delta_digest="d" * 64,
+        containment_fingerprints=("e" * 64, "f" * 64),
+        advisory_fingerprints=("1" * 64,),
+    )
+    values.update(changes)
+    return SubmittedDeltaFingerprint(**values)
+
+
+def test_submitted_delta_exact_and_symmetric_containment_are_authoritative():
+    original = _delta()
+    assert SubmittedDeltaFingerprint.from_dict(original.to_dict()) == original
+    assert len(original.digest) == 64
+    assert compare_submitted_deltas(original, _delta()).reason == "exact_delta_identity"
+    padded = _delta(
+        exact_payload_digest="2" * 64,
+        normalized_delta_digest="3" * 64,
+        containment_fingerprints=("4" * 64, "e" * 64, "f" * 64),
+    )
+    decision = compare_submitted_deltas(original, padded)
+    assert decision.authoritative and decision.reason == "symmetric_delta_containment"
+    assert compare_submitted_deltas(padded, original).authoritative
+
+
+def test_shared_fragment_and_structure_are_advisory_only():
+    original = _delta()
+    independent = _delta(
+        exact_payload_digest="2" * 64,
+        normalized_delta_digest="3" * 64,
+        containment_fingerprints=("4" * 64, "e" * 64),
+    )
+    decision = compare_submitted_deltas(original, independent)
+    assert not decision.authoritative and decision.reason == "advisory_only"
+    assert decision.shared_fragments == ("e" * 64,)
+    assert decision.shared_advisory == ("1" * 64,)
+
+
+def test_different_semantic_targets_do_not_cross_demote():
+    original = _delta()
+    other = _delta(
+        target_id="norm.rmsnorm",
+        members=("norm.rmsnorm",),
+    )
+    assert compare_submitted_deltas(original, other).reason == "different_reward_namespace"
 
 
 def _commit_reveal(led: Ledger, hotkey: str, ch: str, salt: str, rnd: int, fp: str):
@@ -166,6 +222,27 @@ def _write_bundle(root: Path, ops: list[tuple[str, str, str]], files: dict[str, 
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(src)
     return root
+
+
+def test_submitted_delta_excludes_unselected_bundle_files(tmp_path):
+    first = _write_bundle(
+        tmp_path / "first",
+        [("activation.silu_and_mul", "kernels/k.py", "silu_and_mul")],
+        {"kernels/k.py": ORIG},
+    )
+    padded = _write_bundle(
+        tmp_path / "padded",
+        [("activation.silu_and_mul", "kernels/k.py", "silu_and_mul")],
+        {
+            "kernels/k.py": ORIG,
+            "kernels/unselected.py": "def unrelated():\n    return 17\n",
+        },
+    )
+    left = fingerprint_submitted_delta(first)
+    right = fingerprint_submitted_delta(padded)
+    assert left.exact_payload_digest == right.exact_payload_digest
+    assert left.selected_delta_digest == right.selected_delta_digest
+    assert left.containment_fingerprints == right.containment_fingerprints
 
 
 def _write_variant_bundle(

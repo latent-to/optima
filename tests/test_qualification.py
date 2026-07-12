@@ -615,6 +615,9 @@ def test_trajectory_topk_accepts_ties_without_relabeling_runtime_top_one():
     assert _validated_topk_position(left) == [
         ["-0.5", 19], ["-0.5", 7], ["-1", 3]
     ]
+    assert _validated_topk_position(((-0.25, 4), (-1.5, 8))) == [
+        ["-0.25", 4], ["-1.5", 8]
+    ]
     with pytest.raises(QualificationError, match="order"):
         _validated_topk_position(right)
 

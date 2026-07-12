@@ -1,0 +1,190 @@
+{
+  "architectural_unit": "3b",
+  "artifacts": [
+    {
+      "availability": "digest_only",
+      "id": "image.worker",
+      "kind": "container-image",
+      "locator": "localhost:5000/optima-pr3b-worker@sha256:068cbe12cbd23fdfde150bb12c05782d711d39956346f032979064be8610ef90",
+      "reason": "The digest-addressed worker image is not retained in the repository.",
+      "sha256": "068cbe12cbd23fdfde150bb12c05782d711d39956346f032979064be8610ef90",
+      "size_bytes": null
+    },
+    {
+      "availability": "digest_only",
+      "id": "wheel.worker",
+      "kind": "wheel",
+      "locator": null,
+      "reason": "The worker wheel bytes are not retained in the repository.",
+      "sha256": "788679b2d934d687643a2904d5d2ef3f08780013f0e5c004f260c291fef16985",
+      "size_bytes": null
+    },
+    {
+      "availability": "digest_only",
+      "id": "gpu.marginal-lifecycle",
+      "kind": "gpu-receipt",
+      "locator": "/root/optima-pr3b-marginal-proof-e398fa01/receipt.json",
+      "reason": "The canonical B/C/B-prime receipt bytes are not retained in the repository.",
+      "sha256": "5f07f9c0982214174621dfc07a3d9b14521635a77e55a017dedbe6844c3f595e",
+      "size_bytes": null
+    },
+    {
+      "availability": "digest_only",
+      "id": "gpu.residue-sweep",
+      "kind": "gpu-receipt",
+      "locator": "/root/optima-pr3b-marginal-proof-e398fa01/independent-residue-sweep.txt",
+      "reason": "The independent residue-sweep bytes are not retained in the repository.",
+      "sha256": "6af513257cc1749659d074b6658195f3eaf1dd1e4d96f3c5eef8520507a4f17c",
+      "size_bytes": null
+    },
+    {
+      "availability": "digest_only",
+      "id": "gpu.ordering-smoke",
+      "kind": "gpu-receipt",
+      "locator": "/root/optima-pr3b-worker-build-e398fa01/ordering-namespace-smoke.log",
+      "reason": "The ordering and namespace smoke log bytes are not retained in the repository.",
+      "sha256": "8b37624e0ac8c4f2c36ebb703fddb82d0a02e59d062adda3607caefbe29f1e0c",
+      "size_bytes": null
+    },
+    {
+      "availability": "unavailable",
+      "id": "tests.local-full",
+      "kind": "test-log",
+      "locator": null,
+      "reason": "The local 1159-pass and 19-skip summary was recorded without retaining the raw log.",
+      "sha256": null,
+      "size_bytes": null
+    },
+    {
+      "availability": "unavailable",
+      "id": "review.marginal-runtime",
+      "kind": "review-report",
+      "locator": null,
+      "reason": "The implementation, adversarial, and confirmation reviews were not retained as artifacts.",
+      "sha256": null,
+      "size_bytes": null
+    }
+  ],
+  "claims": [
+    {
+      "artifact_ids": [],
+      "id": "scope.marginal-runtime",
+      "statement": "The repository binds exact marginal stack plans and materialized trees to the isolated executor without grading authority.",
+      "status": "verified"
+    },
+    {
+      "artifact_ids": [
+        "tests.local-full"
+      ],
+      "id": "tests.full",
+      "statement": "The exact-head local suite was reported as 1159 passed and 19 skipped; its raw log is unavailable.",
+      "status": "reported_unretained"
+    },
+    {
+      "artifact_ids": [
+        "image.worker",
+        "gpu.marginal-lifecycle"
+      ],
+      "id": "gpu.marginal-lifecycle",
+      "statement": "B/C/B-prime ran with exact B bookends and one candidate stack delta; the canonical receipt is digest-only.",
+      "status": "digest_only"
+    },
+    {
+      "artifact_ids": [
+        "gpu.marginal-lifecycle"
+      ],
+      "id": "candidate.completed-no-fallback",
+      "statement": "Candidate completion was reported for two batches and 2112 charged tokens with zero fallback; the receipt is digest-only.",
+      "status": "digest_only"
+    },
+    {
+      "artifact_ids": [
+        "gpu.residue-sweep"
+      ],
+      "id": "cleanup.zero-residue",
+      "statement": "The independent cleanup result is represented by a digest-only residue sweep.",
+      "status": "digest_only"
+    }
+  ],
+  "classified_diff": {
+    "documentation": {
+      "added": 0,
+      "deleted": 0
+    },
+    "evidence": {
+      "added": 0,
+      "deleted": 0
+    },
+    "production": {
+      "added": 791,
+      "deleted": 3
+    },
+    "test": {
+      "added": 910,
+      "deleted": 0
+    },
+    "tooling": {
+      "added": 0,
+      "deleted": 0
+    },
+    "vendor": {
+      "added": 0,
+      "deleted": 0
+    }
+  },
+  "exit_criteria": [
+    {
+      "artifact_ids": [
+        "gpu.marginal-lifecycle"
+      ],
+      "id": "arms.exact-one-delta",
+      "statement": "The final lifecycle receipt is digest-bound to byte-identical B/B-prime identity and one C stack/tree/native-build delta.",
+      "status": "digest_only"
+    },
+    {
+      "artifact_ids": [
+        "gpu.marginal-lifecycle",
+        "gpu.residue-sweep"
+      ],
+      "id": "executor.lifecycle-cleanup",
+      "statement": "The final lifecycle and cleanup artifacts are digest-bound but not retained in the repository.",
+      "status": "digest_only"
+    }
+  ],
+  "github_pr": 46,
+  "identity": {
+    "base_commit": "38ddaed6947228f0777a85e67c2160490353ea3b",
+    "implementation_commit": "e398fa01d9e3f0c999e7ef18e410f9778cd01a89",
+    "implementation_tree": "1e4673a07f5f4efb1b1b415e9afb55d15b4dacf1",
+    "merge_commit": "17ecdeb5213d03771964939d80da9343618a7e86"
+  },
+  "nonclaims": [
+    "b300.performance",
+    "crown.authority",
+    "quality.authority",
+    "settlement.authority",
+    "speed.authority"
+  ],
+  "record_type": "pr_evidence",
+  "reviews": [
+    {
+      "artifact_id": "review.marginal-runtime",
+      "phase": "implementation",
+      "status": "reported_unretained",
+      "summary": "Implementation review and reproduced loader defects were reported; no report bytes were retained."
+    },
+    {
+      "artifact_id": "review.marginal-runtime",
+      "phase": "adversarial",
+      "status": "reported_unretained",
+      "summary": "Bounded adversarial review was reported; no report bytes were retained."
+    },
+    {
+      "artifact_id": "review.marginal-runtime",
+      "phase": "confirmation",
+      "status": "reported_unretained",
+      "summary": "Final confirmation was reported; no report bytes were retained."
+    }
+  ],
+  "schema_version": 1
+}

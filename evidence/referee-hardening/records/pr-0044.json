@@ -1,0 +1,144 @@
+{
+  "architectural_unit": "2a-native",
+  "artifacts": [
+    {
+      "availability": "digest_only",
+      "id": "image.worker",
+      "kind": "container-image",
+      "locator": "localhost:5000/optima-pr2a-worker@sha256:697858888a7879ad660bd977404b2e3b7e189232687acf83095b696f79debf1a",
+      "reason": "The digest-addressed worker image is not retained in the repository.",
+      "sha256": "697858888a7879ad660bd977404b2e3b7e189232687acf83095b696f79debf1a",
+      "size_bytes": null
+    },
+    {
+      "availability": "unavailable",
+      "id": "gpu.native-proof",
+      "kind": "gpu-receipt",
+      "locator": "/root/optima-pr2a-rtx-native-proof-20260712-020336/receipt.json",
+      "reason": "The private RTX receipt path was recorded without a receipt digest or retained bytes.",
+      "sha256": null,
+      "size_bytes": null
+    },
+    {
+      "availability": "unavailable",
+      "id": "tests.local-full",
+      "kind": "test-log",
+      "locator": null,
+      "reason": "The local 1021-pass and 18-skip summary was recorded without retaining the raw log.",
+      "sha256": null,
+      "size_bytes": null
+    },
+    {
+      "availability": "unavailable",
+      "id": "review.native",
+      "kind": "review-report",
+      "locator": null,
+      "reason": "The reported security and size reviews were not retained as artifacts.",
+      "sha256": null,
+      "size_bytes": null
+    }
+  ],
+  "claims": [
+    {
+      "artifact_ids": [],
+      "id": "scope.hermetic-native",
+      "statement": "The repository adds disposable no-GPU native prebuild, immutable publication, and load-only runtime consumption.",
+      "status": "verified"
+    },
+    {
+      "artifact_ids": [
+        "tests.local-full"
+      ],
+      "id": "tests.full",
+      "statement": "The joined local suite was reported as 1021 passed and 18 skipped; its raw log is unavailable.",
+      "status": "reported_unretained"
+    },
+    {
+      "artifact_ids": [
+        "image.worker",
+        "gpu.native-proof"
+      ],
+      "id": "gpu.native-build-load",
+      "statement": "SM120 compile, tamper rejection, cancellation cleanup, and isolated load were reported; only the image digest remains content-addressed.",
+      "status": "reported_unretained"
+    }
+  ],
+  "classified_diff": {
+    "documentation": {
+      "added": 0,
+      "deleted": 0
+    },
+    "evidence": {
+      "added": 0,
+      "deleted": 0
+    },
+    "production": {
+      "added": 2916,
+      "deleted": 382
+    },
+    "test": {
+      "added": 2051,
+      "deleted": 95
+    },
+    "tooling": {
+      "added": 0,
+      "deleted": 0
+    },
+    "vendor": {
+      "added": 0,
+      "deleted": 0
+    }
+  },
+  "exit_criteria": [
+    {
+      "artifact_ids": [],
+      "id": "native.load-only",
+      "statement": "Runtime rebuild integration accepts sealed publications in load phase and does not compile in the engine worker.",
+      "status": "verified"
+    },
+    {
+      "artifact_ids": [
+        "gpu.native-proof"
+      ],
+      "id": "gpu.tamper-cleanup",
+      "statement": "RTX tamper and cleanup controls were reported without retained receipt bytes.",
+      "status": "reported_unretained"
+    }
+  ],
+  "github_pr": 44,
+  "identity": {
+    "base_commit": "6e4b744cafc87509709204facfc9b258d975d8ef",
+    "implementation_commit": "712d05e316b39e3f660101c939814b8a4176a58b",
+    "implementation_tree": "a8c2289ac83888fe4df42c4bede60ca71ea37599",
+    "merge_commit": "30649398d5a81610400139d95a91587da962dd9f"
+  },
+  "nonclaims": [
+    "b300.performance",
+    "chain.authority",
+    "engine.streaming",
+    "quality.authority",
+    "settlement.authority"
+  ],
+  "record_type": "pr_evidence",
+  "reviews": [
+    {
+      "artifact_id": "review.native",
+      "phase": "implementation",
+      "status": "reported_unretained",
+      "summary": "Implementation review was reported; no report bytes were retained."
+    },
+    {
+      "artifact_id": "review.native",
+      "phase": "adversarial",
+      "status": "reported_unretained",
+      "summary": "Independent security review was reported; no report bytes were retained."
+    },
+    {
+      "artifact_id": "review.native",
+      "phase": "confirmation",
+      "status": "reported_unretained",
+      "summary": "Independent size and scope confirmation was reported; no report bytes were retained."
+    }
+  ],
+  "schema_version": 1
+}

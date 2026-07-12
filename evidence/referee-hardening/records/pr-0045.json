@@ -1,0 +1,192 @@
+{
+  "architectural_unit": "2b",
+  "artifacts": [
+    {
+      "availability": "digest_only",
+      "id": "image.worker",
+      "kind": "container-image",
+      "locator": "localhost:5000/optima-pr2b-worker@sha256:e65ecdee6d04d9e151e94e759dedb0160d89de5a94ecc0638f03f76e90b96a43",
+      "reason": "The digest-addressed worker image is not retained in the repository.",
+      "sha256": "e65ecdee6d04d9e151e94e759dedb0160d89de5a94ecc0638f03f76e90b96a43",
+      "size_bytes": null
+    },
+    {
+      "availability": "digest_only",
+      "id": "wheel.worker",
+      "kind": "wheel",
+      "locator": null,
+      "reason": "The worker wheel bytes are not retained in the repository.",
+      "sha256": "93d8d560ef4fa0b8f2f4061c36ee20fdceea970a1608711ca4fd7e40f6907b4b",
+      "size_bytes": null
+    },
+    {
+      "availability": "digest_only",
+      "id": "gpu.tp8-runtime",
+      "kind": "gpu-receipt",
+      "locator": "/root/optima-pr2b-runtime-proof-3928e7b7-proven/receipt.json",
+      "reason": "The canonical TP8 receipt bytes are not retained in the repository.",
+      "sha256": "d0ba952037b00c9779a609d00f902b026787cb8eb5ce07aa1deaf02c40cceb0c",
+      "size_bytes": null
+    },
+    {
+      "availability": "digest_only",
+      "id": "gpu.failure-negatives",
+      "kind": "gpu-receipt",
+      "locator": "/root/optima-pr2b-failure-negatives-20260712-041720-152a199d/receipt.json",
+      "reason": "The canonical negative-path receipt bytes are not retained in the repository.",
+      "sha256": "4d305fbac3316866fff2cdaa5c3072597994545ec7a2ec484c2766555cf8b437",
+      "size_bytes": null
+    },
+    {
+      "availability": "digest_only",
+      "id": "gpu.failure-companion",
+      "kind": "gpu-receipt",
+      "locator": null,
+      "reason": "The companion negative-path artifact bytes are not retained in the repository.",
+      "sha256": "f1b5a4912b47e7c725908217b0d16671d296f8b6a9b44b7e826faff8b0697efd",
+      "size_bytes": null
+    },
+    {
+      "availability": "digest_only",
+      "id": "gpu.proven-primary",
+      "kind": "gpu-receipt",
+      "locator": null,
+      "reason": "The independently recorded primary proof bytes are not retained in the repository.",
+      "sha256": "7e2d9a673c0f9883e0f5653c25a475b90127b2664a91bf2afa331a1e1a873e65",
+      "size_bytes": null
+    },
+    {
+      "availability": "unavailable",
+      "id": "tests.local-full",
+      "kind": "test-log",
+      "locator": null,
+      "reason": "The local 1144-pass and 19-skip summary was recorded without retaining the raw log.",
+      "sha256": null,
+      "size_bytes": null
+    },
+    {
+      "availability": "unavailable",
+      "id": "review.streaming",
+      "kind": "review-report",
+      "locator": null,
+      "reason": "The implementation, adversarial, and confirmation reviews were not retained as artifacts.",
+      "sha256": null,
+      "size_bytes": null
+    }
+  ],
+  "claims": [
+    {
+      "artifact_ids": [],
+      "id": "scope.streaming-executor",
+      "statement": "The repository adds a host-timed bounded OCI streaming executor without score, quality, crown, or chain authority.",
+      "status": "verified"
+    },
+    {
+      "artifact_ids": [
+        "tests.local-full"
+      ],
+      "id": "tests.full",
+      "statement": "The exact-head local suite was reported as 1144 passed and 19 skipped; its raw log is unavailable.",
+      "status": "reported_unretained"
+    },
+    {
+      "artifact_ids": [
+        "image.worker",
+        "gpu.tp8-runtime"
+      ],
+      "id": "gpu.tp8-runtime",
+      "statement": "The eight-GPU MiniMax-M3 streaming smoke has a recorded source/image/receipt digest chain, but the receipt bytes are unavailable.",
+      "status": "digest_only"
+    },
+    {
+      "artifact_ids": [
+        "gpu.failure-negatives",
+        "gpu.failure-companion",
+        "gpu.proven-primary"
+      ],
+      "id": "gpu.failure-negatives",
+      "statement": "Candidate import, response termination, power/clock, and cleanup negatives have recorded digests without retained bytes.",
+      "status": "digest_only"
+    }
+  ],
+  "classified_diff": {
+    "documentation": {
+      "added": 0,
+      "deleted": 0
+    },
+    "evidence": {
+      "added": 0,
+      "deleted": 0
+    },
+    "production": {
+      "added": 4934,
+      "deleted": 46
+    },
+    "test": {
+      "added": 3655,
+      "deleted": 11
+    },
+    "tooling": {
+      "added": 0,
+      "deleted": 0
+    },
+    "vendor": {
+      "added": 0,
+      "deleted": 0
+    }
+  },
+  "exit_criteria": [
+    {
+      "artifact_ids": [
+        "gpu.tp8-runtime"
+      ],
+      "id": "executor.tp8-lifecycle",
+      "statement": "The TP8 lifecycle, raw evidence framing, and zero-residue result are represented by a digest-only canonical receipt.",
+      "status": "digest_only"
+    },
+    {
+      "artifact_ids": [
+        "gpu.failure-negatives"
+      ],
+      "id": "executor.fail-closed-negatives",
+      "statement": "The final negative matrix is represented by a digest-only canonical receipt.",
+      "status": "digest_only"
+    }
+  ],
+  "github_pr": 45,
+  "identity": {
+    "base_commit": "30649398d5a81610400139d95a91587da962dd9f",
+    "implementation_commit": "3928e7b74a2883ff3b7291fa93ca8c2252dbf980",
+    "implementation_tree": "5d581bc84645198ddfb23ae6cedff0f0641d8168",
+    "merge_commit": "38ddaed6947228f0777a85e67c2160490353ea3b"
+  },
+  "nonclaims": [
+    "b300.performance",
+    "chain.authority",
+    "crown.authority",
+    "quality.authority",
+    "throughput.authority"
+  ],
+  "record_type": "pr_evidence",
+  "reviews": [
+    {
+      "artifact_id": "review.streaming",
+      "phase": "implementation",
+      "status": "reported_unretained",
+      "summary": "Implementation review and one reproduced P1 were reported; no report bytes were retained."
+    },
+    {
+      "artifact_id": "review.streaming",
+      "phase": "adversarial",
+      "status": "reported_unretained",
+      "summary": "Bounded adversarial review was reported; no report bytes were retained."
+    },
+    {
+      "artifact_id": "review.streaming",
+      "phase": "confirmation",
+      "status": "reported_unretained",
+      "summary": "Final bounded confirmation was reported; no report bytes were retained."
+    }
+  ],
+  "schema_version": 1
+}

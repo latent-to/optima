@@ -13,7 +13,10 @@ bundle) must parse under this exact parser and clear the flashinfer arena policy
 from __future__ import annotations
 
 import difflib
+import hashlib
+import os
 import textwrap
+import types
 from pathlib import Path
 
 import pytest
@@ -253,6 +256,16 @@ def test_policy_rejects_unknown_target_and_out_of_tree_paths():
         check("flashinfer", [bad2])
 
 
+def test_overlay_namespace_rejects_bundle_ids(tmp_path, monkeypatch):
+    from optima.dep_policy import overlay_base
+
+    monkeypatch.setenv("OPTIMA_DEP_OVERLAY_CACHE", str(tmp_path))
+    with pytest.raises(RuntimeError, match="64-hex"):
+        overlay_base("optima-materialized-v1")
+    digest = "d" * 64
+    assert overlay_base(digest).parts[-2:] == (digest, "dep_overlays")
+
+
 def test_overlay_materialization_roundtrip(tmp_path):
     """The applier's overlay half against a synthetic site-root: subtree copied, hunks
     applied exactly, new file created, untouched files byte-identical."""
@@ -275,15 +288,197 @@ def test_overlay_materialization_roundtrip(tmp_path):
         _diff(OLD, NEW, path="pkg/data/csrc/moe/kern.cu")
         + _newfile_diff("new header\n", path="pkg/data/csrc/moe/extra.h"))
     dest = tmp_path / "overlay"
-    manifest = ns["_apply_to_overlay"](policy, [("patches/p.patch", parsed)], site, dest)
+    touched = ns["_apply_to_overlay"](policy, [("patches/p.patch", parsed)], site, dest)
 
     assert (dest / "pkg/data/csrc/moe/kern.cu").read_text() == NEW
     assert (dest / "pkg/data/csrc/moe/extra.h").read_text() == "new header\n"
     assert (dest / "pkg/data/csrc/moe/other.cuh").read_text() == "untouched\n"
-    assert set(manifest["files"]) == {"pkg/data/csrc/moe/kern.cu",
-                                      "pkg/data/csrc/moe/extra.h"}
+    assert set(touched) == {"pkg/data/csrc/moe/kern.cu",
+                            "pkg/data/csrc/moe/extra.h"}
     # the shared "install" was never mutated
     assert (site / "pkg/data/csrc/moe/kern.cu").read_text() == OLD
+
+
+def test_dependency_prebuild_compiles_without_loading(tmp_path, monkeypatch):
+    """The hermetic phase calls JitSpec.build only and exports the exact .so."""
+    script = Path(__file__).parent.parent / "optima/patchers/apply_dep_patch.py"
+    namespace: dict = {}
+    exec(compile(script.read_text().replace("\nmain()\n", "\n"), str(script), "exec"), namespace)
+
+    calls: list[tuple[str, object]] = []
+    specs = []
+
+    class FakeSpec:
+        name = "fused_moe_103"
+
+        def __init__(self):
+            self.jit_library_path = (
+                Path(os.environ["FLASHINFER_WORKSPACE_BASE"])
+                / "cached_ops/fused_moe_103/fused_moe_103.so"
+            )
+            specs.append(self)
+
+        def build(self, *, verbose):
+            calls.append(("build", verbose))
+            self.jit_library_path.parent.mkdir(parents=True)
+            self.jit_library_path.write_bytes(b"synthetic-elf")
+
+        def build_and_load(self):
+            calls.append(("build_and_load", None))
+            raise AssertionError("prebuild must not load")
+
+    environment = types.SimpleNamespace(FLASHINFER_CSRC_DIR=Path("/stock"))
+    generator_module = types.SimpleNamespace(
+        gen_cutlass_fused_moe_sm103_module=lambda use_fast_build=False: FakeSpec()
+    )
+
+    def fake_import(name):
+        return {
+            "flashinfer.jit.env": environment,
+            "flashinfer.jit.fused_moe": generator_module,
+        }[name]
+
+    namespace["importlib"] = types.SimpleNamespace(import_module=fake_import)
+    monkeypatch.setenv("OPTIMA_TARGET_GPU_ARCH", "sm103")
+    monkeypatch.delenv("FLASHINFER_CUDA_ARCH_LIST", raising=False)
+    monkeypatch.delenv("FLASHINFER_WORKSPACE_BASE", raising=False)
+
+    from optima.dep_policy import PATCHABLE_DEPS
+
+    artifact = tmp_path / "artifact"
+    artifact.mkdir()
+    overlay = tmp_path / "overlay"
+    overlay.mkdir()
+    rows = namespace["_build_prebuilt_modules"](
+        PATCHABLE_DEPS["flashinfer"],
+        target="flashinfer",
+        overlay_subtree=overlay,
+        artifact_root=artifact,
+    )
+
+    assert calls == [("build", False)]
+    assert environment.FLASHINFER_CSRC_DIR == overlay
+    assert rows[0]["path"] == (
+        "dep_modules/flashinfer/fused_moe_103/fused_moe_103.so"
+    )
+    assert (artifact / rows[0]["path"]).read_bytes() == b"synthetic-elf"
+    assert not specs[0].jit_library_path.parents[2].exists()  # private scratch removed
+    assert "FLASHINFER_CUDA_ARCH_LIST" not in os.environ
+    assert "FLASHINFER_WORKSPACE_BASE" not in os.environ
+
+
+def test_dependency_prebuild_rejects_off_domain_arch_before_import(tmp_path, monkeypatch):
+    script = Path(__file__).parent.parent / "optima/patchers/apply_dep_patch.py"
+    namespace: dict = {}
+    exec(compile(script.read_text().replace("\nmain()\n", "\n"), str(script), "exec"), namespace)
+    namespace["importlib"] = types.SimpleNamespace(
+        import_module=lambda _name: pytest.fail("off-domain build imported flashinfer")
+    )
+    monkeypatch.setenv("OPTIMA_TARGET_GPU_ARCH", "sm120")
+    from optima.dep_policy import PATCHABLE_DEPS
+
+    with pytest.raises(RuntimeError, match="requires target architecture 'sm103'"):
+        namespace["_build_prebuilt_modules"](
+            PATCHABLE_DEPS["flashinfer"],
+            target="flashinfer",
+            overlay_subtree=tmp_path,
+            artifact_root=tmp_path / "artifact",
+        )
+
+
+def test_build_stage_and_load_reopen_use_exact_build_identity(tmp_path, monkeypatch):
+    """Build writes the stage once; load validates read-only bytes without mutation."""
+    script = Path(__file__).parent.parent / "optima/patchers/apply_dep_patch.py"
+    namespace: dict = {}
+    exec(compile(script.read_text().replace("\nmain()\n", "\n"), str(script), "exec"), namespace)
+
+    patch_text = _diff(
+        OLD,
+        NEW,
+        path="flashinfer/data/csrc/fused_moe/kern.cu",
+    )
+    bundle = _mk_bundle(tmp_path, patch_text)
+    site = tmp_path / "site"
+    source = site / "flashinfer/data/csrc/fused_moe/kern.cu"
+    source.parent.mkdir(parents=True)
+    source.write_text(OLD)
+    artifact = tmp_path / "artifact"
+    artifact.mkdir()
+    digest = "b" * 64
+
+    from dataclasses import asdict
+    import optima.dep_policy as dep_policy
+
+    policy = dep_policy.PATCHABLE_DEPS["flashinfer"]
+    module = policy.prebuilt_modules[0]
+
+    def fake_modules(_policy, *, target, overlay_subtree, artifact_root):
+        assert (overlay_subtree / "fused_moe/kern.cu").read_text() == NEW
+        relative = dep_policy.prebuilt_module_relative_path(target, module)
+        output = artifact_root / relative
+        output.parent.mkdir(parents=True)
+        payload = b"compiled-module"
+        output.write_bytes(payload)
+        return [{
+            **asdict(module),
+            "path": relative,
+            "sha256": hashlib.sha256(payload).hexdigest(),
+            "size": len(payload),
+        }]
+
+    namespace["_build_prebuilt_modules"] = fake_modules
+    monkeypatch.setattr(dep_policy, "dependency_site_root", lambda _policy: site)
+    manifest = __import__("optima.manifest", fromlist=["load_manifest"]).load_manifest(bundle)
+    parsed = parse_patch_text(patch_text)
+    namespace["_materialize"](
+        bundle,
+        "flashinfer",
+        [("patches/p.patch", parsed)],
+        policy,
+        artifact_root=artifact,
+        build_spec_digest=digest,
+        manifest=manifest,
+    )
+
+    validated = dep_policy.validate_overlay(
+        bundle,
+        "flashinfer",
+        artifact_root=artifact,
+        build_spec_digest=digest,
+    )
+    assert validated.build_spec_digest == digest
+    assert (validated.subtree / "fused_moe/kern.cu").read_text() == NEW
+    assert manifest.bundle_id == "dep-patch-test"  # never participates in the path
+    assert "dep-patch-test" not in str(validated.root)
+
+    from optima.eval.native_artifact import publish_native_artifact
+
+    publication = publish_native_artifact(
+        artifact, tmp_path / "published", build_spec_digest=digest
+    )
+    artifact = publication.root
+    before = {
+        str(path.relative_to(artifact)): (path.stat().st_mode, path.stat().st_mtime_ns, path.stat().st_size)
+        for path in artifact.rglob("*")
+    }
+    monkeypatch.setenv("OPTIMA_BUNDLE_PATH", str(bundle))
+    monkeypatch.setenv("OPTIMA_REBUILD_PHASE", "load")
+    monkeypatch.setenv("OPTIMA_NATIVE_BUILD_SPEC_DIGEST", digest)
+    monkeypatch.setenv("OPTIMA_NATIVE_ARTIFACT_ROOT", str(artifact))
+    monkeypatch.setenv(
+        "OPTIMA_NATIVE_ARTIFACT_PUBLICATION_DIGEST",
+        publication.publication_digest,
+    )
+    namespace["main"]()
+    after = {
+        str(path.relative_to(artifact)): (path.stat().st_mode, path.stat().st_mtime_ns, path.stat().st_size)
+        for path in artifact.rglob("*")
+    }
+    assert after == before
+
+    monkeypatch.setenv("OPTIMA_NATIVE_BUILD_SPEC_DIGEST", "c" * 64)
+    with pytest.raises(RuntimeError, match="build_spec_digest.*mismatches"):
+        namespace["main"]()
 
 
 # -- the REAL artifact ----------------------------------------------------------

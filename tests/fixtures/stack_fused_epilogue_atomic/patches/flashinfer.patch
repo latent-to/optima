@@ -1,5 +1,5 @@
---- a/data/csrc/fused_moe/fused_moe.cu
-+++ b/data/csrc/fused_moe/fused_moe.cu
+--- a/flashinfer/data/csrc/fused_moe/fused_moe.cu
++++ b/flashinfer/data/csrc/fused_moe/fused_moe.cu
 @@ -1 +1 @@
 -old_finalize();
 +export_prefinalize();

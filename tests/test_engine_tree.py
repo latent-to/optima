@@ -387,6 +387,11 @@ def test_override_entry_shim_preserves_required_ref_and_optional_device_entry(
 
     monkeypatch.syspath_prepend(str(result.root))
     monkeypatch.setattr(sys, "dont_write_bytecode", True)
+    # The SGLang/CUDA validation image installs CuTeDSL even when no GPU is
+    # exposed. Make this specifically the portable-reference branch that the
+    # test names, independent of ambient toolchain packages.
+    monkeypatch.setitem(sys.modules, "cutlass", None)
+    monkeypatch.setitem(sys.modules, "cutlass.cute", None)
     before_modules = set(sys.modules)
     try:
         module = load_module(result.root / op.source)

@@ -155,18 +155,14 @@ def _dep_overlay_env(bundle_path: str) -> None:
     """
     import os
 
-    try:
-        from optima.dep_policy import overlay_base
-        from optima.manifest import load_manifest
+    from optima.manifest import load_manifest
 
-        manifest = load_manifest(bundle_path)
-        if manifest.dep_patches and "FLASHINFER_WORKSPACE_BASE" not in os.environ:
-            ws = overlay_base(manifest.bundle_id) / "jit_workspace"
-            ws.mkdir(parents=True, exist_ok=True)
-            os.environ["FLASHINFER_WORKSPACE_BASE"] = str(ws)
-            logger.info("optima: candidate-local FLASHINFER_WORKSPACE_BASE=%s", ws)
-    except Exception:  # noqa: BLE001 - a bad bundle fails later at load, with context
-        logger.exception("optima: dep-overlay env setup failed for %s", bundle_path)
+    manifest = load_manifest(bundle_path)
+    if manifest.dep_patches and "FLASHINFER_WORKSPACE_BASE" not in os.environ:
+        raise RuntimeError(
+            "dep-patched candidate lacks its content-addressed FlashInfer workspace; "
+            "the reviewed rebuild phase did not provision the runtime environment"
+        )
 
 
 def engine_kwargs(cfg, *, active: bool = False) -> dict[str, Any]:

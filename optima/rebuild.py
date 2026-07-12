@@ -35,7 +35,7 @@ import runpy
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 # Reviewed patchers live ONLY here (repo-relative). A repo_python step may select a
 # registered file under this directory and nowhere else.
@@ -48,6 +48,10 @@ _REGISTERED_PATCHERS = {
 
 class RebuildError(RuntimeError):
     pass
+
+
+RebuildPhase = Literal["all", "build", "load"]
+_REBUILD_PHASES = frozenset({"all", "build", "load"})
 
 
 @dataclass(frozen=True)
@@ -223,13 +227,20 @@ def parse_rebuild_plan(bundle_path: str | Path) -> RebuildPlan | None:
     return RebuildPlan(schema_version=1, steps=tuple(step for _, step in parsed))
 
 
-def apply_rebuild_plan(bundle_path: str | Path) -> bool:
+def apply_rebuild_plan(
+    bundle_path: str | Path, *, phase: RebuildPhase = "all"
+) -> bool:
     """Apply ``rebuild.json`` from ``bundle_path`` if present.
 
     Returns True when a plan was found and applied. All paths are repo-relative or
-    bundle-relative and containment-checked. Network isolation is handled by the
-    caller before this function is invoked.
+    bundle-relative and containment-checked. ``build`` creates native products but
+    must not load them, while ``load`` may validate and load an already-published
+    product but must not compile or repair it. ``all`` preserves the old direct-eval
+    behavior as an explicitly non-authoritative development path. Isolation and the
+    phase-specific mounts are owned by the caller.
     """
+    if phase not in _REBUILD_PHASES:
+        raise RebuildError(f"unsupported rebuild phase: {phase!r}")
     bundle = Path(bundle_path).resolve()
     plan = parse_rebuild_plan(bundle)
     if plan is None:
@@ -241,11 +252,13 @@ def apply_rebuild_plan(bundle_path: str | Path) -> bool:
             raise RebuildError(f"cannot reread rebuild patcher {step.path!r}") from exc
         if current_hash != step.patcher_sha256:
             raise RebuildError(f"rebuild patcher changed after parsing: {step.path!r}")
-        _run_python_script(step._script_path, bundle=bundle)
+        _run_python_script(step._script_path, bundle=bundle, phase=phase)
     return True
 
 
-def _run_python_script(script: Path, *, bundle: Path) -> None:
+def _run_python_script(
+    script: Path, *, bundle: Path, phase: RebuildPhase
+) -> None:
     """Run a reviewed patcher with the triggering bundle's path in the environment.
 
     ``OPTIMA_BUNDLE_PATH`` is the patcher contract: every caller of
@@ -256,8 +269,10 @@ def _run_python_script(script: Path, *, bundle: Path) -> None:
     validated nothing)."""
     old_argv = sys.argv
     old_bundle = os.environ.get("OPTIMA_BUNDLE_PATH")
+    old_phase = os.environ.get("OPTIMA_REBUILD_PHASE")
     sys.argv = [str(script)]
     os.environ["OPTIMA_BUNDLE_PATH"] = str(bundle)
+    os.environ["OPTIMA_REBUILD_PHASE"] = phase
     try:
         runpy.run_path(str(script), run_name="__main__")
     finally:
@@ -266,3 +281,34 @@ def _run_python_script(script: Path, *, bundle: Path) -> None:
             os.environ.pop("OPTIMA_BUNDLE_PATH", None)
         else:
             os.environ["OPTIMA_BUNDLE_PATH"] = old_bundle
+        if old_phase is None:
+            os.environ.pop("OPTIMA_REBUILD_PHASE", None)
+        else:
+            os.environ["OPTIMA_REBUILD_PHASE"] = old_phase
+
+
+def _main(argv: list[str] | None = None) -> int:
+    """Container/development entry point; never a trusted-host rebuild API."""
+    import argparse
+
+    parser = argparse.ArgumentParser(prog="python -m optima.rebuild")
+    parser.add_argument("--phase", choices=sorted(_REBUILD_PHASES), required=True)
+    parser.add_argument("bundle")
+    args = parser.parse_args(argv)
+    if args.phase == "build" and os.environ.get("OPTIMA_REBUILD_CONTAINER") != "1":
+        raise RebuildError(
+            "build subprocess entry requires the disposable rebuild container"
+        )
+    if args.phase == "load" and os.environ.get("OPTIMA_ENGINE_WORKER") != "1":
+        raise RebuildError("load subprocess entry requires an isolated engine worker")
+    if args.phase == "all" and os.environ.get("OPTIMA_REBUILD_DEVELOPMENT") != "1":
+        raise RebuildError(
+            "combined rebuild entry is development-only; set "
+            "OPTIMA_REBUILD_DEVELOPMENT=1 explicitly"
+        )
+    apply_rebuild_plan(args.bundle, phase=args.phase)
+    return 0
+
+
+if __name__ == "__main__":  # pragma: no cover - exercised by subprocess tests
+    raise SystemExit(_main())

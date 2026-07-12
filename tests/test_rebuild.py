@@ -10,6 +10,7 @@ import pytest
 from optima.rebuild import (
     RebuildError,
     RebuildPlan,
+    _main,
     apply_rebuild_plan,
     parse_rebuild_plan,
 )
@@ -78,6 +79,72 @@ def test_parse_is_pure_and_canonicalizes_registered_order(tmp_path, monkeypatch)
 
     assert apply_rebuild_plan(bundle) is True
     assert marker.read_text().splitlines() == ["patch", "build"]
+
+
+@pytest.mark.parametrize("phase", ["all", "build", "load"])
+def test_rebuild_phase_is_passed_exactly_and_environment_is_restored(
+    tmp_path, monkeypatch, phase
+):
+    marker = tmp_path / "phase"
+    repo = _fake_repo(tmp_path)
+    patcher = repo / "optima" / "patchers" / "build_cuda_ext.py"
+    patcher.write_text(
+        "import os\n"
+        f"open({str(marker)!r}, 'w').write(os.environ['OPTIMA_REBUILD_PHASE'])\n"
+    )
+    monkeypatch.setenv("OPTIMA_REPO_ROOT", str(repo))
+    monkeypatch.setenv("OPTIMA_REBUILD_PHASE", "sentinel")
+    bundle = _bundle(
+        tmp_path / "bundle", {"steps": [_step("build_cuda_ext.py")]}
+    )
+
+    assert apply_rebuild_plan(bundle, phase=phase) is True
+    assert marker.read_text() == phase
+    assert __import__("os").environ["OPTIMA_REBUILD_PHASE"] == "sentinel"
+
+
+def test_unknown_rebuild_phase_rejects_before_patcher_execution(tmp_path, monkeypatch):
+    marker = tmp_path / "ran"
+    monkeypatch.setenv("OPTIMA_REPO_ROOT", str(_fake_repo(tmp_path, marker=marker)))
+    bundle = _bundle(
+        tmp_path / "bundle", {"steps": [_step("build_cuda_ext.py")]}
+    )
+    with pytest.raises(RebuildError, match="unsupported rebuild phase"):
+        apply_rebuild_plan(bundle, phase="candidate")  # type: ignore[arg-type]
+    assert not marker.exists()
+
+
+@pytest.mark.parametrize(
+    "phase,message",
+    [
+        ("build", "disposable rebuild container"),
+        ("load", "isolated engine worker"),
+        ("all", "development-only"),
+    ],
+)
+def test_module_entry_requires_phase_specific_container_authority(
+    tmp_path, monkeypatch, phase, message
+):
+    monkeypatch.delenv("OPTIMA_REBUILD_CONTAINER", raising=False)
+    monkeypatch.delenv("OPTIMA_ENGINE_WORKER", raising=False)
+    monkeypatch.delenv("OPTIMA_REBUILD_DEVELOPMENT", raising=False)
+    with pytest.raises(RebuildError, match=message):
+        _main(["--phase", phase, str(tmp_path)])
+
+
+@pytest.mark.parametrize(
+    "phase,environment",
+    [
+        ("build", ("OPTIMA_REBUILD_CONTAINER", "1")),
+        ("load", ("OPTIMA_ENGINE_WORKER", "1")),
+        ("all", ("OPTIMA_REBUILD_DEVELOPMENT", "1")),
+    ],
+)
+def test_module_entry_accepts_only_explicit_internal_or_development_lane(
+    tmp_path, monkeypatch, phase, environment
+):
+    monkeypatch.setenv(*environment)
+    assert _main(["--phase", phase, str(tmp_path)]) == 0
 
 
 def test_parser_normalizes_the_only_two_accepted_path_spellings(tmp_path, monkeypatch):

@@ -607,6 +607,23 @@ def test_lifecycle_derives_prompt_pool_and_exact_selected_trajectories(tmp_path:
     ) != selected
 
 
+def test_trajectory_topk_accepts_ties_without_relabeling_runtime_top_one():
+    from optima.eval.qualification import _validated_topk_position
+
+    left = ((-0.5, 19), (-0.5, 7), (-1.0, 3))
+    right = ((-1.0, 3), (-0.5, 7), (-0.5, 19))
+    assert _validated_topk_position(left) == [
+        ["-0.5", 19], ["-0.5", 7], ["-1", 3]
+    ]
+    with pytest.raises(QualificationError, match="order"):
+        _validated_topk_position(right)
+
+    with pytest.raises(QualificationError, match="duplicate"):
+        _validated_topk_position(((-0.5, 7), (-1.0, 7)))
+    with pytest.raises(QualificationError, match="invalid"):
+        _validated_topk_position(((float("nan"), 7),))
+
+
 def test_trajectory_projection_rejects_subset_relabel_and_short_topk(tmp_path: Path):
     from tests.test_scoring import _lifecycle
 

@@ -53,6 +53,7 @@ from optima.eval.oci_outer_session import (
 from optima.eval.oci_prebuild import (
     OCIPrebuildConfig,
     OCIPrebuildResult,
+    PREBUILD_RECEIPT,
     run_oci_prebuild,
 )
 from optima.eval.oci_process import OCILease, OCIProcessManager, OCIQuiescenceReceipt
@@ -87,6 +88,17 @@ _OPAQUE_ID = re.compile(r"runtime-[0-9a-f]{32}\Z")
 
 class OCIBackendError(RuntimeError):
     """A trusted identity, resource, launch, or cleanup fact is invalid."""
+
+
+def _reference_publication_is_control_only(
+    publication: NativeArtifactPublication,
+) -> bool:
+    """Return whether a pristine publication contains only trusted metadata."""
+
+    return (
+        publication.directories == ()
+        and tuple(row.path for row in publication.files) == (PREBUILD_RECEIPT,)
+    )
 
 
 class OCIBackendDeadlineError(OCIBackendError):
@@ -990,7 +1002,10 @@ class OCIEngineExecutor:
             expected_publication_digest=prebuild.publication.publication_digest,
             limits=self.config.native_limits,
         )
-        if session_protocol == "reference" and publication.files:
+        if (
+            session_protocol == "reference"
+            and not _reference_publication_is_control_only(publication)
+        ):
             raise OCIBackendError("pristine reference exposes candidate native artifacts")
         _validate_mount_roots(
             model_root,
@@ -1040,7 +1055,7 @@ class OCIEngineExecutor:
             )
             if session_protocol == "reference" and (
                 resolved.materialized_tree.runtime_manifest is not None
-                or publication.files
+                or not _reference_publication_is_control_only(publication)
             ):
                 raise OCIBackendError("pristine reference inputs acquired contribution state")
             reopen_launch_tree(launch, resolved.materialized_tree_root)

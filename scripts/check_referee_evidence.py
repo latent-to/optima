@@ -93,6 +93,19 @@ PR4C_FORBIDDEN_MODULES = [
     "optima.eval.capability",
     "optima.eval.throughput_kl",
 ]
+PR4D_BASE = "7b45146a9c7c4e21859fe2878fc3e62a644725e4"
+PR4D_PRODUCTION = [
+    "optima/eval/engine_worker.py",
+    "optima/eval/oci_session_protocol.py",
+    "optima/eval/oci_session_worker.py",
+    "optima/seams.py",
+]
+PR4D_TESTS = [
+    "tests/test_oci_session_protocol.py",
+    "tests/test_oci_session_worker_order.py",
+]
+PR4D_AUTHORITY_ROOTS = ["optima.eval.oci_session_protocol"]
+PR4D_FORBIDDEN_MODULES = PR4C_FORBIDDEN_MODULES
 
 
 class EvidenceError(ValueError):
@@ -301,7 +314,7 @@ def validate_record(record: dict[str, Any], root: Path, where: str) -> None:
         for item in record["claims"]
     ):
         raise EvidenceError("PR 43 must preserve the invalid exact-head full-suite claim")
-    if record["github_pr"] in {47, 48}:
+    if record["github_pr"] in {47, 48, 49}:
         if schema_version != 2:
             raise EvidenceError("retained referee PR evidence must use schema v2")
         retained = {
@@ -375,6 +388,21 @@ def validate_contract_document(contract: dict[str, Any], where: str = "contract"
                 {"change": "modify", "path": "optima/eval/reference_quality.py"},
             ],
             "authority": {"forbidden_modules": PR4C_FORBIDDEN_MODULES, "roots": PR4C_AUTHORITY_ROOTS},
+        },
+        "pr4d": {
+            "schema_version": 2,
+            "architectural_unit": "4d",
+            "base_commit": PR4D_BASE,
+            "budget": {"exemption_policy": "none", "production_additions_max": 250, "test_additions_max": 250},
+            "production": PR4D_PRODUCTION,
+            "test": PR4D_TESTS,
+            "required": [
+                {"change": "modify", "path": "optima/eval/engine_worker.py"},
+                {"change": "modify", "path": "optima/eval/oci_session_protocol.py"},
+                {"change": "modify", "path": "optima/eval/oci_session_worker.py"},
+                {"change": "modify", "path": "optima/seams.py"},
+            ],
+            "authority": {"forbidden_modules": PR4D_FORBIDDEN_MODULES, "roots": PR4D_AUTHORITY_ROOTS},
         },
     }
     spec = specs.get(contract["contract_id"])
@@ -718,7 +746,7 @@ def validate_repository(root: Path, *, records_only: bool = False, pr_base: str 
     evidence = root / "evidence/referee-hardening"
     load_json(evidence / "schema-v1.json")
     schema_v2 = load_json(evidence / "schema-v2.json")
-    expected = set(range(40, 49))
+    expected = set(range(40, 50))
     seen: set[int] = set()
     for path in sorted((evidence / "records").glob("pr-*.json")):
         record = load_json(path)
@@ -737,7 +765,7 @@ def validate_repository(root: Path, *, records_only: bool = False, pr_base: str 
             raise EvidenceError(f"duplicate scope contract: {contract['contract_id']}")
         contract_ids.add(contract["contract_id"])
         contracts.append((contract_path, contract))
-    if contract_ids != {"pr4a", "pr4b", "pr4c"}:
+    if contract_ids != {"pr4a", "pr4b", "pr4c", "pr4d"}:
         raise EvidenceError(f"scope contract set differs: {sorted(contract_ids)}")
     if records_only:
         return

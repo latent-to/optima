@@ -1,0 +1,63 @@
+{
+  "allowed_paths": {
+    "control_exact": [
+      ".github/workflows/referee-evidence.yml",
+      "scripts/check_referee_evidence.py",
+      "tests/test_referee_evidence.py"
+    ],
+    "control_prefixes": [
+      "evidence/referee-hardening/"
+    ],
+    "production": [
+      "optima/eval/engine_worker.py",
+      "optima/eval/oci_session_protocol.py",
+      "optima/eval/oci_session_worker.py",
+      "optima/seams.py"
+    ],
+    "test": [
+      "tests/test_oci_session_protocol.py",
+      "tests/test_oci_session_worker_order.py"
+    ]
+  },
+  "architectural_unit": "4d",
+  "authority_boundary": {
+    "forbidden_modules": [
+      "optima.audit",
+      "optima.chain.validator_loop",
+      "optima.cli",
+      "optima.eval._launch",
+      "optima.eval.capability",
+      "optima.eval.throughput_kl"
+    ],
+    "roots": [
+      "optima.eval.oci_session_protocol"
+    ]
+  },
+  "base_commit": "7b45146a9c7c4e21859fe2878fc3e62a644725e4",
+  "budget": {
+    "exemption_policy": "none",
+    "production_additions_max": 250,
+    "test_additions_max": 250
+  },
+  "contract_id": "pr4d",
+  "record_type": "scope_contract",
+  "required_in_place": [
+    {
+      "change": "modify",
+      "path": "optima/eval/engine_worker.py"
+    },
+    {
+      "change": "modify",
+      "path": "optima/eval/oci_session_protocol.py"
+    },
+    {
+      "change": "modify",
+      "path": "optima/eval/oci_session_worker.py"
+    },
+    {
+      "change": "modify",
+      "path": "optima/seams.py"
+    }
+  ],
+  "schema_version": 2
+}

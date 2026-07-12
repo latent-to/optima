@@ -264,17 +264,24 @@ def isolated_engine_session(
 
         seam.mark_driver()
         receipts = receipt_module
+    from optima.seams import seam_binding_environment
+
+    gate_environment = seam_binding_environment(
+        getattr(cfg, "seam_bindings", ()) if install_seams else ()
+    )
     receipt_dir = tempfile.mkdtemp(prefix="optima_receipts_") if active else ""
     try:
-        with _environment(
-            OPTIMA_ACTIVE="1" if active else "0",
-            OPTIMA_BUNDLE_PATH=bundle_path if active else "",
-            OPTIMA_FRAMEWORK_MODE="1" if framework_mode else "0",
-            OPTIMA_SEAM_RECEIPT_DIR=receipt_dir,
-            OPTIMA_SLOT_AUDIT="",
-            OPTIMA_SLOT_AUDIT_SEED="",
-            SGLANG_PLUGINS="optima" if install_seams else "",
-        ):
+        session_environment = {
+            "OPTIMA_ACTIVE": "1" if active else "0",
+            "OPTIMA_BUNDLE_PATH": bundle_path if active else "",
+            "OPTIMA_FRAMEWORK_MODE": "1" if framework_mode else "0",
+            "OPTIMA_SEAM_RECEIPT_DIR": receipt_dir,
+            "OPTIMA_SLOT_AUDIT": "",
+            "OPTIMA_SLOT_AUDIT_SEED": "",
+            "SGLANG_PLUGINS": "optima" if install_seams else "",
+            **gate_environment,
+        }
+        with _environment(**session_environment):
             import sglang as sgl
 
             kwargs = engine_kwargs(cfg, active=active)

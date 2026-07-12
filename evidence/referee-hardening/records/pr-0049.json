@@ -1,0 +1,165 @@
+{
+  "architectural_unit": "4c",
+  "artifacts": [
+    {
+      "availability": "repository",
+      "id": "github.referee-evidence",
+      "kind": "github-check-receipt",
+      "locator": "evidence/referee-hardening/artifacts/pr-0049-github-checks.json",
+      "reason": null,
+      "sha256": "e753b83cdc326125426658d02371c3733df91f3569395aef48823ba77c680382",
+      "size_bytes": 1844
+    },
+    {
+      "availability": "digest_only",
+      "id": "gpu.seam-binding-negative",
+      "kind": "gpu-receipt",
+      "locator": null,
+      "reason": "The 7309-byte TP8 receipt remains in the private campaign ledger; it records a faithful graph PASS followed by fail-closed candidate completion coverage 0/8 and zero GPU residue.",
+      "sha256": "540aa904586c857d59c2b0a993268c72baa81826e3de6d932c791b9a03286070",
+      "size_bytes": null
+    },
+    {
+      "availability": "unavailable",
+      "id": "tests.pod-full",
+      "kind": "test-log",
+      "locator": null,
+      "reason": "The RTX-container 1386-pass and 3-skip aggregate was reported without retaining the raw log.",
+      "sha256": null,
+      "size_bytes": null
+    },
+    {
+      "availability": "unavailable",
+      "id": "review.causal-qualification",
+      "kind": "review-report",
+      "locator": null,
+      "reason": "The implementation, adversarial, and confirmation reviews were reported without retaining their raw bytes.",
+      "sha256": null,
+      "size_bytes": null
+    }
+  ],
+  "claims": [
+    {
+      "artifact_ids": [],
+      "id": "scope.causal-qualification",
+      "statement": "The implementation publishes and reopens a typed causal B/C cohort, post-candidate pristine-reference transcript, and aggregate PASS, FAIL, or NO_DECISION evidence product.",
+      "status": "verified"
+    },
+    {
+      "artifact_ids": [
+        "github.referee-evidence"
+      ],
+      "id": "tests.github-referee-evidence",
+      "statement": "The retained GitHub receipt records successful evidence and CodeQL checks for the implementation head.",
+      "status": "verified"
+    },
+    {
+      "artifact_ids": [
+        "tests.pod-full"
+      ],
+      "id": "tests.pod-full",
+      "statement": "The exact-head RTX-container suite was reported as 1386 passed and 3 skipped; its raw log is unavailable.",
+      "status": "reported_unretained"
+    },
+    {
+      "artifact_ids": [
+        "gpu.seam-binding-negative"
+      ],
+      "id": "gpu.seam-binding-negative",
+      "statement": "A digest-retained TP8 attempt proved graph verification and fail-closed completion, while exposing that validator seam selection was absent from the isolated engine protocol.",
+      "status": "digest_only"
+    },
+    {
+      "artifact_ids": [],
+      "id": "authority.aggregate",
+      "statement": "The causal runner independently reopens graph, speed, calibration, and pristine-reference quality evidence before publishing its aggregate decision.",
+      "status": "verified"
+    }
+  ],
+  "classified_diff": {
+    "documentation": {
+      "added": 0,
+      "deleted": 0
+    },
+    "evidence": {
+      "added": 383,
+      "deleted": 102
+    },
+    "production": {
+      "added": 1397,
+      "deleted": 12
+    },
+    "test": {
+      "added": 979,
+      "deleted": 12
+    },
+    "tooling": {
+      "added": 106,
+      "deleted": 58
+    },
+    "vendor": {
+      "added": 0,
+      "deleted": 0
+    }
+  },
+  "exit_criteria": [
+    {
+      "artifact_ids": [],
+      "id": "authority.causal-aggregate",
+      "statement": "Causal teardown, entropy selection, one pristine-reference lifetime, and replayable aggregate grading are represented by typed retained evidence.",
+      "status": "verified"
+    },
+    {
+      "artifact_ids": [
+        "gpu.seam-binding-negative"
+      ],
+      "id": "gpu.joined-proof",
+      "statement": "The joined TP8 exit proof was invalidated because isolated sessions did not transport validator-owned seam activation.",
+      "status": "invalidated"
+    },
+    {
+      "artifact_ids": [
+        "github.referee-evidence"
+      ],
+      "id": "ci.evidence-check",
+      "statement": "The repository-retained GitHub receipt binds successful evidence checks to the implementation head.",
+      "status": "verified"
+    }
+  ],
+  "github_pr": 49,
+  "identity": {
+    "base_commit": "f4a68d1a7ecf9c21f3ee6e765e1ad596f108764e",
+    "implementation_commit": "03961936463edcea38fd3e04b314b9204651953a",
+    "implementation_tree": "b0dea32ca928022fde4640986b15dcb3dc49da86",
+    "merge_commit": "7b45146a9c7c4e21859fe2878fc3e62a644725e4"
+  },
+  "nonclaims": [
+    "chain.integration",
+    "crown.authority",
+    "gpu.joined-pass",
+    "production.live-wiring",
+    "settlement.authority"
+  ],
+  "record_type": "pr_evidence",
+  "reviews": [
+    {
+      "artifact_id": "review.causal-qualification",
+      "phase": "implementation",
+      "status": "reported_unretained",
+      "summary": "Implementation review was reported during development; no report bytes were retained."
+    },
+    {
+      "artifact_id": "review.causal-qualification",
+      "phase": "adversarial",
+      "status": "reported_unretained",
+      "summary": "Adversarial review was reported during development; no report bytes were retained."
+    },
+    {
+      "artifact_id": "review.causal-qualification",
+      "phase": "confirmation",
+      "status": "reported_unretained",
+      "summary": "Confirmation review was reported during development; no report bytes were retained."
+    }
+  ],
+  "schema_version": 2
+}

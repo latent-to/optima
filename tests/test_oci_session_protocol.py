@@ -12,6 +12,13 @@ from pathlib import Path
 import pytest
 
 import optima.eval.oci_session_protocol as protocol
+from optima.seams import (
+    SEAM_ADAPTERS,
+    SEAM_BINDINGS,
+    SEAM_BINDING_ENV_GATES,
+    normalize_seam_bindings,
+    seam_binding_environment,
+)
 from optima.eval.oci_session_protocol import (
     CONTROL_MAGIC,
     EVIDENCE_MAGIC,
@@ -75,6 +82,7 @@ def _config(**changes: object) -> EngineSessionConfig:
             "page_size": 64,
             "enable_flashinfer_allreduce_fusion": True,
         },
+        "seam_bindings": (),
     }
     values.update(changes)
     return EngineSessionConfig(**values)  # type: ignore[arg-type]
@@ -147,6 +155,83 @@ def test_engine_config_is_exact_immutable_and_digest_stable() -> None:
     assert len(config.digest) == 64
 
 
+def test_seam_binding_table_is_closed_and_deep_epilogue_shares_arfusion() -> None:
+    assert dict(SEAM_BINDING_ENV_GATES) == {
+        "arfusion": "OPTIMA_ARFUSION_SEAM",
+        "attention": "OPTIMA_ATTENTION_SEAM",
+        "collective": "OPTIMA_COLLECTIVE_SEAM",
+        "moe": "OPTIMA_MOE_SEAM",
+        "msa_prefill": "OPTIMA_MSA_PREFILL_SEAM",
+    }
+    bindings = {binding.binding_id: binding for binding in SEAM_BINDINGS}
+    assert bindings["arfusion"].adapters == (
+        "arfusion",
+        "defer_gate",
+        "moe_export",
+    )
+    for binding in SEAM_BINDINGS:
+        adapter_rows = tuple(
+            adapter
+            for adapter in SEAM_ADAPTERS
+            if adapter.binding_id == binding.binding_id
+        )
+        assert tuple(adapter.name for adapter in adapter_rows) == binding.adapters
+        assert {adapter.environment_gate for adapter in adapter_rows} == {
+            binding.environment_gate
+        }
+
+
+def test_seam_bindings_normalize_and_emit_complete_explicit_environment() -> None:
+    selected = normalize_seam_bindings(["arfusion", "msa_prefill"])
+    assert selected == ("arfusion", "msa_prefill")
+    assert seam_binding_environment(selected) == {
+        "OPTIMA_ARFUSION_SEAM": "1",
+        "OPTIMA_ATTENTION_SEAM": "0",
+        "OPTIMA_COLLECTIVE_SEAM": "0",
+        "OPTIMA_MOE_SEAM": "0",
+        "OPTIMA_MSA_PREFILL_SEAM": "1",
+    }
+    assert seam_binding_environment(()) == {
+        "OPTIMA_ARFUSION_SEAM": "0",
+        "OPTIMA_ATTENTION_SEAM": "0",
+        "OPTIMA_COLLECTIVE_SEAM": "0",
+        "OPTIMA_MOE_SEAM": "0",
+        "OPTIMA_MSA_PREFILL_SEAM": "0",
+    }
+
+
+@pytest.mark.parametrize(
+    ("value", "match"),
+    [
+        ("attention", "array"),
+        ({"attention"}, "array"),
+        (("unknown",), "unknown"),
+        (("moe", "attention"), "sorted"),
+        (("attention", "attention"), "duplicates"),
+        (("attention", 1), "strings"),
+    ],
+)
+def test_seam_bindings_reject_noncanonical_or_open_input(
+    value: object, match: str
+) -> None:
+    with pytest.raises(ValueError, match=match):
+        normalize_seam_bindings(value)
+    with pytest.raises(ValueError, match=match):
+        seam_binding_environment(value)
+
+
+def test_engine_config_binds_seams_in_wire_and_digest() -> None:
+    config = _config(seam_bindings=("attention", "collective"))
+    row = config.to_dict()
+    assert row["seam_bindings"] == ["attention", "collective"]
+    assert EngineSessionConfig.from_dict(row) == config
+    assert config.digest != _config().digest
+
+    row["seam_bindings"] = ("attention",)
+    with pytest.raises(SessionProtocolError, match="array"):
+        EngineSessionConfig.from_dict(row)
+
+
 @pytest.mark.parametrize(
     ("changes", "match"),
     [
@@ -162,6 +247,10 @@ def test_engine_config_is_exact_immutable_and_digest_stable() -> None:
         ({"moe_runner_backend": "x\n"}, "moe_runner_backend"),
         ({"engine_kwargs": {"arbitrary": True}}, "unsupported keys"),
         ({"engine_kwargs": {"page_size": False}}, "page_size"),
+        ({"seam_bindings": "attention"}, "array"),
+        ({"seam_bindings": ("moe", "attention")}, "sorted"),
+        ({"seam_bindings": ("attention", "attention")}, "duplicates"),
+        ({"seam_bindings": ("unknown",)}, "unknown"),
     ],
 )
 def test_engine_config_rejects_invalid_and_unreviewed_fields(

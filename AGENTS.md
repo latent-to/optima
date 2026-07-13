@@ -8,8 +8,8 @@
 **Optima** is a Bittensor-style subnet that incentivizes **inference-throughput
 optimization**. Miners submit GPU **kernels** (Triton / CuteDSL) for individual
 ops in a *fixed* model; a validator swaps each kernel into the model it controls,
-runs it, and scores it on **throughput** gated by **output fidelity** (per-token
-KL + real-benchmark task accuracy). The endgame is a continuously-improving SOTA
+runs it, and scores it on **throughput** gated by **output fidelity** (in-engine
+audit + pristine-reference distribution and task checks). The endgame is a continuously-improving SOTA
 inference stack sold as a managed service; the validator endgame is an 8×B200
 fleet evaluating submissions.
 
@@ -59,8 +59,8 @@ This repo is the **validator harness** (the referee), plus example miner bundles
   selection + attend — gated on per-row `topk_overlap`, with a long-chunk verify shape
   that makes causality violations detectable through the set metric; the seam row's
   `requires` makes the compat canary SKIP it on pins without `minimax_sparse_ops`; its
-  regime is prefill-heavy serving, so score it with `evaluate --input-len` — the short
-  prompt corpus is a pure-decode regime that cannot see a prefill win);
+  regime is prefill-heavy serving, so score it on a prefill-heavy workload — a
+  short-prompt pure-decode regime cannot see a prefill win);
   `moe.fused_experts` (block
   via the `FusedMoE.forward` seam, `OPTIMA_MOE_SEAM=1`); `collective.all_reduce`
   (the TP comms waist, via the `GroupCoordinator.all_reduce` seam,
@@ -175,11 +175,13 @@ pip install -e ".[cpu,dev]" && pytest tests/   # [cpu] pulls torch (the core lea
 python -m optima.cli verify examples/miner_silu_torch --device cpu --dtype float32
 
 # GPU: see docs/DEV_ENVIRONMENT.md for the env setup, then
-python -m optima.cli evaluate examples/miner_silu_triton --model Qwen/Qwen2.5-0.5B-Instruct --no-deterministic
-python -m optima.cli bench     examples/miner_silu_triton --model Qwen/Qwen2.5-1.5B-Instruct --benchmarks gsm8k --samples 64
+python -m optima.cli verify examples/miner_silu_triton --device cuda --dtype bfloat16
+# authoritative scoring is validator-side: chain intake -> qualification
+# (B/C/B'/pristine-T in no-egress workers) -> reproduction -> settlement
+# (docs/TESTNET.md; the legacy local evaluate/bench diagnostics were deleted)
 ```
 
-Always run GPU evals via `python -m optima.cli` (the spawn-safe `__main__` guard
+Always run GPU work via `python -m optima.cli` (the spawn-safe `__main__` guard
 matters — sglang uses `mp spawn`).
 
 ## Conventions / gotchas (learned the hard way)

@@ -2,15 +2,13 @@ from __future__ import annotations
 
 import json
 import os
-import sys
-from types import SimpleNamespace
 
 import pytest
 
 torch = pytest.importorskip("torch")
 
-from optima import receipts, seam
-from optima.eval import _launch, engine_worker
+from optima import receipts
+from optima.eval import engine_worker
 
 
 def _active(pid: int, rank: int, slots=("a", "b"), world_size=2):
@@ -47,28 +45,23 @@ def _distributed_receipt_worker(rank, world_size, store_path, receipt_dir):
 
 
 def test_active_members_require_exact_count_and_identical_slot_set():
-    assert _launch._active_execution_members is engine_worker._active_execution_members
-    assert (
-        _launch._require_execution_completion
-        is engine_worker._require_execution_completion
-    )
     active = [_active(10, 0), _active(11, 1)]
-    assert _launch._active_execution_members(
+    assert engine_worker._active_execution_members(
         active, expected_member_count=2
     ) == ["a", "b"]
 
     with pytest.raises(RuntimeError, match="1/2"):
-        _launch._active_execution_members(active[:1], expected_member_count=2)
+        engine_worker._active_execution_members(active[:1], expected_member_count=2)
     with pytest.raises(RuntimeError, match="3/2"):
-        _launch._active_execution_members(
+        engine_worker._active_execution_members(
             [*active, _active(12, 2, world_size=3)], expected_member_count=2
         )
     with pytest.raises(RuntimeError, match="duplicate"):
-        _launch._active_execution_members(
+        engine_worker._active_execution_members(
             [active[0], {**active[1], "pid": 10}], expected_member_count=2
         )
     with pytest.raises(RuntimeError, match="disagree"):
-        _launch._active_execution_members(
+        engine_worker._active_execution_members(
             [active[0], _active(11, 1, slots=("a",))], expected_member_count=2
         )
 
@@ -82,7 +75,7 @@ def test_fired_without_completed_fails_execution_gate(tmp_path):
         0,
     )
     with pytest.raises(RuntimeError, match="failed execution coverage"):
-        _launch._require_execution_completion(
+        engine_worker._require_execution_completion(
             str(tmp_path),
             active_receipts=active,
             expected_slots=["a"],
@@ -102,7 +95,7 @@ def test_every_member_must_complete_every_slot(tmp_path):
                 index,
             )
             index += 1
-    detail = _launch._require_execution_completion(
+    detail = engine_worker._require_execution_completion(
         str(tmp_path),
         active_receipts=active,
         expected_slots=["a", "b"],
@@ -117,93 +110,12 @@ def test_any_selected_path_fallback_disqualifies(tmp_path):
     _write(tmp_path, "completed", complete, 0)
     _write(tmp_path, "fallback", {**complete, "error_type": "RuntimeError"}, 0)
     with pytest.raises(RuntimeError, match="selected-path fallbacks"):
-        _launch._require_execution_completion(
+        engine_worker._require_execution_completion(
             str(tmp_path),
             active_receipts=active,
             expected_slots=["a"],
             expected_member_count=1,
         )
-
-
-@pytest.mark.parametrize("active", (False, True))
-def test_launched_engine_calls_completion_gate_only_for_active_run(monkeypatch, active):
-    calls = []
-    receipt_dirs = []
-
-    class Engine:
-        def __init__(self, **_kwargs):
-            receipt_dirs.append(os.environ.get("OPTIMA_SEAM_RECEIPT_DIR"))
-
-        def shutdown(self):
-            pass
-
-    cfg = SimpleNamespace(
-        model_path="model",
-        dtype="float32",
-        mem_fraction_static=0.1,
-        seed=0,
-        log_level="error",
-        framework_mode=False,
-        tp_size=1,
-    )
-    monkeypatch.setitem(sys.modules, "sglang", SimpleNamespace(Engine=Engine))
-    monkeypatch.setenv("OPTIMA_SEAM_RECEIPT_DIR", "ambient")
-    monkeypatch.setattr(seam, "mark_driver", lambda: None)
-    monkeypatch.setattr(_launch, "prepare_candidate_environment", lambda *_a, **_k: None)
-    monkeypatch.setattr(_launch, "_wait_gpu_drain", lambda: None)
-    monkeypatch.setattr(
-        receipts,
-        "require",
-        lambda *_a, **_k: [_active(10, 0, slots=("a",), world_size=1)],
-    )
-    monkeypatch.setattr(
-        _launch,
-        "_require_execution_completion",
-        lambda *_a, **_k: calls.append("completed") or "ok",
-    )
-
-    with _launch.launched_engine(
-        cfg, bundle_path="bundle" if active else "", active=active
-    ):
-        pass
-
-    assert calls == (["completed"] if active else [])
-    assert bool(receipt_dirs[0]) is active
-    assert os.environ["OPTIMA_SEAM_RECEIPT_DIR"] == "ambient"
-
-
-def test_launcher_uses_final_resolved_candidate_tp_size(monkeypatch):
-    observed_counts = []
-
-    class Engine:
-        def __init__(self, **_kwargs):
-            pass
-
-        def shutdown(self):
-            pass
-
-    active = [
-        _active(10, 0, slots=("a",)),
-        _active(11, 1, slots=("a",)),
-    ]
-    monkeypatch.setitem(sys.modules, "sglang", SimpleNamespace(Engine=Engine))
-    monkeypatch.setattr(seam, "mark_driver", lambda: None)
-    monkeypatch.setattr(_launch, "prepare_candidate_environment", lambda *_a, **_k: None)
-    monkeypatch.setattr(_launch, "_wait_gpu_drain", lambda: None)
-    monkeypatch.setattr(_launch, "engine_kwargs", lambda *_a, **_k: {"tp_size": 2})
-    monkeypatch.setattr(receipts, "require", lambda *_a, **_k: active)
-
-    def completed_gate(*_args, **kwargs):
-        observed_counts.append(kwargs["expected_member_count"])
-        return "ok"
-
-    monkeypatch.setattr(_launch, "_require_execution_completion", completed_gate)
-    with _launch.launched_engine(
-        SimpleNamespace(framework_mode=False), bundle_path="bundle", active=True
-    ):
-        pass
-
-    assert observed_counts == [2]
 
 
 @pytest.mark.skipif(

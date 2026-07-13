@@ -24,7 +24,7 @@ the whole *mechanism* — typed op-slots, fused-*block* slots, **and cross-GPU *
 slots** (a slot can be one op, a region behind one typed tensor boundary, or a collective
 handed the process group), the seam that swaps an untrusted kernel into a spawned model
 process, op-correctness, bookended throughput measurement, the fidelity gates (in-engine
-audit / KL), a real-task capability gate (GSM8K + MMLU), chain-native commit-reveal
+audit + pristine-reference distribution/task checks), chain-native commit-reveal
 intake with cumulative copy disposition, and tamper-resistant timing. **Ten slots:** `activation.silu_and_mul`,
 `norm.rmsnorm` (ops); `attention.sdpa` / `attention.decode` / `attention.msa_block_score`,
 `moe.fused_experts` (blocks); `collective.all_reduce`, `moe.fused_experts_reduce`,
@@ -225,12 +225,11 @@ optima/
     flashinfer_overlay.py                  # routes the engine's flashinfer import to the patched overlay copy
     sglang_plugin.py                       # entry point for sglang builds that have a plugin fw
   eval/
-    throughput_kl.py        # bookended throughput + fidelity (audit|kl modes; calibration smoke)
-    capability.py           # throughput + fidelity + benchmark accuracy (the real-task scoring path)
-    benchmarks.py           # Benchmark protocol + GSM8K & MMLU (HF), answer extraction
+    scoring.py              # bookended B/C/B' pairing, noise-derived bar, NO-DECISION
+    reference_quality.py    # pristine-T quality record (NLL/top-k KL/argmax/coverage/task)
     oci_backend.py          # validator-owned no-egress worker lifecycle and native prebuild
     qualification_runner.py # B/C/B'/pristine-T authority and aggregate verdict
-    kl.py / prompts.py / _launch.py
+    engine_worker.py / _launch.py
   arena_service.py          # registered runtime/model/topology/workload + non-crown screen
   stack_manifest.py         # evaluation/release stack identity + integration review
   settlement.py             # paired reproduction and transactional target settlement
@@ -307,24 +306,16 @@ export CUDA_HOME=/usr/local/cuda
 export PATH=/usr/local/cuda/bin:$PWD/.venv/bin:$PATH   # sglang JIT needs nvcc+ninja
 export TORCH_CUDA_ARCH_LIST=9.0                        # set to your GPU arch (9.0=H100, 10.0=B200)
 
-# op-correctness on device
+# op-correctness on device: faithful PASSes, broken FAILs
 .venv/bin/python -m optima.cli verify examples/miner_rmsnorm_triton --device cuda
-
-# cheap KL smoke on a generic corpus (calibration / quick check)
-.venv/bin/python -m optima.cli evaluate examples/miner_silu_triton \
-    --model Qwen/Qwen2.5-0.5B-Instruct --no-deterministic            # KL gate
-
-# the real scoring path: throughput on real benchmark prompts (GSM8K + MMLU, long
-# CoT generation), gated on KL *and* task accuracy from the same run
-.venv/bin/python -m optima.cli bench examples/miner_silu_triton \
-    --model Qwen/Qwen2.5-1.5B-Instruct --benchmarks gsm8k,mmlu --samples 64
-
-# gpt-oss-120b TP=4 (multi-GPU): plain-triton MoE, custom-allreduce off
-.venv/bin/python -m optima.cli bench examples/miner_rmsnorm_broken \
-    --model openai/gpt-oss-120b --benchmarks gsm8k,mmlu --samples 16 \
-    --tp-size 4 --moe-runner-backend triton --disable-custom-all-reduce \
-    --mem-fraction 0.85   # must FAIL (accuracy collapse and/or KL blowup)
+.venv/bin/python -m optima.cli verify examples/miner_rmsnorm_broken --device cuda
 ```
+
+End-to-end throughput + fidelity scoring is validator-side: the chain intake loop
+runs the qualification bracket (B/C/B′ + pristine-T) in no-egress workers and
+settles only after independent reproduction (TESTNET.md is the runbook; the
+legacy local `evaluate`/`bench` diagnostics were deleted in the post-arc trim —
+the numbers recorded in this file were measured with them while they existed).
 
 ## The submission ABI
 

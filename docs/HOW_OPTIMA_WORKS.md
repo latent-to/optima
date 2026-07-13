@@ -112,9 +112,7 @@ the **stock** kernels (this is the reference / "gold standard") and once with th
 deterministic, and adversary-independent. "Another GPU pod" is the same idea with
 the reference on separate hardware; it's compatible, just more plumbing.
 
-The direct developer evaluator in
-[../optima/eval/throughput_kl.py](../optima/eval/throughput_kl.py) retains the simple
-baseline/candidate form. Crownable qualification uses the stricter causal authority:
+Crownable qualification uses the strict causal authority:
 baseline B, candidate C, baseline B′, then a separately launched pristine T worker that
 teacher-forces the sealed trajectories and supplies hidden quality evidence. The candidate
 worker is never the grading oracle.
@@ -428,130 +426,90 @@ the timer stays clean.
 
 ---
 
-## Part 6 — How the direct evaluator scores
+## Part 6 — How scoring measures (and why)
 
-The direct development evaluator is implemented in
-[../optima/eval/throughput_kl.py](../optima/eval/throughput_kl.py),
-`evaluate(cfg, bundle_path)`. Production crown authority wraps the same measurement
-principles in B/C/B′/pristine-T causal qualification, graph proof, authenticated raw
-evidence, and independent reproduction.
+The measurement principles below were developed on the original two-launch
+developer evaluator (deleted in the post-arc trim) and now live inside the
+production qualification authority: robust bracketing in
+[../optima/eval/scoring.py](../optima/eval/scoring.py), the B/C/B′/pristine-T
+role schedule in
+[../optima/eval/qualification_runner.py](../optima/eval/qualification_runner.py),
+the quality record in
+[../optima/eval/reference_quality.py](../optima/eval/reference_quality.py), and
+threshold provenance in [../optima/eval/calibration.py](../optima/eval/calibration.py).
 
-### 6.1 Direct baseline and candidate launches
-
-```python
-baseline  = _run_launch(cfg, prompts, bundle_path="",          active=False)  # gold standard
-candidate = _run_launch(cfg, prompts, bundle_path=bundle_path, active=True)   # miner kernel
-```
+### 6.1 Baseline and candidate launches
 
 Same weights, same seed, same sampler, same prompts — the **only** difference is
-the one op. So any delta is attributable to the kernel.
+the one kernel, so any delta is attributable to it.
 
-> **Each launch runs in its own fresh process** (`_launch.call_in_subprocess`).
-> sglang + deterministic mode set process-global CUDA/torch state (deterministic
-> algorithms, the cuBLAS workspace, the sampling backend); in a *shared* driver the
-> baseline's state corrupted the candidate launch on big MoE models (observed on
-> gpt-oss-120b: a no-op kernel "regressed" to 0%). Isolated processes make the two
-> launches independent and free all GPU memory between them. On a 120B MoE the
-> KL noise floor is also workload-dependent — score in `enable_deterministic_inference`
-> mode (floor ~0) or run KL **advisory** (`--kl-advisory`) and rely on the accuracy
-> gate; see README "Calibration findings".
+> **Each launch runs in its own fresh process.** sglang + deterministic mode set
+> process-global CUDA/torch state (deterministic algorithms, the cuBLAS workspace,
+> the sampling backend); in a *shared* driver the baseline's state corrupted the
+> candidate launch on big MoE models (observed on gpt-oss-120b: a no-op kernel
+> "regressed" to 0%). Isolated processes make the launches independent and free
+> all GPU memory between them. Production goes further: candidate execution is
+> fenced in a no-egress OCI worker, and the trusted controller never imports miner
+> code.
 
 ### 6.2 Throughput (robust)
 
-`_measure` does, per launch:
+Per launch: a **warmup** generate (so JIT/compile/graph costs aren't timed), then
+**K timed** generates, reported as the **median** + spread. Tokens come from the
+driver-known token budget (`ignore_eos` keeps budgets identical), never from the
+miner. The candidate is **bracketed** by a baseline before AND after (B, C, B′),
+paired against the mean of the brackets, with the bar derived from the measured
+baseline noise (`1 + max(margin, k·noise)`) and a NO-DECISION verdict when the
+bracketing baselines disagree (`optima/eval/scoring.py`). Median-of-K is why a
+single noisy sample can't swing the score (we measured ~7% run-to-run sd on a
+tiny model — exactly why the noise-derived bar exists).
 
-- a **warmup** generate (so JIT/compile/graph costs aren't timed),
-- then **K timed** generates (`timed_iters`, default 3),
-- records tokens/sec each time, reports the **median** + min/max/stdev (`spread`).
+### 6.3 Fidelity (distribution checks)
 
-Tokens come from sglang's trusted `meta_info["completion_tokens"]`, not from the
-miner. Timing uses `time.perf_counter` in the driver around `engine.generate`,
-with `torch.cuda.synchronize()` on both sides so async work is fully counted.
-Median-of-K is why a single noisy sample can't swing the score (we measured ~7%
-run-to-run sd on a tiny model — exactly why the margin gate exists).
-
-### 6.3 Fidelity (KL)
-
-When `return_logprob=True, top_logprobs_num=k`, sglang returns, per generated
+With `return_logprob=True, top_logprobs_num=k`, sglang exposes, per generated
 position, the top-k `(logprob, token_id, text)` — its actual output distribution.
-We capture this for baseline and candidate.
+The pristine T worker teacher-forces the sealed trajectories and the quality
+record (`reference_quality.py`) gates on the resulting statistics: `mean_nll` /
+`worst_nll`, top-k rollout KL (`topk_kl`), `argmax_rate` (sparse flips),
+`coverage_dev` (a flattened head-matching distribution that fools top-k KL), and
+the arena's `task_score`.
 
-[../optima/eval/kl.py](../optima/eval/kl.py):
+The **alignment** subtlety was a real bug fix and still governs how per-position
+comparison works: greedy decoding means baseline and candidate can *diverge* in
+their token sequence if the kernel changes an argmax. After a divergence, later
+positions aren't comparable (different context). So compare position *i*, **then**
+stop if token *i* differs — and compare position 0 *before* checking, because
+position 0 always has identical context (same prompt), so a kernel that derails
+the very first token still gets a huge KL instead of "zero comparable positions."
 
-- `kl_position(ref_topk, cand_topk)` turns each top-k list into a distribution and
-  computes `KL(ref || cand)` over the union of their supports (with a floor).
-- `kl_over_positions` averages across positions and reports `mean_kl`, `max_kl`,
-  `p99_kl`, and `argmax_disagreements` (how many positions the top token differs).
+> Honest limitation: top-k truncation approximates the true full-vocab KL. It's
+> sharp enough to catch the cheats that matter (calibration collapse, dropped
+> work) at k≥20; the in-engine audit (Part 6.5, [FIDELITY.md](FIDELITY.md))
+> closes the rest by re-running stock on clones of the candidate's real calls.
 
-The alignment (`_aligned_kl` in `throughput_kl.py`) is subtle and was a real bug
-fix: greedy decoding means baseline and candidate can *diverge* in their token
-sequence if the kernel changes an argmax. After a divergence, later positions
-aren't comparable (different context). So we compare position *i*, **then** stop
-if token *i* differs. Crucially we compare position 0 *before* checking — position
-0 always has identical context (same prompt), so a kernel that derails the very
-first token still gets a huge KL instead of "zero comparable positions."
+### 6.4 Gates and verdict
 
-> Honest limitation: top-k truncation means this approximates the true full-vocab
-> KL. It's sharp enough to catch the cheats that matter (calibration collapse,
-> dropped work) at k≥20, but production should capture full logits at a reference
-> seam for the tightest gate.
+The gate philosophy, unchanged since the first evaluator:
 
-### 6.4 Gates and score
+- **fail quality → no crown**, no matter how fast. You cannot trade correctness
+  for speed.
+- **pass quality but below the noise-derived bar → no improvement**; it can't take
+  a target, but it isn't punished.
+- **pass both → the settled value is the measured speedup** (production settles
+  the *lower* of two independent reproductions).
+- **bracketing baselines disagree → NO-DECISION**: re-queue, never crown.
 
-```python
-passed_quality  = mean_kl <= kl_threshold and num_positions > 0       # default 5e-3
-passed_speedup  = speedup >= 1.0 + speedup_margin                     # default 1.02
-score = speedup  if (passed_quality and passed_speedup)
-        else 0.0 if not passed_quality                               # cheat -> 0
-        else speedup                                                 # faithful but slow -> ~1.0, no title
-```
+### 6.5 The realistic workload + the quality authority
 
-Read that carefully — it encodes the whole philosophy:
-
-- **fail quality → score 0**, no matter how fast. You cannot trade correctness for
-  speed.
-- **pass quality but below the speedup margin → no improvement**, so it can't take
-  the title (Part 7), but it isn't punished.
-- **pass both → score = the speedup.**
-
-### 6.5 The realistic workload + the capability gate
-
-The `evaluate` path above times throughput on a generic prompt corpus — fine as a
-cheap KL/calibration smoke, but a *toy* workload (short generations on filler
-prompts). The **scoring** path is `optima bench`
-([../optima/eval/capability.py](../optima/eval/capability.py)): it drives both
-launches with a few samples from **real benchmarks** at realistic generation
-lengths, so the throughput we score reflects the decode-heavy work production
-actually does — not a 64-token toy task.
-
-Two benchmarks today
-([../optima/eval/benchmarks.py](../optima/eval/benchmarks.py)): **GSM8K** (math,
-chain-of-thought, ~256 tokens) and **MMLU** (knowledge, CoT-prompted to ~512). The
-same `Benchmark` protocol takes SWE-bench / Tau-bench / KernelBench later (only
-`check()` changes — run tests/tools in a sandbox instead of extracting an answer).
-
-On that one realistic run we gate on **both**:
-
-- **per-token KL** vs the baseline — the dense, low-variance *primary* gate, on the
-  same prompts (a faithful kernel sits at the noise floor; a cheat blows up).
-- **task accuracy** — no regression on any benchmark beyond a tolerance ("did the
-  model still solve real problems?"); a capability *floor*, but noisy at small n,
-  which is exactly why KL is primary (Part 6.6).
-
-A faithful kernel preserves both; a kernel that secretly degrades the model drops
-accuracy and/or blows up KL and scores zero, even if it looked fast. CLI:
-`optima bench`.
-
-> Honest scope: this fixes the *regime* (real tasks, decode-heavy lengths). It does
-> **not** change that a single small op (silu/rmsnorm) is a tiny fraction of
-> end-to-end runtime, so its *throughput* contribution can sit below the
-> measurement noise floor — that is a slot-size problem (bigger slots like
-> attention/MoE + op-isolated microbenchmarks), tracked separately from the gate.
-
-Why this *simplifies* the design: our objective is **scalar** (throughput), so the
-benchmarks are **AND-gates**, not score components — there is nothing to aggregate
-with a geometric mean (unlike Affine, whose objective is a capability *vector*).
-The broken kernel fails both (KL huge, accuracy → 0); a faithful kernel passes both.
+Throughput must be scored on the regime the arena sells (decode-heavy serving; a
+prefill-heavy slot needs a prefill-heavy workload). Quality has **two modes**
+(see [FIDELITY.md](FIDELITY.md)): rollout-KL statistics against the pristine
+reference — valid only where a stock-vs-stock control measures ~0 — and the
+**in-engine audit**, which randomly samples the candidate's real dispatcher calls,
+re-runs the captured stock baseline on pre-call clones, and compares under the
+slot's own verify tolerances (zero violations + minimum coverage required). The
+arena's `task_score` evidence additionally gates the model getting *dumber* on
+real tasks, paired against the same run's baseline.
 
 ### 6.6 Calibration (learned on real hardware)
 
@@ -561,14 +519,17 @@ on gpt-oss-120b:
 - **KL threshold must equal k× the nondeterminism noise floor**, not a hand-picked
   constant. With `--no-deterministic`, stock-vs-stock KL on gpt-oss-120b was
   **3.9e-4** (the floor). A genuinely-drifting kernel sat at **9.2e-3 (~24× the
-  floor)** — correctly flagged. Always measure stock-vs-stock first; run with
-  `enable_deterministic_inference` so the floor → ~0.
-- **End-to-end KL catches what op-correctness misses.** That drifting kernel
-  *passed* per-op correctness (bf16 tolerance) but failed end-to-end — the layered
-  check (cheap per-op pre-filter → end-to-end gate) working as designed.
-- **Benchmark accuracy needs large n.** At n=12, GSM8K's ~12% std turns a 2-problem
-  flip into "−16.7%." Use KL as the dense, low-variance *primary* gate and
-  benchmark accuracy as a *capability floor* at ~100–200 samples.
+  floor)** — correctly flagged. Always measure stock-vs-stock first. On arenas
+  where two identical stock launches are NOT logit-identical (MiniMax-M3), the
+  floor never reaches ~0 — that measurement is why the audit mode exists.
+- **End-to-end distribution checks catch what op-correctness misses.** A drifting
+  kernel *passed* per-op correctness (bf16 tolerance) but failed end-to-end — the
+  layered check (cheap per-op pre-filter → end-to-end gate) working as designed.
+- **Task accuracy needs large n.** At n=12, GSM8K's ~12% std turns a 2-problem
+  flip into "−16.7%." Dense per-token statistics are the primary gate; task
+  accuracy is a capability *floor* at realistic sample counts. Every merged gate
+  threshold must cite a measured stock-vs-stock floor artifact
+  (`optima/eval/calibration.py` binds that provenance).
 
 ---
 
@@ -790,15 +751,11 @@ The harness package, [../optima/](../optima):
 | [verify_collective.py](../optima/verify_collective.py) | `verify_collective` — DISTRIBUTED verify for collective slots: mp-spawns `world_size` ranks, runs the kernel as the real collective, compares to the fp32 cross-rank reduce. |
 | [compat.py](../optima/compat.py) | `PINNED_SGLANG` + `run_checks` — the static seam canary (`optima compat`), re-run on every sglang bump. |
 | [rebuild.py](../optima/rebuild.py) | The fenced escape hatch: applies only validator-shipped `repo_python` patchers (miner `bundle_python` is rejected). |
-| [eval/throughput_kl.py](../optima/eval/throughput_kl.py) | `evaluate` — the two-launch throughput + KL run, median-of-K, gates, score. |
-| [eval/capability.py](../optima/eval/capability.py) | `evaluate_capability` — the real-task scoring path: two-launch throughput + **KL + benchmark accuracy** on real prompts (`optima bench`). |
-| [eval/benchmarks.py](../optima/eval/benchmarks.py) | `Benchmark` protocol + `Problem` + **GSM8K & MMLU** (HF datasets, numeric + multiple-choice answer extraction) + registry. |
-| [eval/_launch.py](../optima/eval/_launch.py) | Shared spawn-safe, tamper-resistant `launched_engine` + `engine_kwargs` (incl. `tp_size` / `moe_runner_backend`) used by both eval paths. |
+| [eval/_launch.py](../optima/eval/_launch.py) | `call_in_subprocess` — the spawn-safe fresh-process helper `cmd_verify` loads candidates through. |
+| [eval/engine_worker.py](../optima/eval/engine_worker.py) | In-worker engine session: isolation probes, `engine_kwargs`, active/completed receipt gates. |
 | [eval/oci_backend.py](../optima/eval/oci_backend.py) | Validator-owned OCI policy, no-egress/resource fence, leases, native prebuild and authoritative teardown. |
 | [eval/oci_outer_session.py](../optima/eval/oci_outer_session.py) | Trusted-controller protocol for isolated candidate engine sessions and bounded evidence frames. |
 | [eval/qualification_runner.py](../optima/eval/qualification_runner.py) | B/C/B′/pristine-T role schedule, authenticated raw evidence, quality authority, graph proof, and aggregate verdict. |
-| [eval/kl.py](../optima/eval/kl.py) | `kl_over_positions` / `aligned_kl` / `extract_per_prompt` — per-position top-k KL, per-prompt alignment, and sglang-output parsing shared by both eval paths. |
-| [eval/prompts.py](../optima/eval/prompts.py) | `CORPUS` + `sample_prompts(n, seed)` — per-epoch prompt sampling. |
 | [bundle_hash.py](../optima/bundle_hash.py) | `content_hash` — deterministic bundle identity. |
 | [chain/intake.py](../optima/chain/intake.py) | SQLite production authority for finalized intake, screens, qualifications, reproductions, stacks, settlement and weight-publication journal state. |
 | [chain/validator_loop.py](../optima/chain/validator_loop.py) | Finalized reveal → private fetch → immutable publication → registered arena screen/qualification → transactional settlement. |
@@ -833,12 +790,13 @@ GPU, on a CUDA box (the validated recipe — see the main README for the env set
 of `CUDA_HOME`, the `.pth`, and `python -m optima.cli` for spawn-safety):
 
 ```bash
-# op-correctness on device
-python -m optima.cli verify   examples/miner_silu_triton --device cuda --dtype bfloat16
-# end-to-end gate: faithful PASSes, broken FAILs
-python -m optima.cli evaluate examples/miner_silu_triton --model Qwen/Qwen2.5-0.5B-Instruct --no-deterministic
-python -m optima.cli evaluate examples/miner_silu_broken  --model Qwen/Qwen2.5-0.5B-Instruct --no-deterministic
+# op-correctness on device: faithful PASSes, broken FAILs
+python -m optima.cli verify examples/miner_silu_triton --device cuda --dtype bfloat16
+python -m optima.cli verify examples/miner_silu_broken --device cuda --dtype bfloat16
 ```
+
+End-to-end throughput + fidelity is validator-side: the chain intake loop runs the
+qualification bracket in no-egress workers ([TESTNET.md](TESTNET.md)).
 
 ---
 

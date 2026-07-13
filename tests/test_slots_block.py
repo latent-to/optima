@@ -129,16 +129,3 @@ def test_matched_ratio_is_active_only_for_the_block_slot():
     assert get_slot("attention.sdpa").correctness.mode == "matched_ratio"
     assert get_slot("attention.decode").correctness.mode == "matched_ratio"
     assert get_slot("moe.fused_experts").correctness.mode == "matched_ratio"
-
-
-def test_token_match_rate():
-    # The framework-mode correctness metric (torch-free): fraction of generated tokens
-    # matching the trusted baseline; length mismatches count as non-matches.
-    from optima.eval.kl import token_match_rate
-
-    base = [([1, 2, 3, 4], None), ([5, 6], None)]
-    assert token_match_rate(base, base) == (6, 6)                       # identical -> all match
-    diverge = [([1, 2, 9, 4], None), ([5, 7], None)]                    # 2 token flips
-    assert token_match_rate(base, diverge) == (4, 6)
-    shorter = [([1, 2], None), ([5, 6], None)]                          # candidate 2 tokens short
-    assert token_match_rate(base, shorter) == (4, 6)                    # 4 matched, 2 missing

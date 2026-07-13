@@ -205,8 +205,8 @@ def _load_bundle_into_registry(bundle: str) -> None:
         return
     # The reviewed patchers' artifacts (compiled CUDA exts, dep overlays) must exist in
     # THIS process: sglang runs the model in spawned scheduler ranks, and the driver's
-    # sys.modules preloads do not survive the spawn. Cache-hit fast after the driver's
-    # prepare_candidate_environment built once. (2026-07-07: without this the engine
+    # sys.modules preloads do not survive the spawn. Cache-hit fast after the trusted
+    # prebuild phase built once. (2026-07-07: without this the engine
     # silently scored the shim's reference fallback — a phantom-kernel run.) A patcher
     # failure raises out to activate() -> load_failed receipt -> the eval refuses.
     from optima.rebuild import apply_rebuild_plan

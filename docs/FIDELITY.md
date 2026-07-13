@@ -139,14 +139,12 @@ re-evaluation today, but they are where a motivated adversary would dig.
 
 ## 5. Knobs & usage
 
-```bash
-python -m optima.cli evaluate BUNDLE --model M --fidelity-mode audit \
-    --audit-rate 0.05 ...            # extra untimed eager quality launch
-```
+The audit is armed on the validator's untimed quality launch inside the
+qualification bracket (the legacy local `optima evaluate --fidelity-mode ...`
+diagnostic was deleted in the post-arc trim; audit statistics now flow into the
+pristine reference-quality record, `optima/eval/reference_quality.py`).
 
-* `EvalConfig.fidelity_mode` `"kl"` (legacy; valid only on arenas where
-  stock-vs-stock KL is provably ~0) | `"audit"`.
-* `OPTIMA_SLOT_AUDIT` / `OPTIMA_SLOT_AUDIT_SEED` — set by `launched_engine`
+* `OPTIMA_SLOT_AUDIT` / `OPTIMA_SLOT_AUDIT_SEED` — set by the launcher
   for the quality launch only; never set them on a timed launch.
 * Per-slot strictness lives where it always did: `SlotSpec.correctness` +
   `SlotSpec.tolerances` in `optima/slots.py`.

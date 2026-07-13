@@ -219,7 +219,7 @@ swigluoai-vs-SiLU control); the dense CPU path passes; the composed kernel fires
 2. **Recursive scan** (`optima/sandbox.py`) — `scan_tree(root)` applies the existing safety denylist
    to **all bundle `.py`**, not just the declared entry (`seam.py:106`, `cli.py` scan only the entry
    today — the vendored-tree hole: a vendored lib using `open()`/`importlib`/`subprocess` is never
-   scanned). Wire it into `cmd_scan` / `cmd_verify` / `cmd_evaluate` / the seam load. This is the
+   scanned). Wire it into `cmd_scan` / `cmd_verify` / the seam load. This is the
    safety fix (close the hole), NOT a transferability gate — and it does **not** flip to an
    allowlist: per the corrected Axiom 5, a kernel is a kernel (an example legitimately does
    `from sglang.srt...import RMSNorm`), so we don't ban namespaces. Transferability is enforced by

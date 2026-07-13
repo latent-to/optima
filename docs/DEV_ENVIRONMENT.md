@@ -89,7 +89,6 @@ export CUDA_HOME=/usr/local/cuda
 export PATH=/usr/local/cuda/bin:$PWD/.venv/bin:$PATH   # sglang JIT needs nvcc + ninja
 export TORCH_CUDA_ARCH_LIST=9.0                        # set per GPU: 9.0 = H100, 10.0 = B200
 .venv/bin/python -m optima.cli verify   examples/miner_silu_triton --device cuda
-.venv/bin/python -m optima.cli evaluate examples/miner_silu_triton --model Qwen/Qwen2.5-0.5B-Instruct --no-deterministic
 ```
 
 ## Clean-signal eval settings

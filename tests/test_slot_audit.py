@@ -248,26 +248,6 @@ def test_rmsnorm_dispatcher_no_audit_without_env():
     assert calls["n"] == 1 and SLOT not in audit._stats
 
 
-# ---- GSM8K ramble defense (rides along: part of the same gate-stack fix) --------
-
-
-def test_gsm8k_check_ignores_self_generated_questions():
-    from optima.eval.benchmarks import GSM8K, Problem
-
-    g = GSM8K.__new__(GSM8K)  # no dataset load needed for check()
-    p = Problem(id="t", prompt="", answer="42")
-    good_then_ramble = ("Let me think. 6 * 7 = 42. The answer is 42.\n"
-                        "Question: what is 5+5?\nAnswer: The answer is 10.")
-    assert g.check(p, good_then_ramble)          # graded up to the ramble only
-    assert not g.check(p, "The answer is 41.\nQuestion: x\nThe answer is 42.")
-
-
-def test_gsm8k_declares_stop_cue():
-    from optima.eval.benchmarks import GSM8K
-
-    assert "\nQuestion:" in GSM8K.stop
-
-
 # ---- topk_overlap slots (the msa_prefill selection audit, 2026-07-10) -----------
 
 MSA_SLOT = "attention.msa_prefill_block_score"

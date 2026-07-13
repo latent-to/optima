@@ -22,7 +22,8 @@ runs the model, and measures two things:
 
 1. **Throughput** — tokens/second, versus the model running stock (unmodified sglang).
 2. **Fidelity** — does the model still produce the *same outputs*? Measured by
-   per-token KL divergence against the stock run, plus real-benchmark accuracy.
+   an in-engine audit of your kernel's real calls against the stock baseline, plus
+   per-token distribution checks against a pristine reference transcript.
 
 **You earn if and only if your kernel is *both* faster *and* faithful.** A kernel
 that's 30% faster but changes the model's answers scores **zero**. A kernel that's
@@ -78,8 +79,9 @@ Fidelity has **two modes**, selected per arena (`--fidelity-mode`, see
 | **argmax-disagree rate** | a *sparse* cheat — bit-exact almost everywhere but a few tokens flipped | `1%` |
 | **coverage / tail-mass** | a flattened distribution that fools top-k KL | loose by default |
 
-In **both** modes, **benchmark accuracy** (GSM8K / MMLU) gates the model getting
-*dumber*: no regression beyond ~2 points, paired against the same run's baseline.
+In **both** modes, the arena's **task-accuracy evidence** (the `task_score` in the
+pristine reference-quality record) gates the model getting *dumber*, paired against
+the same run's baseline.
 
 The KL threshold is **per-slot** and is calibrated to the model's own
 nondeterminism floor (running the *same* stock kernel twice isn't bitwise identical).
@@ -406,26 +408,27 @@ any provider — [GPU_SETUP.md](GPU_SETUP.md) is the provider-agnostic checklist
 on PATH for Triton JIT.
 
 ```bash
-# 1) op-correctness on real shapes/dtypes
+# op-correctness on real shapes/dtypes (count dims are jittered per run)
 python -m optima.cli verify my_bundle --device cuda --dtype bfloat16
-
-# 2) end-to-end throughput + KL (the real gate), on a small model first
-python -m optima.cli evaluate my_bundle --model Qwen/Qwen2.5-1.5B-Instruct \
-    --num-prompts 64 --max-new-tokens 64
-
-# 3) capability floor on a real task
-python -m optima.cli bench my_bundle --model Qwen/Qwen2.5-1.5B-Instruct \
-    --benchmarks gsm8k --samples 128
 ```
 
 Always launch via `python -m optima.cli` — sglang spawns the scheduler with
 `mp spawn` and the `__main__` guard matters.
 
-Read the `evaluate` output like the validator does: a **speedup ≥ the noise-derived
-bar**, **KL under the per-slot threshold**, and **no accuracy regression**. If the two
-bracketing baselines disagree a lot, your box is too noisy — fix that before trusting
-any number (lock clocks if you can, warm up, or run two replicas concurrently on
-disjoint GPUs so drift cancels).
+The authoritative throughput + fidelity measurement is **validator-side**: your
+bundle goes through the qualification bracket (baseline, candidate, baseline again,
+plus an untimed pristine reference launch) inside no-egress workers, and a PASS must
+then be **independently reproduced** before settlement. There is no local command
+that reproduces that authority — and that's deliberate: a score you could compute
+locally would be a score you could game.
+
+To estimate your win before submitting, A/B the serving throughput yourself with
+stock sglang as the control, measured the way the validator measures (§8): warm up
+and discard, run the candidate **bracketed by two baseline runs**, compare against
+the mean of the brackets, and distrust any delta smaller than the spread between
+your two baselines. If the bracketing baselines disagree a lot, your box is too
+noisy — fix that before trusting any number (lock clocks if you can, warm up, or
+run two replicas concurrently on disjoint GPUs so drift cancels).
 
 ---
 
@@ -437,11 +440,11 @@ disjoint GPUs so drift cancels).
 | `verify` op-correctness fails | wrong math, wrong dtype handling, or shape mismatch vs the slot contract | check the exact signature in `optima slots`; compare to the matching example bundle |
 | `verify` fails only on *some* shapes | your kernel branches on shape or hard-codes dims | make it shape-generic; the verify shapes are jittered per run precisely to catch this |
 | your module raises at import (`load_failed` receipt) | a GPU-only import on a CPU box, or a syntax error | guard GPU imports; make sure the module imports cleanly everywhere it might load |
-| `evaluate` aborts for missing `completed` coverage | the workload never reached an applicable variant on every rank/slot, or a selected path failed before producing the model-facing output | check `active` membership, `fired` routing diagnostics, capability/graph gates, and any `fallback` receipt; never interpret `fired` alone as execution |
+| qualification aborts for missing `completed` coverage | the workload never reached an applicable variant on every rank/slot, or a selected path failed before producing the model-facing output | check `active` membership, `fired` routing diagnostics, capability/graph gates, and any `fallback` receipt; never interpret `fired` alone as execution |
 | audit gate fails (audit mode) | your kernel's output differs from stock beyond the slot's tolerance on real calls — often dropped work | the audit re-ran stock on clones of your actual inputs; treat every violation as real |
 | KL gate fails on a *faithful* kernel (kl mode) | you didn't measure the stock-vs-stock noise floor; your "drift" may be the model's own nondeterminism — or your kernel genuinely isn't bit-faithful | measure the floor first; on nondeterministic arenas the audit mode is the gate and KL is advisory |
 | speedup gate fails | your kernel is simply slower than sglang's (the common case) | profile; see §8 — a faithful-but-slower kernel is the default outcome, not a bug |
-| score is 0 despite a speedup | a fidelity gate failed, or it tied the champion and didn't clear the +2% dethrone margin | check the quality line in the report |
+| score is 0 despite a speedup | a fidelity gate failed, or the incumbent displacement margin wasn't cleared | check the quality evidence in the qualification record |
 | NO-DECISION | the box was too noisy (baselines disagreed >~10%) | quieten the box; re-run |
 
 **The phantom-pass (read this one).** A result that looks *too good* — KL exactly
@@ -573,8 +576,8 @@ with the record).
 **Ready to submit when:**
 
 - [ ] `optima scan` and `optima verify --device cuda` pass on your bundle
-- [ ] `evaluate` shows a speedup over the noise bar with complete `active`/`completed` slot-member coverage and zero `fallback` receipts (§7)
-- [ ] fidelity green in the arena's mode (audit violations 0 / KL under threshold) and `bench` shows no accuracy regression
+- [ ] your own bracketed sglang A/B (§6) shows a speedup that clears your measured
+      baseline noise — the validator's bar is derived the same way
 - [ ] block/collective kernels: `graph_safe` declared and the kernel actually captures
 - [ ] the hosted tar.gz re-hashes to what `chain-package` printed
 

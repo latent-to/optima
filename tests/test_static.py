@@ -7,7 +7,6 @@ the policy scanner and the manifest path-safety checks, plus eligibility and KL.
 from __future__ import annotations
 
 import optima.manifest as M
-from optima.eval.kl import kl_over_positions
 from optima.registry import eligibility_from_metadata
 from optima.sandbox import scan_source
 
@@ -133,21 +132,3 @@ def test_eligibility_gates():
     assert not e.accepts(dtype_name="float32", last_dim=4096, arch="sm90")
     assert not e.accepts(dtype_name="bfloat16", last_dim=4096, arch="sm80")
     assert not e.accepts(dtype_name="bfloat16", last_dim=9000, arch="sm90")
-
-
-# ---- KL ---------------------------------------------------------------------
-
-
-def test_kl_zero_on_identical():
-    ref = [[(-0.1, 5, None), (-2.0, 9, None)], [(-0.05, 7, None), (-3.0, 2, None)]]
-    rep = kl_over_positions(ref, ref)
-    assert rep.mean_kl == 0.0
-    assert rep.argmax_disagreements == 0
-
-
-def test_kl_positive_on_perturbation():
-    ref = [[(-0.1, 5, None), (-2.0, 9, None)], [(-0.05, 7, None), (-3.0, 2, None)]]
-    cand = [[(-0.1, 5, None), (-2.0, 9, None)], [(-3.0, 7, None), (-0.05, 2, None)]]
-    rep = kl_over_positions(ref, cand)
-    assert rep.mean_kl > 0.0
-    assert rep.argmax_disagreements == 1

@@ -132,8 +132,10 @@ surfaces closed − re-baseline churn.
    `optima compat`. It introspects the installed sglang (imports + signatures, no
    GPU) and asserts every seam/API we depend on still exists.
 3. **Behavioral smoke (on the pod).** If the canary is green, confirm the seam
-   still *fires*: `optima bench <broken-bundle>` must still **FAIL** the gate and a
-   faithful bundle must behave. A green canary is necessary but not sufficient.
+   still *fires*: `optima verify <broken-bundle> --device cuda` must still **FAIL**
+   op-correctness, and a qualification pass on a faithful bundle must still produce
+   complete `active`/`completed` receipt coverage. A green canary is necessary but
+   not sufficient.
 4. **Coordinate + re-baseline.** If both pass: update `PINNED_SGLANG`, announce a
    bump at a block height so **all validators upgrade together**, and
    **re-baseline the champion** — re-score the reigning champion against the *new*

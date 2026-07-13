@@ -1,7 +1,7 @@
 # GPU setup — provider-agnostic checklist
 
 How to turn any rented (or owned) CUDA box into a machine that can run Optima's
-GPU gates: `verify --device cuda`, `evaluate`, `bench`, and the validator loop.
+GPU gates: `verify --device cuda` and the validator loop.
 No specific provider is assumed. (The maintainers' own pod notes, with
 provider-specific commands, live in [DEV_ENVIRONMENT.md](DEV_ENVIRONMENT.md) —
 you don't need them.)
@@ -63,24 +63,22 @@ python -m optima.cli compat
 # 2) op-correctness on device — a faithful kernel passes
 python -m optima.cli verify examples/miner_silu_triton --device cuda
 
-# 3) end-to-end smoke on a small model — and the seam actually fires
-python -m optima.cli evaluate examples/miner_silu_triton \
-    --model Qwen/Qwen2.5-0.5B-Instruct --no-deterministic
 ```
 
-The eval demands `active` receipts from every expected scheduler member, then one
-`completed` receipt for every registered slot/member pair and zero `fallback`
+End-to-end throughput + fidelity runs validator-side through the qualification
+bracket. It demands `active` receipts from every expected scheduler member, then
+one `completed` receipt for every registered slot/member pair and zero `fallback`
 receipts. `fired` means only that routing selected a candidate; later adapter or
 kernel work may still fail or intentionally serve stock. Missing completion aborts
 instead of scoring stock-vs-stock. These process-local receipts are diagnostics,
 not correctness or isolation authority (see [MINER_GUIDE.md](MINER_GUIDE.md)).
 
-Always launch GPU evals via `python -m optima.cli ...` — sglang spawns the
+Always launch GPU work via `python -m optima.cli ...` — sglang spawns the
 scheduler with `mp spawn`, so the `__main__` guard matters.
 
 ## 5. Multi-GPU (TP) notes
 
-- `--tp-size N` on `evaluate`/`bench`; collective slots verify distributed
+- Collective slots verify distributed
   (`optima verify --world-size N` — use the arena's TP size).
 - gpt-oss-120b fits a single H100; multi-GPU runs pick a MoE backend via
   `--moe-runner-backend` (see the arena recipes in [STATE_OF_RECORD.md](STATE_OF_RECORD.md)).

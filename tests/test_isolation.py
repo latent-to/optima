@@ -1,13 +1,8 @@
-import os
-import sys
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import TestCase, mock
 
-import pytest
-
-from optima import receipts, seam
-from optima.eval import _launch, engine_worker
+from optima.eval import engine_worker
 
 
 def _sandbox_proc_reader(*, seccomp: int = 2, filters: int = 1, caps: int = 0):
@@ -30,23 +25,11 @@ def _sandbox_proc_reader(*, seccomp: int = 2, filters: int = 1, caps: int = 0):
 
 
 class IsolationTests(TestCase):
-    def test_sandbox_probes_are_shared_engine_worker_compatibility_aliases(self):
-        for name in (
-            "_truthy_env",
-            "_loopback_is_up",
-            "_network_namespace_is_loopback_only",
-            "_egress_is_blocked",
-            "_process_sandbox_is_hardened",
-            "_path_mount_is_read_only",
-        ):
-            self.assertIs(getattr(_launch, name), getattr(engine_worker, name))
-            self.assertEqual(getattr(_launch, name).__module__, engine_worker.__name__)
-
     def test_process_hardening_requires_zero_caps_and_live_seccomp(self):
         with mock.patch.object(
             Path, "read_text", autospec=True, side_effect=_sandbox_proc_reader()
         ):
-            self.assertTrue(_launch._process_sandbox_is_hardened())
+            self.assertTrue(engine_worker._process_sandbox_is_hardened())
         for kwargs in (
             {"seccomp": 0},
             {"filters": 0},
@@ -58,71 +41,10 @@ class IsolationTests(TestCase):
                 autospec=True,
                 side_effect=_sandbox_proc_reader(**kwargs),
             ):
-                self.assertFalse(_launch._process_sandbox_is_hardened())
-
-    def test_external_isolation_is_live_verified(self):
-        with mock.patch.dict("os.environ", {"OPTIMA_EXTERNAL_NO_EGRESS": "1"}), \
-             mock.patch.object(_launch, "_loopback_is_up", return_value=True), \
-             mock.patch.object(
-                 _launch, "_network_namespace_is_loopback_only", return_value=True
-             ), \
-             mock.patch.object(_launch, "_egress_is_blocked", return_value=True), \
-             mock.patch.object(
-                 _launch, "_process_sandbox_is_hardened", return_value=True
-             ):
-            self.assertTrue(_launch.isolate_network())
-
-    def test_external_isolation_claim_fails_any_live_check(self):
-        checks = (
-            "_loopback_is_up",
-            "_network_namespace_is_loopback_only",
-            "_egress_is_blocked",
-            "_process_sandbox_is_hardened",
-        )
-        for failed in checks:
-            patches = {
-                name: mock.patch.object(_launch, name, return_value=name != failed)
-                for name in checks
-            }
-            with mock.patch.dict(
-                "os.environ", {"OPTIMA_EXTERNAL_NO_EGRESS": "1"}
-            ), patches[checks[0]], patches[checks[1]], patches[checks[2]], patches[checks[3]]:
-                self.assertFalse(_launch.isolate_network())
-
-    def test_requested_isolation_fails_closed(self):
-        cfg = SimpleNamespace(
-            isolate=True,
-            framework_mode=False,
-            allow_unsafe_no_isolation=False,
-        )
-
-        with mock.patch.object(_launch, "isolate_network", return_value=False):
-            with self.assertRaisesRegex(_launch.IsolationError, "could not be proven"):
-                _launch.prepare_candidate_environment(cfg, bundle_path="", active=True)
-
-    def test_framework_mode_requires_isolation_by_default(self):
-        cfg = SimpleNamespace(
-            isolate=False,
-            framework_mode=True,
-            allow_unsafe_no_isolation=False,
-        )
-
-        with self.assertRaisesRegex(_launch.IsolationError, "framework_mode requires"):
-            _launch.prepare_candidate_environment(cfg, bundle_path="", active=True)
-
-    def test_unsafe_dev_override_allows_failed_isolation(self):
-        cfg = SimpleNamespace(
-            isolate=True,
-            framework_mode=True,
-            allow_unsafe_no_isolation=True,
-        )
-
-        with mock.patch.object(_launch, "isolate_network", return_value=False):
-            _launch.prepare_candidate_environment(cfg, bundle_path="", active=True)
+                self.assertFalse(engine_worker._process_sandbox_is_hardened())
 
 
-def test_engine_kwargs_preserve_candidate_overrides_and_legacy_alias():
-    assert _launch.engine_kwargs is engine_worker.engine_kwargs
+def test_engine_kwargs_preserve_candidate_overrides():
     cfg = SimpleNamespace(
         model_path="model",
         dtype="float16",
@@ -178,169 +100,3 @@ def test_prepare_and_entry_share_one_module_instance(tmp_path):
 
     entry2 = load_entry(src, "entry")
     assert entry2() is None
-
-
-def _setup_bundle(tmp_path, *, include_setup=True):
-    tmp_path.mkdir(parents=True, exist_ok=True)
-    (tmp_path / "kernel.py").write_text(
-        "def entry(x, out):\n    out.copy_(x)\n"
-        "def patch_engine():\n    return None\n"
-    )
-    setup_line = 'setup = "patch_engine"\n' if include_setup else ""
-    (tmp_path / "manifest.toml").write_text(
-        'bundle_id = "setup-test"\n'
-        'abi_version = "optima-op-abi-v0"\n'
-        "[[ops]]\n"
-        'slot = "activation.silu_and_mul"\n'
-        'source = "kernel.py"\n'
-        'entry = "entry"\n'
-        + setup_line
-    )
-    return tmp_path
-
-
-def _isolation_cfg(*, framework_mode, isolate=True, allow_unsafe=False):
-    return SimpleNamespace(
-        isolate=isolate,
-        framework_mode=framework_mode,
-        allow_unsafe_no_isolation=allow_unsafe,
-    )
-
-
-def test_setup_bundle_requires_explicit_framework_mode_before_isolation(tmp_path):
-    bundle = _setup_bundle(tmp_path)
-    with mock.patch.object(_launch, "isolate_network", return_value=True) as isolate:
-        with pytest.raises(_launch.IsolationError, match="declares setup"):
-            _launch.prepare_candidate_environment(
-                _isolation_cfg(framework_mode=False),
-                bundle_path=str(bundle),
-                active=True,
-            )
-    isolate.assert_not_called()
-
-
-def test_armed_setup_and_ordinary_bundle_pass_candidate_preflight(tmp_path):
-    setup_bundle = _setup_bundle(tmp_path / "setup")
-    ordinary_bundle = _setup_bundle(tmp_path / "ordinary", include_setup=False)
-    with mock.patch.object(_launch, "isolate_network", return_value=True):
-        _launch.prepare_candidate_environment(
-            _isolation_cfg(framework_mode=True),
-            bundle_path=str(setup_bundle),
-            active=True,
-        )
-        _launch.prepare_candidate_environment(
-            _isolation_cfg(framework_mode=False),
-            bundle_path=str(ordinary_bundle),
-            active=True,
-        )
-
-
-def test_setup_cannot_use_unsafe_no_isolation_override(tmp_path):
-    bundle = _setup_bundle(tmp_path)
-    with pytest.raises(_launch.IsolationError, match="unsafe development override"):
-        _launch.prepare_candidate_environment(
-            _isolation_cfg(
-                framework_mode=True, isolate=False, allow_unsafe=True
-            ),
-            bundle_path=str(bundle),
-            active=True,
-        )
-
-
-def test_setup_cannot_bypass_failed_isolation(tmp_path):
-    bundle = _setup_bundle(tmp_path)
-    with mock.patch.object(_launch, "isolate_network", return_value=False):
-        with pytest.raises(_launch.IsolationError, match="failed fence"):
-            _launch.prepare_candidate_environment(
-                _isolation_cfg(framework_mode=True, allow_unsafe=True),
-                bundle_path=str(bundle),
-                active=True,
-            )
-
-
-def test_external_worker_requires_read_only_inputs_and_prebuild_binding(
-    tmp_path, monkeypatch
-):
-    bundle = _setup_bundle(tmp_path)
-    cfg = _isolation_cfg(framework_mode=True)
-    cfg.model_path = "/models/model"
-    external = {
-        "OPTIMA_EXTERNAL_NO_EGRESS": "1",
-        "OPTIMA_ENGINE_WORKER": "1",
-        "OPTIMA_PREBUILT_ARTIFACTS": "1",
-        "OPTIMA_NATIVE_BUILD_SPEC_DIGEST": "a" * 64,
-        "OPTIMA_NATIVE_ARTIFACT_ROOT": "/optima/native",
-        "OPTIMA_NATIVE_ARTIFACT_PUBLICATION_DIGEST": "b" * 64,
-    }
-    monkeypatch.setattr(_launch, "isolate_network", lambda: True)
-    monkeypatch.setattr(_launch, "_dep_overlay_env", lambda _bundle: None)
-    monkeypatch.setenv("OPTIMA_EXTERNAL_NO_EGRESS", "1")
-    monkeypatch.setenv("OPTIMA_ENGINE_WORKER", "1")
-    monkeypatch.setattr(_launch, "_path_mount_is_read_only", lambda _path: False)
-    with pytest.raises(_launch.IsolationError, match="mounted read-only"):
-        _launch.prepare_candidate_environment(
-            cfg, bundle_path=str(bundle), active=True
-        )
-
-    monkeypatch.setattr(_launch, "_path_mount_is_read_only", lambda _path: True)
-    with pytest.raises(_launch.IsolationError, match="prebuild binding"):
-        _launch.prepare_candidate_environment(
-            cfg, bundle_path=str(bundle), active=True
-        )
-
-    for name, value in external.items():
-        monkeypatch.setenv(name, value)
-    with mock.patch("optima.rebuild.apply_rebuild_plan") as rebuild:
-        _launch.prepare_candidate_environment(
-            cfg, bundle_path=str(bundle), active=True
-        )
-    rebuild.assert_not_called()
-
-
-@pytest.mark.parametrize(
-    ("active", "framework_mode", "expected"),
-    ((False, True, "0"), (True, False, "0"), (True, True, "1")),
-)
-def test_launch_scopes_framework_arming_and_restores_parent(
-    monkeypatch, active, framework_mode, expected
-):
-    observed = []
-
-    class Engine:
-        def __init__(self, **_kwargs):
-            observed.append(os.environ.get("OPTIMA_FRAMEWORK_MODE"))
-
-        def shutdown(self):
-            return None
-
-    cfg = SimpleNamespace(
-        model_path="model",
-        dtype="float32",
-        mem_fraction_static=0.1,
-        seed=0,
-        log_level="error",
-        framework_mode=framework_mode,
-    )
-    monkeypatch.setenv("OPTIMA_FRAMEWORK_MODE", "ambient")
-    monkeypatch.setitem(sys.modules, "sglang", SimpleNamespace(Engine=Engine))
-    monkeypatch.setattr(seam, "mark_driver", lambda: None)
-    monkeypatch.setattr(_launch, "prepare_candidate_environment", lambda *_a, **_k: None)
-    monkeypatch.setattr(_launch, "_wait_gpu_drain", lambda: None)
-    monkeypatch.setattr(
-        receipts,
-        "require",
-        lambda *_a, **_k: [
-            {"slots": ["s"], "pid": 10, "rank": -1, "world_size": -1}
-        ],
-    )
-    monkeypatch.setattr(
-        _launch, "_require_execution_completion", lambda *_a, **_k: "ok"
-    )
-
-    with _launch.launched_engine(
-        cfg, bundle_path="bundle" if active else "", active=active
-    ):
-        assert os.environ["OPTIMA_FRAMEWORK_MODE"] == expected
-
-    assert observed == [expected]
-    assert os.environ["OPTIMA_FRAMEWORK_MODE"] == "ambient"

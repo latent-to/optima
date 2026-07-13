@@ -1,6 +1,6 @@
 # Optima, explained end to end
 
-This is the long-form explainer. By the end you should understand, with no gaps:
+This document describes the end-to-end architecture:
 
 - what Optima is and the three roles (miner / validator / chain),
 - **what the validator actually does** and what the "gold standard" should be,
@@ -8,7 +8,7 @@ This is the long-form explainer. By the end you should understand, with no gaps:
 - the entire lifecycle of a submission, file by file,
 - the deep trick that gets an untrusted kernel *into* a running model,
 - exactly how scoring (throughput + KL) and anti-copy (commit-reveal) work,
-- **every failure mode I can think of**, which are defended and which are not,
+- the principal failure modes, their controls, and remaining limitations,
 - what is *proven on real hardware* vs what is still a stub.
 
 It points at every file. Paths are relative to this doc (`docs/`), so
@@ -26,6 +26,11 @@ It points at every file. Paths are relative to this doc (`docs/`), so
 > kernels **have** measured faster than stock sglang through the referee (the
 > fused-epilogue collectives, 1.044–1.074× vs the noise bar — see the README's
 > measured record); the bundles in `examples/` remain correctness demos.
+> Crownable candidate execution is isolated in validator-owned no-egress OCI
+> workers. Production intake and settlement use SQLite and a registered arena
+> service; one passing qualification remains `reproduction_pending` until an
+> independent second pass. Serving artifacts are produced by a separate, signed,
+> chain-independent release path.
 
 > Reading order: Parts 1–3 are the mental model. Part 4 is the pipeline. Part 5
 > is the clever bit (how a kernel gets into the model). Parts 6–7 are scoring and
@@ -66,13 +71,13 @@ You asked: *"I think the validator's function is to run the forward pass and
 compare it to some gold standard which we could pin to a production API or
 another GPU pod."* That's the right shape. Two refinements that matter a lot.
 
-### 2.1 The validator owns everything except one op
+### 2.1 The validator owns everything except one registered target
 
-The validator owns the model weights, the model graph, the tokenizer, the
-sampler, the benchmark prompts, the timing, and the reference. The **only** thing
-the miner contributes is the implementation of **one operation** ("op slot") deep
-inside the forward pass — for example the SiLU activation in the MLP. Everything
-around that op is trusted validator code.
+The validator owns the model weights, model graph, tokenizer, sampler, workload,
+timing, reference, arena configuration, and stack assembly. A miner contributes one
+registered singleton target or one exact atomic target. Targets may be individual ops,
+fused blocks, collectives, or a bounded reviewed overlay product, but remain upstream of
+the sampler and have validator-owned input/output and quality contracts.
 
 This is the single most important design decision, and it's a direct answer to
 your "arbitrary code execution / API substitution" worry (see Part 8.1). Because
@@ -107,10 +112,12 @@ the **stock** kernels (this is the reference / "gold standard") and once with th
 deterministic, and adversary-independent. "Another GPU pod" is the same idea with
 the reference on separate hardware; it's compatible, just more plumbing.
 
-This is implemented as the **two-launch** evaluation in
-[../optima/eval/throughput_kl.py](../optima/eval/throughput_kl.py): `evaluate()`
-launches the model with the kernel **off** (baseline = the gold standard), then
-again with it **on** (candidate), and diffs them.
+The direct developer evaluator in
+[../optima/eval/throughput_kl.py](../optima/eval/throughput_kl.py) retains the simple
+baseline/candidate form. Crownable qualification uses the stricter causal authority:
+baseline B, candidate C, baseline B′, then a separately launched pristine T worker that
+teacher-forces the sealed trajectories and supplies hidden quality evidence. The candidate
+worker is never the grading oracle.
 
 > Nuance for later: today's reference is "the same model with stock kernels."
 > That's perfect for kernels meant to be *numerically equivalent* (a faster
@@ -221,12 +228,11 @@ worry is exactly why. If the miner controls the entire forward pass, they can:
 - drop layers, 1-bit quantize, or otherwise gut the model, then
 - make the *output* look correct by fetching real answers from an API.
 
-With a kernel-slot, the miner controls **one cheap op** and the validator
-produces the tokens and logprobs from the rest of the trusted model. There's no
-final output to substitute, and faking a cheap op (silu) via an API is slower and
-pointless. The kernel-slot design **structurally removes** the attack class you
-were most worried about. The residual risk (the kernel is still *code* running
-in-process) is real and is handled separately by isolation — see Part 8.
+With a registered target, the validator still produces tokens and quality evidence from
+the complete model and a separate pristine T authority. The candidate does not control
+the final output, timing driver, workload, or grading reference. Arbitrary host launch
+code remains untrusted and is therefore imported, built, and executed only inside the
+OCI isolation boundary described in Part 8.
 
 ---
 
@@ -235,68 +241,51 @@ in-process) is real and is handled separately by isolation — see Part 8.
 Here is the entire pipeline, with the file/function that does each step.
 
 ```
-   MINER                              VALIDATOR
-   -----                              ---------
-1  commit  H(bundle,hotkey,salt) ───► record commitment      commit_reveal.Ledger.commit
-                                      (no bundle seen yet)
-                ... commit window closes ...
-2  reveal  bundle + salt        ───► verify vs commitment     commit_reveal.Ledger.reveal
-                                      detect copies            (earliest commit = original)
-3                                     parse manifest           manifest.load_manifest
-4                                     static policy scan        sandbox.scan_source
-5                                     (build) load kernel       sandbox.load_entry   [isolated]
-6                                     op-correctness vs ref     verify.verify_entry
-7                                     end-to-end: 2 launches    eval.throughput_kl.evaluate
-                                        baseline (kernel off)
-                                        candidate (kernel on)
-                                        -> throughput + KL
-8                                     score + king-of-the-hill  commit_reveal.Ledger.settle
-                                      -> weights to the chain
+   MINER                                  VALIDATOR
+   -----                                  ---------
+1  native timelock commitment       ───► finalized chain history
+2  revealed hash + fetch URL        ───► private hostile-archive fetch
+3                                         exact re-hash + copy priority
+4                                         immutable worker publication
+5                                         registered arena admission
+6                                         non-crown static/build/ABI/graph/serve screen
+7                                         isolated B/C/B'/pristine-T qualification
+8                                         independent reproduction of the same delta
+9                                         transactional target/stack settlement
+10                                        journaled weight reconciliation
+11                                        reviewed chain-independent Engine release
 ```
 
-Step by step:
+The production stages are:
 
-1. **Commit** ([../optima/commit_reveal.py](../optima/commit_reveal.py),
-   `Ledger.commit`). The miner posts `H(content_hash, hotkey, salt)` — a hash that
-   *binds* them to an exact bundle without revealing it. CLI: `optima commit`.
-
-2. **Reveal** (`Ledger.reveal`). After the commit window, the miner posts the
-   bundle + salt. The validator recomputes the hash and checks it matches a
-   commitment *that hotkey* made earlier. This is what makes copying impossible
-   (Part 7). CLI: `optima reveal`.
-
-3. **Parse manifest** ([../optima/manifest.py](../optima/manifest.py),
-   `load_manifest`). Validates schema, ABI version, and — importantly —
-   **path-safety**: source paths must be relative, inside the bundle, no `..`
-   escape, no absolute paths, no symlink escape (`_safe_relpath`).
-
-4. **Static policy scan** ([../optima/sandbox.py](../optima/sandbox.py),
-   `scan_source`). An AST pass over the kernel source that rejects obvious
-   egress / code-execution patterns (`socket`, `subprocess`, `pickle.loads`,
-   `torch.load`, `os.system`, `eval`, `__import__`, dunder-escape attributes…)
-   *before* anything is imported. It is careful not to false-positive on Triton's
-   `tl.load`/`tl.store`. **This is a tripwire, not the boundary** (Part 8).
-   CLI: `optima scan`.
-
-5. **Load the kernel** (`sandbox.load_entry`). Imports the miner module and pulls
-   out the `entry` callable. This *runs miner code*, so in production it must
-   happen inside the isolated worker (Part 5.4 / Part 8), not the trusted parent.
-
-6. **Op-correctness** ([../optima/verify.py](../optima/verify.py),
-   `verify_entry`). Generates deterministic inputs for the slot's standard shapes,
-   runs the miner kernel and the slot's `reference`, and compares with an
-   allclose-style tolerance. This is the cheap gate: a kernel that's outright
-   wrong is rejected here, before the expensive end-to-end run. CLI:
-   `optima verify`.
-
-7. **End-to-end evaluate**
-   ([../optima/eval/throughput_kl.py](../optima/eval/throughput_kl.py),
-   `evaluate`). The two-launch run that produces throughput + KL. This is the
-   heart of scoring; Part 6 dissects it. CLI: `optima evaluate`.
-
-8. **Settle** (`Ledger.settle`). Applies king-of-the-hill: a challenger only
-   becomes champion if it beats the current best by a margin; copies and
-   non-improvers earn nothing. Emits weights for the chain. CLI: `optima settle`.
+1. **Finalized arrival.** Native Bittensor timelock commit-reveal hides the URL until
+   reveal. `chain.read_finalized_reveal_history` supplies consensus ordering; SQLite
+   records a durable cursor and reservation before fetch.
+2. **Private intake and publication.** `chain.fetch.fetch_bundle` rejects unsafe or
+   oversized archives and re-derives the committed tree hash. Copy precedence is resolved
+   from finalized order. `chain.publication.publish_worker_bundle` copies accepted input
+   into an immutable, hash-complete worker tree; the private fetch tree is not mounted into
+   the worker.
+3. **Arena admission and screening.** A validator-injected `ArenaServiceRegistry` selects
+   an exact runtime/model/topology/workload policy. The fixed static, build, ABI, graph, and
+   abbreviated-serving screens are non-economic: they can reject, retry, hold, or promote,
+   but cannot crown.
+4. **Qualification.** Promoted candidates run under the causal B/C/B′/pristine-T authority.
+   Candidate import and native build occur only in the no-egress OCI worker. The controller
+   owns roles, timing, graph proof, raw quality evidence, evidence authentication, and
+   teardown.
+5. **Independent reproduction.** The first PASS is retained as
+   `reproduction_pending`. A second PASS must bind the same arena, target, delta, incumbent
+   and candidate stack identities while using independent authority and selection evidence.
+6. **Settlement and weights.** `settlement.py` plans the target-level stack transition from
+   the paired candidate and uses the lower speedup. `FinalizedIntakeStore` commits it
+   transactionally. `set-weights` separately reconciles a journaled global reward projection
+   against finalized metagraph state.
+7. **Integration and release.** An approved `IntegrationReviewRecord` binds the two crown
+   attempts, exact source, provenance/license/security/compatibility/test evidence, and
+   review commit. Only integrated refs enter `EngineReleaseManifest`. Model provisioning and
+   signed release construction are chain-independent and produce serving artifacts rather
+   than referee state.
 
 ---
 
@@ -439,12 +428,15 @@ the timer stays clean.
 
 ---
 
-## Part 6 — How scoring works
+## Part 6 — How the direct evaluator scores
 
-All in [../optima/eval/throughput_kl.py](../optima/eval/throughput_kl.py),
-`evaluate(cfg, bundle_path)`.
+The direct development evaluator is implemented in
+[../optima/eval/throughput_kl.py](../optima/eval/throughput_kl.py),
+`evaluate(cfg, bundle_path)`. Production crown authority wraps the same measurement
+principles in B/C/B′/pristine-T causal qualification, graph proof, authenticated raw
+evidence, and independent reproduction.
 
-### 6.1 Two launches
+### 6.1 Direct baseline and candidate launches
 
 ```python
 baseline  = _run_launch(cfg, prompts, bundle_path="",          active=False)  # gold standard
@@ -597,79 +589,61 @@ commitments bind to and the thing copy-detection compares.
 The problem: submissions are evaluated in the open, so a lazy miner could copy the
 current leader's bundle and resubmit. Commit-reveal kills this:
 
-- **Commit window:** each miner posts `H(content_hash, hotkey, salt)`. This hides
-  the bundle (you can't tell what they committed to) but **binds** them to it.
-- **Reveal window:** the miner posts `(content_hash, salt)`. A reveal is accepted
-  only if `H(content_hash, hotkey, salt)` equals a commitment *that hotkey* posted
-  earlier (`Ledger.reveal`).
+- **Commit window:** each miner posts a native timelock commitment containing the
+  content hash and encrypted fetch URL. The payload is unreadable until its reveal round.
+- **Reveal window:** validators read the revealed payload from finalized chain history,
+  fetch the bundle, and independently re-derive the exact committed content hash.
 
 A copier who only sees a rival's bundle at reveal time has **no matching prior
 commitment** for it, so they cannot reveal it. And if two miners independently
 committed to the same content, the **earliest commit (lowest sequence) is the
 original**; later identical ones are marked copies (`original=False`).
 
-### 7.3 King of the hill defeats ties and Sybils
+### 7.3 Transactional target settlement
 
-`Ledger.settle(round, margin)`:
+Production settlement operates on canonical singleton or atomic targets, not manifest
+row order. A candidate is eligible only after two independently authorized passing
+qualifications; its settlement speed is the lower measured value. The planner assembles
+the exact incumbent stack plus that one delta, checks target displacement and compatibility,
+and produces an append-only event plan. SQLite commits the event and resulting evaluation
+stack atomically. Copy-demoted and non-passing submissions never enter this path.
 
-- Take all this round's **passing, original** scores (copies are excluded and
-  listed in `rejected_copies`).
-- The best is the **challenger**. It takes the title only if
-  `challenger_score >= champion_score * (1 + margin)`.
-- The champion gets the emission weight (winner-take-all baseline:
-  `weights = {champion: 1.0}`).
-
-Why this is copy- and Sybil-resistant: a copy *ties* the champion, never clears
-the margin, so it earns nothing. The only way to earn is to genuinely beat the
-best. (We validated this on GPU: a faithful-but-slower kernel scored 0.935 and
-took no title — `weights: {}`.)
-
-> Winner-take-all is the simple baseline. Production likely smooths it (reward the
-> champion + a bounty to the most recent *distinct* improver, decay former
-> champions) to keep miners engaged. The mechanism file is where that policy
-> lives.
+Emission projection is separate from target settlement. The policy uses retained
+relative-improvement and time-decay state plus bounded discovery rewards, then maps hotkeys
+to the finalized metagraph. Weight submission is journaled and fail-closed rather than a
+side effect of evaluation.
 
 ### 7.4 Mapping to Bittensor
 
-In a real subnet: commitments live **on-chain** (subtensor commit-reveal),
-bundles are fetched from a content-addressed store, `hotkey` is the miner's SS58
-address, and `weights` is what the validator sets on-chain each epoch. The
-semantics in `commit_reveal.py` are identical; the JSON ledger is a local stand-in
-so the whole mechanism is testable without a chain or a GPU
-([../tests/test_commit_reveal.py](../tests/test_commit_reveal.py)).
+Commitments live on-chain, `hotkey` is the miner's SS58 address, and weights are the
+validator's finalized projection. `optima/chain/` is the production path and persists its
+authority in SQLite. `commit_reveal.py` and its JSON ledger remain a local mechanism
+simulator for development and compatibility; they are not settlement authority.
 
 ---
 
 ## Part 8 — The threat model (every failure mode I can think of)
 
-This is the section you asked for. I group attacks by **what the miner is trying
-to fake**, give each a verdict, and am explicit about residual risk. "Mitigated"
-means *in the current design*; "needs isolation" means *requires the sandbox layer
-that is specified but not yet built*.
+The tables group attacks by the authority they target. "Mitigated" denotes a control in
+the production path; "partial" denotes a residual that still requires calibration,
+operational policy, or broader coverage.
 
 ### 8.1 Your attack: substitute the output (e.g. via an API call)
 
 > *"The miner runs gibberish kernels while the real results come from an API call,
 > so the KL diff looks correct."*
 
-**Verdict: structurally defeated by the kernel-slot design — for the output. The
-in-process variant is the real residual risk.**
+**Verdict: structurally defeated by the registered-target design and enforced by the
+OCI boundary.**
 
-- The miner only implements **one op** (silu). They never produce the final
-  tokens or the logprobs — sglang does, downstream, from the whole forward pass.
-  The KL is computed by the validator from sglang's logprobs (Part 5.6, step 8).
-  There is **no final output to substitute**, and faking a cheap op via a network
-  call is slower and pointless. The attack you described assumes whole-model
-  submission, which we specifically don't allow (Part 3.3).
-- **BUT** — and this is the honest residual — the kernel is still *arbitrary code
-  running in the scheduler process*. The op-slot contract ("just fill `out` from
-  `x`") is enforced only by convention. A malicious kernel's code could, in
-  principle, reach beyond its op: monkeypatch the sampler, hook the model output,
-  patch sglang's logprob computation, or exfiltrate weights. So the attack doesn't
-  vanish — it **relocates** from "fake the output" to "escape the op-slot
-  abstraction via in-process code." That is handled by **isolation** (8.4), which
-  is the most important not-yet-built piece. The static scan (`sandbox.scan_source`)
-  is a tripwire for the lazy version of this, not a guarantee.
+- The miner implements one registered singleton or exact atomic target upstream of the
+  sampler. It does not own the final tokens, role schedule, timing, or T quality evidence.
+  There is no miner-defined final output or grading reference to substitute.
+- Candidate Python can mutate its own scheduler process, so that entire process is
+  untrusted. It runs inside a no-egress OCI worker with bounded mounts, read-only root,
+  dropped privileges/capabilities, seccomp/resource policy, a distinct CUDA context, and
+  controller-owned teardown. Static scanning remains a tripwire rather than the boundary.
+  The trusted controller and pristine T authority are outside that worker.
 
 ### 8.2 Fake the result — pass KL without doing the real work
 
@@ -686,36 +660,35 @@ in-process variant is the real residual risk.**
 | # | Attack | Verdict | How |
 |---|---|---|---|
 | 6 | Monkeypatch the timer | **Mitigated** | `seam.mark_driver()` — the timing process never imports miner code (Part 5.5). |
-| 7 | Fabricate the token count | **Needs isolation** | `completion_tokens` is computed *in the scheduler process — where the miner kernel also runs* (Part 5.5), so an in-process escape (8.4 #11) can inflate it without touching the driver's clock. **General rule: everything the scheduler sends the driver — token count, logprobs, text — is only as trustworthy as the (unbuilt) isolation; the wall-clock *denominator* is the only genuinely tamper-proof half of throughput.** Partial hardening short of isolation: count from the returned `output_ids` rather than a separate field, and/or fix the budget (`ignore_eos` + a set `max_new_tokens`) so the driver knows the count *a priori*. |
+| 7 | Fabricate the token count | **Mitigated** | The controller fixes the token budget and validates authenticated, fixed-width worker evidence; candidate output is not trusted as an unconstrained throughput numerator. |
 | 8 | Offload work to an untimed stream / return early | **Mitigated** | `torch.cuda.synchronize()` brackets the timer; async work is counted. |
 | 9 | Be fast only on the benchmark shapes | **Partial** | The scoring corpus is now **real benchmarks** (GSM8K + MMLU, long CoT generation), sampled per epoch — far more shape-diverse than the old 40-prompt toy set — and a kernel that corrupts only certain shapes trips the argmax-rate gate (#2). Residual: a kernel can still *branch* on shape to be fast-where-measured; rotate/expand toward the serving distribution and consider random sequence lengths. |
 | 10 | Manipulate GPU clocks | **Needs host op** | Lock clocks (`nvidia-smi -lgc`) at the validator host; not enforced in code yet. |
 
 ### 8.4 Escape the abstraction — arbitrary code execution
 
-This is the real frontier and the biggest not-yet-built piece. The kernel is
-Python that runs in the scheduler process.
+Candidate Python and generated native artifacts are treated as hostile. The production
+boundary is the validator-owned OCI session, not Python-level sandboxing.
 
 | # | Attack | Verdict | How (required) |
 |---|---|---|---|
-| 11 | Patch other model components / the sampler / measurement from inside the kernel | **Needs isolation** | The seam only *invites* the kernel; it doesn't sandbox it. Run the scheduler in a locked-down process. |
-| 12 | Exfiltrate weights / IP over the network | **Needs isolation** | Network namespace with **no egress**. Static scan blocks the obvious imports but isn't a boundary. |
-| 13 | Attack the validator host / persist / hit other evals | **Needs isolation** | Ephemeral per-eval process + PID/mount/user namespaces, seccomp, no shared FS. |
-| 14 | Hang the GPU (infinite-loop kernel) — DoS | **Needs watchdog** | Per-eval CUDA **context** + a watchdog that kills the whole context on timeout. CUDA can't preempt a running kernel cleanly. |
-| 15 | Out-of-bounds device writes corrupt other tensors / leak across requests | **Needs isolation** | Device code isn't memory-safe within a context. One CUDA context per eval (MPS/MIG or one process per eval). |
-| 16 | Supply-chain: malicious source runs at import/compile (global ctor, etc.) | **Partial** | Static scan + the load happening only inside the isolated worker. Source-only (no prebuilt binaries) + offline build help. |
+| 11 | Patch model components / sampler / measurement | **Mitigated at authority boundary** | Such mutation remains inside the candidate worker. The trusted controller assigns roles and timing; the pristine T worker independently grades sealed trajectories. |
+| 12 | Exfiltrate weights or evidence | **Mitigated** | Candidate OCI networking is disabled; mounts and protocol frames are bounded and validator-owned. |
+| 13 | Persist on the validator or affect later evaluations | **Mitigated** | Ephemeral OCI lifecycle, read-only root, bounded mounts, dropped capabilities, seccomp/resource policy, teardown and residue checks. |
+| 14 | Hang the GPU | **Mitigated operationally** | Controller deadlines terminate the worker and own device teardown; the result is validator-side NO_DECISION, not a candidate pass. |
+| 15 | Out-of-bounds device writes | **Contained per evaluation** | Candidate engine construction and CUDA context live inside the disposable worker; no other candidate shares that session. |
+| 16 | Malicious import or native compilation | **Mitigated at authority boundary** | Source/native build and loading occur only inside the isolated worker under an attested toolchain and artifact policy. |
 
-**Bottom line for Part 8:** the *scoring* attacks (8.2, 8.3) are largely defeated
-by the current design and demonstrated. The *isolation* attacks (8.4) are the
-ones that still require the sandbox layer described in Part 10 before you can open
-the door to genuinely untrusted miners. Today, "the VM is the sandbox" — fine for
-a controlled demo, not for adversaries.
+**Bottom line for Part 8:** untrusted code may control its own candidate engine, but not
+the chain/control plane, arm schedule, trusted evidence authority, settlement record, or
+serving release. Timed-workload fingerprinting, numerical calibration, and hardware-
+specific coverage remain ongoing concerns rather than isolation gaps.
 
 ### 8.5 Mechanism / economic attacks
 
 | # | Attack | Verdict | How |
 |---|---|---|---|
-| 17 | Copy the champion's bundle | **Mitigated** | Commit-reveal + copy detection + king-of-the-hill (Part 7). |
+| 17 | Copy the champion's bundle | **Mitigated** | Finalized timelock priority + exact/structural copy disposition; copied content never enters qualification or settlement. |
 | 18 | Front-run a rival's reveal | **Mitigated** | Can't reveal what you have no prior commitment to. |
 | 19 | Sybil (many identities split reward) | **Mitigated-ish** | Only improvement-over-best earns; copies earn 0; chain registration has a cost. |
 | 20 | Overfit the eval distribution (great on eval prompts, useless in production) | **Ongoing risk** | Fresh per-epoch prompts from a corpus; rotate/expand toward the real serving distribution. This never fully "closes" — it's a tuning discipline. |
@@ -753,8 +726,9 @@ up to gpt-oss-120b:
   noise floor of 3.9e-4 (~24×) — correctly flagged. (The layered gate working.)
 - **Robust scoring**: median-of-K with spread; tamper-resistant timing
   (`mark_driver`); a faithful-but-slower kernel correctly earns no title.
-- **Commit-reveal + king-of-the-hill**: commit→reveal→evaluate→settle, copy
-  detection, margin gate. 75 unit tests green.
+- **The current authority is stricter than the original mechanism:** finalized native
+  commit-reveal intake, immutable publication, registered non-crown screening, isolated
+  B/C/B′/T qualification, independent reproduction, and transactional target settlement.
 - **gpt-oss-120b fits one 80 GB H100** (~69 GB at its native quantization), so the
   bootstrap doesn't need a B200 cluster.
 
@@ -767,29 +741,26 @@ ones are caught by the gate.
 
 ---
 
-## Part 10 — What is NOT done (production gaps)
+## Part 10 — Remaining work
 
-In rough priority:
-
-1. **Isolation** (8.4): per-eval process + namespaces + no network egress + GPU
-   context isolation + watchdog. *Required before untrusted miners.* Today the VM
-   is the trust boundary.
-2. **More kernels that beat sglang** — proven possible (2026-07-07: the fused-epilogue
+1. **More kernels that beat sglang** — proven possible (2026-07-07: the fused-epilogue
    collectives measured 1.044–1.074× through the referee on the M3 arena); now it needs
-   breadth. Ten slots exist; the example bundles are correctness demos. The prizes are MLA/weight-absorbed attention,
+   breadth. Eleven slots exist; the example bundles are correctness demos. The prizes are MLA/weight-absorbed attention,
    dense FP8/FP4 GEMM, and *comms-overlap* blocks (a block that owns its trailing reduce) —
    plus the multi-GPU surface (TP / PD-disaggregation / EP). Each new slot is a `SlotSpec` +
    a seam patch; the hard part is a kernel that wins, not the wiring.
+2. **Cross-validator calibration**: pinned arena/runtime/model/topology identities,
+   measured noise floors and workload mixtures reduce divergence; B300-specific
+   false-crown, charged-tail, drift, SM103 and NVLink behavior still require B300 proof.
 3. **Cross-validator determinism**: locked clocks, pinned HW/driver, deterministic
    mode on, more medians — so independent validators agree (Bittensor consensus).
 4. **Full-logit KL** at a reference seam (vs top-k) for the tightest fidelity gate.
-5. **Chain integration: DONE (2026-07-08)** — native timelock commit-reveal
-   submissions, hash-verified fetch, and the validator loop ran live on the
-   public testnet (`optima chain-*`, `docs/TESTNET.md`). Still open on this
-   front: an owned subnet, staked validator permits, and a hosted bundle store
-   (ledger state is still a local JSON file).
-6. **Bigger models / multi-GPU** (DeepSeek-V4 scale) on the 8×B200 validator.
-7. **A leaderboard/dashboard** over the ledger (mostly a fundraising artifact).
+5. **Mainnet operation** — chain integration, finalized SQLite intake, registered arena
+   screening, settlement, and journaled weight publication exist. Deployment still needs
+   an owned subnet, production validator permits/cadence, hosted bundle storage, backups,
+   monitoring, and serving-registry rollout.
+6. **Bigger models / multi-GPU** (DeepSeek-V4 scale) on the 8×B300 validator.
+7. **A leaderboard/dashboard** over transactional intake and release state.
 
 ---
 
@@ -803,6 +774,9 @@ The harness package, [../optima/](../optima):
 | [manifest.py](../optima/manifest.py) | Parse + validate `manifest.toml`. Schema + ABI check + **path-safety** (`_safe_relpath`). Pure-Python. |
 | [target_catalog.py](../optima/target_catalog.py) | Pure validator policy for canonical singleton/atomic contribution identity, exact members, displacement/compatible overlap, and allowed features. It contains no crown, chain, or settlement policy; stack manifests bind catalog identity in the later assembly layer. |
 | [sandbox.py](../optima/sandbox.py) | `scan_source` (AST policy tripwire), `load_entry` (import the kernel — isolate in prod), `probe_in_subprocess`. |
+| [arena_service.py](../optima/arena_service.py) | Validator-owned arena identity, capacity/retry policy, fixed non-crown screen, admission, and qualification planning. |
+| [stack_manifest.py](../optima/stack_manifest.py) | Evaluation and release stack identity, exact marginal replacement, integrated contribution refs, and integration-review authority. |
+| [settlement.py](../optima/settlement.py) | Two-PASS reproduction candidate, conservative speed, transactional target-level settlement plan and evidence. |
 | [registry.py](../optima/registry.py) | `KernelRegistry` (process-global `REGISTRY`), `KernelImpl`, `Eligibility`. The dispatcher's lookup table + active toggle. |
 | [dispatch.py](../optima/dispatch.py) | `make_{silu_and_mul,rmsnorm,attention,moe,allreduce}_dispatcher` — the one place a miner kernel is called; validator owns the allocation, the call site, + fallback. |
 | [seam.py](../optima/seam.py) | `activate()` (install seam + env-driven load), `mark_driver()` (tamper-resistant timing). Shared by bootstrap + plugin. |
@@ -821,21 +795,27 @@ The harness package, [../optima/](../optima):
 | [eval/capability.py](../optima/eval/capability.py) | `evaluate_capability` — the real-task scoring path: two-launch throughput + **KL + benchmark accuracy** on real prompts (`optima bench`). |
 | [eval/benchmarks.py](../optima/eval/benchmarks.py) | `Benchmark` protocol + `Problem` + **GSM8K & MMLU** (HF datasets, numeric + multiple-choice answer extraction) + registry. |
 | [eval/_launch.py](../optima/eval/_launch.py) | Shared spawn-safe, tamper-resistant `launched_engine` + `engine_kwargs` (incl. `tp_size` / `moe_runner_backend`) used by both eval paths. |
+| [eval/oci_backend.py](../optima/eval/oci_backend.py) | Validator-owned OCI policy, no-egress/resource fence, leases, native prebuild and authoritative teardown. |
+| [eval/oci_outer_session.py](../optima/eval/oci_outer_session.py) | Trusted-controller protocol for isolated candidate engine sessions and bounded evidence frames. |
+| [eval/qualification_runner.py](../optima/eval/qualification_runner.py) | B/C/B′/pristine-T role schedule, authenticated raw evidence, quality authority, graph proof, and aggregate verdict. |
 | [eval/kl.py](../optima/eval/kl.py) | `kl_over_positions` / `aligned_kl` / `extract_per_prompt` — per-position top-k KL, per-prompt alignment, and sglang-output parsing shared by both eval paths. |
 | [eval/prompts.py](../optima/eval/prompts.py) | `CORPUS` + `sample_prompts(n, seed)` — per-epoch prompt sampling. |
 | [bundle_hash.py](../optima/bundle_hash.py) | `content_hash` — deterministic bundle identity. |
-| [commit_reveal.py](../optima/commit_reveal.py) | `Ledger` — commit/reveal, copy detection, king-of-the-hill `settle`, persistence. |
-| [cli.py](../optima/cli.py) | The driver: `slots compat scan verify evaluate bench hash commit reveal ledger settle`. |
+| [chain/intake.py](../optima/chain/intake.py) | SQLite production authority for finalized intake, screens, qualifications, reproductions, stacks, settlement and weight-publication journal state. |
+| [chain/validator_loop.py](../optima/chain/validator_loop.py) | Finalized reveal → private fetch → immutable publication → registered arena screen/qualification → transactional settlement. |
+| [commit_reveal.py](../optima/commit_reveal.py) | Legacy local commit/reveal and settlement simulator; not the production chain authority. |
+| [model_provision.py](../optima/model_provision.py) | Exact all-file model-tree hashing and independently reopenable content-addressed receipts. |
+| [release.py](../optima/release.py) | Signed chain-independent Engine release descriptor, deterministic source/wheel, SBOM/provenance, and OCI build context. |
+| [cli.py](../optima/cli.py) | User/operator commands for verification/evaluation, chain intake, weight reconciliation, model provisioning, and release verification/context construction. |
 
 Examples [../examples/](../examples): one (or more) bundle per slot —
 `miner_silu_{triton,torch,broken,sparse}`, `miner_rmsnorm_{triton,broken}`,
 `miner_attention_torch` / `miner_attention_decode_torch`, `miner_moe_fused_experts_torch`,
-`miner_allreduce_torch` (`*_broken` = adversarial, must FAIL). Tests
-[../tests/](../tests) (75 across 9 files): `test_static.py`
-(scanner/manifest/eligibility/KL), `test_verify_cpu.py` + `test_slots_block.py` +
-`test_moe_seam.py` (op/block correctness), `test_collective.py` (distributed verify),
-`test_rebuild.py`, `test_isolation.py`, `test_benchmarks.py`, `test_commit_reveal.py`
-(the ledger mechanism).
+`miner_allreduce_torch` (`*_broken` = adversarial, must FAIL). The
+[../tests/](../tests) tree covers submission policy, typed ABI and variants, distributed
+verification/graph proof, OCI isolation and protocols, causal qualification, finalized
+SQLite intake, settlement/economics/weight publication, stack assembly, model provisioning,
+and signed release construction.
 
 ---
 
@@ -860,7 +840,7 @@ python -m optima.cli verify   examples/miner_silu_triton --device cuda --dtype b
 # end-to-end gate: faithful PASSes, broken FAILs
 python -m optima.cli evaluate examples/miner_silu_triton --model Qwen/Qwen2.5-0.5B-Instruct --no-deterministic
 python -m optima.cli evaluate examples/miner_silu_broken  --model Qwen/Qwen2.5-0.5B-Instruct --no-deterministic
-# a full anti-copy round
+# legacy local mechanism simulation (production uses finalized chain intake + SQLite)
 optima commit  examples/miner_silu_triton --hotkey alice --salt s1 --round 0 --ledger l.json
 optima reveal  examples/miner_silu_triton --hotkey alice --salt s1 --round 0 --ledger l.json
 python -m optima.cli evaluate examples/miner_silu_triton --model Qwen/Qwen2.5-0.5B-Instruct \
@@ -877,14 +857,14 @@ optima settle  --round 0 --ledger l.json
   `activation.silu_and_mul`). Defined by the validator in `slots.py`.
 - **Seam** — the mechanism that routes a model op to the miner's kernel
   (`bootstrap.py` + `seam.py` + `dispatch.py`).
-- **Driver / scheduler** — the validator's timing process vs the spawned process
-  that runs the model (and the miner kernel).
-- **Baseline / candidate** — the two launches: stock kernels (reference) vs miner
-  kernel.
+- **Controller / worker** — the trusted validator authority vs the isolated OCI process
+  that constructs an engine and runs a candidate.
+- **B / C / B′ / T** — baseline bookend, candidate, second baseline bookend, and the
+  separate pristine teacher-forced quality authority.
 - **KL** — divergence between the candidate's and baseline's output distributions;
   the fidelity gate.
-- **Champion / challenger** — the standing best kernel vs a new one trying to beat
-  it by the margin.
+- **Champion / challenger** — the standing target contribution vs a paired,
+  independently reproduced candidate trying to clear the measured bar.
 - **Commit-reveal** — commit a hash first, reveal the bundle later; makes copying
   impossible.
 - **Hotkey** — a miner's on-chain identity (SS58 address).

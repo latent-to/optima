@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Any, TypeAlias
 
+from optima.eval.evidence_store import EvidenceArtifactRef
 from optima.stack_identity import (
     StackIdentityError,
     canonical_digest,
@@ -24,6 +25,7 @@ from optima.stack_identity import (
 
 
 CONTRIBUTION_REF_SCHEMA_VERSION = 1
+INTEGRATION_REVIEW_SCHEMA_VERSION = 1
 STACK_MANIFEST_SCHEMA_VERSION = 1
 EVALUATION_STACK_POLICY_VERSION = "evaluation-stack.v1"
 ENGINE_RELEASE_POLICY_VERSION = "engine-release.v1"
@@ -223,6 +225,233 @@ class ProposalContributionRef:
             attribution_digest=row["attribution_digest"],  # type: ignore[arg-type]
             schema_version=row["schema_version"],  # type: ignore[arg-type]
         )
+
+
+@dataclass(frozen=True)
+class IntegrationReviewArtifacts:
+    """Retained evidence references used by one source-integration review."""
+
+    primary_attempt_ref: EvidenceArtifactRef
+    reproduction_attempt_ref: EvidenceArtifactRef
+    license_evidence_ref: EvidenceArtifactRef
+    provenance_evidence_ref: EvidenceArtifactRef
+    security_review_ref: EvidenceArtifactRef
+    compatibility_evidence_ref: EvidenceArtifactRef
+    test_evidence_ref: EvidenceArtifactRef
+
+    def __post_init__(self) -> None:
+        for field in self.__dataclass_fields__:
+            if type(getattr(self, field)) is not EvidenceArtifactRef:
+                raise StackManifestError(
+                    f"integration review artifact {field} is not exactly typed"
+                )
+        if self.primary_attempt_ref == self.reproduction_attempt_ref:
+            raise StackManifestError(
+                "integration review artifacts reuse the primary attempt"
+            )
+        expected = {
+            "primary_attempt_ref": (
+                "qualification.cohort-attempt",
+                "optima.qualification.cohort-attempt.v1",
+            ),
+            "reproduction_attempt_ref": (
+                "qualification.cohort-attempt",
+                "optima.qualification.cohort-attempt.v1",
+            ),
+            "license_evidence_ref": (
+                "integration.license",
+                "optima.integration.license.v1",
+            ),
+            "provenance_evidence_ref": (
+                "integration.provenance",
+                "optima.integration.provenance.v1",
+            ),
+            "security_review_ref": (
+                "integration.security-review",
+                "optima.integration.security-review.v1",
+            ),
+            "compatibility_evidence_ref": (
+                "integration.compatibility",
+                "optima.integration.compatibility.v1",
+            ),
+            "test_evidence_ref": (
+                "integration.tests",
+                "optima.integration.tests.v1",
+            ),
+        }
+        for field, (domain, schema) in expected.items():
+            reference = getattr(self, field)
+            if (
+                reference.domain != domain
+                or reference.schema != schema
+                or reference.media_type != "application/json"
+            ):
+                raise StackManifestError(
+                    f"integration review artifact {field} has the wrong domain/schema"
+                )
+        references = tuple(getattr(self, field) for field in self.__dataclass_fields__)
+        if len({reference.sha256 for reference in references}) != len(references):
+            raise StackManifestError(
+                "integration review artifact digests must be pairwise distinct"
+            )
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            field: getattr(self, field).to_dict()
+            for field in self.__dataclass_fields__
+        }
+
+    @classmethod
+    def from_dict(cls, value: object) -> "IntegrationReviewArtifacts":
+        row = _strict_object(
+            value,
+            fields=frozenset(cls.__dataclass_fields__),
+            name="integration review artifacts",
+        )
+        return cls(
+            **{
+                field: EvidenceArtifactRef.from_dict(row[field])
+                for field in cls.__dataclass_fields__
+            }
+        )
+
+    @property
+    def digest(self) -> str:
+        return canonical_digest("optima.integration-review.artifacts", self.to_dict())
+
+
+@dataclass(frozen=True)
+class IntegrationReviewRecord:
+    """Reviewed promotion from one reproduced crown to ordinary Optima source.
+
+    The record is deliberately chain-independent after construction: chain/crown
+    identities remain immutable provenance, while approval, source, licenses,
+    compatibility, security, and tests are owned by source control and release review.
+    """
+
+    target_id: str
+    target_spec_digest: str
+    proposal_contribution_digest: str
+    settlement_candidate_digest: str
+    settlement_evidence_digest: str
+    crown_event_digest: str
+    primary_attempt_digest: str
+    reproduction_attempt_digest: str
+    integrated_source_tree_digest: str
+    selected_payload_digest: str
+    attribution_digest: str
+    license_evidence_digest: str
+    provenance_evidence_digest: str
+    security_review_digest: str
+    compatibility_evidence_digest: str
+    test_evidence_digest: str
+    artifacts: IntegrationReviewArtifacts
+    reviewer: str
+    review_commit: str
+    approved: bool = True
+    schema_version: int = INTEGRATION_REVIEW_SCHEMA_VERSION
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "target_id", _target_id(self.target_id))
+        for field in (
+            "target_spec_digest",
+            "proposal_contribution_digest",
+            "settlement_candidate_digest",
+            "settlement_evidence_digest",
+            "crown_event_digest",
+            "primary_attempt_digest",
+            "reproduction_attempt_digest",
+            "integrated_source_tree_digest",
+            "selected_payload_digest",
+            "attribution_digest",
+            "license_evidence_digest",
+            "provenance_evidence_digest",
+            "security_review_digest",
+            "compatibility_evidence_digest",
+            "test_evidence_digest",
+        ):
+            object.__setattr__(self, field, _digest(getattr(self, field), field=field))
+        if self.primary_attempt_digest == self.reproduction_attempt_digest:
+            raise StackManifestError("integration review requires independent attempts")
+        if type(self.artifacts) is not IntegrationReviewArtifacts:
+            raise StackManifestError("integration review lacks retained artifact references")
+        expected_artifacts = (
+            ("primary_attempt_digest", self.artifacts.primary_attempt_ref),
+            ("reproduction_attempt_digest", self.artifacts.reproduction_attempt_ref),
+            ("license_evidence_digest", self.artifacts.license_evidence_ref),
+            ("provenance_evidence_digest", self.artifacts.provenance_evidence_ref),
+            ("security_review_digest", self.artifacts.security_review_ref),
+            ("compatibility_evidence_digest", self.artifacts.compatibility_evidence_ref),
+            ("test_evidence_digest", self.artifacts.test_evidence_ref),
+        )
+        if any(getattr(self, field) != reference.sha256 for field, reference in expected_artifacts):
+            raise StackManifestError(
+                "integration review digest differs from retained artifact references"
+            )
+        if (
+            not isinstance(self.reviewer, str)
+            or not self.reviewer
+            or self.reviewer.strip() != self.reviewer
+            or len(self.reviewer) > 256
+            or any(char in self.reviewer for char in "\x00\r\n")
+        ):
+            raise StackManifestError("integration reviewer identity is malformed")
+        if not isinstance(self.review_commit, str) or re.fullmatch(
+            r"[0-9a-f]{40}", self.review_commit
+        ) is None:
+            raise StackManifestError("integration review_commit must be a full Git SHA-1")
+        if self.approved is not True:
+            raise StackManifestError("only approved integration records may enter a release")
+        _current_version(
+            self.schema_version,
+            field="integration review schema_version",
+            expected=INTEGRATION_REVIEW_SCHEMA_VERSION,
+        )
+
+    @property
+    def selected_delta_digest(self) -> str:
+        return _selected_delta(
+            self.target_id, self.target_spec_digest, self.selected_payload_digest
+        )
+
+    @property
+    def digest(self) -> str:
+        return canonical_digest("optima.contribution.integration-review", self.to_dict())
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            field: (
+                self.artifacts.to_dict()
+                if field == "artifacts"
+                else getattr(self, field)
+            )
+            for field in self.__dataclass_fields__
+        }
+
+    @classmethod
+    def from_dict(cls, value: object) -> "IntegrationReviewRecord":
+        row = _strict_object(
+            value,
+            fields=frozenset(cls.__dataclass_fields__),
+            name="integration review",
+        )
+        values = dict(row)
+        values["artifacts"] = IntegrationReviewArtifacts.from_dict(row["artifacts"])
+        return cls(**values)  # type: ignore[arg-type]
+
+    def integrated_ref(self) -> "IntegratedContributionRef":
+        return IntegratedContributionRef(
+            target_id=self.target_id,
+            target_spec_digest=self.target_spec_digest,
+            integrated_source_tree_digest=self.integrated_source_tree_digest,
+            selected_payload_digest=self.selected_payload_digest,
+            attribution_digest=self.attribution_digest,
+            integration_record_digest=self.digest,
+        )
+
+    def require_ref(self, value: "IntegratedContributionRef") -> None:
+        if not isinstance(value, IntegratedContributionRef) or value != self.integrated_ref():
+            raise StackManifestError("integrated contribution differs from its review record")
 
 
 @dataclass(frozen=True)
@@ -774,6 +1003,30 @@ class EngineReleaseManifest:
             context_catalog_digest=context.catalog_digest,
             target_specs=context._target_specs,
         )
+
+    def validate_integrations(
+        self,
+        records: Mapping[str, IntegrationReviewRecord]
+        | Iterable[tuple[str, IntegrationReviewRecord]],
+    ) -> None:
+        """Require one exact approved review record for every shipped target."""
+
+        raw = tuple(records.items()) if isinstance(records, Mapping) else tuple(records)
+        checked: dict[str, IntegrationReviewRecord] = {}
+        for item in raw:
+            if not isinstance(item, (tuple, list)) or len(item) != 2:
+                raise StackManifestError("integration records must be target/record pairs")
+            target, record = item
+            target = _target_id(target, field="integration record target")
+            if target in checked or type(record) is not IntegrationReviewRecord:
+                raise StackManifestError("integration records are duplicated or untyped")
+            if record.target_id != target:
+                raise StackManifestError("integration record target differs from its key")
+            checked[target] = record
+        if set(checked) != set(self.entries):
+            raise StackManifestError("release integration-record coverage differs")
+        for target, ref in self.entries.items():
+            checked[target].require_ref(ref)
 
 
 def stack_manifest_from_dict(

@@ -15,6 +15,7 @@ from __future__ import annotations
 import difflib
 import hashlib
 import os
+import sys
 import textwrap
 import types
 from pathlib import Path
@@ -339,6 +340,13 @@ def test_dependency_prebuild_compiles_without_loading(tmp_path, monkeypatch):
         }[name]
 
     namespace["importlib"] = types.SimpleNamespace(import_module=fake_import)
+    # The complete suite intentionally exercises live FlashInfer adapters before
+    # this hermetic-prebuild unit test.  Restore the process boundary that the
+    # production prebuild container provides, while monkeypatch retains the exact
+    # prior module objects after this test.
+    for name in tuple(sys.modules):
+        if name == "flashinfer" or name.startswith("flashinfer."):
+            monkeypatch.delitem(sys.modules, name)
     monkeypatch.setenv("OPTIMA_TARGET_GPU_ARCH", "sm103")
     monkeypatch.delenv("FLASHINFER_CUDA_ARCH_LIST", raising=False)
     monkeypatch.delenv("FLASHINFER_WORKSPACE_BASE", raising=False)

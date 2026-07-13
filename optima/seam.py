@@ -38,12 +38,22 @@ class _MaterializedNamespaceFinder(abc.MetaPathFinder):
 def _install_materialized_namespace() -> bool:
     """Expose only sealed contribution namespaces after child spawn preparation."""
 
+    release_required = _truthy(os.environ.get("OPTIMA_RELEASE_REQUIRED"))
     root = _ENGINE_TREE
+    release_digest = os.environ.get("OPTIMA_RELEASE_DESCRIPTOR_DIGEST", "")
+    release_verified = os.environ.get("OPTIMA_RELEASE_VERIFIED", "")
     if (
         os.environ.get("OPTIMA_ENGINE_WORKER") != "1"
         or os.environ.get("OPTIMA_BUNDLE_PATH") != root
         or _DIGEST.fullmatch(os.environ.get("OPTIMA_ENGINE_TREE_DIGEST", "")) is None
         or _DIGEST.fullmatch(os.environ.get("OPTIMA_STACK_DIGEST", "")) is None
+        or (
+            release_required
+            and (
+                _DIGEST.fullmatch(release_digest) is None
+                or release_verified != release_digest
+            )
+        )
     ):
         return False
     try:
@@ -62,6 +72,12 @@ def _install_materialized_namespace() -> bool:
 
 def _truthy(v: str | None) -> bool:
     return (v or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _release_abort(message: str) -> None:
+    """Terminate signed-release startup past bootstrap's development catch-all."""
+
+    raise SystemExit(f"optima signed release refused: {message}")
 
 
 # Set TRUE in the validator's driver/timer process (NOT inherited by the spawned
@@ -93,8 +109,11 @@ def activate() -> None:
     (optima/seams.py) — the same table the bootstrap watch-list and the compat canary
     use, so there is no parallel list to keep in sync.
     """
+    release_required = _truthy(os.environ.get("OPTIMA_RELEASE_REQUIRED"))
     if not _IS_DRIVER:
-        _install_materialized_namespace()
+        namespace_installed = _install_materialized_namespace()
+        if release_required and not namespace_installed:
+            _release_abort("materialized namespace did not reopen")
 
     from optima.registry import REGISTRY
     from optima.seams import SEAM_ADAPTERS
@@ -105,6 +124,8 @@ def activate() -> None:
             mod.install(REGISTRY)
         except Exception:  # noqa: BLE001 - never break engine startup
             logger.exception("optima: failed to install seam %s", adapter.name)
+            if release_required:
+                _release_abort(f"seam {adapter.name} did not install")
 
     if _IS_DRIVER:
         # Timing process: seams installed (pass-through) but we never load the
@@ -118,6 +139,8 @@ def activate() -> None:
 
     bundle = os.environ.get("OPTIMA_BUNDLE_PATH", "").strip()
     if not bundle or not _truthy(os.environ.get("OPTIMA_ACTIVE")):
+        if release_required:
+            _release_abort("candidate activation was not armed")
         REGISTRY.disable()
         return
 
@@ -141,12 +164,16 @@ def activate() -> None:
             # known slots, every op skipped): for the eval this is exactly as
             # stock-vs-stock as a failed load — say so, don't stay silent.
             receipts.write("load_failed", {"bundle": bundle, "reason": "no slots registered"})
+            if release_required:
+                _release_abort("bundle registered no slots")
     except Exception:  # noqa: BLE001 - a bad bundle must not wedge the engine
-        logger.exception("optima: bundle load failed for %s; running baseline", bundle)
+        logger.exception("optima: bundle load failed for %s", bundle)
         from optima import receipts
 
         receipts.write("load_failed", {"bundle": bundle, "reason": "exception during load"})
         REGISTRY.clear()
+        if release_required:
+            _release_abort("bundle activation failed")
 
 
 def _load_bundle_into_registry(bundle: str) -> None:

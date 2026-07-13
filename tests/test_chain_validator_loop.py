@@ -6,6 +6,11 @@ from pathlib import Path
 import pytest
 
 import optima.chain.validator_loop as loop
+from optima.arena_service import (
+    SCREEN_STAGES, AdmissionDecision, ArenaQualificationWork,
+    ArenaScreenReceipt, ArenaService, ArenaServiceRegistry, PromotionDecision,
+    ScreenGrade, ScreenStageResult,
+)
 from optima.bundle_hash import content_hash
 from optima.chain import FinalizedRevealSnapshot, RevealedCommitment
 from optima.chain.intake import FinalizedIntakeStore, IntakeScope
@@ -13,7 +18,8 @@ from optima.chain.payload import encode_payload
 from optima.eval.evidence_store import EvidenceArtifactRef
 from optima.eval.qualification import QualificationDecision
 from optima.eval.qualification_intake import (
-    QualificationIntakeBatch, QualificationIntakeOutcome,
+    QualificationAuthorityManifest, QualificationIntakeBatch,
+    QualificationIntakeOutcome, QualificationPlanFactory,
 )
 
 
@@ -73,6 +79,7 @@ def _run(tmp_path, monkeypatch, snapshot, sources, **changes):
         intake_db=tmp_path / "state" / "intake.sqlite3",
         private_root=tmp_path / "private-cache",
         publication_root=tmp_path / "worker",
+        intake_only=True,
     )
     options.update(changes)
     return loop.run_pass(_NoWeightsSubtensor(), 307, **options), calls, options
@@ -179,21 +186,55 @@ def test_live_loop_calls_batch_qualification_and_retains_fail_outcome(
     digest = content_hash(source)
     snapshot = _snapshot([("miner", encode_payload(digest, "https://example.com/a"))])
 
-    class FakeFactory:
-        def __init__(self, reservations):
-            self.manifest = type("Manifest", (), {
-                "reservations": reservations,
-                "digest": "a" * 64,
-                "to_dict": lambda self: {"digest": self.digest},
-            })()
-
-    monkeypatch.setattr(loop, "QualificationPlanFactory", FakeFactory)
     calls = []
+    service = object.__new__(ArenaService)
+    service.manifest = type(
+        "Manifest",
+        (),
+        {"digest": "e" * 64, "qualification_policy_digest": "f" * 64},
+    )()
+    registry = object.__new__(ArenaServiceRegistry)
+    monkeypatch.setattr(ArenaServiceRegistry, "require", lambda *_: service)
+    monkeypatch.setattr(ArenaService, "admit", lambda *_: AdmissionDecision.ADMIT)
+    monkeypatch.setattr(
+        ArenaService, "admit_qualification", lambda *_args, **_kwargs: AdmissionDecision.ADMIT
+    )
+    monkeypatch.setattr(
+        ArenaService,
+        "screen",
+        lambda self, candidate: ArenaScreenReceipt(
+            self.identity,
+            candidate.digest,
+            candidate.screen_attempt,
+            tuple(
+                ScreenStageResult(stage, ScreenGrade.PASS, chr(97 + index) * 64, 1)
+                for index, stage in enumerate(SCREEN_STAGES)
+            ),
+            PromotionDecision.PROMOTE,
+        ),
+    )
 
-    def planner(_reservations, _publications, authority_rows):
-        return loop.QualificationWork(
-            FakeFactory(authority_rows), object(), lambda *_: None, lambda **_: None, 30.0
+    def plan(_self, candidates, _receipts):
+        reservations = tuple(row.reservation for row in candidates)
+        authority = QualificationAuthorityManifest(
+            "registered", "a" * 64, "b" * 64, "c" * 64, "d" * 64,
+            tuple(row.selected_delta_digest for row in reservations), reservations,
         )
+        factory = QualificationPlanFactory(
+            authority, lambda _ref: b"s" * 32, lambda _secret: None
+        )
+        return ArenaQualificationWork(
+            factory,
+            object(),
+            lambda *_: None,
+            lambda **_: None,
+            30.0,
+            _self.manifest.qualification_policy_digest,
+        )
+
+    monkeypatch.setattr(ArenaService, "plan_qualification", plan)
+    # The focused test uses a deliberately non-building plan and a mocked runner.
+    monkeypatch.setattr(loop, "QualificationAuthorityManifest", type("NotManifest", (), {}))
 
     def qualify(factory, **_kwargs):
         calls.append(factory.manifest.digest)
@@ -220,9 +261,11 @@ def test_live_loop_calls_batch_qualification_and_retains_fail_outcome(
         monkeypatch,
         snapshot,
         {digest: source},
-        qualification_planner=planner,
+        intake_only=False,
+        arena_registry=registry,
+        arena_id="test-arena",
     )
-    assert calls == ["a" * 64]
+    assert len(calls) == 1 and len(calls[0]) == 64
     assert set(result.decisions.values()) == {"FAIL"}
     with FinalizedIntakeStore(options["intake_db"], scope=SCOPE) as store:
         row = store.all()[0]

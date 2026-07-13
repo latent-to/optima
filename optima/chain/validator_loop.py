@@ -12,13 +12,19 @@ from __future__ import annotations
 
 import hashlib
 import logging
-import math
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional
 
 from optima import chain
+from optima.arena_service import (
+    AdmissionDecision,
+    ArenaCandidateBinding,
+    ArenaQualificationWork,
+    ArenaService,
+    ArenaServiceRegistry,
+)
 from optima.chain.fetch import FetchError, FetchTransientError, fetch_bundle
 from optima.chain.intake import (
     FinalizedArrival,
@@ -39,7 +45,6 @@ from optima.copy_fingerprint import fingerprint_submitted_delta
 from optima.eval.qualification_intake import (
     QualificationAuthorityManifest,
     QualificationIntakeBatch,
-    QualificationPlanFactory,
     QualificationReservation,
     run_qualification_intake,
 )
@@ -53,38 +58,9 @@ class IntakeControllerError(RuntimeError):
     """Validator-owned intake/qualification authority is inconsistent."""
 
 
-@dataclass(frozen=True)
-class QualificationWork:
-    """Exact authorities required for one already-planned cohort execution."""
-
-    factory: QualificationPlanFactory
-    executor: object
-    entropy_provider: object
-    hidden_judge: object
-    deadline: float
-
-    def __post_init__(self) -> None:
-        if type(self.factory) is not QualificationPlanFactory:
-            raise IntakeControllerError("qualification work has no exact plan factory")
-        if not callable(self.entropy_provider) or not callable(self.hidden_judge):
-            raise IntakeControllerError("qualification work authorities are not callable")
-        if (
-            isinstance(self.deadline, bool)
-            or not isinstance(self.deadline, (int, float))
-            or not math.isfinite(float(self.deadline))
-            or float(self.deadline) <= 0
-        ):
-            raise IntakeControllerError("qualification deadline is invalid")
-
-
-QualificationPlanner = Callable[
-    [
-        tuple[IntakeReservation, ...],
-        tuple[WorkerBundlePublication, ...],
-        tuple[QualificationReservation, ...],
-    ],
-    QualificationWork,
-]
+# Compatibility names for code constructing trusted providers.  The live loop
+# accepts only a closed ArenaServiceRegistry, never an arbitrary planner callback.
+QualificationWork = ArenaQualificationWork
 
 
 @dataclass
@@ -99,6 +75,7 @@ class PassResult:
     decisions: dict[str, str] = field(default_factory=dict)
     held: list[str] = field(default_factory=list)
     settlements: dict[str, str] = field(default_factory=dict)
+    screens: dict[str, str] = field(default_factory=dict)
 
 
 def _finalized_arrivals(snapshot) -> tuple[FinalizedArrival, ...]:
@@ -188,10 +165,10 @@ def _qualification_reservations(
 
 
 def _validate_work(
-    work: QualificationWork,
+    work: ArenaQualificationWork,
     expected: tuple[QualificationReservation, ...],
 ) -> None:
-    if type(work) is not QualificationWork:
+    if type(work) is not ArenaQualificationWork:
         raise IntakeControllerError("qualification planner returned an untyped work item")
     if work.factory.manifest.reservations != expected:
         raise IntakeControllerError("qualification factory changed finalized cohort order")
@@ -201,10 +178,19 @@ def _apply_qualification(
     store: FinalizedIntakeStore,
     reservations: tuple[IntakeReservation, ...],
     publications: tuple[WorkerBundlePublication, ...],
-    planner: QualificationPlanner,
+    service: ArenaService,
 ) -> QualificationIntakeBatch:
     authority_rows = _qualification_reservations(reservations, publications)
-    work = planner(reservations, publications, authority_rows)
+    candidates = tuple(
+        ArenaCandidateBinding(authority, publication, reservation.screen_attempts)
+        for reservation, publication, authority in zip(
+            reservations, publications, authority_rows, strict=True
+        )
+    )
+    receipts = tuple(
+        store.latest_promoted_screen(row.reservation_id) for row in reservations
+    )
+    work = service.plan_qualification(candidates, receipts)
     _validate_work(work, authority_rows)
     prepared = None
     if type(work.factory.manifest) is QualificationAuthorityManifest:
@@ -247,6 +233,45 @@ def _apply_qualification(
         evidence_root=None if prepared is None else prepared.evidence_root,
     )
     return batch
+
+
+def _screen_pending(
+    store: FinalizedIntakeStore,
+    service: ArenaService,
+    *,
+    current_block: int,
+) -> dict[str, str]:
+    decisions: dict[str, str] = {}
+    for row in store.screenable(limit=store.policy.max_cohort):
+        admission = service.admit(
+            store.arena_queue_snapshot(current_block=current_block)
+        )
+        if admission is AdmissionDecision.QUEUE:
+            break
+        if admission is AdmissionDecision.HOLD:
+            store.mark_held(row.reservation_id, "arena_screen_capacity_hold")
+            decisions[row.reservation_id] = "hold"
+            continue
+        publication = reopen_worker_bundle(
+            row.publication_root,
+            row.arrival.content_hash,
+            expected_receipt_digest=row.publication_digest,
+        )
+        active = store.begin_screen(
+            row.reservation_id, service_digest=service.identity
+        )
+        authority = _qualification_reservations((active,), (publication,))[0]
+        candidate = ArenaCandidateBinding(
+            authority, publication, active.screen_attempts
+        )
+        receipt = service.screen(candidate)
+        store.apply_screen_receipt(
+            active.reservation_id,
+            candidate_digest=candidate.digest,
+            receipt=receipt,
+        )
+        decisions[active.reservation_id] = receipt.decision.value
+    return decisions
 
 
 def _settle_pending(
@@ -295,9 +320,24 @@ def run_pass(
     private_root: str | Path,
     publication_root: str | Path,
     policy: IntakePolicy = IntakePolicy(),
-    qualification_planner: QualificationPlanner | None = None,
+    arena_registry: ArenaServiceRegistry | None = None,
+    arena_id: str | None = None,
+    intake_only: bool = False,
 ) -> PassResult:
     """Run one non-emitting finalized intake/qualification pass."""
+
+    if type(intake_only) is not bool:
+        raise IntakeControllerError("intake_only must be an exact boolean")
+    if intake_only:
+        if arena_registry is not None or arena_id is not None:
+            raise IntakeControllerError("intake-only mode cannot receive arena authority")
+        service = None
+    else:
+        if type(arena_registry) is not ArenaServiceRegistry or not arena_id:
+            raise IntakeControllerError(
+                "live validation requires an injected registered arena service"
+            )
+        service = arena_registry.require(arena_id)
 
     scope = IntakeScope(str(subtensor.get_block_hash(0)).lower(), netuid)
     with FinalizedIntakeStore(intake_db, policy, scope=scope) as store:
@@ -376,8 +416,28 @@ def run_pass(
             result.copies[copied] = predecessor
             result.published.pop(copied, None)
 
-        if qualification_planner is not None:
-            cohort = store.published(limit=policy.max_cohort)
+        if service is not None:
+            result.screens.update(
+                _screen_pending(
+                    store, service, current_block=snapshot.finalized_block
+                )
+            )
+            cohort = store.promoted(limit=policy.max_cohort)
+            if cohort:
+                admission = service.admit_qualification(
+                    store.arena_queue_snapshot(
+                        current_block=snapshot.finalized_block
+                    ),
+                    cohort_size=len(cohort),
+                )
+                if admission is AdmissionDecision.HOLD:
+                    for row in cohort:
+                        store.mark_held(
+                            row.reservation_id, "arena_qualification_capacity_hold"
+                        )
+                    cohort = ()
+                elif admission is AdmissionDecision.QUEUE:
+                    cohort = ()
             if cohort:
                 publications = tuple(
                     reopen_worker_bundle(
@@ -388,7 +448,7 @@ def run_pass(
                     for row in cohort
                 )
                 batch = _apply_qualification(
-                    store, cohort, publications, qualification_planner
+                    store, cohort, publications, service
                 )
                 result.decisions.update(
                     (row.reservation_digest, row.decision.value)
@@ -421,7 +481,9 @@ def run_validator(
     private_root: str | Path,
     publication_root: str | Path,
     policy: IntakePolicy = IntakePolicy(),
-    qualification_planner: QualificationPlanner | None = None,
+    arena_registry: ArenaServiceRegistry | None = None,
+    arena_id: str | None = None,
+    intake_only: bool = False,
     interval_s: float = DEFAULT_INTERVAL_S,
     once: bool = False,
     max_consecutive_failures: int = 10,
@@ -439,7 +501,9 @@ def run_validator(
                 private_root=private_root,
                 publication_root=publication_root,
                 policy=policy,
-                qualification_planner=qualification_planner,
+                arena_registry=arena_registry,
+                arena_id=arena_id,
+                intake_only=intake_only,
             )
             failures = 0
             logger.info(
@@ -466,6 +530,6 @@ def run_validator(
 
 
 __all__ = [
-    "IntakeControllerError", "PassResult", "QualificationPlanner",
-    "QualificationWork", "run_pass", "run_validator",
+    "IntakeControllerError", "PassResult", "QualificationWork", "run_pass",
+    "run_validator",
 ]

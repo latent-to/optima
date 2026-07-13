@@ -5,6 +5,10 @@ import json
 
 import pytest
 
+from optima.arena_service import (
+    SCREEN_STAGES, ArenaScreenReceipt, PromotionDecision, ScreenGrade,
+    ScreenStageResult,
+)
 from optima.chain.intake import (
     FinalizedArrival, FinalizedIntakeStore, IntakeError, IntakePolicy,
     IntakeScope, SQLiteWeightPublicationJournal,
@@ -24,7 +28,10 @@ from optima.economics import (
     MetagraphMember,
     StandingRewardClaim,
 )
-from optima.settlement import SettlementCandidate, plan_settlement
+from optima.settlement import (
+    SettlementCandidate, SettlementEventType, SettlementQualification,
+    plan_settlement,
+)
 from optima.stack_identity import sha256_hex
 from optima.stack_manifest import (
     EvaluationStackContext,
@@ -82,6 +89,24 @@ def _h(label: str) -> str:
     return sha256_hex(label.encode())
 
 
+def _promote(store: FinalizedIntakeStore, reservation_id: str) -> None:
+    active = store.begin_screen(reservation_id, service_digest=_h("service"))
+    candidate_digest = _h(f"candidate:{reservation_id}:{active.screen_attempts}")
+    receipt = ArenaScreenReceipt(
+        _h("service"),
+        candidate_digest,
+        active.screen_attempts,
+        tuple(
+            ScreenStageResult(stage, ScreenGrade.PASS, _h(stage), 1)
+            for stage in SCREEN_STAGES
+        ),
+        PromotionDecision.PROMOTE,
+    )
+    store.apply_screen_receipt(
+        reservation_id, candidate_digest=candidate_digest, receipt=receipt
+    )
+
+
 def _stack_context(catalog: TargetCatalog) -> EvaluationStackContext:
     targets = catalog.snapshot()["targets"]
     assert isinstance(targets, list)
@@ -128,9 +153,16 @@ def _qualified_settlement_candidate(store: FinalizedIntakeStore) -> SettlementCa
         incumbent, tree_digest=arm.baseline_before.tree_digest
     )
     evidence_root = store.path.parent / "evidence"
-    attempt = publish_evidence(
+    primary_attempt = publish_evidence(
         evidence_root,
-        b"retained qualification attempt",
+        b"retained primary qualification attempt",
+        domain="qualification.cohort-attempt",
+        media_type="application/json",
+        schema="optima.qualification.cohort-attempt.v1",
+    )
+    reproduction_attempt = publish_evidence(
+        evidence_root,
+        b"retained reproduction qualification attempt",
         domain="qualification.cohort-attempt",
         media_type="application/json",
         schema="optima.qualification.cohort-attempt.v1",
@@ -151,47 +183,71 @@ def _qualified_settlement_candidate(store: FinalizedIntakeStore) -> SettlementCa
         publication_digest="d" * 64,
         publication_root="/published/candidate",
     )
-    store.mark_qualifying(row.reservation_id, "7" * 64, AUTHORITY)
-    candidate = SettlementCandidate(
-        lane="registered",
-        arena_digest=incumbent.arena_digest,
-        reservation_digest=row.reservation_id,
-        finalized_block=row.arrival.block,
-        event_index=row.arrival.event_index,
-        event_subindex=row.arrival.event_subindex,
-        hotkey=row.arrival.hotkey,
-        target_id=target,
-        members=(target,),
-        selected_delta_digest=arm.selected_delta_digest,
-        qualification_authority_digest="7" * 64,
-        qualification_plan_digest="6" * 64,
-        qualification_attempt_digest=attempt.sha256,
-        qualification_report_digest="4" * 64,
-        arm_digest=arm.digest,
-        incumbent_stack_digest=arm.baseline_before.stack_digest,
-        incumbent_tree_digest=arm.baseline_before.tree_digest,
-        candidate_stack_digest=arm.challenger.stack_digest,
-        candidate_tree_digest=arm.challenger.tree_digest,
-        speedup="1.05",
-        incumbent_manifest=incumbent,
-        candidate_manifest=arm.candidate,
+    _promote(store, row.reservation_id)
+    def qualification(marker: str, authority: str, attempt, speedup: str):
+        return SettlementQualification(
+            lane="registered",
+            arena_digest=incumbent.arena_digest,
+            reservation_digest=row.reservation_id,
+            finalized_block=row.arrival.block,
+            event_index=row.arrival.event_index,
+            event_subindex=row.arrival.event_subindex,
+            hotkey=row.arrival.hotkey,
+            target_id=target,
+            members=(target,),
+            selected_delta_digest=arm.selected_delta_digest,
+            qualification_authority_digest=authority,
+            qualification_plan_digest=_h("plan-" + marker),
+            qualification_attempt_digest=attempt.sha256,
+            qualification_report_digest=_h("report-" + marker),
+            selection_commitment_digest=_h("commitment-" + marker),
+            selection_secret_commitment_digest=_h("secret-" + marker),
+            selection_evidence_digest=_h("selection-" + marker),
+            arm_digest=arm.digest,
+            incumbent_stack_digest=arm.baseline_before.stack_digest,
+            incumbent_tree_digest=arm.baseline_before.tree_digest,
+            candidate_stack_digest=arm.challenger.stack_digest,
+            candidate_tree_digest=arm.challenger.tree_digest,
+            speedup=speedup,
+            incumbent_manifest=incumbent,
+            candidate_manifest=arm.candidate,
+        )
+
+    authorities = (_h("primary-authority"), _h("reproduction-authority"))
+    qualifications = (
+        qualification("primary", authorities[0], primary_attempt, "1.05"),
+        qualification("reproduction", authorities[1], reproduction_attempt, "1.04"),
     )
-    outcome = QualificationIntakeOutcome(
-        row.reservation_id,
-        arm.selected_delta_digest,
-        "7" * 64,
-        QualificationDecision.PASS,
-        "qualified",
-        False,
-        attempt_artifact_sha256=attempt.sha256,
-        report_digest="4" * 64,
-        settlement_candidate=candidate,
-    )
-    store.apply_qualification_batch(
-        QualificationIntakeBatch("7" * 64, (outcome,), attempt),
-        evidence_root=evidence_root,
-    )
-    return candidate
+    for index, (authority, attempt, settled) in enumerate(
+        zip(
+            authorities,
+            (primary_attempt, reproduction_attempt),
+            qualifications,
+            strict=True,
+        )
+    ):
+        if index:
+            _promote(store, row.reservation_id)
+        store.mark_qualifying(row.reservation_id, authority, AUTHORITY)
+        outcome = QualificationIntakeOutcome(
+            row.reservation_id,
+            arm.selected_delta_digest,
+            authority,
+            QualificationDecision.PASS,
+            "qualified",
+            False,
+            attempt_artifact_sha256=attempt.sha256,
+            report_digest=settled.qualification_report_digest,
+            settlement_qualification=settled,
+        )
+        store.apply_qualification_batch(
+            QualificationIntakeBatch(authority, (outcome,), attempt),
+            evidence_root=evidence_root,
+        )
+        if index == 0:
+            assert store.get(row.reservation_id).status == "reproduction_pending"
+            assert store.lease_settlement_cohort(current_block=11) is None
+    return SettlementCandidate.from_reproductions(*qualifications)
 
 
 def test_finalized_batch_is_reserved_atomically_before_transport(tmp_path):
@@ -403,6 +459,7 @@ def test_qualification_no_decision_is_retained_before_bounded_requeue(tmp_path):
             publication_digest="d" * 64,
             publication_root="/published/a",
         )
+        _promote(store, row.reservation_id)
         store.mark_qualifying(row.reservation_id, "6" * 64, AUTHORITY)
         store.mark_outcome(
             row.reservation_id,
@@ -448,6 +505,7 @@ def test_retry_groups_are_selected_separately_in_finalized_order(tmp_path):
                 publication_digest=marker * 64,
                 publication_root=f"/published/{marker}",
             )
+            _promote(store, row.reservation_id)
             store.mark_qualifying(row.reservation_id, "7" * 64, AUTHORITY)
             store.mark_outcome(
                 row.reservation_id,
@@ -463,10 +521,11 @@ def test_retry_groups_are_selected_separately_in_finalized_order(tmp_path):
             )
 
         assert store.published() == (store.get(first.reservation_id),)
+        _promote(store, first.reservation_id)
         store.mark_qualifying(first.reservation_id, "5" * 64, AUTHORITY)
         store.mark_outcome(
             first.reservation_id,
-            decision="PASS",
+            decision="FAIL",
             attempt_ref=ATTEMPT,
             report_digest="4" * 64,
             reason="qualified",
@@ -491,6 +550,7 @@ def test_qualification_batch_persists_dispositions_and_groups_atomically(tmp_pat
                 publication_digest=marker * 64,
                 publication_root=f"/published/{marker}",
             )
+            _promote(store, row.reservation_id)
             store.mark_qualifying(row.reservation_id, "7" * 64, AUTHORITY)
         failure = "6" * 64
         outcomes = tuple(
@@ -535,13 +595,13 @@ def test_late_earlier_fingerprint_retroactively_identifies_a_qualified_copy(tmp_
             publication_digest="b" * 64,
             publication_root="/published/later",
         )
+        _promote(store, later.reservation_id)
         store.mark_qualifying(later.reservation_id, "5" * 64, AUTHORITY)
         store.mark_outcome(
             later.reservation_id,
-            decision="PASS",
-            attempt_ref=ATTEMPT,
-            report_digest="4" * 64,
-            reason="qualified",
+            decision="NO_DECISION",
+            failure_digest="4" * 64,
+            reason="not_decided",
         )
 
         store.mark_fetching(first.reservation_id)
@@ -586,6 +646,10 @@ def test_pass_projection_settles_atomically_and_recovers_stack_and_claim(tmp_pat
         assert len(standing) == 1
         assert standing[0].arena_digest == candidate.arena_digest
         assert standing[0].retained_evidence_digest == evidence[0].digest
+        crown = store.reopen_active_crown(candidate.arena_digest, candidate.target_id)
+        assert crown.candidate == candidate
+        assert crown.evidence == evidence[0]
+        assert crown.event.event_type is SettlementEventType.CROWN
         assert store.lease_settlement_cohort(current_block=12) is None
 
     with _store(tmp_path) as reopened:
@@ -593,6 +657,16 @@ def test_pass_projection_settles_atomically_and_recovers_stack_and_claim(tmp_pat
         assert current.generation == 1
         assert current.manifest.digest == candidate.candidate_stack_digest
         assert reopened.active_reward_claims()[0][0].hotkey == candidate.hotkey
+        crown = reopened.reopen_active_crown(
+            candidate.arena_digest, candidate.target_id
+        )
+        assert crown.candidate == candidate
+        reopened._db.execute(
+            "UPDATE settlement_events SET event_json='{}' WHERE event_id=?",
+            (crown.event.digest,),
+        )
+        with pytest.raises(IntakeError, match="event is corrupt"):
+            reopened.reopen_active_crown(candidate.arena_digest, candidate.target_id)
 
 
 def test_interrupted_settlement_lease_requeues_retained_evidence_without_gpu(tmp_path):
@@ -695,9 +769,9 @@ def test_weight_projection_reopens_every_active_crown_and_holds_on_loss(tmp_path
         artifact = (
             store.path.parent
             / "evidence"
-            / evidence[0].attempt_ref.domain
-            / evidence[0].attempt_ref.sha256[:2]
-            / evidence[0].attempt_ref.sha256
+            / evidence[0].primary_attempt_ref.domain
+            / evidence[0].primary_attempt_ref.sha256[:2]
+            / evidence[0].primary_attempt_ref.sha256
         )
         artifact.unlink()
         with pytest.raises(IntakeError, match="cannot reopen"):
@@ -742,6 +816,7 @@ def test_pass_without_exact_settlement_projection_is_rejected_atomically(tmp_pat
             publication_digest="d" * 64,
             publication_root="/published/a",
         )
+        _promote(store, row.reservation_id)
         store.mark_qualifying(row.reservation_id, "7" * 64, AUTHORITY)
         outcome = QualificationIntakeOutcome(
             row.reservation_id,

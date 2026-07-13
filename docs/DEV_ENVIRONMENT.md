@@ -32,12 +32,18 @@ is configured (`~/.lium`). **Pod names/IPs change on redeploy — always run
 Rent a multi-GPU box (e.g. B200) per experiment when you need TP / PD-disagg / EP;
 names/IPs are whatever `lium ps` shows.
 
-Current lium pods run without `CAP_SYS_ADMIN`, so in-process
-`unshare(CLONE_NEWNET)` no-egress isolation fails with `EPERM` there. Use
-`--allow-unsafe-no-isolation` only for dev throughput replication. Production
-validator scoring should run the eval worker in a privileged namespace-capable
-container/VM, or launch the candidate side under Docker/OCI with `--network=none`
-and the required GPU mounts.
+Some rented pods do not grant `CAP_SYS_ADMIN`; direct `unshare(CLONE_NEWNET)`
+therefore fails with `EPERM`. Production qualification does not rely on that direct
+path: the validator-owned OCI process manager launches the candidate worker with no
+network, a read-only root filesystem, bounded mounts, seccomp/resource policy, and
+controller-owned teardown. `--allow-unsafe-no-isolation` is restricted to non-crownable
+development replication.
+
+RTX Blackwell hardware is sufficient for referee integration, OCI lifecycle,
+distributed graph, testnet, and chain-independent release validation. B300 runs are
+reserved for properties the RTX topology cannot establish: SM103/CuTe support,
+NVLink/P2P and custom all-reduce behavior, B300-specific noise/calibration, TP4 role
+swaps, and performance qualification of the MiniMax-M3 campaign kernels.
 
 ### Driving a pod programmatically
 

@@ -227,6 +227,53 @@ PR7_AUTHORITY_ROOTS = [
     "optima.settlement",
 ]
 PR7_FORBIDDEN_MODULES = PR6_FORBIDDEN_MODULES
+PR8_BASE = "084fb8d7e6debe22d1852f0cd0ffca915648bb2d"
+PR8_PRODUCTION = [
+    "AGENTS.md",
+    "README.md",
+    "docs/DEV_ENVIRONMENT.md",
+    "docs/HOW_OPTIMA_WORKS.md",
+    "docs/STATE_OF_RECORD.md",
+    "docs/TESTNET.md",
+    "optima/arena_service.py",
+    "optima/chain/intake.py",
+    "optima/chain/validator_loop.py",
+    "optima/chain/weights.py",
+    "optima/cli.py",
+    "optima/engine_tree.py",
+    "optima/eval/qualification_intake.py",
+    "optima/eval/qualification_runner.py",
+    "optima/model_provision.py",
+    "optima/release.py",
+    "optima/settlement.py",
+    "optima/stack_manifest.py",
+    "pyproject.toml",
+]
+PR8_TESTS = [
+    "tests/test_arena_service.py",
+    "tests/test_chain_intake.py",
+    "tests/test_chain_validator_loop.py",
+    "tests/test_cli_chain.py",
+    "tests/test_engine_tree.py",
+    "tests/test_model_provision.py",
+    "tests/test_qualification_intake.py",
+    "tests/test_qualification_runner.py",
+    "tests/test_release.py",
+    "tests/test_settlement.py",
+    "tests/test_stack_manifest.py",
+    "tests/test_vendor_provenance.py",
+    "tests/test_weight_publication.py",
+]
+PR8_AUTHORITY_ROOTS = [
+    "optima.arena_service",
+    "optima.chain.intake",
+    "optima.chain.validator_loop",
+    "optima.chain.weights",
+    "optima.eval.qualification_intake",
+    "optima.release",
+    "optima.settlement",
+]
+PR8_FORBIDDEN_MODULES = PR7_FORBIDDEN_MODULES
 
 
 class EvidenceError(ValueError):
@@ -595,6 +642,28 @@ def validate_contract_document(contract: dict[str, Any], where: str = "contract"
             ],
             "authority": {"forbidden_modules": PR7_FORBIDDEN_MODULES, "roots": PR7_AUTHORITY_ROOTS},
         },
+        "pr8": {
+            "schema_version": 2,
+            "architectural_unit": "8",
+            "base_commit": PR8_BASE,
+            "budget": {"exemption_policy": "none", "production_additions_max": 6500, "test_additions_max": 5000},
+            "production": PR8_PRODUCTION,
+            "test": PR8_TESTS,
+            "required": [
+                {"change": "add", "path": "optima/arena_service.py"},
+                {"change": "modify", "path": "optima/chain/intake.py"},
+                {"change": "modify", "path": "optima/chain/validator_loop.py"},
+                {"change": "modify", "path": "optima/cli.py"},
+                {"change": "modify", "path": "optima/engine_tree.py"},
+                {"change": "modify", "path": "optima/eval/qualification_intake.py"},
+                {"change": "add", "path": "optima/model_provision.py"},
+                {"change": "add", "path": "optima/release.py"},
+                {"change": "modify", "path": "optima/settlement.py"},
+                {"change": "modify", "path": "optima/stack_manifest.py"},
+                {"change": "modify", "path": "pyproject.toml"},
+            ],
+            "authority": {"forbidden_modules": PR8_FORBIDDEN_MODULES, "roots": PR8_AUTHORITY_ROOTS},
+        },
     }
     spec = specs.get(contract["contract_id"])
     if spec is None or schema_version != spec["schema_version"]:
@@ -957,7 +1026,7 @@ def validate_repository(root: Path, *, records_only: bool = False, pr_base: str 
         contract_ids.add(contract["contract_id"])
         contracts.append((contract_path, contract))
     if contract_ids != {
-        "pr4a", "pr4b", "pr4c", "pr4d", "pr4e", "pr5", "pr6", "pr7"
+        "pr4a", "pr4b", "pr4c", "pr4d", "pr4e", "pr5", "pr6", "pr7", "pr8"
     }:
         raise EvidenceError(f"scope contract set differs: {sorted(contract_ids)}")
     if records_only:

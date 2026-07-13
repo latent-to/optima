@@ -24,6 +24,7 @@ dependencies = [
 # `pip install torch --index-url https://download.pytorch.org/whl/cpu` first.
 cpu = ["torch"]
 dev = ["pytest>=7"]
+release = ["cryptography>=41"]
 
 [project.scripts]
 optima = "optima.cli:main"

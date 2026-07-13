@@ -5,10 +5,14 @@ from dataclasses import replace
 import pytest
 
 from optima.discovery import DiscoveryArmPlan
+from optima.eval.evidence_store import EvidenceArtifactRef
 from optima.settlement import (
     SettlementCandidate,
     SettlementError,
+    SettlementEvidence,
+    SettlementEvent,
     SettlementEventType,
+    SettlementQualification,
     plan_settlement,
 )
 from optima.stack_identity import sha256_hex
@@ -93,7 +97,7 @@ def _candidate(
         expected_context=_context(catalog),
     )
     members = catalog.require(replacement.target_id).members
-    return SettlementCandidate(
+    primary = SettlementQualification(
         lane="registered",
         arena_digest=incumbent.arena_digest,
         reservation_digest=_h(f"reservation:{label}"),
@@ -108,6 +112,9 @@ def _candidate(
         qualification_plan_digest=_h(f"plan-authority:{label}"),
         qualification_attempt_digest=_h(f"attempt:{label}"),
         qualification_report_digest=_h(f"report:{label}"),
+        selection_commitment_digest=_h(f"selection-commitment:{label}"),
+        selection_secret_commitment_digest=_h(f"selection-secret:{label}"),
+        selection_evidence_digest=_h(f"selection-evidence:{label}"),
         arm_digest=plan.digest,
         incumbent_stack_digest=plan.baseline_before.stack_digest,
         incumbent_tree_digest=plan.baseline_before.tree_digest,
@@ -117,6 +124,18 @@ def _candidate(
         incumbent_manifest=incumbent,
         candidate_manifest=plan.candidate,
     )
+    reproduction = replace(
+        primary,
+        qualification_authority_digest=_h(f"reproduction-authority:{label}"),
+        qualification_plan_digest=_h(f"reproduction-plan-authority:{label}"),
+        qualification_attempt_digest=_h(f"reproduction-attempt:{label}"),
+        qualification_report_digest=_h(f"reproduction-report:{label}"),
+        selection_commitment_digest=_h(f"reproduction-selection-commitment:{label}"),
+        selection_secret_commitment_digest=_h(f"reproduction-selection-secret:{label}"),
+        selection_evidence_digest=_h(f"reproduction-selection-evidence:{label}"),
+        speedup=("1.04" if speedup == "1.05" else speedup),
+    )
+    return SettlementCandidate.from_reproductions(primary, reproduction)
 
 
 def _discovery(
@@ -131,7 +150,7 @@ def _discovery(
         build_profile_digest=_h("build-profile"),
         overlay_identity_digest=_h(f"overlay:{label}"),
     )
-    return SettlementCandidate(
+    primary = SettlementQualification(
         lane="discovery",
         arena_digest=incumbent.arena_digest,
         reservation_digest=_h(f"reservation:{label}"),
@@ -146,6 +165,9 @@ def _discovery(
         qualification_plan_digest=_h(f"plan-authority:{label}"),
         qualification_attempt_digest=_h(f"attempt:{label}"),
         qualification_report_digest=_h(f"report:{label}"),
+        selection_commitment_digest=_h(f"selection-commitment:{label}"),
+        selection_secret_commitment_digest=_h(f"selection-secret:{label}"),
+        selection_evidence_digest=_h(f"selection-evidence:{label}"),
         arm_digest=arm.digest,
         incumbent_stack_digest=arm.baseline_before.stack_digest,
         incumbent_tree_digest=arm.baseline_before.tree_digest,
@@ -155,6 +177,24 @@ def _discovery(
         incumbent_manifest=incumbent,
         proposal_digest=arm.proposal_digest,
     )
+    return SettlementCandidate.from_reproductions(
+        primary,
+        replace(
+            primary,
+            qualification_authority_digest=_h(f"reproduction-authority:{label}"),
+            qualification_plan_digest=_h(f"reproduction-plan-authority:{label}"),
+            qualification_attempt_digest=_h(f"reproduction-attempt:{label}"),
+            qualification_report_digest=_h(f"reproduction-report:{label}"),
+            selection_commitment_digest=_h(
+                f"reproduction-selection-commitment:{label}"
+            ),
+            selection_secret_commitment_digest=_h(
+                f"reproduction-selection-secret:{label}"
+            ),
+            selection_evidence_digest=_h(f"reproduction-selection-evidence:{label}"),
+            speedup="1.02",
+        ),
+    )
 
 
 def test_candidate_json_round_trip_and_digest_are_canonical() -> None:
@@ -163,10 +203,96 @@ def test_candidate_json_round_trip_and_digest_are_canonical() -> None:
     reopened = SettlementCandidate.from_dict(candidate.to_dict())
     assert reopened == candidate
     assert reopened.digest == candidate.digest
+    assert candidate.speedup == "1.04"
     with pytest.raises(SettlementError, match="canonical decimal"):
-        replace(candidate, speedup="1.050")
+        replace(candidate.primary, speedup="1.050")
     with pytest.raises(SettlementError, match="target/delta"):
-        replace(candidate, selected_delta_digest=_h("other"))
+        replace(candidate.primary, selected_delta_digest=_h("other"))
+
+
+def test_single_pass_or_reused_evidence_cannot_become_settlement_candidate() -> None:
+    catalog = default_target_catalog()
+    candidate = _candidate(
+        _stack(catalog), _ref(catalog, MSA, "a"), catalog, label="a"
+    )
+    with pytest.raises(SettlementError, match="reuses primary"):
+        SettlementCandidate.from_reproductions(candidate.primary, candidate.primary)
+    with pytest.raises(SettlementError, match="reproduction identity"):
+        SettlementCandidate.from_reproductions(
+            candidate.primary,
+            replace(candidate.reproduction, hotkey="different-miner"),
+        )
+
+
+@pytest.mark.parametrize(
+    "field",
+    (
+        "qualification_authority_digest",
+        "qualification_plan_digest",
+        "qualification_attempt_digest",
+        "qualification_report_digest",
+        "selection_commitment_digest",
+        "selection_secret_commitment_digest",
+        "selection_evidence_digest",
+    ),
+)
+def test_each_reproduction_authority_and_evidence_identity_must_be_distinct(
+    field: str,
+) -> None:
+    catalog = default_target_catalog()
+    candidate = _candidate(
+        _stack(catalog), _ref(catalog, MSA, "a"), catalog, label="a"
+    )
+    reproduced = replace(
+        candidate.reproduction,
+        **{field: getattr(candidate.primary, field)},
+    )
+    with pytest.raises(SettlementError, match="reuses primary"):
+        SettlementCandidate.from_reproductions(candidate.primary, reproduced)
+
+
+def test_conservative_speed_uses_slower_independent_reproduction() -> None:
+    catalog = default_target_catalog()
+    candidate = _candidate(
+        _stack(catalog), _ref(catalog, MSA, "a"), catalog,
+        label="a", speedup="1.09",
+    )
+    slower = replace(candidate.reproduction, speedup="1.03")
+    reproduced = SettlementCandidate.from_reproductions(candidate.primary, slower)
+    assert reproduced.speedup == "1.03"
+
+
+def test_settlement_evidence_binds_both_retained_attempts() -> None:
+    catalog = default_target_catalog()
+    candidate = _candidate(
+        _stack(catalog), _ref(catalog, MSA, "a"), catalog, label="a"
+    )
+    primary_ref = EvidenceArtifactRef(
+        "qualification.cohort-attempt",
+        candidate.primary.qualification_attempt_digest,
+        1,
+        "application/json",
+        "optima.qualification.cohort-attempt.v1",
+    )
+    reproduction_ref = EvidenceArtifactRef(
+        "qualification.cohort-attempt",
+        candidate.reproduction.qualification_attempt_digest,
+        1,
+        "application/json",
+        "optima.qualification.cohort-attempt.v1",
+    )
+    evidence = SettlementEvidence.bind(
+        candidate,
+        primary_attempt_ref=primary_ref,
+        reproduction_attempt_ref=reproduction_ref,
+    )
+    assert SettlementEvidence.from_dict(evidence.to_dict()) == evidence
+    with pytest.raises(SettlementError, match="differ from the candidate"):
+        SettlementEvidence.bind(
+            candidate,
+            primary_attempt_ref=reproduction_ref,
+            reproduction_attempt_ref=primary_ref,
+        )
 
 
 def test_highest_speedup_wins_and_events_form_hash_chain() -> None:
@@ -197,6 +323,7 @@ def test_highest_speedup_wins_and_events_form_hash_chain() -> None:
     assert [row.sequence for row in plan.events] == [7, 8, 9, 10]
     for prior, current in zip(plan.events, plan.events[1:]):
         assert current.previous_event_digest == prior.digest
+    assert SettlementEvent.from_dict(plan.events[1].to_dict()) == plan.events[1]
 
 
 def test_equal_speedup_uses_finalized_order_not_input_order() -> None:

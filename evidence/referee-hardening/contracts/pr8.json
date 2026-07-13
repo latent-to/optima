@@ -1,0 +1,140 @@
+{
+  "allowed_paths": {
+    "control_exact": [
+      ".github/workflows/referee-evidence.yml",
+      "scripts/check_referee_evidence.py",
+      "tests/test_referee_evidence.py"
+    ],
+    "control_prefixes": [
+      "evidence/referee-hardening/"
+    ],
+    "production": [
+      "AGENTS.md",
+      "README.md",
+      "docs/DEV_ENVIRONMENT.md",
+      "docs/HOW_OPTIMA_WORKS.md",
+      "docs/STATE_OF_RECORD.md",
+      "docs/TESTNET.md",
+      "optima/arena_service.py",
+      "optima/chain/intake.py",
+      "optima/chain/validator_loop.py",
+      "optima/chain/weights.py",
+      "optima/cli.py",
+      "optima/engine_tree.py",
+      "optima/eval/qualification_intake.py",
+      "optima/eval/qualification_runner.py",
+      "optima/model_provision.py",
+      "optima/release.py",
+      "optima/release_host.py",
+      "optima/release_runtime.py",
+      "optima/seam.py",
+      "optima/settlement.py",
+      "optima/stack_manifest.py",
+      "pyproject.toml"
+    ],
+    "test": [
+      "tests/test_arena_service.py",
+      "tests/test_chain_intake.py",
+      "tests/test_chain_validator_loop.py",
+      "tests/test_cli_chain.py",
+      "tests/test_dep_patches.py",
+      "tests/test_engine_tree.py",
+      "tests/test_model_provision.py",
+      "tests/test_qualification_intake.py",
+      "tests/test_qualification_runner.py",
+      "tests/test_release.py",
+      "tests/test_release_host.py",
+      "tests/test_settlement.py",
+      "tests/test_stack_manifest.py",
+      "tests/test_vendor_provenance.py",
+      "tests/test_weight_publication.py"
+    ]
+  },
+  "architectural_unit": "8",
+  "authority_boundary": {
+    "forbidden_modules": [
+      "optima.audit",
+      "optima.commit_reveal",
+      "optima.eval._launch",
+      "optima.eval.capability",
+      "optima.eval.throughput_kl"
+    ],
+    "roots": [
+      "optima.arena_service",
+      "optima.chain.intake",
+      "optima.chain.validator_loop",
+      "optima.chain.weights",
+      "optima.eval.qualification_intake",
+      "optima.release",
+      "optima.release_host",
+      "optima.settlement"
+    ]
+  },
+  "base_commit": "084fb8d7e6debe22d1852f0cd0ffca915648bb2d",
+  "budget": {
+    "exemption_policy": "none",
+    "production_additions_max": 6500,
+    "test_additions_max": 5000
+  },
+  "contract_id": "pr8",
+  "record_type": "scope_contract",
+  "required_in_place": [
+    {
+      "change": "add",
+      "path": "optima/arena_service.py"
+    },
+    {
+      "change": "modify",
+      "path": "optima/chain/intake.py"
+    },
+    {
+      "change": "modify",
+      "path": "optima/chain/validator_loop.py"
+    },
+    {
+      "change": "modify",
+      "path": "optima/cli.py"
+    },
+    {
+      "change": "modify",
+      "path": "optima/engine_tree.py"
+    },
+    {
+      "change": "modify",
+      "path": "optima/eval/qualification_intake.py"
+    },
+    {
+      "change": "add",
+      "path": "optima/model_provision.py"
+    },
+    {
+      "change": "add",
+      "path": "optima/release.py"
+    },
+    {
+      "change": "add",
+      "path": "optima/release_host.py"
+    },
+    {
+      "change": "add",
+      "path": "optima/release_runtime.py"
+    },
+    {
+      "change": "modify",
+      "path": "optima/seam.py"
+    },
+    {
+      "change": "modify",
+      "path": "optima/settlement.py"
+    },
+    {
+      "change": "modify",
+      "path": "optima/stack_manifest.py"
+    },
+    {
+      "change": "modify",
+      "path": "pyproject.toml"
+    }
+  ],
+  "schema_version": 2
+}

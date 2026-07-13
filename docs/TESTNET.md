@@ -15,16 +15,16 @@ NATIVE timelock commit-reveal (`set_reveal_commitment`):
   included) can read the bundle URL before the reveal, so there is no
   pre-evaluation copy window;
 - the reveal block is the consensus anti-copy priority timestamp — the validator
-  replays reveals into the Ledger in chain order, so "earliest committer wins"
+  replays finalized reveals in chain order, so "earliest committer wins"
   is decided by the chain, not by any off-chain clock;
 - chain-side caps: 1024 bytes per timelock payload, ~3100 payload-bytes per
   hotkey per epoch (each commit costs `max(100, bytes)` of that budget).
 
-Everything else — fetching, hash verification, copy detection, the gate chain,
-settlement — happens on the validator, recorded in the JSON ledger
-(`commit_reveal.Ledger`). Weight policy is read from `Ledger.current_weights()`
-— the ONE place emission policy lives (currently per-slot king-of-the-hill;
-NOT frozen winner-take-all).
+Everything else happens on the validator. `FinalizedIntakeStore` records finalized
+priority, private fetch, immutable worker publication, copy disposition, arena-screen
+receipts, qualifications, reproduction state, settlement, stack state, and weight-
+publication journal entries in SQLite. The legacy JSON `commit_reveal.Ledger` remains a
+development simulator; it is not the production chain authority.
 
 ## Prerequisites
 
@@ -60,33 +60,48 @@ optima chain-submit examples/miner_silu_torch --url https://example.com/bundle.t
 # 3. inspect the subnet: neurons, permits, revealed submissions
 optima chain-status --netuid 307 --network "$NET" --wallet default --hotkey default
 
-# 4. validator: the referee loop (single pass with --once; daemon without)
-optima chain-validate --netuid 307 --network "$NET" --wallet default --hotkey default \
-    --ledger chain_ledger.json --bundles-dir chain_bundles \
-    --once --margin 0 --dry-run-weights
+# 4. validator: finalized intake only (single pass with --once; daemon without)
+optima chain-validate --netuid 307 --network "$NET" \
+    --intake-db chain_intake/intake.sqlite3 \
+    --private-root chain_intake/private --publication-root chain_intake/worker \
+    --intake-only --once
 ```
 
-One `chain-validate` pass = read revealed commitments (chain order) → fetch each
-new artifact (size-capped; hostile-archive-safe extraction: no symlinks /
-hardlinks / path escapes) → **re-hash the extracted tree and refuse a mismatch
-with the committed hash** → fingerprint + Ledger reveal (copies are demoted, not
-evaluated) → evaluate originals out-of-process → record scores → settle per slot
-→ push weights (the SDK routes through the drand commit-reveal weight path
-automatically when the subnet enables it). Every submission gets an EvalRecord,
-so restarts skip known work and dead URLs are not refetched.
+One intake pass reads finalized reveals in consensus order, fetches each new artifact
+with archive and extraction limits, **re-hashes the extracted tree against the committed
+hash**, records copy priority, and creates an immutable worker publication. The SQLite
+cursor and per-stage state make the pass restart-safe; miner failures, transient transport
+faults, and validator holds remain distinct dispositions.
 
-### Evaluators
+### Qualification and settlement
 
-- Default (no flag): **verify-mode plumbing** — runs `optima verify` on CPU and
-  scores pass/fail as 1.0/0.0. A 1.0 never clears a positive dethrone margin, so
-  plumbing runs use `--margin 0`. Never use this for real emissions.
-- Production: `--eval-cmd 'ssh gpubox optima-eval.sh {bundle} {report}'` — any
-  command template; exit 0 = passed the gate chain, and a JSON report
-  (`{"score":..., "kl_mean":..., "slot":...}`) written to `{report}` carries the
-  real throughput score from `optima evaluate` (graphs-on, audit fidelity mode,
-  GSM8K gate — the full referee).
+Production validation is not selected by a miner-supplied command or module path.
+Deployment code calls `cmd_chain_validate(..., arena_registry=...)` or
+`run_validator(...)` with a trusted `ArenaServiceRegistry` and an `arena_id`. The
+registered service binds the runtime, model, topology, workload mixture, capacity and
+retry policy, screen policy, and qualification-plan factory. Its non-crown screen runs
+the fixed static/build/ABI/graph/abbreviated-serving stages before promotion.
 
-## Validated on netuid 307 (2026-07-08)
+Full qualification uses the isolated B/C/B′/pristine-T authority. One passing report is
+stored as `reproduction_pending`; a second pass must use independent authority and
+selection evidence while matching the same arena, target, delta, incumbent and candidate
+stack identities. Settlement receives only the paired candidate and uses the lower
+speedup. Weight submission is a separate control-plane reconciliation:
+
+```bash
+optima set-weights --intake-db chain_intake/intake.sqlite3 \
+  --netuid 307 --network "$NET" --wallet default --hotkey default \
+  --half-life-blocks <N> --discovery-lifetime-blocks <N> \
+  --discovery-pool-ppm <PPM> --refresh-blocks <N> --dry-run
+```
+
+## Historical testnet receipts
+
+The following receipts established the chain SDK, timelock, fetch, copy, restart, and
+weight-publication behavior before the SQLite authority replacement. They do not claim a
+joined production-arena run for the current implementation.
+
+### Netuid 307 (2026-07-08)
 
 - Registered validator (uid 3) + miner (uid 4) hotkeys; burn ≈ 0.0005 tTAO each.
 - Committed `miner_silu_torch` (178-byte payload, 5-block timelock) from the
@@ -100,7 +115,7 @@ so restarts skip known work and dead URLs are not refetched.
   weights to apply. Hyperparams there: tempo 360, commit-reveal weights ENABLED,
   weights_rate_limit 100 (skipped under commit-reveal).
 
-## Validated on netuid 307, round 2 (2026-07-10) — real weights
+### Netuid 307, round 2 (2026-07-10) — real weights
 
 Everything the 07-08 pass left dry-run, landed for real (the subnet owner
 start-called 307 around 07-08, so `SubtokenEnabled` and permits now work there):
@@ -139,10 +154,10 @@ Operational gotchas (learned here):
 
 ## Threat-model notes
 
-- The validator never imports miner code: evaluation is subprocess-only, same as
-  `optima verify`. Bundle fetch treats archives as hostile (member-type and
-  path checks, archive/extracted/member-count budgets).
-- Chain keys stay on the control box; the GPU box only ever sees the bundle
-  directory (SUBNET_BLUEPRINT §8). Wire `--eval-cmd` over SSH accordingly.
+- The trusted controller never imports miner code or loads candidate native artifacts.
+  Candidate import, hermetic native compilation, engine construction, and execution occur
+  in a validator-owned OCI worker with no network egress and bounded mounts/protocols.
+- Chain keys remain on the control plane. Arena workers receive only immutable,
+  hash-complete publications and validator-owned plans; they cannot set weights.
 - A miner lying about the hash (committing X, hosting Y) is rejected at the
   re-hash step and recorded, so the lie is not retried every pass.

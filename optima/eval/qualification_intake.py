@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable
 
 if TYPE_CHECKING:
-    from optima.settlement import SettlementCandidate
+    from optima.settlement import SettlementQualification
 
 from optima.discovery import DiscoveryArmPlan
 from optima.eval.evidence_store import EvidenceArtifactRef, publish_evidence
@@ -572,7 +572,7 @@ class QualificationIntakeOutcome:
     attempt_artifact_sha256: str | None = None
     report_digest: str | None = None
     failure_digest: str | None = None
-    settlement_candidate: SettlementCandidate | None = None
+    settlement_qualification: SettlementQualification | None = None
 
     def __post_init__(self) -> None:
         for field in (
@@ -607,30 +607,30 @@ class QualificationIntakeOutcome:
             raise QualificationIntakeError(
                 "PASS/FAIL requires a complete attempt and report product"
             )
-        from optima.settlement import SettlementCandidate
+        from optima.settlement import SettlementQualification
 
-        if self.settlement_candidate is not None:
-            if type(self.settlement_candidate) is not SettlementCandidate:
+        if self.settlement_qualification is not None:
+            if type(self.settlement_qualification) is not SettlementQualification:
                 raise QualificationIntakeError(
-                    "settlement projection is not exactly typed"
+                    "settlement qualification is not exactly typed"
                 )
             if self.decision is not QualificationDecision.PASS:
                 raise QualificationIntakeError(
-                    "non-PASS outcome cannot carry settlement authority"
+                    "non-PASS outcome cannot carry a settlement qualification"
                 )
             if (
-                self.settlement_candidate.reservation_digest != self.reservation_digest
-                or self.settlement_candidate.selected_delta_digest
+                self.settlement_qualification.reservation_digest != self.reservation_digest
+                or self.settlement_qualification.selected_delta_digest
                 != self.selected_delta_digest
-                or self.settlement_candidate.qualification_authority_digest
+                or self.settlement_qualification.qualification_authority_digest
                 != self.authority_manifest_digest
-                or self.settlement_candidate.qualification_attempt_digest
+                or self.settlement_qualification.qualification_attempt_digest
                 != self.attempt_artifact_sha256
-                or self.settlement_candidate.qualification_report_digest
+                or self.settlement_qualification.qualification_report_digest
                 != self.report_digest
             ):
                 raise QualificationIntakeError(
-                    "settlement projection differs from qualification outcome"
+                    "settlement qualification differs from qualification outcome"
                 )
 
 
@@ -821,14 +821,14 @@ def run_qualification_intake(
             or report.selected_delta_digest != reservation.selected_delta_digest
         ):
             raise QualificationIntakeError("qualification report order differs")
-        settlement_candidate = None
+        settlement_qualification = None
         if (
             report.decision is QualificationDecision.PASS
             and prepared_candidates
         ):
-            from optima.settlement import SettlementCandidate
+            from optima.settlement import SettlementQualification
 
-            settlement_candidate = SettlementCandidate.from_qualification(
+            settlement_qualification = SettlementQualification.from_qualification(
                 reservation_digest=reservation.reservation_digest,
                 finalized_block=reservation.finalized_block,
                 event_index=reservation.finalized_event_index,
@@ -840,6 +840,7 @@ def run_qualification_intake(
                 report=report,
                 authority=manifest,
                 attempt_ref=reference,
+                attempt=attempt,
             )
         outcomes.append(
             QualificationIntakeOutcome(
@@ -851,7 +852,7 @@ def run_qualification_intake(
                 report.retryable,
                 attempt_artifact_sha256=reference.sha256,
                 report_digest=report.digest,
-                settlement_candidate=settlement_candidate,
+                settlement_qualification=settlement_qualification,
             )
         )
         if report.decision is QualificationDecision.NO_DECISION:

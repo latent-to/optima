@@ -17,6 +17,7 @@ import posixpath
 import re
 import shutil
 import stat
+import subprocess
 import tempfile
 from contextlib import contextmanager
 from collections.abc import Mapping
@@ -993,6 +994,267 @@ def inspect_contribution(
         return replace(_inspect_contribution(staged, catalog=catalog), root=source)
 
 
+def _git_output(repository: Path, *arguments: str) -> bytes:
+    try:
+        result = subprocess.run(
+            ("git", "-C", str(repository), *arguments),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise EngineTreeError(f"cannot inspect integration review commit: {exc}") from None
+    if result.returncode != 0:
+        detail = result.stderr.decode("utf-8", errors="replace").strip()
+        raise EngineTreeError(
+            f"integration review commit inspection failed: {detail or result.returncode}"
+        )
+    return result.stdout
+
+
+def _review_commit_source_digest(
+    repository_root: str | Path,
+    source_root: str | Path,
+    review_commit: str,
+) -> str:
+    """Require the reviewed Git commit to contain the exact integrated source tree."""
+
+    if not isinstance(review_commit, str) or re.fullmatch(r"[0-9a-f]{40}", review_commit) is None:
+        raise EngineTreeError("integration review_commit must be a full Git SHA-1")
+    repository = _source_directory(repository_root, field="integration repository")
+    source = _source_directory(source_root, field="integrated source tree")
+    try:
+        relative_root = source.relative_to(repository)
+    except ValueError:
+        raise EngineTreeError(
+            "integrated source tree is outside the integration repository"
+        ) from None
+    observed_top = Path(
+        _git_output(repository, "rev-parse", "--show-toplevel")
+        .decode("utf-8", errors="strict")
+        .strip()
+    ).resolve(strict=True)
+    if observed_top != repository:
+        raise EngineTreeError("integration repository is not the Git worktree root")
+    resolved_commit = (
+        _git_output(repository, "rev-parse", "--verify", f"{review_commit}^{{commit}}")
+        .decode("ascii", errors="strict")
+        .strip()
+    )
+    if resolved_commit != review_commit:
+        raise EngineTreeError("integration review_commit did not resolve exactly")
+
+    relative_posix = relative_root.as_posix()
+    pathspec = ":(literal)." if relative_posix == "." else f":(literal){relative_posix}"
+    raw_rows = _git_output(
+        repository,
+        "ls-tree",
+        "-r",
+        "-z",
+        "--full-tree",
+        review_commit,
+        "--",
+        pathspec,
+    )
+    committed: list[dict[str, object]] = []
+    prefix = "" if relative_posix == "." else relative_posix + "/"
+    for raw_row in raw_rows.split(b"\0"):
+        if not raw_row:
+            continue
+        try:
+            identity, raw_path = raw_row.split(b"\t", 1)
+            mode, kind, object_id = identity.split(b" ", 2)
+            repository_path = raw_path.decode("utf-8", errors="strict")
+        except (UnicodeDecodeError, ValueError):
+            raise EngineTreeError("integration review commit tree is malformed") from None
+        if kind != b"blob" or mode not in {b"100644", b"100755"}:
+            raise EngineTreeError(
+                f"integration review commit contains unsupported entry {repository_path!r}"
+            )
+        if prefix and not repository_path.startswith(prefix):
+            raise EngineTreeError("integration review commit escaped the source subtree")
+        logical = repository_path[len(prefix):]
+        path = PurePosixPath(logical)
+        if any(part in _SKIP_DIRS for part in path.parts):
+            continue
+        if path.suffix in _SKIP_SUFFIXES or path.name.startswith("._"):
+            continue
+        logical = _logical_path(logical, field="reviewed source path")
+        payload = _git_output(repository, "cat-file", "blob", object_id.decode("ascii"))
+        committed.append(
+            {"mode": _FILE_MODE, "path": logical, "sha256": sha256_hex(payload)}
+        )
+    if not committed:
+        raise EngineTreeError("integration review commit contains no source files")
+    committed_digest = canonical_digest(
+        "optima.integrated-source-tree",
+        {"files": sorted(committed, key=lambda row: str(row["path"]))},
+    )
+    current_digest = integrated_source_tree_digest(source)
+    if committed_digest != current_digest:
+        raise EngineTreeError(
+            "integrated source tree differs from the integration review_commit"
+        )
+    return current_digest
+
+
+def promote_integrated_contribution(
+    *,
+    candidate: object,
+    settlement_evidence: object,
+    crown_event: object,
+    proposal: object,
+    integrated_source_root: str | Path,
+    repository_root: str | Path,
+    evidence_root: str | Path,
+    catalog: object,
+    review_commit: str,
+    review_artifacts: object,
+    reviewer: str,
+):
+    """Promote one reproduced CROWN into an exact reviewed source contribution.
+
+    This is the validator-owned construction path for ``IntegrationReviewRecord``.
+    It reopens no miner-selected authority: every economic identity arrives as an
+    already typed settlement object, while the integrated source is independently
+    inspected and required to exist byte-for-byte at ``review_commit``.
+    """
+
+    from optima.settlement import (
+        SettlementCandidate,
+        SettlementEvidence,
+        SettlementEvent,
+        SettlementEventType,
+    )
+    from optima.eval.evidence_store import EvidenceStoreError, reopen_evidence
+    from optima.stack_manifest import (
+        IntegrationReviewArtifacts,
+        IntegrationReviewRecord,
+        ProposalContributionRef,
+    )
+
+    if type(candidate) is not SettlementCandidate or candidate.lane != "registered":
+        raise EngineTreeError("integration promotion requires one registered candidate")
+    if type(settlement_evidence) is not SettlementEvidence:
+        raise EngineTreeError("integration promotion settlement evidence is not exactly typed")
+    expected_evidence = (
+        (settlement_evidence.candidate_digest, candidate.digest),
+        (settlement_evidence.reservation_digest, candidate.reservation_digest),
+        (
+            settlement_evidence.primary_authority_digest,
+            candidate.primary.qualification_authority_digest,
+        ),
+        (
+            settlement_evidence.primary_attempt_ref.sha256,
+            candidate.primary.qualification_attempt_digest,
+        ),
+        (
+            settlement_evidence.primary_report_digest,
+            candidate.primary.qualification_report_digest,
+        ),
+        (
+            settlement_evidence.primary_selection_evidence_digest,
+            candidate.primary.selection_evidence_digest,
+        ),
+        (
+            settlement_evidence.reproduction_authority_digest,
+            candidate.reproduction.qualification_authority_digest,
+        ),
+        (
+            settlement_evidence.reproduction_attempt_ref.sha256,
+            candidate.reproduction.qualification_attempt_digest,
+        ),
+        (
+            settlement_evidence.reproduction_report_digest,
+            candidate.reproduction.qualification_report_digest,
+        ),
+        (
+            settlement_evidence.reproduction_selection_evidence_digest,
+            candidate.reproduction.selection_evidence_digest,
+        ),
+    )
+    if any(observed != expected for observed, expected in expected_evidence):
+        raise EngineTreeError("integration promotion evidence differs from its candidate")
+    if type(proposal) is not ProposalContributionRef:
+        raise EngineTreeError("integration promotion proposal is not exactly typed")
+    if candidate.candidate_manifest is None:
+        raise EngineTreeError("integration promotion candidate lacks its exact manifest")
+    replacement = candidate.candidate_manifest.entries.get(candidate.target_id)
+    if replacement != proposal or proposal.selected_delta_digest != candidate.selected_delta_digest:
+        raise EngineTreeError("integration promotion proposal differs from the crowned delta")
+    if (
+        type(crown_event) is not SettlementEvent
+        or crown_event.event_type is not SettlementEventType.CROWN
+        or crown_event.candidate_digest != candidate.digest
+        or crown_event.subject_digest != proposal.digest
+        or crown_event.target_id != proposal.target_id
+        or crown_event.from_stack_digest != candidate.incumbent_stack_digest
+        or crown_event.from_tree_digest != candidate.incumbent_tree_digest
+        or crown_event.to_stack_digest != candidate.incumbent_stack_digest
+        or crown_event.to_tree_digest != candidate.incumbent_tree_digest
+        or crown_event.reason != "qualified_win"
+    ):
+        raise EngineTreeError("integration promotion event is not the exact candidate CROWN")
+    if type(review_artifacts) is not IntegrationReviewArtifacts:
+        raise EngineTreeError("integration promotion review artifacts are not exactly typed")
+    if (
+        review_artifacts.primary_attempt_ref != settlement_evidence.primary_attempt_ref
+        or review_artifacts.reproduction_attempt_ref
+        != settlement_evidence.reproduction_attempt_ref
+    ):
+        raise EngineTreeError("integration review artifacts differ from settlement evidence")
+    try:
+        for reference in (
+            review_artifacts.primary_attempt_ref,
+            review_artifacts.reproduction_attempt_ref,
+            review_artifacts.license_evidence_ref,
+            review_artifacts.provenance_evidence_ref,
+            review_artifacts.security_review_ref,
+            review_artifacts.compatibility_evidence_ref,
+            review_artifacts.test_evidence_ref,
+        ):
+            reopen_evidence(evidence_root, reference)
+    except EvidenceStoreError as exc:
+        raise EngineTreeError(
+            f"cannot reopen retained integration review evidence: {exc}"
+        ) from None
+
+    inspected = inspect_contribution(integrated_source_root, catalog=catalog)
+    if (
+        inspected.target_id != proposal.target_id
+        or inspected.target_spec_digest != proposal.target_spec_digest
+        or inspected.selected_payload_digest != proposal.selected_payload_digest
+        or inspected.selected_delta_digest != proposal.selected_delta_digest
+    ):
+        raise EngineTreeError("integrated source differs from the crowned proposal payload")
+    source_digest = _review_commit_source_digest(
+        repository_root, integrated_source_root, review_commit
+    )
+    return IntegrationReviewRecord(
+        target_id=proposal.target_id,
+        target_spec_digest=proposal.target_spec_digest,
+        proposal_contribution_digest=proposal.digest,
+        settlement_candidate_digest=candidate.digest,
+        settlement_evidence_digest=settlement_evidence.digest,
+        crown_event_digest=crown_event.digest,
+        primary_attempt_digest=settlement_evidence.primary_attempt_ref.sha256,
+        reproduction_attempt_digest=settlement_evidence.reproduction_attempt_ref.sha256,
+        integrated_source_tree_digest=source_digest,
+        selected_payload_digest=proposal.selected_payload_digest,
+        attribution_digest=proposal.attribution_digest,
+        license_evidence_digest=review_artifacts.license_evidence_ref.sha256,
+        provenance_evidence_digest=review_artifacts.provenance_evidence_ref.sha256,
+        security_review_digest=review_artifacts.security_review_ref.sha256,
+        compatibility_evidence_digest=review_artifacts.compatibility_evidence_ref.sha256,
+        test_evidence_digest=review_artifacts.test_evidence_ref.sha256,
+        artifacts=review_artifacts,
+        reviewer=reviewer,
+        review_commit=review_commit,
+    )
+
+
 def _put_file(files: dict[str, bytes], path: str, data: bytes) -> None:
     path = _logical_path(path, field="emitted path")
     if path in files:
@@ -1573,6 +1835,7 @@ def materialize_engine_tree(
     catalog: object,
     resolver: ContributionSourceResolver | Mapping[tuple[str, str], str | Path],
     destination: str | Path,
+    integration_records: object | None = None,
 ) -> MaterializedEngineTree:
     """Assemble one validated evaluation or release stack without executing it."""
 
@@ -1589,6 +1852,19 @@ def materialize_engine_tree(
     if not isinstance(stack, (EvaluationStackManifest, EngineReleaseManifest)):
         raise TypeError("stack must be an EvaluationStackManifest or EngineReleaseManifest")
     stack.validate_against(context)
+    if isinstance(stack, EngineReleaseManifest):
+        if integration_records is None:
+            raise EngineTreeError(
+                "release materialization requires approved integration records"
+            )
+        try:
+            stack.validate_integrations(integration_records)  # type: ignore[arg-type]
+        except (TypeError, ValueError) as exc:
+            raise EngineTreeError(f"release integration authority is invalid: {exc}") from None
+    elif integration_records is not None:
+        raise EngineTreeError(
+            "evaluation materialization must not accept release integration records"
+        )
     if stack.catalog_digest != catalog.digest or stack.catalog_snapshot != catalog.snapshot():
         raise EngineTreeError("stack catalog does not match materializer catalog")
     entries = stack.entries

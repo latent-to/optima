@@ -12,6 +12,7 @@ from scripts.check_referee_evidence import (
     load_json,
     validate_authority_boundary,
     validate_contract_document,
+    validate_donor_disposition,
     validate_record,
     validate_repository,
     validate_scope,
@@ -36,6 +37,10 @@ def test_exact_historical_classification() -> None:
     assert counts["production"] == {"added": 791, "deleted": 3}
     assert counts["test"] == {"added": 910, "deleted": 0}
     assert classify("optima/eval/seccomp_moby_v0_2_1.json") == "vendor"
+
+
+def test_donor_disposition_is_path_complete_and_git_bound() -> None:
+    validate_donor_disposition(ROOT)
 
 
 def test_pr43_preserves_invalid_exact_head_claim() -> None:
@@ -318,6 +323,28 @@ def test_pr7_contract_bounds_transactional_settlement_and_weights() -> None:
     over_budget = dict(changes)
     over_budget["optima/settlement.py"] = ("A", 4201, 0)
     with pytest.raises(EvidenceError, match="pr7 line budget"):
+        validate_scope(contract, over_budget)
+
+
+def test_pr8_contract_bounds_release_join_and_deletion_closure() -> None:
+    contract = load_json(EVIDENCE / "contracts/pr8.json")
+    validate_contract_document(contract)
+    changes = {
+        item["path"]: ({"add": "A", "modify": "M"}[item["change"]], 1, 0)
+        for item in contract["required_in_place"]
+    }
+    validate_scope(contract, changes)
+    schema = load_json(EVIDENCE / "schema-v2.json")
+    validate_v2_schema_contract(schema, contract)
+
+    outside = dict(changes)
+    outside["optima/commit_reveal.py"] = ("M", 1, 0)
+    with pytest.raises(EvidenceError, match="outside frozen pr8"):
+        validate_scope(contract, outside)
+
+    over_budget = dict(changes)
+    over_budget["optima/release.py"] = ("A", 6501, 0)
+    with pytest.raises(EvidenceError, match="pr8 line budget"):
         validate_scope(contract, over_budget)
 
 

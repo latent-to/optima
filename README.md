@@ -8,8 +8,18 @@ result on **output fidelity** — a sampled in-engine comparison against the sto
 baseline, plus task accuracy on real benchmarks. A kernel earns only if it is
 faster at equal quality.
 
-This repository is the validator harness (the referee), the chain integration,
-and example miner bundles.
+This repository contains the validator harness, chain integration, deterministic
+Optima Engine release tooling, and example miner bundles. Untrusted candidate
+execution is confined to validator-owned, no-egress OCI workers; the chain and
+wallet control plane does not load miner code.
+
+The production path is deliberately staged. Finalized chain arrivals are retained in
+SQLite, published to immutable worker trees, and admitted by a registered validator-
+owned arena service. Static, build, ABI, graph, and abbreviated-serving screens are
+non-crownable. A promoted candidate must pass two independent full qualifications
+before transactional settlement; a single pass remains `reproduction_pending`.
+Reviewed winners enter a separate chain-independent release path that seals the model
+tree and emits signed source, wheel, SBOM, provenance, and OCI build-context artifacts.
 
 | You are | Start here |
 |---|---|

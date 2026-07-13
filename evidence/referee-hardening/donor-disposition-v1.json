@@ -1,0 +1,602 @@
+{
+  "schema_version": 1,
+  "record_type": "donor_disposition_inventory",
+  "donor": {
+    "base_commit": "203bb559fd2ddd2fbb2db94ae14126d640d13db3",
+    "tip_commit": "1b1c842b6bcedaa24831ed195ef214c33a3316db",
+    "tag": "referee-hardening-donor-20260711",
+    "changed_path_count": 121,
+    "added_path_count": 63,
+    "modified_path_count": 58,
+    "sorted_name_status_sha256": "190f4a2cb8b10b2b03ffd946ce44fc8cacdf382eb45f73b83e7e18b3007b8c2b",
+    "base_tree": "785d99b93509acbbf36b046331683f0e8318e87c",
+    "tip_tree": "e8535ac4a3a9678ae110a43fafd986afa36eb960"
+  },
+  "disposition_counts": {
+    "PORT": 11,
+    "ADAPT": 100,
+    "DELETE": 4,
+    "DEFER": 2,
+    "VENDOR": 4
+  },
+  "rules": {
+    "path_coverage": "Every path in the sorted output of git diff --name-status BASE TIP appears exactly once in entries.",
+    "mixed_files": "A mixed existing file is ADAPT unless its complete donor change is a byte-preserved vendor or standalone mechanism.",
+    "same_pr_replacements": "PR8 replacements name their final path and a bounded same-merge rationale because no immutable implementation commit exists before this inventory is committed.",
+    "delete": "DELETE rejects or supersedes the donor hunk; it does not authorize removal of unrelated current code.",
+    "defer": "DEFER preserves the experiment only in the frozen donor and does not make it crownable."
+  },
+  "routes": {
+    "local_secret_filename": {
+      "disposition": "DELETE",
+      "rationale": "A developer-specific .pass filename is not a production credential boundary. Release construction excludes credentials and validator deployment must inject secrets outside the repository."
+    },
+    "governance_docs": {
+      "disposition": "ADAPT",
+      "replacement_paths": [
+        "docs/HOW_OPTIMA_WORKS.md",
+        "docs/PRODUCT_CONTRACT.md",
+        "docs/REFEREE_HARDENING_AUDIT.md",
+        "docs/REFEREE_HARDENING_DONOR_MAP.md",
+        "docs/REFEREE_HARDENING_SPLIT_PLAN.md",
+        "docs/STATE_OF_RECORD.md",
+        "docs/TESTNET.md"
+      ],
+      "replacement_commits": [
+        "be48417ba11f47c3b96531372befb12878d70aae",
+        "155786011880c8b6a49cd686692f158f6b3bf55c",
+        "587be331d71c3bd3874cd9aedc06edfae1411ea7"
+      ],
+      "rationale": "The architecture and split plan were edited and merged as neutral governance documents; PR8 updates state claims in place after joined proof."
+    },
+    "vendor_material": {
+      "disposition": "VENDOR",
+      "replacement_paths": [
+        "NOTICE",
+        "optima/arena_assets/minimax_m3/sglang_patch/flashinfer_trtllm.py",
+        "optima/arena_assets/minimax_m3/sglang_patch/modelopt_quant.py",
+        "optima/eval/seccomp_moby_v0_2_1.json",
+        "optima/vendor_provenance.json",
+        "LICENSES/MINIMAX_COMMUNITY_LICENSE.txt",
+        "LICENSES/SGLANG.txt"
+      ],
+      "replacement_commits": [
+        "cb427a927b6b40c559bee9412fede3aa106dc1fe"
+      ],
+      "rationale": "The frozen upstream bytes, hashes, derivations, licenses, and package identities landed in the isolated provenance change."
+    },
+    "arena_policy": {
+      "disposition": "ADAPT",
+      "replacement_paths": [
+        "optima/arena_service.py",
+        "optima/stack_identity.py",
+        "optima/stack_manifest.py",
+        "optima/target_catalog.py",
+        "tests/test_arena_service.py",
+        "tests/test_stack_manifest.py",
+        "tests/test_target_catalog.py"
+      ],
+      "replacement_commits": [
+        "7bd5808f5292cb21b8587ea47b59ed18b1cfdaeb"
+      ],
+      "bounded_rationale": "The donor ArenaProfile mixed runtime, workload, quality, settlement, and release policy. Merged stack/catalog identities own stable competition identity; PR8's registered arena service owns runtime, workload mixture, capacity, screening, and qualification policy in this merge unit."
+    },
+    "typed_contracts": {
+      "disposition": "PORT",
+      "replacement_paths": [
+        "optima/capabilities.py",
+        "optima/tensor_spec.py",
+        "tests/test_capabilities.py",
+        "tests/test_kernel_variants.py",
+        "tests/test_tensor_spec.py"
+      ],
+      "replacement_commits": [
+        "fe75a50fdc8518af390b700b76bf474f1ff473c2",
+        "e7b7ddcb2b6e5f64473ddda0248fd2105f95a816"
+      ],
+      "rationale": "The standalone capability and tensor schemas were retained as the contribution-contract foundation."
+    },
+    "target_identity": {
+      "disposition": "ADAPT",
+      "replacement_paths": [
+        "optima/target_catalog.py",
+        "optima/stack_identity.py",
+        "optima/stack_manifest.py",
+        "optima/stack_plan.py",
+        "tests/test_target_catalog.py",
+        "tests/test_stack_manifest.py",
+        "tests/test_stack_plan.py"
+      ],
+      "replacement_commits": [
+        "7bd5808f5292cb21b8587ea47b59ed18b1cfdaeb",
+        "6be2c8eaeed1b3c33256260866732d65c701ae9d"
+      ],
+      "rationale": "The useful singleton and atomic-target semantics were rebuilt without the donor's device-only crown restriction or whole-serving title."
+    },
+    "execution_contracts": {
+      "disposition": "ADAPT",
+      "replacement_paths": [
+        "optima/dispatch.py",
+        "optima/receipts.py",
+        "optima/registry.py",
+        "optima/slots.py",
+        "optima/verify.py",
+        "optima/verify_collective.py",
+        "tests/test_collective.py",
+        "tests/test_dispatch_execution_receipts.py",
+        "tests/test_verify_cpu.py"
+      ],
+      "replacement_commits": [
+        "d6c681a505f949a89bdb68114b0d72d2c0ebd67d",
+        "fe75a50fdc8518af390b700b76bf474f1ff473c2",
+        "e7b7ddcb2b6e5f64473ddda0248fd2105f95a816",
+        "d1f8f5cce2a6a0f615022b62b2e890bfa19988f8"
+      ],
+      "rationale": "Typed outputs, variants, capability routing, stock fallback, completed/fallback receipts, and distributed graph replay were retained and bound to the canonical target catalog."
+    },
+    "setup_and_seams": {
+      "disposition": "ADAPT",
+      "replacement_paths": [
+        "optima/audit.py",
+        "optima/bootstrap.py",
+        "optima/eval/_launch.py",
+        "optima/seam.py",
+        "optima/seams.py",
+        "tests/test_arfusion_seam.py",
+        "tests/test_eval_fidelity_mode.py",
+        "tests/test_isolation.py",
+        "tests/test_seam_receipts.py",
+        "tests/test_slot_audit.py"
+      ],
+      "replacement_commits": [
+        "a83e8d1e6924fcbe1436161dddd554078d7d8504",
+        "a8f1e85bd5f88360c3ba94bae932bf66c5bae11d",
+        "e7b7ddcb2b6e5f64473ddda0248fd2105f95a816",
+        "dac7b14eb24d01d7ec08e544c2c356bda075bb71"
+      ],
+      "rationale": "Setup gating, delayed seam activation, rank coverage, and diagnostic audit behavior were retained while crown authority moved to isolated qualification evidence."
+    },
+    "chain_intake": {
+      "disposition": "ADAPT",
+      "replacement_paths": [
+        "optima/chain/fetch.py",
+        "optima/chain/intake.py",
+        "optima/chain/payload.py",
+        "optima/chain/publication.py",
+        "optima/chain/validator_loop.py",
+        "tests/test_chain_fetch.py",
+        "tests/test_chain_intake.py",
+        "tests/test_chain_payload.py",
+        "tests/test_chain_publication.py",
+        "tests/test_chain_validator_loop.py"
+      ],
+      "replacement_commits": [
+        "dfeccbbf1c8d0ae194e1ad11dfef54f8ed96c2b6",
+        "e1d3eec4d6023909c2e1c5b51880d24fe40179e5",
+        "9290ce30e9647d9905fb801f96b308320af2ba39",
+        "5d6458339d0977ee1f565e5ffcf51478fbdeecde"
+      ],
+      "bounded_rationale": "Strict finalized hostile transport and durable publication were retained. PR8 connects intake to registered screening and independent reproduction in the same merge unit."
+    },
+    "settlement_authority": {
+      "disposition": "ADAPT",
+      "replacement_paths": [
+        "optima/chain/__init__.py",
+        "optima/chain/validator_loop.py",
+        "optima/chain/weights.py",
+        "optima/commit_reveal.py",
+        "optima/settlement.py",
+        "tests/test_chain.py",
+        "tests/test_chain_validator_loop.py",
+        "tests/test_commit_reveal.py",
+        "tests/test_ledger_durability.py",
+        "tests/test_per_slot_settle.py",
+        "tests/test_settlement.py",
+        "tests/test_weight_publication.py"
+      ],
+      "replacement_commits": [
+        "5d6458339d0977ee1f565e5ffcf51478fbdeecde",
+        "67e621b6b973a882fe8f0abd38277ca457a6c8da"
+      ],
+      "bounded_rationale": "Durable settlement, global projection, publication journaling, and exact metagraph snapshots replaced donor whole-serving titles. PR8 requires two independent retained PASS qualifications before settlement."
+    },
+    "compatibility": {
+      "disposition": "ADAPT",
+      "replacement_paths": [
+        "optima/chain_canary.py",
+        "optima/compat.py",
+        "tests/test_chain_canary.py"
+      ],
+      "replacement_commits": [
+        "e866acf75d1407a0fa1474a564ad61b1cb2cd339"
+      ],
+      "rationale": "Pinned runtime and chain canaries remain validator-owned but no longer carry arena, settlement, or release policy."
+    },
+    "copy_provenance": {
+      "disposition": "ADAPT",
+      "replacement_paths": [
+        "optima/copy_fingerprint.py",
+        "optima/chain/intake.py",
+        "tests/test_copy_fingerprint.py",
+        "tests/test_chain_intake.py"
+      ],
+      "replacement_commits": [
+        "dfeccbbf1c8d0ae194e1ad11dfef54f8ed96c2b6"
+      ],
+      "rationale": "Copy evidence is computed over the submitted delta; exact and containment matches remain authoritative while shared fragments are advisory."
+    },
+    "deep_atomic_overlay": {
+      "disposition": "ADAPT",
+      "replacement_paths": [
+        "optima/dep_policy.py",
+        "optima/integrations/flashinfer_overlay.py",
+        "optima/patchers/apply_dep_patch.py",
+        "optima/patchers/build_cuda_ext.py",
+        "optima/rebuild.py",
+        "tests/test_cuda_ext_cache.py",
+        "tests/test_dep_patches.py",
+        "tests/test_flashinfer_overlay.py",
+        "tests/test_rebuild.py"
+      ],
+      "replacement_commits": [
+        "712d05e316b39e3f660101c939814b8a4176a58b"
+      ],
+      "rationale": "The reviewed overlay and hermetic native-build mechanism was retained, while device-component hooks and in-controller dlopen were excluded."
+    },
+    "device_component_experiment": {
+      "disposition": "DEFER",
+      "rationale": "Raw device-pointer components do not provide memory safety and are unnecessary for isolated component attribution. The experiment remains only in the frozen donor and is not crownable."
+    },
+    "device_state": {
+      "disposition": "PORT",
+      "replacement_paths": [
+        "optima/eval/device_state.py",
+        "tests/test_device_state.py"
+      ],
+      "replacement_commits": [
+        "cfec056b99ec38a2c405a9840b36cbe2bbc61d0e"
+      ],
+      "rationale": "The sealed device-state receipt mechanism was retained as a standalone executor primitive."
+    },
+    "isolated_executor": {
+      "disposition": "ADAPT",
+      "replacement_paths": [
+        "optima/eval/engine_launch.py",
+        "optima/eval/native_artifact.py",
+        "optima/eval/oci_backend.py",
+        "optima/eval/oci_outer_session.py",
+        "optima/eval/oci_prebuild.py",
+        "optima/eval/oci_process.py",
+        "optima/eval/oci_session_protocol.py",
+        "optima/eval/oci_session_worker.py",
+        "optima/eval/oci_site/sitecustomize.py",
+        "optima/eval/runtime_preflight.py",
+        "tests/test_engine_launch.py",
+        "tests/test_native_artifact.py",
+        "tests/test_oci_backend.py",
+        "tests/test_oci_outer_session.py",
+        "tests/test_oci_prebuild.py",
+        "tests/test_oci_process.py",
+        "tests/test_oci_session_protocol.py",
+        "tests/test_oci_session_worker.py",
+        "tests/test_oci_session_worker_order.py"
+      ],
+      "replacement_commits": [
+        "c87ff4bac132928337b5d68316c26dc45d49c380",
+        "cfec056b99ec38a2c405a9840b36cbe2bbc61d0e",
+        "8f6ddc51d35cdb28ac9b5df70706bc332aba4b26",
+        "a70c46fe5e1ab4e97aabe57999304d04075b6ce2",
+        "dabcbb733356aa0ee2109ba05b1e8b7add84b550"
+      ],
+      "rationale": "External timing, streaming protocol, sandboxing, watchdogs, immutable native publication, cleanup, and topology receipts were retained behind EngineLaunchSpec and the isolated executor."
+    },
+    "runtime_preflight": {
+      "disposition": "PORT",
+      "replacement_paths": [
+        "optima/eval/runtime_preflight.py",
+        "tests/test_runtime_preflight.py"
+      ],
+      "replacement_commits": [
+        "c87ff4bac132928337b5d68316c26dc45d49c380"
+      ],
+      "rationale": "The standalone runtime and device preflight primitive was retained."
+    },
+    "legacy_one_shot": {
+      "disposition": "DELETE",
+      "replacement_paths": [
+        "optima/eval/engine_launch.py",
+        "optima/eval/oci_session_protocol.py",
+        "optima/eval/oci_session_worker.py",
+        "tests/test_engine_launch.py",
+        "tests/test_oci_session_protocol.py",
+        "tests/test_oci_session_worker.py"
+      ],
+      "replacement_commits": [
+        "c87ff4bac132928337b5d68316c26dc45d49c380",
+        "cfec056b99ec38a2c405a9840b36cbe2bbc61d0e"
+      ],
+      "rationale": "The one-shot HMAC/result-file worker was superseded by the framed streaming session protocol and is absent from the accepted tree."
+    },
+    "quality_authority": {
+      "disposition": "ADAPT",
+      "replacement_paths": [
+        "optima/eval/calibration.py",
+        "optima/eval/evidence_store.py",
+        "optima/eval/qualification.py",
+        "optima/eval/qualification_intake.py",
+        "optima/eval/qualification_runner.py",
+        "optima/eval/reference_protocol.py",
+        "optima/eval/reference_quality.py",
+        "tests/test_calibration.py",
+        "tests/test_evidence_store.py",
+        "tests/test_qualification.py",
+        "tests/test_qualification_intake.py",
+        "tests/test_qualification_runner.py",
+        "tests/test_reference_protocol.py",
+        "tests/test_reference_quality.py"
+      ],
+      "replacement_commits": [
+        "b6f4c8b23ca3c22e2e38275d24389da053645abc",
+        "dac7b14eb24d01d7ec08e544c2c356bda075bb71",
+        "a5797e00b3ba46902a88a7f83f6a734af2a4a2d1",
+        "03961936463edcea38fd3e04b314b9204651953a",
+        "dabcbb733356aa0ee2109ba05b1e8b7add84b550"
+      ],
+      "bounded_rationale": "Post-C sealing, pristine teacher forcing, raw evidence publication/reopen, and three-way quality were rebound to exact stack and delta identities. PR8 adds the independent-reproduction intake requirement."
+    },
+    "serving_orchestration": {
+      "disposition": "ADAPT",
+      "replacement_paths": [
+        "optima/eval/capability.py",
+        "optima/eval/marginal_runtime.py",
+        "optima/eval/prompts.py",
+        "optima/eval/qualification_runner.py",
+        "optima/eval/throughput_kl.py",
+        "tests/test_marginal_runtime.py",
+        "tests/test_prompt_seeding.py",
+        "tests/test_qualification_runner.py"
+      ],
+      "replacement_commits": [
+        "4221420a0e04dc5b8681c44e7eb51de6080bc375",
+        "e398fa01d9e3f0c999e7ef18e410f9778cd01a89",
+        "dabcbb733356aa0ee2109ba05b1e8b7add84b550"
+      ],
+      "rationale": "Batching, prompt seeding, token accounting, and hooks were retained; local and one-shot paths cannot produce crownable evidence."
+    },
+    "scoring": {
+      "disposition": "PORT",
+      "replacement_paths": [
+        "optima/eval/scoring.py",
+        "tests/test_scoring.py"
+      ],
+      "replacement_commits": [
+        "dabcbb733356aa0ee2109ba05b1e8b7add84b550"
+      ],
+      "rationale": "Bookended noise measurement and the PASS/FAIL/NO_DECISION speed decision were retained."
+    },
+    "discovery": {
+      "disposition": "ADAPT",
+      "replacement_paths": [
+        "optima/discovery.py",
+        "optima/discovery_overlay.py",
+        "optima/sandbox.py",
+        "tests/test_discovery.py",
+        "tests/test_discovery_overlay.py",
+        "tests/test_scan_hardening.py"
+      ],
+      "replacement_commits": [
+        "dabcbb733356aa0ee2109ba05b1e8b7add84b550"
+      ],
+      "rationale": "Bounded source deltas and post-spawn overlays were retained as discovery products; they require validator integration review before entering a release stack."
+    },
+    "manifest_parser": {
+      "disposition": "ADAPT",
+      "replacement_paths": [
+        "optima/manifest.py",
+        "optima/stack_manifest.py",
+        "optima/target_catalog.py"
+      ],
+      "replacement_commits": [
+        "e2048cfbc562b0bdc175423914d7daa91ea4ca82",
+        "7bd5808f5292cb21b8587ea47b59ed18b1cfdaeb"
+      ],
+      "rationale": "Submission parsing remains narrow; crown identity and composition moved into canonical target and stack contracts."
+    },
+    "release_product": {
+      "disposition": "ADAPT",
+      "replacement_paths": [
+        "optima/engine_tree.py",
+        "optima/model_provision.py",
+        "optima/release.py",
+        "optima/stack_manifest.py",
+        "tests/test_engine_tree.py",
+        "tests/test_model_provision.py",
+        "tests/test_release.py",
+        "tests/test_stack_manifest.py"
+      ],
+      "bounded_rationale": "PR8 implements these paths in this merge unit. It accepts only validator-approved IntegrationReviewRecord entries, seals the model and integrated engine tree, emits deterministic chain-independent source/wheel/container evidence, and excludes proposal bundles and subnet authority from the serving artifact."
+    },
+    "runtime_overlay": {
+      "disposition": "ADAPT",
+      "replacement_paths": [
+        "optima/engine_tree.py",
+        "optima/discovery_overlay.py",
+        "optima/eval/engine_launch.py",
+        "tests/test_engine_tree.py",
+        "tests/test_discovery_overlay.py",
+        "tests/test_engine_launch.py"
+      ],
+      "replacement_commits": [
+        "d2feb2213227c05fc6bbc457e8943600e8675fae",
+        "c87ff4bac132928337b5d68316c26dc45d49c380",
+        "dabcbb733356aa0ee2109ba05b1e8b7add84b550"
+      ],
+      "rationale": "Runtime resolution moved to exact materialized engine trees and launch specs; exploratory source overlays are fenced behind discovery."
+    },
+    "cli_surface": {
+      "disposition": "ADAPT",
+      "replacement_paths": [
+        "optima/cli.py"
+      ],
+      "bounded_rationale": "CLI hunks landed only with their owning subsystem. PR8 adds model-provision and release inspection commands in this merge unit; no mixed donor CLI was transplanted wholesale."
+    },
+    "packaging": {
+      "disposition": "ADAPT",
+      "replacement_paths": [
+        "pyproject.toml",
+        "optima/vendor_provenance.json",
+        "tests/test_release.py",
+        "tests/test_vendor_provenance.py"
+      ],
+      "replacement_commits": [
+        "cb427a927b6b40c559bee9412fede3aa106dc1fe"
+      ],
+      "bounded_rationale": "Vendor package data and license files landed with provenance. PR8 adds only the chain-independent release dependency and validates deterministic release contents in this merge unit."
+    },
+    "test_adaptation": {
+      "disposition": "ADAPT",
+      "replacement_paths": [
+        "tests/test_chain_intake.py",
+        "tests/test_chain_validator_loop.py",
+        "tests/test_engine_launch.py",
+        "tests/test_qualification.py",
+        "tests/test_qualification_runner.py",
+        "tests/test_reference_protocol.py",
+        "tests/test_reference_quality.py",
+        "tests/test_settlement.py"
+      ],
+      "replacement_commits": [
+        "c87ff4bac132928337b5d68316c26dc45d49c380",
+        "a5797e00b3ba46902a88a7f83f6a734af2a4a2d1",
+        "03961936463edcea38fd3e04b314b9204651953a",
+        "dabcbb733356aa0ee2109ba05b1e8b7add84b550",
+        "dfeccbbf1c8d0ae194e1ad11dfef54f8ed96c2b6",
+        "5d6458339d0977ee1f565e5ffcf51478fbdeecde"
+      ],
+      "bounded_rationale": "Donor tests coupled to old whole-serving, one-shot, or JSON authority were rewritten against the isolated executor, pristine evidence, finalized intake, and transactional settlement contracts."
+    }
+  },
+  "entries": [
+    {"change": "M", "path": ".gitignore", "route": "local_secret_filename"},
+    {"change": "M", "path": "NOTICE", "route": "vendor_material"},
+    {"change": "M", "path": "docs/HOW_OPTIMA_WORKS.md", "route": "governance_docs"},
+    {"change": "A", "path": "docs/PRODUCT_CONTRACT.md", "route": "governance_docs"},
+    {"change": "A", "path": "docs/REFEREE_HARDENING_AUDIT.md", "route": "governance_docs"},
+    {"change": "A", "path": "docs/REFEREE_HARDENING_DONOR_MAP.md", "route": "governance_docs"},
+    {"change": "A", "path": "docs/REFEREE_HARDENING_SPLIT_PLAN.md", "route": "governance_docs"},
+    {"change": "M", "path": "docs/STATE_OF_RECORD.md", "route": "governance_docs"},
+    {"change": "M", "path": "docs/TESTNET.md", "route": "governance_docs"},
+    {"change": "A", "path": "optima/arena_assets/minimax_m3/sglang_patch/flashinfer_trtllm.py", "route": "vendor_material"},
+    {"change": "A", "path": "optima/arena_assets/minimax_m3/sglang_patch/modelopt_quant.py", "route": "vendor_material"},
+    {"change": "A", "path": "optima/arenas.py", "route": "arena_policy"},
+    {"change": "M", "path": "optima/audit.py", "route": "setup_and_seams"},
+    {"change": "M", "path": "optima/bootstrap.py", "route": "setup_and_seams"},
+    {"change": "A", "path": "optima/capabilities.py", "route": "typed_contracts"},
+    {"change": "M", "path": "optima/chain/__init__.py", "route": "settlement_authority"},
+    {"change": "M", "path": "optima/chain/fetch.py", "route": "chain_intake"},
+    {"change": "M", "path": "optima/chain/payload.py", "route": "chain_intake"},
+    {"change": "M", "path": "optima/chain/validator_loop.py", "route": "chain_intake"},
+    {"change": "M", "path": "optima/chain_canary.py", "route": "compatibility"},
+    {"change": "M", "path": "optima/cli.py", "route": "cli_surface"},
+    {"change": "M", "path": "optima/commit_reveal.py", "route": "settlement_authority"},
+    {"change": "M", "path": "optima/compat.py", "route": "compatibility"},
+    {"change": "A", "path": "optima/competition.py", "route": "target_identity"},
+    {"change": "M", "path": "optima/copy_fingerprint.py", "route": "copy_provenance"},
+    {"change": "M", "path": "optima/dep_policy.py", "route": "deep_atomic_overlay"},
+    {"change": "A", "path": "optima/device_component.py", "route": "device_component_experiment"},
+    {"change": "M", "path": "optima/dispatch.py", "route": "execution_contracts"},
+    {"change": "M", "path": "optima/eval/_launch.py", "route": "setup_and_seams"},
+    {"change": "M", "path": "optima/eval/capability.py", "route": "serving_orchestration"},
+    {"change": "A", "path": "optima/eval/device_state.py", "route": "device_state"},
+    {"change": "A", "path": "optima/eval/external_quality.py", "route": "quality_authority"},
+    {"change": "A", "path": "optima/eval/host_attestation.py", "route": "quality_authority"},
+    {"change": "A", "path": "optima/eval/oci_backend.py", "route": "isolated_executor"},
+    {"change": "A", "path": "optima/eval/oci_outer_session.py", "route": "isolated_executor"},
+    {"change": "A", "path": "optima/eval/oci_prebuild.py", "route": "isolated_executor"},
+    {"change": "A", "path": "optima/eval/oci_protocol.py", "route": "legacy_one_shot"},
+    {"change": "A", "path": "optima/eval/oci_session_protocol.py", "route": "isolated_executor"},
+    {"change": "A", "path": "optima/eval/oci_session_worker.py", "route": "isolated_executor"},
+    {"change": "A", "path": "optima/eval/oci_site/sitecustomize.py", "route": "isolated_executor"},
+    {"change": "A", "path": "optima/eval/oci_worker.py", "route": "legacy_one_shot"},
+    {"change": "M", "path": "optima/eval/prompts.py", "route": "serving_orchestration"},
+    {"change": "A", "path": "optima/eval/qualification.py", "route": "quality_authority"},
+    {"change": "A", "path": "optima/eval/runtime_preflight.py", "route": "runtime_preflight"},
+    {"change": "M", "path": "optima/eval/scoring.py", "route": "scoring"},
+    {"change": "A", "path": "optima/eval/seccomp_moby_v0_2_1.json", "route": "vendor_material"},
+    {"change": "M", "path": "optima/eval/throughput_kl.py", "route": "serving_orchestration"},
+    {"change": "M", "path": "optima/integrations/flashinfer_overlay.py", "route": "deep_atomic_overlay"},
+    {"change": "A", "path": "optima/ipc.py", "route": "isolated_executor"},
+    {"change": "M", "path": "optima/manifest.py", "route": "manifest_parser"},
+    {"change": "A", "path": "optima/model_provision.py", "route": "release_product"},
+    {"change": "M", "path": "optima/patchers/apply_dep_patch.py", "route": "deep_atomic_overlay"},
+    {"change": "M", "path": "optima/patchers/build_cuda_ext.py", "route": "deep_atomic_overlay"},
+    {"change": "M", "path": "optima/rebuild.py", "route": "deep_atomic_overlay"},
+    {"change": "M", "path": "optima/receipts.py", "route": "execution_contracts"},
+    {"change": "A", "path": "optima/referee_release.py", "route": "release_product"},
+    {"change": "A", "path": "optima/referee_runtime.py", "route": "release_product"},
+    {"change": "M", "path": "optima/registry.py", "route": "execution_contracts"},
+    {"change": "A", "path": "optima/runtime_overlay.py", "route": "runtime_overlay"},
+    {"change": "M", "path": "optima/sandbox.py", "route": "discovery"},
+    {"change": "M", "path": "optima/seam.py", "route": "setup_and_seams"},
+    {"change": "M", "path": "optima/slots.py", "route": "execution_contracts"},
+    {"change": "A", "path": "optima/source_release.py", "route": "release_product"},
+    {"change": "A", "path": "optima/system_overlay.py", "route": "discovery"},
+    {"change": "A", "path": "optima/system_patch.py", "route": "discovery"},
+    {"change": "A", "path": "optima/tensor_spec.py", "route": "typed_contracts"},
+    {"change": "M", "path": "optima/verify.py", "route": "execution_contracts"},
+    {"change": "M", "path": "optima/verify_collective.py", "route": "execution_contracts"},
+    {"change": "M", "path": "pyproject.toml", "route": "packaging"},
+    {"change": "A", "path": "tests/quality_report_helpers.py", "route": "test_adaptation"},
+    {"change": "A", "path": "tests/test_arenas.py", "route": "arena_policy"},
+    {"change": "M", "path": "tests/test_arfusion_seam.py", "route": "setup_and_seams"},
+    {"change": "A", "path": "tests/test_capabilities.py", "route": "typed_contracts"},
+    {"change": "M", "path": "tests/test_chain.py", "route": "settlement_authority"},
+    {"change": "M", "path": "tests/test_chain_canary.py", "route": "compatibility"},
+    {"change": "M", "path": "tests/test_chain_fetch.py", "route": "chain_intake"},
+    {"change": "M", "path": "tests/test_chain_payload.py", "route": "chain_intake"},
+    {"change": "M", "path": "tests/test_chain_validator_loop.py", "route": "chain_intake"},
+    {"change": "M", "path": "tests/test_collective.py", "route": "execution_contracts"},
+    {"change": "M", "path": "tests/test_commit_reveal.py", "route": "settlement_authority"},
+    {"change": "A", "path": "tests/test_competition.py", "route": "target_identity"},
+    {"change": "M", "path": "tests/test_copy_fingerprint.py", "route": "copy_provenance"},
+    {"change": "A", "path": "tests/test_cuda_ext_cache.py", "route": "deep_atomic_overlay"},
+    {"change": "M", "path": "tests/test_dep_patches.py", "route": "deep_atomic_overlay"},
+    {"change": "A", "path": "tests/test_device_component.py", "route": "device_component_experiment"},
+    {"change": "A", "path": "tests/test_device_state.py", "route": "device_state"},
+    {"change": "A", "path": "tests/test_dispatch_execution_receipts.py", "route": "execution_contracts"},
+    {"change": "A", "path": "tests/test_eval_fidelity_mode.py", "route": "setup_and_seams"},
+    {"change": "A", "path": "tests/test_eval_one_shot_batches.py", "route": "legacy_one_shot"},
+    {"change": "A", "path": "tests/test_external_quality.py", "route": "quality_authority"},
+    {"change": "M", "path": "tests/test_flashinfer_overlay.py", "route": "deep_atomic_overlay"},
+    {"change": "A", "path": "tests/test_host_attestation.py", "route": "quality_authority"},
+    {"change": "A", "path": "tests/test_host_attestation_integration.py", "route": "quality_authority"},
+    {"change": "M", "path": "tests/test_isolation.py", "route": "setup_and_seams"},
+    {"change": "A", "path": "tests/test_kernel_variants.py", "route": "typed_contracts"},
+    {"change": "M", "path": "tests/test_ledger_durability.py", "route": "settlement_authority"},
+    {"change": "A", "path": "tests/test_model_provision.py", "route": "release_product"},
+    {"change": "M", "path": "tests/test_msa_prefill_block_score.py", "route": "execution_contracts"},
+    {"change": "A", "path": "tests/test_oci_backend.py", "route": "isolated_executor"},
+    {"change": "A", "path": "tests/test_oci_outer_session.py", "route": "isolated_executor"},
+    {"change": "A", "path": "tests/test_oci_session_worker_order.py", "route": "isolated_executor"},
+    {"change": "A", "path": "tests/test_packaging.py", "route": "packaging"},
+    {"change": "A", "path": "tests/test_pending_settlement.py", "route": "test_adaptation"},
+    {"change": "M", "path": "tests/test_per_slot_settle.py", "route": "settlement_authority"},
+    {"change": "M", "path": "tests/test_prompt_seeding.py", "route": "serving_orchestration"},
+    {"change": "A", "path": "tests/test_qualification_report.py", "route": "quality_authority"},
+    {"change": "M", "path": "tests/test_rebuild.py", "route": "deep_atomic_overlay"},
+    {"change": "A", "path": "tests/test_referee_runtime.py", "route": "release_product"},
+    {"change": "A", "path": "tests/test_retry_admin.py", "route": "test_adaptation"},
+    {"change": "A", "path": "tests/test_retry_lease.py", "route": "test_adaptation"},
+    {"change": "A", "path": "tests/test_runtime_preflight.py", "route": "runtime_preflight"},
+    {"change": "A", "path": "tests/test_safe_ipc.py", "route": "isolated_executor"},
+    {"change": "M", "path": "tests/test_scan_hardening.py", "route": "discovery"},
+    {"change": "M", "path": "tests/test_scoring.py", "route": "scoring"},
+    {"change": "M", "path": "tests/test_seam_receipts.py", "route": "setup_and_seams"},
+    {"change": "M", "path": "tests/test_slot_audit.py", "route": "setup_and_seams"},
+    {"change": "A", "path": "tests/test_source_release.py", "route": "release_product"},
+    {"change": "A", "path": "tests/test_system_patch.py", "route": "discovery"},
+    {"change": "A", "path": "tests/test_teacher_protocol.py", "route": "quality_authority"},
+    {"change": "A", "path": "tests/test_tensor_spec.py", "route": "typed_contracts"},
+    {"change": "M", "path": "tests/test_verify_cpu.py", "route": "execution_contracts"}
+  ]
+}

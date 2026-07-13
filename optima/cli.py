@@ -76,6 +76,61 @@ def cmd_chain_compat(_: argparse.Namespace) -> int:
     return 0 if all(c.ok for c in checks) else 2
 
 
+def cmd_model_provision(args: argparse.Namespace) -> int:
+    from optima.model_provision import provision_model
+
+    result = provision_model(
+        args.model_root,
+        args.publication_root,
+        expected_content_digest=args.expected_content_digest,
+        workers=args.workers,
+    )
+    print(json.dumps(
+        {
+            "content_digest": result.receipt.content_digest,
+            "receipt_digest": result.receipt.receipt_digest,
+            "receipt_path": str(result.receipt_path),
+        },
+        sort_keys=True,
+    ))
+    return 0
+
+
+def cmd_release_verify(args: argparse.Namespace) -> int:
+    from optima.release import reopen_release
+
+    release = reopen_release(
+        args.release_root,
+        expected_descriptor_digest=args.descriptor_digest,
+        expected_public_key=args.expected_public_key,
+    )
+    print(json.dumps(
+        {
+            "descriptor_digest": release.descriptor.digest,
+            "engine_tree_digest": release.descriptor.engine_tree_digest,
+            "public_key": release.signature.public_key,
+            "release_tree_digest": release.release_tree_digest,
+        },
+        sort_keys=True,
+    ))
+    return 0
+
+
+def cmd_release_context(args: argparse.Namespace) -> int:
+    from optima.release import container_context, reopen_release
+
+    release = reopen_release(
+        args.release_root,
+        expected_descriptor_digest=args.descriptor_digest,
+        expected_public_key=args.expected_public_key,
+    )
+    result = container_context(
+        release, args.destination, expected_public_key=args.expected_public_key
+    )
+    print(result)
+    return 0
+
+
 def cmd_set_weights(args: argparse.Namespace) -> int:
     from optima import chain
     from optima.chain.intake import (
@@ -225,16 +280,24 @@ def cmd_chain_status(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_chain_validate(args: argparse.Namespace) -> int:
+def cmd_chain_validate(
+    args: argparse.Namespace, *, arena_registry=None
+) -> int:
     import logging
 
     from optima import chain
     from optima.chain.validator_loop import run_validator
 
-    if not args.intake_only:
+    from optima.arena_service import ArenaServiceRegistry
+
+    injected = arena_registry
+    if not args.intake_only and (
+        type(injected) is not ArenaServiceRegistry
+        or not getattr(args, "arena_id", None)
+    ):
         raise SystemExit(
-            "chain-validate requires --intake-only until a registered arena service "
-            "supplies the causal qualification planner"
+            "chain-validate requires --intake-only or a validator-injected "
+            "ArenaServiceRegistry plus --arena-id"
         )
     subtensor = chain.connect(args.network, retry_forever=not args.once)
     # Daemon-mode observability: between passes the loop reports only through the
@@ -262,6 +325,9 @@ def cmd_chain_validate(args: argparse.Namespace) -> int:
         intake_db=args.intake_db,
         private_root=args.private_root,
         publication_root=args.publication_root,
+        arena_registry=injected,
+        arena_id=None if args.intake_only else args.arena_id,
+        intake_only=args.intake_only,
         interval_s=args.interval,
         once=args.once,
     )
@@ -270,11 +336,13 @@ def cmd_chain_validate(args: argparse.Namespace) -> int:
             f"intake @finalized {res.finalized_block}: seen={res.seen} "
             f"reserved={len(res.reserved)} published={len(res.published)} "
             f"copies={len(res.copies)} rejected={len(res.rejected)} "
-            f"held={len(res.held)}"
+            f"screens={len(res.screens)} decisions={len(res.decisions)} "
+            f"settlements={len(res.settlements)} held={len(res.held)}"
         )
         for reservation, why in res.rejected.items():
             print(f"  rejected {reservation[:16]}… {why}")
-        print("settlement/weights: disabled in finalized intake")
+        if args.intake_only:
+            print("qualification/settlement: disabled by --intake-only")
     return 0
 
 
@@ -885,6 +953,35 @@ def build_parser() -> argparse.ArgumentParser:
     sp.set_defaults(func=cmd_chain_compat)
 
     sp = sub.add_parser(
+        "model-provision",
+        help="seal exact model bytes into a content-addressed external receipt",
+    )
+    sp.add_argument("model_root")
+    sp.add_argument("publication_root")
+    sp.add_argument("--expected-content-digest")
+    sp.add_argument("--workers", type=int, default=4)
+    sp.set_defaults(func=cmd_model_provision)
+
+    sp = sub.add_parser(
+        "release-verify",
+        help="reopen and verify a signed chain-independent Optima Engine release",
+    )
+    sp.add_argument("release_root")
+    sp.add_argument("--expected-public-key", required=True)
+    sp.add_argument("--descriptor-digest")
+    sp.set_defaults(func=cmd_release_verify)
+
+    sp = sub.add_parser(
+        "release-context",
+        help="materialize a deterministic OCI build context from a verified release",
+    )
+    sp.add_argument("release_root")
+    sp.add_argument("destination")
+    sp.add_argument("--expected-public-key", required=True)
+    sp.add_argument("--descriptor-digest")
+    sp.set_defaults(func=cmd_release_context)
+
+    sp = sub.add_parser(
         "set-weights",
         help="control-plane reconcile of the transactional global reward projection",
     )
@@ -945,6 +1042,8 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--network", required=True)
     sp.add_argument("--intake-only", action="store_true",
                     help="explicitly disable qualification, settlement, signing, and weights")
+    sp.add_argument("--arena-id", default=None,
+                    help="validator-owned registered arena selected from injected services")
     sp.add_argument("--intake-db", default="chain_intake/intake.sqlite3")
     sp.add_argument("--private-root", default="chain_intake/private",
                     help="validator-private 0700/0600 fetch storage")

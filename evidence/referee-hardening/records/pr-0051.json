@@ -1,0 +1,163 @@
+{
+  "architectural_unit": "4e",
+  "artifacts": [
+    {
+      "availability": "repository",
+      "id": "github.referee-evidence",
+      "kind": "github-check-receipt",
+      "locator": "evidence/referee-hardening/artifacts/pr-0051-github-checks.json",
+      "reason": null,
+      "sha256": "54b57b27c6845452cc3abc40255e49d8165391f1c4962a9f12e94e1812dd829a",
+      "size_bytes": 1844
+    },
+    {
+      "availability": "digest_only",
+      "id": "gpu.post-t-speed-negative",
+      "kind": "gpu-receipt",
+      "locator": null,
+      "reason": "The 7201-byte TP8 receipt remains in the private campaign ledger; it records successful graph control, B/C/B-prime, and pristine T followed by a fail-closed raw-speed projection error and zero GPU residue.",
+      "sha256": "cbebe07dd400f60044e5ed3cd52304b661caea5d606ab1182b1bde0707c932e8",
+      "size_bytes": null
+    },
+    {
+      "availability": "unavailable",
+      "id": "tests.rtx-focused",
+      "kind": "test-log",
+      "locator": null,
+      "reason": "A 98-pass focused RTX qualification and protocol matrix was reported during the corrective hardware cycle without retaining the raw log in the repository.",
+      "sha256": null,
+      "size_bytes": null
+    },
+    {
+      "availability": "unavailable",
+      "id": "review.final-qualification",
+      "kind": "review-report",
+      "locator": null,
+      "reason": "The bounded implementation, adversarial, and confirmation reviews were reported without retaining their raw bytes.",
+      "sha256": null,
+      "size_bytes": null
+    }
+  ],
+  "claims": [
+    {
+      "artifact_ids": [],
+      "id": "scope.final-qualification-corrections",
+      "statement": "The implementation accepts tied retained top probabilities without inventing a token-order tie break and permits only the validated control prebuild inventory in pristine-reference sessions.",
+      "status": "verified"
+    },
+    {
+      "artifact_ids": [
+        "github.referee-evidence"
+      ],
+      "id": "tests.github-referee-evidence",
+      "statement": "The retained GitHub receipt records successful evidence and CodeQL checks for the implementation head.",
+      "status": "verified"
+    },
+    {
+      "artifact_ids": [
+        "gpu.post-t-speed-negative"
+      ],
+      "id": "gpu.corrected-boundaries",
+      "statement": "A digest-retained TP8 attempt crossed the tied-row and pristine-publication boundaries owned by this change before a distinct post-T speed-evidence inconsistency failed closed.",
+      "status": "digest_only"
+    },
+    {
+      "artifact_ids": [],
+      "id": "authority.no-aggregate-decision",
+      "statement": "The retained hardware attempt produced no aggregate PASS, crown, settlement, or weight authority.",
+      "status": "verified"
+    }
+  ],
+  "classified_diff": {
+    "documentation": {
+      "added": 0,
+      "deleted": 0
+    },
+    "evidence": {
+      "added": 265,
+      "deleted": 0
+    },
+    "production": {
+      "added": 49,
+      "deleted": 14
+    },
+    "test": {
+      "added": 184,
+      "deleted": 1
+    },
+    "tooling": {
+      "added": 29,
+      "deleted": 2
+    },
+    "vendor": {
+      "added": 0,
+      "deleted": 0
+    }
+  },
+  "exit_criteria": [
+    {
+      "artifact_ids": [],
+      "id": "quality.tied-retained-rows",
+      "statement": "Retained probability rows allow exact ties while continuing to reject nonfinite, duplicate-token, or increasing-logprob rows.",
+      "status": "verified"
+    },
+    {
+      "artifact_ids": [],
+      "id": "reference.control-publication",
+      "statement": "Pristine reference accepts only the exact validator-owned prebuild control inventory and continues to reject candidate native artifacts.",
+      "status": "verified"
+    },
+    {
+      "artifact_ids": [
+        "gpu.post-t-speed-negative"
+      ],
+      "id": "gpu.joined-qualification",
+      "statement": "The joined TP8 attempt is not a qualification PASS because raw speed evidence disagreed with device receipt counters after pristine T.",
+      "status": "invalidated"
+    },
+    {
+      "artifact_ids": [
+        "github.referee-evidence"
+      ],
+      "id": "ci.evidence-check",
+      "statement": "The repository-retained GitHub receipt binds successful evidence checks to the implementation head.",
+      "status": "verified"
+    }
+  ],
+  "github_pr": 51,
+  "identity": {
+    "base_commit": "39f1bbf4e8f341d1f443ec7e71b6d3fdb07dccf0",
+    "implementation_commit": "d9f9769bb1735f88bbf24ea1f0bc1c853b76fbad",
+    "implementation_tree": "209675ae35103fe44f9a8d024d329fd36d34229a",
+    "merge_commit": "1b8a35568bc0910a898a2b9b19165cbe956d23c7"
+  },
+  "nonclaims": [
+    "canonical-pr4.closure",
+    "chain.integration",
+    "crown.authority",
+    "gpu.joined-pass",
+    "settlement.authority"
+  ],
+  "record_type": "pr_evidence",
+  "reviews": [
+    {
+      "artifact_id": "review.final-qualification",
+      "phase": "implementation",
+      "status": "reported_unretained",
+      "summary": "Implementation review was reported during development; no report bytes were retained."
+    },
+    {
+      "artifact_id": "review.final-qualification",
+      "phase": "adversarial",
+      "status": "reported_unretained",
+      "summary": "Adversarial review was reported during development; no report bytes were retained."
+    },
+    {
+      "artifact_id": "review.final-qualification",
+      "phase": "confirmation",
+      "status": "reported_unretained",
+      "summary": "Confirmation review was reported during development; no report bytes were retained."
+    }
+  ],
+  "schema_version": 2
+}

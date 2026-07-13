@@ -227,6 +227,59 @@ PR7_AUTHORITY_ROOTS = [
     "optima.settlement",
 ]
 PR7_FORBIDDEN_MODULES = PR6_FORBIDDEN_MODULES
+PR8_BASE = "084fb8d7e6debe22d1852f0cd0ffca915648bb2d"
+PR8_PRODUCTION = [
+    "AGENTS.md",
+    "README.md",
+    "docs/DEV_ENVIRONMENT.md",
+    "docs/HOW_OPTIMA_WORKS.md",
+    "docs/STATE_OF_RECORD.md",
+    "docs/TESTNET.md",
+    "optima/arena_service.py",
+    "optima/chain/intake.py",
+    "optima/chain/validator_loop.py",
+    "optima/chain/weights.py",
+    "optima/cli.py",
+    "optima/engine_tree.py",
+    "optima/eval/qualification_intake.py",
+    "optima/eval/qualification_runner.py",
+    "optima/model_provision.py",
+    "optima/release.py",
+    "optima/release_host.py",
+    "optima/release_runtime.py",
+    "optima/seam.py",
+    "optima/settlement.py",
+    "optima/stack_manifest.py",
+    "pyproject.toml",
+]
+PR8_TESTS = [
+    "tests/test_arena_service.py",
+    "tests/test_chain_intake.py",
+    "tests/test_chain_validator_loop.py",
+    "tests/test_cli_chain.py",
+    "tests/test_dep_patches.py",
+    "tests/test_engine_tree.py",
+    "tests/test_model_provision.py",
+    "tests/test_qualification_intake.py",
+    "tests/test_qualification_runner.py",
+    "tests/test_release.py",
+    "tests/test_release_host.py",
+    "tests/test_settlement.py",
+    "tests/test_stack_manifest.py",
+    "tests/test_vendor_provenance.py",
+    "tests/test_weight_publication.py",
+]
+PR8_AUTHORITY_ROOTS = [
+    "optima.arena_service",
+    "optima.chain.intake",
+    "optima.chain.validator_loop",
+    "optima.chain.weights",
+    "optima.eval.qualification_intake",
+    "optima.release",
+    "optima.release_host",
+    "optima.settlement",
+]
+PR8_FORBIDDEN_MODULES = PR7_FORBIDDEN_MODULES
 
 
 class EvidenceError(ValueError):
@@ -250,6 +303,119 @@ def load_json(path: Path) -> dict[str, Any]:
     if type(value) is not dict:
         raise EvidenceError(f"{path} must contain one object")
     return value
+
+
+def validate_donor_disposition(root: Path) -> None:
+    path = root / "evidence/referee-hardening/donor-disposition-v1.json"
+    inventory = load_json(path)
+    _keys(
+        inventory,
+        {
+            "disposition_counts", "donor", "entries", "record_type", "routes",
+            "rules", "schema_version",
+        },
+        "donor disposition inventory",
+    )
+    if inventory["schema_version"] != 1 or inventory["record_type"] != "donor_disposition_inventory":
+        raise EvidenceError("donor disposition inventory has an unsupported schema")
+    donor = inventory["donor"]
+    _keys(
+        donor,
+        {
+            "added_path_count", "base_commit", "base_tree", "changed_path_count",
+            "modified_path_count", "sorted_name_status_sha256", "tag", "tip_commit",
+            "tip_tree",
+        },
+        "donor disposition inventory.donor",
+    )
+    base = _git_oid(donor["base_commit"], "donor disposition inventory.donor.base_commit")
+    tip = _git_oid(donor["tip_commit"], "donor disposition inventory.donor.tip_commit")
+    _sha(donor["sorted_name_status_sha256"], "donor disposition inventory.donor.sorted_name_status_sha256")
+    base_tree = _git_oid(donor["base_tree"], "donor disposition inventory.donor.base_tree")
+    tip_tree = _git_oid(donor["tip_tree"], "donor disposition inventory.donor.tip_tree")
+    if donor["tag"] != "referee-hardening-donor-20260711":
+        raise EvidenceError("donor disposition inventory binds the wrong tag")
+    # The tag is an archival label, not a clone-local authority dependency.  The
+    # full base/tip commits and their exact diff digests are the durable binding.
+    git(root, "cat-file", "-e", f"{base}^{{commit}}")
+    git(root, "cat-file", "-e", f"{tip}^{{commit}}")
+    if (
+        git(root, "rev-parse", f"{base}^{{tree}}") != base_tree
+        or git(root, "rev-parse", f"{tip}^{{tree}}") != tip_tree
+    ):
+        raise EvidenceError("donor disposition inventory tree identity is wrong")
+
+    actual: list[tuple[str, str]] = []
+    name_status = str(git(root, "diff", "--name-status", "--no-renames", f"{base}..{tip}"))
+    for line in name_status.splitlines():
+        status, relative = line.split("\t", 1)
+        actual.append((status, relative))
+    canonical_name_status = "".join(
+        f"{status}\t{relative}\n" for status, relative in sorted(actual)
+    ).encode()
+    if hashlib.sha256(canonical_name_status).hexdigest() != donor["sorted_name_status_sha256"]:
+        raise EvidenceError("donor disposition inventory name-status digest is wrong")
+    routes = inventory["routes"]
+    entries = inventory["entries"]
+    if type(routes) is not dict or not routes or type(entries) is not list:
+        raise EvidenceError("donor disposition inventory routes and entries must be nonempty")
+    allowed = {"PORT", "ADAPT", "DELETE", "DEFER", "VENDOR"}
+    route_dispositions: dict[str, str] = {}
+    for route_id, route in routes.items():
+        _ident(route_id, f"donor disposition inventory.routes.{route_id}")
+        if type(route) is not dict or route.get("disposition") not in allowed:
+            raise EvidenceError(f"donor disposition route {route_id} has an invalid disposition")
+        route_dispositions[route_id] = route["disposition"]
+        replacement_paths = route.get("replacement_paths")
+        commits = route.get("replacement_commits")
+        rationale = route.get("rationale") or route.get("bounded_rationale")
+        if replacement_paths is not None and (
+            type(replacement_paths) is not list
+            or not replacement_paths
+            or any(type(item) is not str or not item for item in replacement_paths)
+            or len(replacement_paths) != len(set(replacement_paths))
+        ):
+            raise EvidenceError(f"donor disposition route {route_id} has invalid replacement paths")
+        if commits is not None:
+            if type(commits) is not list or not commits or len(commits) != len(set(commits)):
+                raise EvidenceError(f"donor disposition route {route_id} has invalid replacement commits")
+            for index, commit in enumerate(commits):
+                oid = _git_oid(commit, f"donor disposition route {route_id}.replacement_commits[{index}]")
+                git(root, "cat-file", "-e", f"{oid}^{{commit}}")
+        if not rationale or type(rationale) is not str:
+            raise EvidenceError(f"donor disposition route {route_id} needs a rationale")
+        if route["disposition"] in {"PORT", "VENDOR"} and (not replacement_paths or not commits):
+            raise EvidenceError(f"donor disposition route {route_id} must bind retained bytes")
+        if route["disposition"] == "ADAPT" and not replacement_paths:
+            raise EvidenceError(f"donor disposition route {route_id} must bind replacement paths")
+
+    recorded: list[tuple[str, str]] = []
+    used_routes: set[str] = set()
+    counts = {name: 0 for name in allowed}
+    for index, entry in enumerate(entries):
+        where = f"donor disposition inventory.entries[{index}]"
+        _keys(entry, {"change", "path", "route"}, where)
+        if entry["change"] not in {"A", "M"} or type(entry["path"]) is not str:
+            raise EvidenceError(f"{where} has an invalid changed path")
+        if entry["route"] not in routes:
+            raise EvidenceError(f"{where} refers to an unknown route")
+        recorded.append((entry["change"], entry["path"]))
+        used_routes.add(entry["route"])
+        counts[route_dispositions[entry["route"]]] += 1
+    if len(recorded) != len(set(recorded)) or set(recorded) != set(actual):
+        raise EvidenceError("donor disposition inventory is not path-complete")
+    if used_routes != set(routes):
+        raise EvidenceError("donor disposition inventory contains unused routes")
+    added = sum(status == "A" for status, _ in actual)
+    modified = sum(status == "M" for status, _ in actual)
+    if (
+        donor["changed_path_count"] != len(actual)
+        or donor["added_path_count"] != added
+        or donor["modified_path_count"] != modified
+    ):
+        raise EvidenceError("donor disposition inventory path counts are wrong")
+    if inventory["disposition_counts"] != counts:
+        raise EvidenceError("donor disposition inventory disposition counts are wrong")
 
 
 def _keys(value: dict[str, Any], expected: set[str], where: str) -> None:
@@ -595,6 +761,31 @@ def validate_contract_document(contract: dict[str, Any], where: str = "contract"
             ],
             "authority": {"forbidden_modules": PR7_FORBIDDEN_MODULES, "roots": PR7_AUTHORITY_ROOTS},
         },
+        "pr8": {
+            "schema_version": 2,
+            "architectural_unit": "8",
+            "base_commit": PR8_BASE,
+            "budget": {"exemption_policy": "none", "production_additions_max": 6500, "test_additions_max": 5000},
+            "production": PR8_PRODUCTION,
+            "test": PR8_TESTS,
+            "required": [
+                {"change": "add", "path": "optima/arena_service.py"},
+                {"change": "modify", "path": "optima/chain/intake.py"},
+                {"change": "modify", "path": "optima/chain/validator_loop.py"},
+                {"change": "modify", "path": "optima/cli.py"},
+                {"change": "modify", "path": "optima/engine_tree.py"},
+                {"change": "modify", "path": "optima/eval/qualification_intake.py"},
+                {"change": "add", "path": "optima/model_provision.py"},
+                {"change": "add", "path": "optima/release.py"},
+                {"change": "add", "path": "optima/release_host.py"},
+                {"change": "add", "path": "optima/release_runtime.py"},
+                {"change": "modify", "path": "optima/seam.py"},
+                {"change": "modify", "path": "optima/settlement.py"},
+                {"change": "modify", "path": "optima/stack_manifest.py"},
+                {"change": "modify", "path": "pyproject.toml"},
+            ],
+            "authority": {"forbidden_modules": PR8_FORBIDDEN_MODULES, "roots": PR8_AUTHORITY_ROOTS},
+        },
     }
     spec = specs.get(contract["contract_id"])
     if spec is None or schema_version != spec["schema_version"]:
@@ -937,7 +1128,8 @@ def validate_repository(root: Path, *, records_only: bool = False, pr_base: str 
     evidence = root / "evidence/referee-hardening"
     load_json(evidence / "schema-v1.json")
     schema_v2 = load_json(evidence / "schema-v2.json")
-    expected = set(range(40, 51))
+    validate_donor_disposition(root)
+    expected = set(range(40, 55))
     seen: set[int] = set()
     for path in sorted((evidence / "records").glob("pr-*.json")):
         record = load_json(path)
@@ -957,7 +1149,7 @@ def validate_repository(root: Path, *, records_only: bool = False, pr_base: str 
         contract_ids.add(contract["contract_id"])
         contracts.append((contract_path, contract))
     if contract_ids != {
-        "pr4a", "pr4b", "pr4c", "pr4d", "pr4e", "pr5", "pr6", "pr7"
+        "pr4a", "pr4b", "pr4c", "pr4d", "pr4e", "pr5", "pr6", "pr7", "pr8"
     }:
         raise EvidenceError(f"scope contract set differs: {sorted(contract_ids)}")
     if records_only:

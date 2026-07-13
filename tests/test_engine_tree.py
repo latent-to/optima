@@ -5,6 +5,7 @@ import importlib
 import json
 import os
 import shutil
+import subprocess
 import sys
 from dataclasses import replace
 from pathlib import Path
@@ -23,20 +24,31 @@ from optima.discovery import (
     inspect_discovery,
     reopen_discovery_engine_binding,
 )
+from optima.eval.evidence_store import EvidenceArtifactRef, publish_evidence
 from optima.engine_tree import (
     EngineTreeError,
     inspect_contribution,
     integrated_source_tree_digest,
     materialize_discovery_engine_tree,
     materialize_engine_tree,
+    promote_integrated_contribution,
     reopen_materialized_engine_tree,
 )
 from optima.manifest import load_manifest
 from optima.sandbox import load_module
+from optima.settlement import (
+    SettlementCandidate,
+    SettlementEvidence,
+    SettlementEventType,
+    SettlementQualification,
+    plan_settlement,
+)
 from optima.stack_manifest import (
     EngineReleaseManifest,
     EvaluationStackContext,
     EvaluationStackManifest,
+    IntegrationReviewRecord,
+    IntegrationReviewArtifacts,
     IntegratedContributionRef,
     ProposalContributionRef,
     ReleaseStackContext,
@@ -53,6 +65,12 @@ OVERRIDE = Path(__file__).parents[1] / "examples" / "miner_m3_swigluoai_override
 
 def _digest(label: str) -> str:
     return hashlib.sha256(label.encode()).hexdigest()
+
+
+def _evidence(domain: str, digest: str) -> EvidenceArtifactRef:
+    return EvidenceArtifactRef(
+        domain, digest, 1, "application/json", f"optima.{domain}.v1"
+    )
 
 
 def _spec_digests(catalog: TargetCatalog) -> dict[str, str]:
@@ -665,14 +683,36 @@ def test_override_entry_shim_preserves_required_ref_and_optional_device_entry(
 def test_integrated_release_revalidates_reviewed_source(tmp_path: Path) -> None:
     catalog = default_target_catalog()
     inspected = inspect_contribution(MSA, catalog=catalog)
-    ref = IntegratedContributionRef(
+    record = IntegrationReviewRecord(
         target_id=inspected.target_id,
         target_spec_digest=inspected.target_spec_digest,
+        proposal_contribution_digest=_digest("proposal"),
+        settlement_candidate_digest=_digest("candidate"),
+        settlement_evidence_digest=_digest("settlement-evidence"),
+        crown_event_digest=_digest("crown"),
+        primary_attempt_digest=_digest("primary"),
+        reproduction_attempt_digest=_digest("reproduction"),
         integrated_source_tree_digest=integrated_source_tree_digest(MSA),
         selected_payload_digest=inspected.selected_payload_digest,
         attribution_digest=_digest("attribution"),
-        integration_record_digest=_digest("integration-record"),
+        license_evidence_digest=_digest("license"),
+        provenance_evidence_digest=_digest("provenance"),
+        security_review_digest=_digest("security"),
+        compatibility_evidence_digest=_digest("compatibility"),
+        test_evidence_digest=_digest("tests"),
+        artifacts=IntegrationReviewArtifacts(
+            _evidence("qualification.cohort-attempt", _digest("primary")),
+            _evidence("qualification.cohort-attempt", _digest("reproduction")),
+            _evidence("integration.license", _digest("license")),
+            _evidence("integration.provenance", _digest("provenance")),
+            _evidence("integration.security-review", _digest("security")),
+            _evidence("integration.compatibility", _digest("compatibility")),
+            _evidence("integration.tests", _digest("tests")),
+        ),
+        reviewer="optima-test-reviewer",
+        review_commit="a" * 40,
     )
+    ref = record.integrated_ref()
     context = ReleaseStackContext(
         runtime_digest=_digest("runtime"),
         base_engine_digest=_digest("base"),
@@ -694,6 +734,7 @@ def test_integrated_release_revalidates_reviewed_source(tmp_path: Path) -> None:
         catalog=catalog,
         resolver=_sources((ref, MSA)),
         destination=tmp_path / "release",
+        integration_records={record.target_id: record},
     )
     assert result.stack_digest == release.digest
 
@@ -707,6 +748,7 @@ def test_integrated_release_revalidates_reviewed_source(tmp_path: Path) -> None:
             catalog=catalog,
             resolver=_sources((ref, padded)),
             destination=tmp_path / "wrong-source",
+            integration_records={record.target_id: record},
         )
 
     wrong_payload = replace(ref, selected_payload_digest=_digest("wrong-payload"))
@@ -717,15 +759,213 @@ def test_integrated_release_revalidates_reviewed_source(tmp_path: Path) -> None:
         catalog_digest=catalog.digest,
         entries={wrong_payload.target_id: wrong_payload},
     )
-    with pytest.raises(EngineTreeError, match="selected payload digest mismatch"):
+    with pytest.raises(EngineTreeError, match="integration authority is invalid"):
         materialize_engine_tree(
             wrong_release,
             context=context,
             catalog=catalog,
             resolver=_sources((wrong_payload, MSA)),
             destination=tmp_path / "wrong-payload",
+            integration_records={record.target_id: record},
         )
 
+
+def test_integration_promotion_binds_crown_evidence_source_and_review_commit(
+    tmp_path: Path,
+) -> None:
+    catalog = default_target_catalog()
+    context = _evaluation_context(catalog)
+    proposal = _proposal_ref(MSA, catalog)
+    incumbent = _evaluation_stack(catalog, context)
+    arm = plan_marginal_arm(
+        incumbent,
+        proposal,
+        catalog=catalog,
+        incumbent_tree_digest=_digest("promotion-incumbent-tree"),
+        candidate_tree_digest=_digest("promotion-candidate-tree"),
+        expected_context=context,
+    )
+    primary_attempt_payload = b'{"attempt":"primary"}'
+    reproduction_attempt_payload = b'{"attempt":"reproduction"}'
+    primary = SettlementQualification(
+        lane="registered",
+        arena_digest=incumbent.arena_digest,
+        reservation_digest=_digest("promotion-reservation"),
+        finalized_block=10,
+        event_index=0,
+        event_subindex=0,
+        hotkey="miner-promotion",
+        target_id=proposal.target_id,
+        members=tuple(sorted(catalog.require(proposal.target_id).members)),
+        selected_delta_digest=arm.selected_delta_digest,
+        qualification_authority_digest=_digest("promotion-authority"),
+        qualification_plan_digest=_digest("promotion-plan"),
+        qualification_attempt_digest=hashlib.sha256(primary_attempt_payload).hexdigest(),
+        qualification_report_digest=_digest("promotion-report"),
+        selection_commitment_digest=_digest("promotion-selection-commitment"),
+        selection_secret_commitment_digest=_digest("promotion-selection-secret"),
+        selection_evidence_digest=_digest("promotion-selection-evidence"),
+        arm_digest=arm.digest,
+        incumbent_stack_digest=arm.baseline_before.stack_digest,
+        incumbent_tree_digest=arm.baseline_before.tree_digest,
+        candidate_stack_digest=arm.challenger.stack_digest,
+        candidate_tree_digest=arm.challenger.tree_digest,
+        speedup="1.05",
+        incumbent_manifest=incumbent,
+        candidate_manifest=arm.candidate,
+    )
+    reproduction = replace(
+        primary,
+        qualification_authority_digest=_digest("promotion-reproduction-authority"),
+        qualification_plan_digest=_digest("promotion-reproduction-plan"),
+        qualification_attempt_digest=hashlib.sha256(
+            reproduction_attempt_payload
+        ).hexdigest(),
+        qualification_report_digest=_digest("promotion-reproduction-report"),
+        selection_commitment_digest=_digest(
+            "promotion-reproduction-selection-commitment"
+        ),
+        selection_secret_commitment_digest=_digest(
+            "promotion-reproduction-selection-secret"
+        ),
+        selection_evidence_digest=_digest(
+            "promotion-reproduction-selection-evidence"
+        ),
+        speedup="1.04",
+    )
+    candidate = SettlementCandidate.from_reproductions(primary, reproduction)
+    evidence_root = tmp_path / "integration-evidence"
+    primary_ref = publish_evidence(
+        evidence_root,
+        primary_attempt_payload,
+        domain="qualification.cohort-attempt",
+        media_type="application/json",
+        schema="optima.qualification.cohort-attempt.v1",
+    )
+    reproduction_ref = publish_evidence(
+        evidence_root,
+        reproduction_attempt_payload,
+        domain="qualification.cohort-attempt",
+        media_type="application/json",
+        schema="optima.qualification.cohort-attempt.v1",
+    )
+    evidence = SettlementEvidence.bind(
+        candidate,
+        primary_attempt_ref=primary_ref,
+        reproduction_attempt_ref=reproduction_ref,
+    )
+    settlement = plan_settlement(
+        (candidate,),
+        current_manifest=incumbent,
+        current_tree_digest=arm.baseline_before.tree_digest,
+    )
+    crown = next(
+        row for row in settlement.events if row.event_type is SettlementEventType.CROWN
+    )
+
+    repository = tmp_path / "review-repository"
+    integrated = repository / "integrated"
+    shutil.copytree(MSA, integrated)
+    subprocess.run(("git", "init", "-q", str(repository)), check=True)
+    subprocess.run(("git", "-C", str(repository), "add", "integrated"), check=True)
+    subprocess.run(
+        (
+            "git", "-C", str(repository), "-c", "user.name=Optima Review",
+            "-c", "user.email=review@optima.invalid", "commit", "-q", "-m", "review",
+        ),
+        check=True,
+    )
+    review_commit = subprocess.run(
+        ("git", "-C", str(repository), "rev-parse", "HEAD"),
+        check=True,
+        stdout=subprocess.PIPE,
+        text=True,
+    ).stdout.strip()
+    def reviewed(label: str, domain: str) -> EvidenceArtifactRef:
+        payload = json.dumps(
+            {"evidence": label}, separators=(",", ":"), sort_keys=True
+        ).encode("utf-8")
+        return publish_evidence(
+            evidence_root,
+            payload,
+            domain=domain,
+            media_type="application/json",
+            schema=f"optima.{domain}.v1",
+        )
+
+    artifacts = IntegrationReviewArtifacts(
+        primary_ref,
+        reproduction_ref,
+        reviewed("promotion-license", "integration.license"),
+        reviewed("promotion-provenance", "integration.provenance"),
+        reviewed("promotion-security", "integration.security-review"),
+        reviewed("promotion-compatibility", "integration.compatibility"),
+        reviewed("promotion-tests", "integration.tests"),
+    )
+
+    def promote(**changes):
+        arguments = {
+            "candidate": candidate,
+            "settlement_evidence": evidence,
+            "crown_event": crown,
+            "proposal": proposal,
+            "integrated_source_root": integrated,
+            "repository_root": repository,
+            "evidence_root": evidence_root,
+            "catalog": catalog,
+            "review_commit": review_commit,
+            "review_artifacts": artifacts,
+            "reviewer": "validator-release-review",
+        }
+        arguments.update(changes)
+        return promote_integrated_contribution(**arguments)
+
+    record = promote()
+    assert record.settlement_candidate_digest == candidate.digest
+    assert record.settlement_evidence_digest == evidence.digest
+    assert record.crown_event_digest == crown.digest
+    assert record.proposal_contribution_digest == proposal.digest
+    assert record.artifacts == artifacts
+    assert record.review_commit == review_commit
+    assert IntegrationReviewRecord.from_dict(record.to_dict()) == record
+
+    with pytest.raises(EngineTreeError, match="exact candidate CROWN"):
+        promote(
+            crown_event=replace(crown, subject_digest=_digest("wrong-crown-subject"))
+        )
+    with pytest.raises(EngineTreeError, match="crowned delta"):
+        promote(
+            proposal=replace(
+                proposal, attribution_digest=_digest("wrong-proposal-attribution")
+            )
+        )
+    with pytest.raises(EngineTreeError, match="evidence differs"):
+        promote(
+            settlement_evidence=replace(
+                evidence, primary_report_digest=_digest("wrong-primary-report")
+            )
+        )
+
+    license_ref = artifacts.license_evidence_ref
+    license_path = (
+        evidence_root / license_ref.domain / license_ref.sha256[:2] / license_ref.sha256
+    )
+    license_path.unlink()
+    with pytest.raises(EngineTreeError, match="cannot reopen retained"):
+        promote()
+    restored = reviewed("promotion-license", "integration.license")
+    assert restored == license_ref
+    license_path.chmod(0o600)
+    license_path.write_bytes(b"x" * license_ref.size)
+    license_path.chmod(0o400)
+    with pytest.raises(EngineTreeError, match="cannot reopen retained"):
+        promote()
+    license_path.unlink()
+    assert reviewed("promotion-license", "integration.license") == license_ref
+
+    (integrated / "unreviewed-padding.txt").write_text("not in review commit\n")
+    with pytest.raises(EngineTreeError, match="differs from the integration review_commit"):
+        promote()
 
 def test_inert_padding_changes_artifact_not_selected_payload(tmp_path: Path) -> None:
     padded = tmp_path / "padded"

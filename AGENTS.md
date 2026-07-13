@@ -44,10 +44,11 @@ This repo is the **validator harness** (the referee), plus example miner bundles
 
 ## Current state (keep this honest)
 
-- **Mechanism: done & validated on real GPUs** (H100, up to gpt-oss-120b). Typed
-  op-slots, the `.pth`+post-import seam, op-correctness, two-launch throughput+KL,
-  a GSM8K capability gate, commit-reveal + king-of-the-hill, tamper-resistant
-  timing. A slot is a single **op**, a fused **block**, *or* a cross-GPU **collective**
+- **The kernel mechanism is validated on real GPUs** (H100, up to gpt-oss-120b).
+  The hardened authority adds typed targets, correctness/graph proof, bookended B/C/B′
+  throughput with pristine-T quality authority, independent reproduction, finalized
+  commit-reveal intake, and transactional target settlement. A slot is a single **op**,
+  a fused **block**, *or* a cross-GPU **collective**
   (same cheat-resistant contract — validator allocates outputs, miner fills them, the
   kernel never reaches the sampler — just a wider boundary): `activation.silu_and_mul`,
   `norm.rmsnorm` (ops); `attention.sdpa`/`attention.decode` (blocks via the
@@ -92,8 +93,10 @@ This repo is the **validator harness** (the referee), plus example miner bundles
   deterministic mode refuses fa4) — rollout-KL there punishes ANY timing change, i.e.
   exactly what miners are paid for. Pod-validated: honest kernel 2,996 audited calls /
   0 violations = PASS while advisory KL read 0.89; sabotage kernel 3,120/3,120 = FAIL.
-  Known residuals (see the doc's adversarial matrix): in-process tampering (the standing
-  isolation gap), timed-workload fingerprinting, attention slot not yet audited.
+  Known residuals (see the doc's adversarial matrix): timed-workload fingerprinting and
+  attention-slot audit coverage. Crownable candidate execution is fenced in validator-
+  owned OCI sessions with no network egress; the trusted controller never loads miner
+  Python or native extensions.
 - **Scoring is noise-robust without clock-locking** (`optima/eval/scoring.py`): the candidate is
   bracketed by a baseline before AND after (B,C,B'), paired against the mean, with the bar
   derived from measured baseline noise (`1 + max(margin, k·noise)`) and a NO-DECISION verdict
@@ -109,9 +112,11 @@ This repo is the **validator harness** (the referee), plus example miner bundles
   import closure**, with a per-FILE containment compare so neither padding the bundle with an
   extra op nor relocating a stolen body into an imported module evades auto-demote — plus a
   structural skeleton fingerprint (advisory, flags rename/constant-tweak).
-  `optima settle --per-slot` = a champion per slot, emission split (pays specialists); a champion
-  on a different `PINNED_SGLANG` is flagged stale (re-baseline). `optima verify` loads + runs the
-  kernel **out-of-process** so the CLI never imports miner code (full netns isolation is still TODO).
+  Production settlement uses explicit singleton or atomic competition targets and
+  transactional stack state. One passing qualification is retained as
+  `reproduction_pending`; settlement requires a second independent passing authority and
+  uses the lower of the two measured speedups. Candidate execution runs out of process in
+  a no-egress OCI worker, so the trusted controller never imports miner code.
 - **FIRST REAL WIN (2026-07-07): a submitted kernel beat sglang through optima's own
   scorer at equal fidelity.** The `miner_m3_fused_epilogue` bundle (the July-2 campaign's
   v6 Lamport fused AR+residual+RMSNorm, `collective.ar_residual_rmsnorm`, graph_safe) on
@@ -137,25 +142,30 @@ This repo is the **validator harness** (the referee), plus example miner bundles
   `optima/chain/` = the full loop: miners commit `{"v":1,"h":<content_hash>,"u":<url>}`
   via the chain's NATIVE timelock commit-reveal (`set_reveal_commitment`, ≤1024 B —
   URL unreadable until the reveal block, which is the anti-copy priority timestamp);
-  `optima chain-validate` reads reveals in chain order, fetches (hostile-archive-safe,
-  size-capped), **re-hashes the extracted tree against the committed hash**, fingerprints
-  + demotes copies, evaluates out-of-process (pluggable `--eval-cmd` → the real GPU gate
-  chain), settles per slot, and pushes weights (SDK auto-routes through drand CRv4 when
-  the subnet enables commit-reveal weights). Emission policy lives in ONE seam,
-  `Ledger.current_weights` — swap it there, nowhere else. Proven on netuid 307: the deep
+  `optima chain-validate` reads finalized reveals in chain order, fetches
+  hostile archives into private storage, **re-hashes the extracted tree against the
+  committed hash**, fingerprints copies, and publishes an immutable worker tree. A
+  validator-injected `ArenaServiceRegistry` applies the registered static/build/ABI/graph/
+  abbreviated-serving screen before expensive qualification. SQLite records intake,
+  receipts, reproduction state, stack transitions, and settlement; `optima set-weights`
+  reconciles the resulting global reward projection separately. Proven on netuid 307:
+  the deep
   FE bundle was chain-committed by a miner hotkey and the loop crowned it at **SCORE
   1.0717 (1.072× vs bar 1.026; audit 12,824/0)** — the third independent deep repro.
   Runbook: `docs/TESTNET.md`; canary: `optima chain-compat` (SDK 10.3.2; note
-  `bittensor-drand<2.0.0`). Weights stayed dry-run on 307 (zero-stake = no permit, and
-  that subnet can't accept stake) — a real push needs our own subnet.
-- **Open — the next goals:** isolation for untrusted miners; the tiered eval scheduler
-  (screen cheap, record rarely, amortized B,C1..Ck,B' bookends; resident-engine screener
-  design in the 07-07 ledger); a real DB behind the Ledger; mainnet economics (own
-  subnet, staked validator permits, hosted bundle store); more slots (MLA/weight-absorbed
-  attention, FP8/FP4 GEMM, graph-safe paged attention); upstream: report minimax_m3's
-  unwired `is_last_layer` (stock last-layer AR realization is unclear — probe before
-  filing). NOTE: emissions will NOT stay winner-take-all (relative-improvement +
-  time-decay direction) — don't design around argmax-only scoring.
+  `bittensor-drand<2.0.0`). The first pass kept weights dry-run; a later permitted
+  netuid-307 pass validated real commit-reveal weight publication and restart safety.
+- **Release path:** evaluation and serving are separate products. Approved integration
+  reviews authorize contributions in an `EngineReleaseManifest`; model provisioning
+  receipts seal every model file; signed, chain-independent releases carry deterministic
+  source/wheel artifacts, SBOM/provenance, a pinned serving specification, and an OCI
+  build context. Chain or wallet code is not included in the serving wheel.
+- **Open — the next goals:** mainnet economics and operations (owned subnet, validator
+  permits, hosted bundle storage); more slots (MLA/weight-absorbed attention, FP8/FP4
+  GEMM, graph-safe paged attention); and B300-only qualification of SM103/CuTe,
+  NVLink/custom-collective behavior, topology-specific calibration, and the existing
+  MiniMax-M3 campaign kernels. NOTE: emissions will NOT stay winner-take-all
+  (relative-improvement + time-decay direction) — don't design around argmax-only scoring.
 
 ## How to run
 
@@ -202,9 +212,10 @@ matters — sglang uses `mp spawn`).
   needs no per-submission reconfigure. **Hard line: a slot must stay upstream of the
   logprobs/sampler**, or the output-substitution attack (run gibberish, fetch the
   real answer from an API) reappears — that line is what keeps op/block slots safe.
-- Miner submissions are Triton/CuteDSL source, not raw CUDA extensions. That
-  narrows the attack surface and keeps submissions inspectable, but the host
-  Python launch code still runs in-process, so isolation remains required.
+- Miner submissions are Triton/CuteDSL source, not prebuilt CUDA extensions. That
+  narrows the artifact surface and keeps submissions inspectable. Import, native build,
+  engine construction, and candidate execution occur only inside the no-egress OCI
+  worker; the trusted controller validates bounded protocol evidence and owns teardown.
 - Don't claim a kernel "drifts" without measuring the **stock-vs-stock KL noise
   floor** first (we got burned on this).
 - **sglang is pinned** (`PINNED_SGLANG` in `optima/compat.py`) — all validators

@@ -67,8 +67,45 @@ def _speedup(value: object) -> str:
 
 
 @dataclass(frozen=True)
-class SettlementCandidate:
-    """Exact PASS projection consumed by settlement, not a second quality grader."""
+class SettlementReproductionIdentity:
+    """Exact contribution identity that an independent PASS must reproduce."""
+
+    arena_digest: str
+    target_id: str
+    selected_delta_digest: str
+    hotkey: str
+    incumbent_stack_digest: str
+    incumbent_tree_digest: str
+    candidate_stack_digest: str
+    candidate_tree_digest: str
+
+    def __post_init__(self) -> None:
+        for field in (
+            "arena_digest", "selected_delta_digest", "incumbent_stack_digest",
+            "incumbent_tree_digest", "candidate_stack_digest", "candidate_tree_digest",
+        ):
+            object.__setattr__(self, field, _digest(getattr(self, field), field))
+        for field in ("target_id", "hotkey"):
+            object.__setattr__(self, field, _identifier(getattr(self, field), field))
+
+    def to_dict(self) -> dict[str, str]:
+        return {
+            field: getattr(self, field)
+            for field in self.__dataclass_fields__
+        }
+
+    @property
+    def digest(self) -> str:
+        return canonical_digest("optima.settlement.reproduction-identity", self.to_dict())
+
+
+@dataclass(frozen=True)
+class SettlementQualification:
+    """One independently selected, reopened, and regraded PASS projection.
+
+    A qualification is deliberately not a settlement candidate.  Settlement authority
+    exists only after two distinct qualifications reproduce the same contribution.
+    """
 
     lane: str
     arena_digest: str
@@ -84,6 +121,9 @@ class SettlementCandidate:
     qualification_plan_digest: str
     qualification_attempt_digest: str
     qualification_report_digest: str
+    selection_commitment_digest: str
+    selection_secret_commitment_digest: str
+    selection_evidence_digest: str
     arm_digest: str
     incumbent_stack_digest: str
     incumbent_tree_digest: str
@@ -105,6 +145,9 @@ class SettlementCandidate:
             "qualification_plan_digest",
             "qualification_attempt_digest",
             "qualification_report_digest",
+            "selection_commitment_digest",
+            "selection_secret_commitment_digest",
+            "selection_evidence_digest",
             "arm_digest",
             "incumbent_stack_digest",
             "incumbent_tree_digest",
@@ -188,6 +231,19 @@ class SettlementCandidate:
     def challenger(self) -> StackArmIdentity:
         return StackArmIdentity(self.candidate_stack_digest, self.candidate_tree_digest)
 
+    @property
+    def reproduction_identity(self) -> SettlementReproductionIdentity:
+        return SettlementReproductionIdentity(
+            self.arena_digest,
+            self.target_id,
+            self.selected_delta_digest,
+            self.hotkey,
+            self.incumbent_stack_digest,
+            self.incumbent_tree_digest,
+            self.candidate_stack_digest,
+            self.candidate_tree_digest,
+        )
+
     @classmethod
     def from_qualification(
         cls,
@@ -203,7 +259,8 @@ class SettlementCandidate:
         report,
         authority,
         attempt_ref,
-    ) -> "SettlementCandidate":
+        attempt,
+    ) -> "SettlementQualification":
         """Project already reopened trusted types without reimplementing their grader."""
 
         from optima.discovery import DiscoveryArmPlan
@@ -213,7 +270,9 @@ class SettlementCandidate:
         from optima.eval.qualification_intake import QualificationAuthorityManifest
         from optima.eval.qualification_runner import (
             CandidateQualificationReport,
+            CohortQualificationAttempt,
             DiscoveryCandidateQualificationReport,
+            DiscoveryQualificationAttempt,
         )
         from optima.stack_plan import MarginalArmPlan
 
@@ -235,7 +294,10 @@ class SettlementCandidate:
         arm = prepared.arm
         if type(arm) is MarginalArmPlan:
             lane = "registered"
-            if type(report) is not CandidateQualificationReport:
+            if (
+                type(report) is not CandidateQualificationReport
+                or type(attempt) is not CohortQualificationAttempt
+            ):
                 raise SettlementError("registered candidate report has the wrong type")
             if (
                 report.marginal_arm_digest != arm.digest
@@ -246,7 +308,10 @@ class SettlementCandidate:
             manifest = arm.candidate
         elif type(arm) is DiscoveryArmPlan:
             lane = "discovery"
-            if type(report) is not DiscoveryCandidateQualificationReport:
+            if (
+                type(report) is not DiscoveryCandidateQualificationReport
+                or type(attempt) is not DiscoveryQualificationAttempt
+            ):
                 raise SettlementError("discovery candidate report has the wrong type")
             if (
                 report.discovery_arm_digest != arm.digest
@@ -259,11 +324,25 @@ class SettlementCandidate:
         if authority.lane != lane:
             raise SettlementError("qualification authority lane differs from its arm")
         if (
+            attempt.authority_digest != authority.authority_digest
+            or attempt.commitment.digest != authority.commitment_digest
+            or sum(row.digest == report.digest for row in attempt.reports) != 1
+        ):
+            raise SettlementError("qualification attempt differs from its authority/report")
+        if (
             reservation.selected_delta_digest != arm.selected_delta_digest
             or report.selected_delta_digest != arm.selected_delta_digest
             or authority.candidate_deltas.count(arm.selected_delta_digest) != 1
         ):
             raise SettlementError("qualification selected-delta identity differs")
+        selection_evidence_digest = canonical_digest(
+            "optima.settlement.selection-evidence",
+            {
+                "commitment_digest": attempt.commitment.digest,
+                "entropy_digest": attempt.entropy.digest,
+                "selection_digest": attempt.selection.digest,
+            },
+        )
         return cls(
             lane=lane,
             arena_digest=arm.incumbent.arena_digest,
@@ -279,6 +358,9 @@ class SettlementCandidate:
             qualification_plan_digest=authority.authority_digest,
             qualification_attempt_digest=attempt_ref.sha256,
             qualification_report_digest=report.digest,
+            selection_commitment_digest=attempt.commitment.digest,
+            selection_secret_commitment_digest=attempt.commitment.secret_commitment,
+            selection_evidence_digest=selection_evidence_digest,
             arm_digest=arm.digest,
             incumbent_stack_digest=arm.baseline_before.stack_digest,
             incumbent_tree_digest=arm.baseline_before.tree_digest,
@@ -312,6 +394,9 @@ class SettlementCandidate:
             "qualification_authority_digest": self.qualification_authority_digest,
             "qualification_plan_digest": self.qualification_plan_digest,
             "qualification_report_digest": self.qualification_report_digest,
+            "selection_commitment_digest": self.selection_commitment_digest,
+            "selection_secret_commitment_digest": self.selection_secret_commitment_digest,
+            "selection_evidence_digest": self.selection_evidence_digest,
             "proposal_digest": self.proposal_digest,
             "reservation_digest": self.reservation_digest,
             "selected_delta_digest": self.selected_delta_digest,
@@ -320,14 +405,14 @@ class SettlementCandidate:
         }
 
     @classmethod
-    def from_dict(cls, value: object) -> "SettlementCandidate":
+    def from_dict(cls, value: object) -> "SettlementQualification":
         fields = set(cls.__dataclass_fields__)
         if type(value) is not dict or set(value) != fields:
-            raise SettlementError("settlement candidate fields do not match")
+            raise SettlementError("settlement qualification fields do not match")
         row = dict(value)
         members = row.get("members")
         if type(members) is not list:
-            raise SettlementError("settlement candidate members are malformed")
+            raise SettlementError("settlement qualification members are malformed")
         row["members"] = tuple(members)
         manifest = row.get("candidate_manifest")
         row["candidate_manifest"] = (
@@ -340,33 +425,198 @@ class SettlementCandidate:
 
     @property
     def digest(self) -> str:
-        return canonical_digest("optima.settlement.candidate", self.to_dict())
+        return canonical_digest("optima.settlement.qualification", self.to_dict())
+
+
+@dataclass(frozen=True)
+class SettlementCandidate:
+    """A primary PASS and an independent reproduction of the exact same delta."""
+
+    primary: SettlementQualification
+    reproduction: SettlementQualification
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.primary) is not SettlementQualification
+            or type(self.reproduction) is not SettlementQualification
+        ):
+            raise SettlementError("settlement candidate requires two exact qualifications")
+        if self.primary.reproduction_identity != self.reproduction.reproduction_identity:
+            raise SettlementError(
+                "independent reproduction differs from the primary reproduction identity"
+            )
+        common = (
+            "lane", "arena_digest", "reservation_digest", "finalized_block",
+            "event_index", "event_subindex", "hotkey", "target_id", "members",
+            "selected_delta_digest", "arm_digest", "incumbent_stack_digest",
+            "incumbent_tree_digest", "candidate_stack_digest", "candidate_tree_digest",
+            "incumbent_manifest", "proposal_digest", "candidate_manifest",
+        )
+        if any(
+            getattr(self.primary, field) != getattr(self.reproduction, field)
+            for field in common
+        ):
+            raise SettlementError(
+                "independent reproduction differs from the primary contribution identity"
+            )
+        distinct = (
+            "qualification_authority_digest", "qualification_plan_digest",
+            "qualification_attempt_digest", "qualification_report_digest",
+            "selection_commitment_digest", "selection_secret_commitment_digest",
+            "selection_evidence_digest",
+        )
+        if any(
+            getattr(self.primary, field) == getattr(self.reproduction, field)
+            for field in distinct
+        ):
+            raise SettlementError(
+                "independent reproduction reuses primary authority or evidence"
+            )
+
+    @classmethod
+    def from_reproductions(
+        cls,
+        primary: SettlementQualification,
+        reproduction: SettlementQualification,
+    ) -> "SettlementCandidate":
+        return cls(primary, reproduction)
+
+    def __getattr__(self, field: str):
+        # Keep common identity access explicit to the pair while callers migrate from
+        # the former single-PASS candidate representation.
+        if field in SettlementQualification.__dataclass_fields__:
+            return getattr(self.primary, field)
+        raise AttributeError(field)
+
+    @property
+    def speedup(self) -> str:
+        """Conservative reproduced speed: the slower independently passing run."""
+
+        return min(
+            (self.primary.speedup, self.reproduction.speedup),
+            key=Decimal,
+        )
+
+    @property
+    def finalized_order(self) -> tuple[int, int, int, str]:
+        return self.primary.finalized_order
+
+    @property
+    def incumbent(self) -> StackArmIdentity:
+        return self.primary.incumbent
+
+    @property
+    def challenger(self) -> StackArmIdentity:
+        return self.primary.challenger
+
+    @property
+    def reproduction_identity(self) -> SettlementReproductionIdentity:
+        return self.primary.reproduction_identity
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "primary": self.primary.to_dict(),
+            "reproduction": self.reproduction.to_dict(),
+        }
+
+    @classmethod
+    def from_dict(cls, value: object) -> "SettlementCandidate":
+        if type(value) is not dict or set(value) != {"primary", "reproduction"}:
+            raise SettlementError("settlement candidate fields do not match")
+        return cls(
+            SettlementQualification.from_dict(value["primary"]),
+            SettlementQualification.from_dict(value["reproduction"]),
+        )
+
+    @property
+    def digest(self) -> str:
+        return canonical_digest("optima.settlement.candidate.v2", self.to_dict())
 
 
 @dataclass(frozen=True)
 class SettlementEvidence:
-    """Receipt that retained attempt bytes were reopened for one exact candidate."""
+    """Receipt that both retained attempt artifacts were reopened for one candidate."""
 
     candidate_digest: str
     reservation_digest: str
-    authority_digest: str
-    attempt_ref: EvidenceArtifactRef
-    report_digest: str
+    primary_authority_digest: str
+    primary_attempt_ref: EvidenceArtifactRef
+    primary_report_digest: str
+    primary_selection_evidence_digest: str
+    reproduction_authority_digest: str
+    reproduction_attempt_ref: EvidenceArtifactRef
+    reproduction_report_digest: str
+    reproduction_selection_evidence_digest: str
 
     def __post_init__(self) -> None:
         for field in (
-            "candidate_digest", "reservation_digest", "authority_digest", "report_digest"
+            "candidate_digest", "reservation_digest", "primary_authority_digest",
+            "primary_report_digest", "primary_selection_evidence_digest",
+            "reproduction_authority_digest", "reproduction_report_digest",
+            "reproduction_selection_evidence_digest",
         ):
             object.__setattr__(self, field, _digest(getattr(self, field), field))
-        if type(self.attempt_ref) is not EvidenceArtifactRef:
-            raise SettlementError("settlement attempt reference is not exactly typed")
+        if (
+            type(self.primary_attempt_ref) is not EvidenceArtifactRef
+            or type(self.reproduction_attempt_ref) is not EvidenceArtifactRef
+        ):
+            raise SettlementError("settlement attempt references are not exactly typed")
+        if any(
+            left == right
+            for left, right in (
+                (self.primary_authority_digest, self.reproduction_authority_digest),
+                (self.primary_attempt_ref.sha256, self.reproduction_attempt_ref.sha256),
+                (self.primary_report_digest, self.reproduction_report_digest),
+                (
+                    self.primary_selection_evidence_digest,
+                    self.reproduction_selection_evidence_digest,
+                ),
+            )
+        ):
+            raise SettlementError("settlement evidence does not contain a reproduction")
+
+    @classmethod
+    def bind(
+        cls,
+        candidate: SettlementCandidate,
+        *,
+        primary_attempt_ref: EvidenceArtifactRef,
+        reproduction_attempt_ref: EvidenceArtifactRef,
+    ) -> "SettlementEvidence":
+        if type(candidate) is not SettlementCandidate:
+            raise SettlementError("settlement evidence candidate is not exactly typed")
+        if (
+            type(primary_attempt_ref) is not EvidenceArtifactRef
+            or primary_attempt_ref.sha256 != candidate.primary.qualification_attempt_digest
+            or type(reproduction_attempt_ref) is not EvidenceArtifactRef
+            or reproduction_attempt_ref.sha256
+            != candidate.reproduction.qualification_attempt_digest
+        ):
+            raise SettlementError("settlement attempt references differ from the candidate")
+        return cls(
+            candidate.digest,
+            candidate.reservation_digest,
+            candidate.primary.qualification_authority_digest,
+            primary_attempt_ref,
+            candidate.primary.qualification_report_digest,
+            candidate.primary.selection_evidence_digest,
+            candidate.reproduction.qualification_authority_digest,
+            reproduction_attempt_ref,
+            candidate.reproduction.qualification_report_digest,
+            candidate.reproduction.selection_evidence_digest,
+        )
 
     def to_dict(self) -> dict[str, object]:
         return {
-            "attempt_ref": self.attempt_ref.to_dict(),
-            "authority_digest": self.authority_digest,
             "candidate_digest": self.candidate_digest,
-            "report_digest": self.report_digest,
+            "primary_attempt_ref": self.primary_attempt_ref.to_dict(),
+            "primary_authority_digest": self.primary_authority_digest,
+            "primary_report_digest": self.primary_report_digest,
+            "primary_selection_evidence_digest": self.primary_selection_evidence_digest,
+            "reproduction_attempt_ref": self.reproduction_attempt_ref.to_dict(),
+            "reproduction_authority_digest": self.reproduction_authority_digest,
+            "reproduction_report_digest": self.reproduction_report_digest,
+            "reproduction_selection_evidence_digest": self.reproduction_selection_evidence_digest,
             "reservation_digest": self.reservation_digest,
         }
 
@@ -378,9 +628,14 @@ class SettlementEvidence:
         return cls(
             value["candidate_digest"],  # type: ignore[arg-type]
             value["reservation_digest"],  # type: ignore[arg-type]
-            value["authority_digest"],  # type: ignore[arg-type]
-            EvidenceArtifactRef.from_dict(value["attempt_ref"]),
-            value["report_digest"],  # type: ignore[arg-type]
+            value["primary_authority_digest"],  # type: ignore[arg-type]
+            EvidenceArtifactRef.from_dict(value["primary_attempt_ref"]),
+            value["primary_report_digest"],  # type: ignore[arg-type]
+            value["primary_selection_evidence_digest"],  # type: ignore[arg-type]
+            value["reproduction_authority_digest"],  # type: ignore[arg-type]
+            EvidenceArtifactRef.from_dict(value["reproduction_attempt_ref"]),
+            value["reproduction_report_digest"],  # type: ignore[arg-type]
+            value["reproduction_selection_evidence_digest"],  # type: ignore[arg-type]
         )
 
     @property
@@ -647,6 +902,6 @@ def plan_settlement(
 
 __all__ = [
     "SettlementCandidate", "SettlementError", "SettlementEvidence", "SettlementEvent",
-    "SettlementEventType", "SettlementPlan", "StackTransitionOutput",
-    "plan_settlement",
+    "SettlementEventType", "SettlementPlan", "SettlementQualification",
+    "SettlementReproductionIdentity", "StackTransitionOutput", "plan_settlement",
 ]

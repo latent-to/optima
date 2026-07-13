@@ -27,7 +27,10 @@ if TYPE_CHECKING:
 
 _HASH = re.compile(r"[0-9a-f]{64}\Z")
 _BLOCK_HASH = re.compile(r"0x[0-9a-f]{64}\Z")
-_ACTIVE = ("reserved", "fetching", "transport_retry", "published", "qualifying")
+_ACTIVE = (
+    "reserved", "fetching", "transport_retry", "published", "screening",
+    "promoted", "qualifying", "reproduction_pending",
+)
 _TERMINAL = ("failed", "expired", "qualified")
 _STATUSES = frozenset((*_ACTIVE, *_TERMINAL, "held", "no_decision"))
 
@@ -173,6 +176,11 @@ class IntakeReservation:
     publication_root: str
     qualification_authority_digest: str
     qualification_evidence_digest: str
+    arena_service_digest: str
+    screen_lane: str
+    screen_status: str
+    screen_stage_count: int
+    screen_attempts: int
     decision: str
     reason: str
 
@@ -198,12 +206,26 @@ class IntakeReservation:
             "publication_digest",
             "qualification_authority_digest",
             "qualification_evidence_digest",
+            "arena_service_digest",
         ):
             value = getattr(self, field)
             if value and _HASH.fullmatch(value) is None:
                 raise IntakeError(f"reservation {field} is malformed")
         if self.decision not in {"", "PASS", "FAIL", "NO_DECISION"}:
             raise IntakeError("reservation decision is unsupported")
+        if self.screen_lane not in {"", "primary", "reproduction"}:
+            raise IntakeError("reservation screen lane is unsupported")
+        if self.screen_status not in {
+            "", "running", "promote", "reject", "retry", "hold",
+        }:
+            raise IntakeError("reservation screen status is unsupported")
+        if (
+            type(self.screen_stage_count) is not int
+            or self.screen_stage_count < 0
+            or type(self.screen_attempts) is not int
+            or self.screen_attempts < 0
+        ):
+            raise IntakeError("reservation screen counters are malformed")
 
 
 @dataclass(frozen=True)
@@ -254,7 +276,7 @@ class SettlementLease:
     previous_event_digest: str
 
     def __post_init__(self) -> None:
-        from optima.settlement import SettlementCandidate
+        from optima.settlement import SettlementCandidate, SettlementQualification
 
         for field in ("lease_id", "authority_digest"):
             require_sha256_hex(getattr(self, field), field=field)
@@ -412,6 +434,11 @@ class FinalizedIntakeStore:
                 qualification_authority_digest TEXT NOT NULL DEFAULT '',
                 qualification_authority_json TEXT NOT NULL DEFAULT '',
                 qualification_evidence_digest TEXT NOT NULL DEFAULT '',
+                arena_service_digest TEXT NOT NULL DEFAULT '',
+                screen_lane TEXT NOT NULL DEFAULT '',
+                screen_status TEXT NOT NULL DEFAULT '',
+                screen_stage_count INTEGER NOT NULL DEFAULT 0,
+                screen_attempts INTEGER NOT NULL DEFAULT 0,
                 retry_group_digest TEXT NOT NULL DEFAULT '',
                 retry_position INTEGER NOT NULL DEFAULT 0,
                 decision TEXT NOT NULL DEFAULT '',
@@ -435,12 +462,34 @@ class FinalizedIntakeStore:
                 reason TEXT NOT NULL,
                 PRIMARY KEY(reservation_id, attempt_index)
             ) STRICT;
+            CREATE TABLE IF NOT EXISTS arena_screen_dispositions (
+                reservation_id TEXT NOT NULL REFERENCES reservations(reservation_id),
+                attempt_index INTEGER NOT NULL,
+                service_digest TEXT NOT NULL,
+                candidate_digest TEXT NOT NULL,
+                receipt_digest TEXT NOT NULL UNIQUE,
+                receipt_json TEXT NOT NULL,
+                decision TEXT NOT NULL,
+                stage_count INTEGER NOT NULL,
+                lane TEXT NOT NULL,
+                PRIMARY KEY(reservation_id, attempt_index)
+            ) STRICT;
+            CREATE TABLE IF NOT EXISTS settlement_qualifications (
+                reservation_id TEXT NOT NULL REFERENCES reservations(reservation_id),
+                reproduction_index INTEGER NOT NULL,
+                qualification_digest TEXT NOT NULL UNIQUE,
+                qualification_json TEXT NOT NULL,
+                attempt_ref_json TEXT NOT NULL,
+                evidence_root TEXT NOT NULL,
+                PRIMARY KEY(reservation_id, reproduction_index)
+            ) STRICT;
             CREATE TABLE IF NOT EXISTS settlement_candidates (
                 reservation_id TEXT PRIMARY KEY REFERENCES reservations(reservation_id),
                 authority_digest TEXT NOT NULL,
                 candidate_digest TEXT NOT NULL UNIQUE,
                 candidate_json TEXT NOT NULL,
                 evidence_root TEXT NOT NULL,
+                reproduction_evidence_root TEXT NOT NULL DEFAULT '',
                 settlement_evidence_digest TEXT NOT NULL DEFAULT '',
                 status TEXT NOT NULL,
                 lease_id TEXT NOT NULL DEFAULT '',
@@ -495,14 +544,51 @@ class FinalizedIntakeStore:
             ) STRICT;
             """
         )
+        reservation_columns = {
+            row["name"] for row in self._db.execute("PRAGMA table_info(reservations)")
+        }
+        additions = {
+            "arena_service_digest": "TEXT NOT NULL DEFAULT ''",
+            "screen_lane": "TEXT NOT NULL DEFAULT ''",
+            "screen_status": "TEXT NOT NULL DEFAULT ''",
+            "screen_stage_count": "INTEGER NOT NULL DEFAULT 0",
+            "screen_attempts": "INTEGER NOT NULL DEFAULT 0",
+        }
+        for name, declaration in additions.items():
+            if name not in reservation_columns:
+                self._db.execute(
+                    f"ALTER TABLE reservations ADD COLUMN {name} {declaration}"
+                )
+        settlement_columns = {
+            row["name"] for row in self._db.execute(
+                "PRAGMA table_info(settlement_candidates)"
+            )
+        }
+        if "reproduction_evidence_root" not in settlement_columns:
+            self._db.execute(
+                "ALTER TABLE settlement_candidates ADD COLUMN "
+                "reproduction_evidence_root TEXT NOT NULL DEFAULT ''"
+            )
         schema = self._db.execute(
             "SELECT value FROM metadata WHERE key='schema'"
         ).fetchone()
         if schema is None:
-            self._db.execute("INSERT INTO metadata(key,value) VALUES('schema','2')")
-        elif schema["value"] == "1":
-            self._db.execute("UPDATE metadata SET value='2' WHERE key='schema'")
-        elif schema["value"] != "2":
+            self._db.execute("INSERT INTO metadata(key,value) VALUES('schema','3')")
+        elif schema["value"] in {"1", "2"}:
+            # v1/v2 allowed one PASS to become settlement-pending.  Preserve all
+            # rows for audit but fail them closed until a fresh two-PASS service
+            # qualification is run under this schema.
+            self._db.execute(
+                "UPDATE settlement_candidates SET status='held',lease_id='',"
+                "lease_expires_block=0,reason='schema3_reproduction_required'"
+            )
+            self._db.execute(
+                "UPDATE reservations SET status='held',decision='NO_DECISION',"
+                "reason='schema3_reproduction_required' WHERE reservation_id IN "
+                "(SELECT reservation_id FROM settlement_candidates)"
+            )
+            self._db.execute("UPDATE metadata SET value='3' WHERE key='schema'")
+        elif schema["value"] != "3":
             raise IntakeError("intake database schema is unsupported")
 
     def _bind_scope(self) -> None:
@@ -523,6 +609,12 @@ class FinalizedIntakeStore:
                 "UPDATE reservations SET status='held', decision='NO_DECISION', "
                 "reason='controller_restart_during_' || status "
                 "WHERE status IN ('fetching','qualifying')"
+            )
+            self._db.execute(
+                "UPDATE reservations SET status=CASE screen_lane "
+                "WHEN 'reproduction' THEN 'reproduction_pending' ELSE 'published' END,"
+                "decision='',screen_status='retry',"
+                "reason='controller_restart_during_screening' WHERE status='screening'"
             )
             self._db.execute(
                 "UPDATE settlement_candidates SET status='pending',lease_id='',"
@@ -600,7 +692,8 @@ class FinalizedIntakeStore:
                 raise IntakeError("finalized cursor regressed or changed hash")
             pending = self._db.execute(
                 "SELECT COUNT(*) AS n FROM reservations WHERE status IN "
-                "('reserved','fetching','transport_retry','published','qualifying','held','no_decision')"
+                "('reserved','fetching','transport_retry','published','screening',"
+                "'promoted','qualifying','reproduction_pending','held','no_decision')"
             ).fetchone()["n"]
             for arrival in rows:
                 existing = self._db.execute(
@@ -682,6 +775,8 @@ class FinalizedIntakeStore:
             row["target_id"], members, fingerprint, row["transport_attempts"],
             row["publication_digest"], row["publication_root"],
             row["qualification_authority_digest"], row["qualification_evidence_digest"],
+            row["arena_service_digest"], row["screen_lane"], row["screen_status"],
+            row["screen_stage_count"], row["screen_attempts"],
             row["decision"], row["reason"],
         )
 
@@ -742,7 +837,10 @@ class FinalizedIntakeStore:
     def mark_held(self, reservation_id: str, reason: str) -> IntakeReservation:
         return self._transition(
             reservation_id,
-            {"reserved", "fetching", "transport_retry", "published", "qualifying", "no_decision"},
+            {
+                "reserved", "fetching", "transport_retry", "published", "screening",
+                "promoted", "qualifying", "reproduction_pending", "no_decision",
+            },
             "held",
             "NO_DECISION",
             reason,
@@ -806,6 +904,219 @@ class FinalizedIntakeStore:
             )
         return tuple(self._row(row) for row in rows)
 
+    def screenable(self, *, limit: int | None = None) -> tuple[IntakeReservation, ...]:
+        """Return validator-selected work awaiting a fresh non-crown screen."""
+
+        bound = self.policy.max_cohort if limit is None else limit
+        if type(bound) is not int or bound <= 0 or bound > self.policy.max_cohort:
+            raise IntakeError("screen cohort limit is invalid")
+        rows = self._db.execute(
+            "SELECT * FROM reservations WHERE status IN "
+            "('published','reproduction_pending') ORDER BY "
+            "CASE status WHEN 'reproduction_pending' THEN 0 ELSE 1 END,"
+            "block,event_index,event_subindex,hotkey,content_hash LIMIT ?",
+            (bound,),
+        )
+        return tuple(self._row(row) for row in rows)
+
+    def arena_queue_snapshot(self, *, current_block: int):
+        from optima.arena_service import ArenaQueueSnapshot
+
+        if type(current_block) is not int or current_block < 0:
+            raise IntakeError("arena queue block is malformed")
+        queued = self._db.execute(
+            "SELECT COUNT(*) AS n,MIN(block) AS oldest FROM reservations WHERE "
+            "status IN ('published','reproduction_pending','promoted')"
+        ).fetchone()
+        active_screens = self._db.execute(
+            "SELECT COUNT(*) AS n FROM reservations WHERE status='screening'"
+        ).fetchone()["n"]
+        active_qualifications = self._db.execute(
+            "SELECT COUNT(*) AS n FROM reservations WHERE status='qualifying'"
+        ).fetchone()["n"]
+        oldest = queued["oldest"]
+        return ArenaQueueSnapshot(
+            queued["n"],
+            0 if oldest is None else max(0, current_block - oldest),
+            active_screens,
+            active_qualifications,
+        )
+
+    def begin_screen(
+        self, reservation_id: str, *, service_digest: str
+    ) -> IntakeReservation:
+        require_sha256_hex(service_digest, field="arena service digest")
+        with self._transaction():
+            row = self.get(reservation_id)
+            if row.status not in {"published", "reproduction_pending"}:
+                raise IntakeError("only screenable intake may begin arena screening")
+            lane = (
+                "reproduction" if row.status == "reproduction_pending" else "primary"
+            )
+            attempts = self._db.execute(
+                "SELECT COUNT(*) AS n FROM arena_screen_dispositions "
+                "WHERE reservation_id=?",
+                (reservation_id,),
+            ).fetchone()["n"]
+            self._db.execute(
+                "UPDATE reservations SET status='screening',arena_service_digest=?,"
+                "screen_lane=?,screen_status='running',screen_stage_count=0,"
+                "screen_attempts=?,decision='',reason='' WHERE reservation_id=?",
+                (service_digest, lane, attempts + 1, reservation_id),
+            )
+        return self.get(reservation_id)
+
+    def apply_screen_receipt(
+        self,
+        reservation_id: str,
+        *,
+        candidate_digest: str,
+        receipt,
+    ) -> IntakeReservation:
+        """Atomically retain one non-crown screen and its derived disposition."""
+
+        from optima.arena_service import ArenaScreenReceipt, PromotionDecision
+
+        require_sha256_hex(candidate_digest, field="screen candidate digest")
+        if type(receipt) is not ArenaScreenReceipt:
+            raise IntakeError("arena screen receipt is not exactly typed")
+        encoded = json.dumps(
+            receipt.to_dict(), separators=(",", ":"), sort_keys=True
+        )
+        with self._transaction():
+            row = self.get(reservation_id)
+            if (
+                row.status != "screening"
+                or row.arena_service_digest != receipt.service_digest
+                or row.screen_attempts != receipt.screen_attempt
+                or receipt.candidate_digest != candidate_digest
+            ):
+                raise IntakeError("arena screen receipt differs from active screening")
+            attempt = row.screen_attempts - 1
+            self._db.execute(
+                "INSERT INTO arena_screen_dispositions(reservation_id,attempt_index,"
+                "service_digest,candidate_digest,receipt_digest,receipt_json,decision,"
+                "stage_count,lane) VALUES(?,?,?,?,?,?,?,?,?)",
+                (
+                    reservation_id, attempt, receipt.service_digest,
+                    candidate_digest, receipt.digest, encoded, receipt.decision.value,
+                    len(receipt.results), row.screen_lane,
+                ),
+            )
+            if receipt.decision is PromotionDecision.PROMOTE:
+                status, decision, reason = "promoted", "", "screen_promoted"
+            elif receipt.decision is PromotionDecision.REJECT:
+                status, decision, reason = "failed", "FAIL", "screen_rejected"
+            elif receipt.decision is PromotionDecision.RETRY:
+                status = (
+                    "reproduction_pending"
+                    if row.screen_lane == "reproduction"
+                    else "published"
+                )
+                decision, reason = "", "screen_retry"
+            else:
+                status, decision, reason = "held", "NO_DECISION", "screen_held"
+            self._db.execute(
+                "UPDATE reservations SET status=?,screen_status=?,screen_stage_count=?,"
+                "decision=?,reason=? WHERE reservation_id=?",
+                (
+                    status, receipt.decision.value, len(receipt.results),
+                    decision, reason, reservation_id,
+                ),
+            )
+        return self.get(reservation_id)
+
+    def screen_dispositions(
+        self, reservation_id: str
+    ) -> tuple[dict[str, object], ...]:
+        self.get(reservation_id)
+        result = []
+        for row in self._db.execute(
+            "SELECT attempt_index,service_digest,candidate_digest,receipt_digest,"
+            "receipt_json,decision,stage_count,lane FROM arena_screen_dispositions "
+            "WHERE reservation_id=? ORDER BY attempt_index",
+            (reservation_id,),
+        ):
+            value = dict(row)
+            value["receipt"] = json.loads(value.pop("receipt_json"))
+            result.append(value)
+        return tuple(result)
+
+    def latest_promoted_screen(self, reservation_id: str):
+        from optima.arena_service import (
+            ArenaScreenReceipt, PromotionDecision, ScreenGrade, ScreenStageResult,
+        )
+
+        row = self.get(reservation_id)
+        if row.status != "promoted" or row.screen_status != "promote":
+            raise IntakeError("reservation has no standing promoted screen")
+        retained = self._db.execute(
+            "SELECT receipt_digest,receipt_json,stage_count FROM "
+            "arena_screen_dispositions WHERE reservation_id=? "
+            "ORDER BY attempt_index DESC LIMIT 1",
+            (reservation_id,),
+        ).fetchone()
+        if retained is None:
+            raise IntakeError("promoted screen receipt is missing")
+        try:
+            raw = json.loads(retained["receipt_json"])
+            results = tuple(
+                ScreenStageResult(
+                    item["stage"],
+                    ScreenGrade(item["grade"]),
+                    item["evidence_digest"],
+                    item["elapsed_ms"],
+                )
+                for item in raw["results"]
+            )
+            receipt = ArenaScreenReceipt(
+                raw["service_digest"], raw["candidate_digest"],
+                raw["screen_attempt"], results,
+                PromotionDecision(raw["decision"]),
+            )
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise IntakeError(f"promoted screen receipt is corrupt: {exc}") from None
+        if (
+            receipt.digest != retained["receipt_digest"]
+            or len(receipt.results) != retained["stage_count"]
+            or receipt.decision is not PromotionDecision.PROMOTE
+        ):
+            raise IntakeError("promoted screen receipt differs from retained bytes")
+        return receipt
+
+    def promoted(self, *, limit: int | None = None) -> tuple[IntakeReservation, ...]:
+        bound = self.policy.max_cohort if limit is None else limit
+        if type(bound) is not int or bound <= 0 or bound > self.policy.max_cohort:
+            raise IntakeError("promoted cohort limit is invalid")
+        first = self._db.execute(
+            "SELECT retry_group_digest,screen_lane FROM reservations "
+            "WHERE status='promoted' ORDER BY "
+            "CASE screen_lane WHEN 'reproduction' THEN 0 ELSE 1 END,"
+            "block,event_index,event_subindex,hotkey,content_hash LIMIT 1"
+        ).fetchone()
+        if first is None:
+            return ()
+        if first["screen_lane"] == "reproduction":
+            rows = self._db.execute(
+                "SELECT * FROM reservations WHERE status='promoted' "
+                "AND screen_lane='reproduction' ORDER BY block,event_index,"
+                "event_subindex,hotkey,content_hash LIMIT 1"
+            )
+        elif first["retry_group_digest"]:
+            rows = self._db.execute(
+                "SELECT * FROM reservations WHERE status='promoted' "
+                "AND retry_group_digest=? ORDER BY retry_position LIMIT ?",
+                (first["retry_group_digest"], bound),
+            )
+        else:
+            rows = self._db.execute(
+                "SELECT * FROM reservations WHERE status='promoted' "
+                "AND screen_lane='primary' AND retry_group_digest='' ORDER BY "
+                "block,event_index,event_subindex,hotkey,content_hash LIMIT ?",
+                (bound,),
+            )
+        return tuple(self._row(row) for row in rows)
+
     def settlement_blockers(self, reservation_id: str) -> tuple[IntakeReservation, ...]:
         candidate = self.get(reservation_id)
         if not candidate.target_members:
@@ -862,7 +1173,10 @@ class FinalizedIntakeStore:
             raise IntakeError("claimed predecessor is not an authoritative delta copy")
         return self._transition(
             reservation_id,
-            {"published", "qualifying", "qualified", "held", "no_decision"},
+            {
+                "published", "screening", "promoted", "qualifying",
+                "reproduction_pending", "qualified", "held", "no_decision",
+            },
             "failed",
             "FAIL",
             f"copy_of:{predecessor.reservation_id}",
@@ -884,8 +1198,8 @@ class FinalizedIntakeStore:
             raise IntakeError("qualification authority manifest is oversized")
         with self._transaction():
             row = self.get(reservation_id)
-            if row.status != "published":
-                raise IntakeError("only published intake may enter qualification")
+            if row.status != "promoted" or row.screen_status != "promote":
+                raise IntakeError("only screen-promoted intake may enter qualification")
             self._db.execute(
                 "UPDATE reservations SET status='qualifying',qualification_authority_digest=?,"
                 "qualification_authority_json=?,"
@@ -906,6 +1220,10 @@ class FinalizedIntakeStore:
     ) -> IntakeReservation:
         if decision not in {"PASS", "FAIL", "NO_DECISION"}:
             raise IntakeError("qualification decision is unsupported")
+        if decision == "PASS":
+            raise IntakeError(
+                "PASS requires a typed settlement qualification and reproduction gate"
+            )
         report_based = attempt_ref is not None or bool(report_digest)
         if report_based and (
             type(attempt_ref) is not EvidenceArtifactRef or not report_digest
@@ -926,7 +1244,7 @@ class FinalizedIntakeStore:
             if attempt_ref is not None
             else ""
         )
-        status = {"PASS": "qualified", "FAIL": "failed", "NO_DECISION": "no_decision"}[decision]
+        status = {"FAIL": "failed", "NO_DECISION": "no_decision"}[decision]
         with self._transaction():
             row = self.get(reservation_id)
             authority_json = self._db.execute(
@@ -990,16 +1308,18 @@ class FinalizedIntakeStore:
 
         from optima.eval.qualification_intake import QualificationIntakeBatch
         from optima.eval.qualification import QualificationDecision
-        from optima.settlement import SettlementCandidate
+        from optima.settlement import SettlementCandidate, SettlementQualification
 
         if type(batch) is not QualificationIntakeBatch:
             raise IntakeError("qualification batch is not exactly typed")
         if any(
             outcome.decision is QualificationDecision.PASS
-            and type(outcome.settlement_candidate) is not SettlementCandidate
+            and type(outcome.settlement_qualification) is not SettlementQualification
             for outcome in batch.outcomes
         ):
-            raise IntakeError("PASS qualification lacks a settlement projection")
+            raise IntakeError(
+                "PASS qualification lacks a settlement projection qualification"
+            )
         root = None if evidence_root is None else Path(evidence_root)
         if any(
             outcome.decision is QualificationDecision.PASS
@@ -1077,78 +1397,136 @@ class FinalizedIntakeStore:
                         outcome.decision.value, outcome.reason,
                     ),
                 )
-                candidate = outcome.settlement_candidate
-                if candidate is not None:
+                qualification = outcome.settlement_qualification
+                if qualification is not None:
                     if (
-                        type(candidate) is not SettlementCandidate
-                        or candidate.reservation_digest != reservation_id
-                        or candidate.hotkey != row.arrival.hotkey
+                        type(qualification) is not SettlementQualification
+                        or qualification.reservation_digest != reservation_id
+                        or qualification.hotkey != row.arrival.hotkey
                         or (
-                            candidate.finalized_block,
-                            candidate.event_index,
-                            candidate.event_subindex,
+                            qualification.finalized_block,
+                            qualification.event_index,
+                            qualification.event_subindex,
                         )
                         != (
                             row.arrival.block,
                             row.arrival.event_index,
                             row.arrival.event_subindex,
                         )
-                        or candidate.target_id != row.target_id
-                        or candidate.members != row.target_members
-                        or candidate.selected_delta_digest
+                        or qualification.target_id != row.target_id
+                        or qualification.members != row.target_members
+                        or qualification.selected_delta_digest
                         != row.delta_fingerprint.selected_delta_digest
-                        or candidate.qualification_authority_digest
+                        or qualification.qualification_authority_digest
                         != batch.authority_manifest_digest
-                        or candidate.qualification_attempt_digest != evidence
-                        or candidate.qualification_report_digest
+                        or qualification.qualification_attempt_digest != evidence
+                        or qualification.qualification_report_digest
                         != outcome.report_digest
                     ):
                         raise IntakeError(
-                            "settlement candidate differs from retained qualification"
+                            "settlement qualification differs from retained PASS"
                         )
-                    self.evaluation_stack(candidate.arena_digest)
-                    candidate_json = json.dumps(
-                        candidate.to_dict(), separators=(",", ":"), sort_keys=True
+                    self.evaluation_stack(qualification.arena_digest)
+                    qualification_json = json.dumps(
+                        qualification.to_dict(), separators=(",", ":"), sort_keys=True
                     )
+                    if attempt_ref is None or root is None:
+                        raise IntakeError("retained PASS evidence is incomplete")
+                    retained = self._db.execute(
+                        "SELECT reproduction_index,qualification_digest,qualification_json,"
+                        "attempt_ref_json,evidence_root FROM settlement_qualifications "
+                        "WHERE reservation_id=? ORDER BY reproduction_index",
+                        (reservation_id,),
+                    ).fetchall()
+                    expected_lane = "primary" if not retained else "reproduction"
+                    if row.screen_lane != expected_lane or len(retained) > 1:
+                        raise IntakeError("qualification PASS used the wrong reproduction lane")
+                    reproduction_index = len(retained)
                     self._db.execute(
-                        "INSERT INTO settlement_candidates(reservation_id,authority_digest,"
-                        "candidate_digest,candidate_json,evidence_root,status) "
-                        "VALUES(?,?,?,?,?, 'pending')",
+                        "INSERT INTO settlement_qualifications(reservation_id,"
+                        "reproduction_index,qualification_digest,qualification_json,"
+                        "attempt_ref_json,evidence_root) VALUES(?,?,?,?,?,?)",
                         (
-                            reservation_id,
-                            batch.authority_manifest_digest,
-                            candidate.digest,
-                            candidate_json,
-                            str(root),
+                            reservation_id, reproduction_index, qualification.digest,
+                            qualification_json, attempt_json, str(root),
                         ),
                     )
+                    if reproduction_index == 1:
+                        try:
+                            primary = SettlementQualification.from_dict(
+                                json.loads(retained[0]["qualification_json"])
+                            )
+                            candidate = SettlementCandidate.from_reproductions(
+                                primary, qualification
+                            )
+                        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                            raise IntakeError(
+                                f"independent reproduction is inconsistent: {exc}"
+                            ) from None
+                        if primary.digest != retained[0]["qualification_digest"]:
+                            raise IntakeError("primary settlement qualification is corrupt")
+                        candidate_json = json.dumps(
+                            candidate.to_dict(), separators=(",", ":"), sort_keys=True
+                        )
+                        self._db.execute(
+                            "INSERT INTO settlement_candidates(reservation_id,authority_digest,"
+                            "candidate_digest,candidate_json,evidence_root,"
+                            "reproduction_evidence_root,status) "
+                            "VALUES(?,?,?,?,?,?, 'pending')",
+                            (
+                                reservation_id,
+                                primary.qualification_authority_digest,
+                                candidate.digest,
+                                candidate_json,
+                                retained[0]["evidence_root"],
+                                str(root),
+                            ),
+                        )
                 if reservation_id in retry:
                     group, position, reason = retry[reservation_id]
-                    status = (
-                        "published"
-                        if attempt + 1 < self.policy.max_qualification_retries
-                        else "held"
+                    retry_status = (
+                        "reproduction_pending"
+                        if row.screen_lane == "reproduction"
+                        else "published"
                     )
+                    status = retry_status if (
+                        attempt + 1 < self.policy.max_qualification_retries
+                    ) else "held"
                     self._db.execute(
                         "UPDATE reservations SET status=?,decision=?,reason=?,"
                         "retry_group_digest=?,retry_position=?,qualification_authority_digest='',"
                         "qualification_authority_json='',qualification_evidence_digest='' "
                         "WHERE reservation_id=?",
                         (
-                            status, "" if status == "published" else "NO_DECISION",
+                            status,
+                            "" if status in {"published", "reproduction_pending"}
+                            else "NO_DECISION",
                             reason, group, position, reservation_id,
                         ),
                     )
                 else:
-                    status = {
-                        "PASS": "qualified", "FAIL": "failed"
-                    }[outcome.decision.value]
+                    if outcome.decision is QualificationDecision.PASS:
+                        completed = self._db.execute(
+                            "SELECT COUNT(*) AS n FROM settlement_qualifications "
+                            "WHERE reservation_id=?",
+                            (reservation_id,),
+                        ).fetchone()["n"]
+                        status = "qualified" if completed == 2 else "reproduction_pending"
+                        decision = "PASS" if completed == 2 else ""
+                        reason = (
+                            outcome.reason if completed == 2 else "reproduction_pending"
+                        )
+                    else:
+                        status, decision, reason = (
+                            "failed", outcome.decision.value, outcome.reason
+                        )
                     self._db.execute(
                         "UPDATE reservations SET status=?,decision=?,reason=?,"
-                        "qualification_evidence_digest=?,retry_group_digest='',retry_position=0 "
+                        "qualification_evidence_digest=?,retry_group_digest='',retry_position=0,"
+                        "qualification_authority_digest='',qualification_authority_json='' "
                         "WHERE reservation_id=?",
                         (
-                            status, outcome.decision.value, outcome.reason,
+                            status, decision, reason,
                             evidence, reservation_id,
                         ),
                     )
@@ -1258,47 +1636,88 @@ class FinalizedIntakeStore:
         candidate: SettlementCandidate,
     ):
         from optima.eval.evidence_store import EvidenceArtifactRef
-        from optima.settlement import SettlementEvidence
+        from optima.settlement import SettlementEvidence, SettlementQualification
 
         row = self._db.execute(
-            "SELECT sc.evidence_root,sc.candidate_digest,r.status,r.decision,"
-            "qd.authority_digest,qd.attempt_ref_json,qd.report_digest,qd.decision AS qdecision "
-            "FROM settlement_candidates sc JOIN reservations r USING(reservation_id) "
-            "JOIN qualification_dispositions qd USING(reservation_id) "
-            "WHERE sc.reservation_id=? AND qd.evidence_digest=? "
-            "ORDER BY qd.attempt_index DESC LIMIT 1",
-            (candidate.reservation_digest, candidate.qualification_attempt_digest),
+            "SELECT sc.evidence_root,sc.reproduction_evidence_root,"
+            "sc.candidate_digest,r.status,r.decision FROM settlement_candidates sc "
+            "JOIN reservations r USING(reservation_id) WHERE sc.reservation_id=?",
+            (candidate.reservation_digest,),
         ).fetchone()
         if (
             row is None
             or row["candidate_digest"] != candidate.digest
             or row["status"] != "qualified"
             or row["decision"] != "PASS"
-            or row["qdecision"] != "PASS"
-            or row["authority_digest"] != candidate.qualification_authority_digest
-            or row["report_digest"] != candidate.qualification_report_digest
-            or not row["attempt_ref_json"]
             or not row["evidence_root"]
+            or not row["reproduction_evidence_root"]
         ):
             raise IntakeError("settlement evidence no longer has standing authority")
-        try:
-            reference = EvidenceArtifactRef.from_dict(
-                json.loads(row["attempt_ref_json"])
+        retained = tuple(
+            self._db.execute(
+                "SELECT reproduction_index,qualification_digest,qualification_json,"
+                "attempt_ref_json,evidence_root FROM settlement_qualifications "
+                "WHERE reservation_id=? ORDER BY reproduction_index",
+                (candidate.reservation_digest,),
             )
-        except (TypeError, ValueError, json.JSONDecodeError) as exc:
-            raise IntakeError(f"settlement evidence reference is corrupt: {exc}") from None
-        if reference.sha256 != candidate.qualification_attempt_digest:
-            raise IntakeError("settlement attempt reference differs from candidate")
-        return (
-            Path(row["evidence_root"]),
-            SettlementEvidence(
-                candidate.digest,
-                candidate.reservation_digest,
-                candidate.qualification_authority_digest,
-                reference,
-                candidate.qualification_report_digest,
-            ),
         )
+        if len(retained) != 2 or tuple(
+            item["reproduction_index"] for item in retained
+        ) != (0, 1):
+            raise IntakeError("settlement candidate lacks two retained qualifications")
+        qualifications = []
+        references = []
+        try:
+            for item in retained:
+                qualification = SettlementQualification.from_dict(
+                    json.loads(item["qualification_json"])
+                )
+                reference = EvidenceArtifactRef.from_dict(
+                    json.loads(item["attempt_ref_json"])
+                )
+                if (
+                    qualification.digest != item["qualification_digest"]
+                    or reference.sha256
+                    != qualification.qualification_attempt_digest
+                ):
+                    raise IntakeError("retained reproduction identity differs")
+                disposition = self._db.execute(
+                    "SELECT authority_digest,report_digest,decision FROM "
+                    "qualification_dispositions WHERE reservation_id=? "
+                    "AND evidence_digest=?",
+                    (
+                        candidate.reservation_digest,
+                        qualification.qualification_attempt_digest,
+                    ),
+                ).fetchone()
+                if (
+                    disposition is None
+                    or disposition["decision"] != "PASS"
+                    or disposition["authority_digest"]
+                    != qualification.qualification_authority_digest
+                    or disposition["report_digest"]
+                    != qualification.qualification_report_digest
+                ):
+                    raise IntakeError("retained reproduction lost PASS authority")
+                qualifications.append(qualification)
+                references.append(reference)
+        except IntakeError:
+            raise
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise IntakeError(f"settlement reproduction is corrupt: {exc}") from None
+        if tuple(qualifications) != (candidate.primary, candidate.reproduction):
+            raise IntakeError("retained reproductions differ from settlement candidate")
+        roots = (Path(retained[0]["evidence_root"]), Path(retained[1]["evidence_root"]))
+        if roots != (
+            Path(row["evidence_root"]), Path(row["reproduction_evidence_root"])
+        ):
+            raise IntakeError("settlement reproduction roots differ")
+        receipt = SettlementEvidence.bind(
+            candidate,
+            primary_attempt_ref=references[0],
+            reproduction_attempt_ref=references[1],
+        )
+        return roots, tuple(references), receipt
 
     def reopen_settlement_evidence(
         self,
@@ -1311,9 +1730,10 @@ class FinalizedIntakeStore:
 
         if type(candidate) is not SettlementCandidate:
             raise IntakeError("settlement evidence candidate is not exactly typed")
-        root, receipt = self._settlement_evidence_metadata(candidate)
+        roots, references, receipt = self._settlement_evidence_metadata(candidate)
         try:
-            reopen_evidence(root, receipt.attempt_ref)
+            for root, reference in zip(roots, references, strict=True):
+                reopen_evidence(root, reference)
         except (EvidenceStoreError, OSError) as exc:
             raise IntakeError(f"retained settlement evidence cannot reopen: {exc}") from None
         return receipt
@@ -1499,7 +1919,9 @@ class FinalizedIntakeStore:
             ):
                 raise IntakeError("settlement priority changed while evidence was open")
             for candidate in lease.candidates:
-                _root, expected_receipt = self._settlement_evidence_metadata(candidate)
+                _roots, _references, expected_receipt = (
+                    self._settlement_evidence_metadata(candidate)
+                )
                 if expected_receipt != evidence_by_candidate[candidate.digest]:
                     raise IntakeError("settlement evidence changed after reopening")
             marks = ",".join("?" for _ in ids)
@@ -1854,7 +2276,13 @@ class FinalizedIntakeStore:
                 "SELECT COUNT(*) AS n FROM qualification_dispositions WHERE reservation_id=?",
                 (reservation_id,),
             ).fetchone()["n"]
-            status = "published" if attempts < self.policy.max_qualification_retries else "held"
+            retained = self._db.execute(
+                "SELECT COUNT(*) AS n FROM settlement_qualifications "
+                "WHERE reservation_id=?",
+                (reservation_id,),
+            ).fetchone()["n"]
+            retry_status = "reproduction_pending" if retained == 1 else "published"
+            status = retry_status if attempts < self.policy.max_qualification_retries else "held"
             self._db.execute(
                 "UPDATE reservations SET status=?,decision='',reason=?,"
                 "retry_group_digest=?,retry_position=?,"
@@ -1900,7 +2328,10 @@ class FinalizedIntakeStore:
             raise IntakeError("reservation is not old enough for explicit expiry")
         return self._transition(
             reservation_id,
-            {"reserved", "transport_retry", "published", "held", "no_decision"},
+            {
+                "reserved", "transport_retry", "published", "promoted",
+                "reproduction_pending", "held", "no_decision",
+            },
             "expired",
             "NO_DECISION",
             reason,
@@ -1913,7 +2344,20 @@ class FinalizedIntakeStore:
             row = self.get(reservation_id)
             if row.status not in {"held", "no_decision"}:
                 raise IntakeError("only held intake may be released")
-            status = "published" if row.publication_digest else "transport_retry"
+            if row.reason == "schema3_reproduction_required":
+                raise IntakeError(
+                    "legacy single-PASS settlement requires explicit archival migration"
+                )
+            reproductions = self._db.execute(
+                "SELECT COUNT(*) AS n FROM settlement_qualifications "
+                "WHERE reservation_id=?",
+                (reservation_id,),
+            ).fetchone()["n"]
+            status = (
+                "reproduction_pending" if reproductions == 1
+                else "published" if row.publication_digest
+                else "transport_retry"
+            )
             attempts = row.transport_attempts if row.publication_digest else 0
             self._db.execute(
                 "UPDATE reservations SET status=?,decision='',reason=?,"

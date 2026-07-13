@@ -483,3 +483,27 @@ def test_outcomes_and_batches_cannot_claim_evidence_free_pass() -> None:
     )
     with pytest.raises(intake.QualificationIntakeError, match="internally inconsistent"):
         intake.QualificationIntakeBatch(_d("authority"), (outcome,))
+
+
+def test_single_pass_outcome_cannot_smuggle_a_settlement_candidate() -> None:
+    reference = EvidenceArtifactRef(
+        "qualification.cohort-attempt",
+        _d("attempt"),
+        1,
+        "application/json",
+        "optima.qualification.cohort-attempt.v1",
+    )
+    with pytest.raises(
+        intake.QualificationIntakeError, match="settlement qualification"
+    ):
+        intake.QualificationIntakeOutcome(
+            _d("reservation"),
+            _d("delta"),
+            _d("authority"),
+            QualificationDecision.PASS,
+            "qualified",
+            False,
+            attempt_artifact_sha256=reference.sha256,
+            report_digest=_d("report"),
+            settlement_qualification=object(),  # type: ignore[arg-type]
+        )

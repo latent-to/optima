@@ -1,0 +1,180 @@
+{
+  "architectural_unit": "6",
+  "artifacts": [
+    {
+      "availability": "repository",
+      "id": "github.referee-evidence",
+      "kind": "github-check-receipt",
+      "locator": "evidence/referee-hardening/artifacts/pr-0053-github-checks.json",
+      "reason": null,
+      "sha256": "579f07d250f063143641ee001c30c52a8840d0f9de2aacf31a8471129a5d16ad",
+      "size_bytes": 1844
+    },
+    {
+      "availability": "digest_only",
+      "id": "testnet.immutable-publication",
+      "kind": "testnet-receipt",
+      "locator": null,
+      "reason": "The finalized testnet-307 reveal-to-publication receipt remains in the private campaign ledger; repository-retained bytes are unavailable.",
+      "sha256": "5e19848ed13a51560589d7375596482476191b625aeedcb7096e99f4a5fb6274",
+      "size_bytes": null
+    },
+    {
+      "availability": "unavailable",
+      "id": "tests.rtx-focused",
+      "kind": "test-log",
+      "locator": null,
+      "reason": "The exact final head's 368-pass focused RTX-container summary was reported without retaining the raw log.",
+      "sha256": null,
+      "size_bytes": null
+    },
+    {
+      "availability": "unavailable",
+      "id": "oci.nonroot-restart",
+      "kind": "oci-receipt",
+      "locator": null,
+      "reason": "The non-root immutable publication, reopen, and restart control was reported without retaining a standalone receipt artifact.",
+      "sha256": null,
+      "size_bytes": null
+    },
+    {
+      "availability": "unavailable",
+      "id": "review.finalized-intake",
+      "kind": "review-report",
+      "locator": null,
+      "reason": "The implementation, adversarial, and confirmation reviews were reported without retaining their raw bytes.",
+      "sha256": null,
+      "size_bytes": null
+    }
+  ],
+  "claims": [
+    {
+      "artifact_ids": [],
+      "id": "scope.finalized-intake",
+      "statement": "The implementation replaces production command-based grading with finalized ordered intake, hardened fetch, immutable delta publication, copy reconciliation, and a typed causal-qualification call boundary.",
+      "status": "verified"
+    },
+    {
+      "artifact_ids": [
+        "github.referee-evidence"
+      ],
+      "id": "tests.github-referee-evidence",
+      "statement": "The retained GitHub receipt records successful evidence and CodeQL checks for the implementation head.",
+      "status": "verified"
+    },
+    {
+      "artifact_ids": [
+        "testnet.immutable-publication"
+      ],
+      "id": "testnet.finalized-publication",
+      "statement": "A digest-retained testnet-307 receipt binds one finalized canonical reveal to a rehashed immutable three-file publication that reopened after restart without refetch.",
+      "status": "digest_only"
+    },
+    {
+      "artifact_ids": [],
+      "id": "authority.intake-only",
+      "statement": "The production CLI remains explicitly intake-only; this architectural unit creates no settlement, weight, or chain-to-GPU qualification authority.",
+      "status": "verified"
+    }
+  ],
+  "classified_diff": {
+    "documentation": {
+      "added": 0,
+      "deleted": 0
+    },
+    "evidence": {
+      "added": 97,
+      "deleted": 0
+    },
+    "production": {
+      "added": 4068,
+      "deleted": 468
+    },
+    "test": {
+      "added": 1835,
+      "deleted": 253
+    },
+    "tooling": {
+      "added": 57,
+      "deleted": 1
+    },
+    "vendor": {
+      "added": 0,
+      "deleted": 0
+    }
+  },
+  "exit_criteria": [
+    {
+      "artifact_ids": [],
+      "id": "authority.finalized-priority",
+      "statement": "Arrival priority binds finalized block hash and reveal-event order, persists before transport, and fails closed on missing or ambiguous cross-miner ordering evidence.",
+      "status": "verified"
+    },
+    {
+      "artifact_ids": [],
+      "id": "authority.immutable-publication",
+      "statement": "Private fetch bytes are normalized and independently republished into a content-addressed read-only worker product before qualification use.",
+      "status": "verified"
+    },
+    {
+      "artifact_ids": [
+        "testnet.immutable-publication"
+      ],
+      "id": "testnet.restart-proof",
+      "statement": "The digest-retained live testnet run reached finalized intake, immutable publication, and restart reopen with settlement and weights disabled.",
+      "status": "digest_only"
+    },
+    {
+      "artifact_ids": [
+        "tests.rtx-focused"
+      ],
+      "id": "tests.focused-head",
+      "statement": "The exact final head was reported to pass 368 focused RTX-container tests; the raw log is unavailable.",
+      "status": "reported_unretained"
+    },
+    {
+      "artifact_ids": [
+        "github.referee-evidence"
+      ],
+      "id": "ci.evidence-check",
+      "statement": "The repository-retained GitHub receipt binds successful evidence checks to the implementation head.",
+      "status": "verified"
+    }
+  ],
+  "github_pr": 53,
+  "identity": {
+    "base_commit": "3606a95cf675e1d08a9f2b9117fbbca8e36fbda0",
+    "implementation_commit": "9290ce30e9647d9905fb801f96b308320af2ba39",
+    "implementation_tree": "7c91e18bf93dfc0322911455c21a7143e683f606",
+    "merge_commit": "b58259135dcfdbb654bb5de87415e53e36487cc0"
+  },
+  "nonclaims": [
+    "chain-to-gpu.qualification",
+    "crown.authority",
+    "gpu.full-model-proof",
+    "settlement.authority",
+    "weights.publication"
+  ],
+  "record_type": "pr_evidence",
+  "reviews": [
+    {
+      "artifact_id": "review.finalized-intake",
+      "phase": "implementation",
+      "status": "reported_unretained",
+      "summary": "Implementation review was reported during development; no report bytes were retained."
+    },
+    {
+      "artifact_id": "review.finalized-intake",
+      "phase": "adversarial",
+      "status": "reported_unretained",
+      "summary": "Adversarial review was reported during development; no report bytes were retained."
+    },
+    {
+      "artifact_id": "review.finalized-intake",
+      "phase": "confirmation",
+      "status": "reported_unretained",
+      "summary": "Confirmation review was reported during development; no report bytes were retained."
+    }
+  ],
+  "schema_version": 2
+}

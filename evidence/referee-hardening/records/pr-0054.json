@@ -1,0 +1,186 @@
+{
+  "architectural_unit": "7",
+  "artifacts": [
+    {
+      "availability": "repository",
+      "id": "github.referee-evidence",
+      "kind": "github-check-receipt",
+      "locator": "evidence/referee-hardening/artifacts/pr-0054-github-checks.json",
+      "reason": null,
+      "sha256": "06de40b985772e27c15dc20f9fedfc3c83da9b250743200ef3d00b4e72313302",
+      "size_bytes": 1844
+    },
+    {
+      "availability": "unavailable",
+      "id": "tests.rtx-focused",
+      "kind": "test-log",
+      "locator": null,
+      "reason": "The exact normalized head's 129-pass focused RTX-container summary was reported without retaining the raw log.",
+      "sha256": null,
+      "size_bytes": null
+    },
+    {
+      "availability": "unavailable",
+      "id": "tests.predecessor-broad",
+      "kind": "test-log",
+      "locator": null,
+      "reason": "A predecessor-head broad run reported 1643 passed, 3 skipped, and one dependency-prebuild import-order failure that passed in isolation; the raw logs were not retained.",
+      "sha256": null,
+      "size_bytes": null
+    },
+    {
+      "availability": "unavailable",
+      "id": "testnet.global-projection-dry-run",
+      "kind": "testnet-receipt",
+      "locator": null,
+      "reason": "The testnet-307 metagraph readback and dry-run projection at block 7547314 were reported without retaining a standalone receipt artifact.",
+      "sha256": null,
+      "size_bytes": null
+    },
+    {
+      "availability": "unavailable",
+      "id": "review.transactional-settlement",
+      "kind": "review-report",
+      "locator": null,
+      "reason": "The final contract, security, and confirmation reviews were reported without retaining their raw bytes.",
+      "sha256": null,
+      "size_bytes": null
+    }
+  ],
+  "claims": [
+    {
+      "artifact_ids": [],
+      "id": "scope.transactional-settlement",
+      "statement": "The implementation adds one transactional retained-evidence-to-crown authority, explicit stack-transition events, global relative-improvement reward projection, and append-only fail-closed weight publication state.",
+      "status": "verified"
+    },
+    {
+      "artifact_ids": [
+        "github.referee-evidence"
+      ],
+      "id": "tests.github-referee-evidence",
+      "statement": "The retained GitHub receipt records successful evidence and CodeQL checks for the implementation head.",
+      "status": "verified"
+    },
+    {
+      "artifact_ids": [
+        "tests.rtx-focused"
+      ],
+      "id": "tests.focused-head",
+      "statement": "The exact normalized head was reported to pass 129 focused RTX-container tests; the raw log is unavailable.",
+      "status": "reported_unretained"
+    },
+    {
+      "artifact_ids": [
+        "testnet.global-projection-dry-run"
+      ],
+      "id": "testnet.dry-run",
+      "statement": "A live testnet-307 readback and global-projection dry run was reported at block 7547314 with zero publication-journal rows and no extrinsic; no receipt bytes were retained.",
+      "status": "reported_unretained"
+    },
+    {
+      "artifact_ids": [],
+      "id": "authority.no-live-crown",
+      "statement": "The implementation does not claim a joined chain-to-GPU crown, release, mainnet-calibrated emissions policy, or real weight extrinsic.",
+      "status": "verified"
+    }
+  ],
+  "classified_diff": {
+    "documentation": {
+      "added": 57,
+      "deleted": 0
+    },
+    "evidence": {
+      "added": 100,
+      "deleted": 0
+    },
+    "production": {
+      "added": 3543,
+      "deleted": 60
+    },
+    "test": {
+      "added": 1490,
+      "deleted": 19
+    },
+    "tooling": {
+      "added": 56,
+      "deleted": 1
+    },
+    "vendor": {
+      "added": 0,
+      "deleted": 0
+    }
+  },
+  "exit_criteria": [
+    {
+      "artifact_ids": [],
+      "id": "authority.transactional-settlement",
+      "statement": "Only a retained qualified PASS with exact arena, target, stack, tree, report, finalized-priority, and evidence bindings can produce a settlement transition and reward claim.",
+      "status": "verified"
+    },
+    {
+      "artifact_ids": [],
+      "id": "authority.global-projection",
+      "statement": "All active arena claims are reopened and normalized in one deterministic projection; any missing, orphaned, or invalid arena authority holds the whole projection.",
+      "status": "verified"
+    },
+    {
+      "artifact_ids": [],
+      "id": "authority.weight-publication",
+      "statement": "Weight publication journals intent before SDK use and remains pending or held until exact authoritative metagraph readback confirms the projected sparse weights.",
+      "status": "verified"
+    },
+    {
+      "artifact_ids": [
+        "tests.predecessor-broad"
+      ],
+      "id": "tests.full-exact-head-green",
+      "statement": "No green exact-final-head full-suite receipt exists; the predecessor-head broad run retained one import-order failure and its raw log is unavailable.",
+      "status": "invalidated"
+    },
+    {
+      "artifact_ids": [
+        "github.referee-evidence"
+      ],
+      "id": "ci.evidence-check",
+      "statement": "The repository-retained GitHub receipt binds successful evidence checks to the implementation head.",
+      "status": "verified"
+    }
+  ],
+  "github_pr": 54,
+  "identity": {
+    "base_commit": "b58259135dcfdbb654bb5de87415e53e36487cc0",
+    "implementation_commit": "67e621b6b973a882fe8f0abd38277ca457a6c8da",
+    "implementation_tree": "dc70630108123a4b41d8536b2c7d4a6246cc19df",
+    "merge_commit": "084fb8d7e6debe22d1852f0cd0ffca915648bb2d"
+  },
+  "nonclaims": [
+    "b300.calibration",
+    "chain-to-gpu.crown",
+    "emissions.mainnet-calibration",
+    "release.production",
+    "weights.real-extrinsic"
+  ],
+  "record_type": "pr_evidence",
+  "reviews": [
+    {
+      "artifact_id": "review.transactional-settlement",
+      "phase": "implementation",
+      "status": "reported_unretained",
+      "summary": "A bounded implementation and contract review was reported; no report bytes were retained."
+    },
+    {
+      "artifact_id": "review.transactional-settlement",
+      "phase": "adversarial",
+      "status": "reported_unretained",
+      "summary": "A bounded security review reported no blocking defect; no report bytes were retained."
+    },
+    {
+      "artifact_id": "review.transactional-settlement",
+      "phase": "confirmation",
+      "status": "reported_unretained",
+      "summary": "A bounded final confirmation was reported; no report bytes were retained."
+    }
+  ],
+  "schema_version": 2
+}

@@ -1,0 +1,197 @@
+{
+  "architectural_unit": "5",
+  "artifacts": [
+    {
+      "availability": "repository",
+      "id": "github.referee-evidence",
+      "kind": "github-check-receipt",
+      "locator": "evidence/referee-hardening/artifacts/pr-0052-github-checks.json",
+      "reason": null,
+      "sha256": "2a7113f9915fd2bc2a54028c22c76a993f0d2a560ae4e39c6fd8645b484ce371",
+      "size_bytes": 1844
+    },
+    {
+      "availability": "digest_only",
+      "id": "gpu.discovery-qualification",
+      "kind": "gpu-receipt",
+      "locator": null,
+      "reason": "The joined TP8 discovery receipt remains in the private campaign ledger and binds the GPU-proven predecessor tree rather than the final static-only normalized head.",
+      "sha256": "9a51b7ba94da7584b721cd6f33112239ba65d18b9ab4076cae5f6fd85d9363cf",
+      "size_bytes": null
+    },
+    {
+      "availability": "digest_only",
+      "id": "gpu.worker-wheel",
+      "kind": "wheel-artifact",
+      "locator": null,
+      "reason": "The exact GPU-proven worker wheel was retained only by digest in the private campaign ledger.",
+      "sha256": "aeea808d6e217782525fd3d4a3a25559d814c01e7c90547783314a09f88b1009",
+      "size_bytes": null
+    },
+    {
+      "availability": "digest_only",
+      "id": "gpu.worker-image",
+      "kind": "oci-image",
+      "locator": null,
+      "reason": "The exact GPU-proven worker image was retained in the private pod registry and recorded only by manifest digest in the campaign ledger.",
+      "sha256": "95d7558b2f95cb5b918271f0f0a5ec92c969bf4b2961203678a47423d86c08c7",
+      "size_bytes": null
+    },
+    {
+      "availability": "unavailable",
+      "id": "tests.normalized-focused",
+      "kind": "test-log",
+      "locator": null,
+      "reason": "The final normalized head's 68-pass focused pod summary was reported without retaining the raw log.",
+      "sha256": null,
+      "size_bytes": null
+    },
+    {
+      "availability": "unavailable",
+      "id": "tests.gpu-tree",
+      "kind": "test-log",
+      "locator": null,
+      "reason": "The GPU-proven predecessor tree's 401-pass focused result and earlier 1509-pass, 3-skip, 1-deselection broad summary were reported without retaining raw logs.",
+      "sha256": null,
+      "size_bytes": null
+    },
+    {
+      "availability": "unavailable",
+      "id": "review.discovery",
+      "kind": "review-report",
+      "locator": null,
+      "reason": "The three bounded clean review reports were not retained as repository artifacts.",
+      "sha256": null,
+      "size_bytes": null
+    }
+  ],
+  "claims": [
+    {
+      "artifact_ids": [],
+      "id": "scope.bounded-discovery",
+      "statement": "The implementation adds an inspectable pinned-SGLang patch proposal, policy-bounded hermetic overlay build, scheduler-child activation proof, and discovery qualification product without granting target or stack mutation authority.",
+      "status": "verified"
+    },
+    {
+      "artifact_ids": [
+        "github.referee-evidence"
+      ],
+      "id": "tests.github-referee-evidence",
+      "statement": "The retained GitHub receipt records successful evidence and CodeQL checks for the final normalized implementation head.",
+      "status": "verified"
+    },
+    {
+      "artifact_ids": [
+        "gpu.discovery-qualification",
+        "gpu.worker-wheel",
+        "gpu.worker-image"
+      ],
+      "id": "gpu.discovery-lane",
+      "statement": "Digest-retained TP8 evidence binds scheduler-only eight-rank candidate activation, B/C/B-prime/T completion, independent reopen, graph-requested execution, and zero residue on the GPU-proven predecessor tree.",
+      "status": "digest_only"
+    },
+    {
+      "artifact_ids": [
+        "gpu.discovery-qualification"
+      ],
+      "id": "gpu.marker-rejected",
+      "statement": "The harmless discovery marker was correctly rejected for measured speed regression; the receipt is infrastructure proof, not a throughput win or crown.",
+      "status": "digest_only"
+    }
+  ],
+  "classified_diff": {
+    "documentation": {
+      "added": 0,
+      "deleted": 0
+    },
+    "evidence": {
+      "added": 94,
+      "deleted": 0
+    },
+    "production": {
+      "added": 5043,
+      "deleted": 237
+    },
+    "test": {
+      "added": 3817,
+      "deleted": 38
+    },
+    "tooling": {
+      "added": 56,
+      "deleted": 1
+    },
+    "vendor": {
+      "added": 0,
+      "deleted": 0
+    }
+  },
+  "exit_criteria": [
+    {
+      "artifact_ids": [],
+      "id": "authority.fenced-discovery",
+      "statement": "Discovery proposals are bounded source products whose materialization and activation are validator-owned and whose output cannot directly mutate the catalog, evaluation stack, settlement, or weights.",
+      "status": "verified"
+    },
+    {
+      "artifact_ids": [
+        "gpu.discovery-qualification"
+      ],
+      "id": "gpu.joined-discovery-proof",
+      "statement": "The digest-retained GPU-proven tree completed the discovery B/C/B-prime/T infrastructure proof and rejected its regressing marker candidate.",
+      "status": "digest_only"
+    },
+    {
+      "artifact_ids": [
+        "tests.normalized-focused"
+      ],
+      "id": "tests.normalized-head",
+      "statement": "The final static-normalized head was reported to pass 68 focused pod tests; the raw log is unavailable.",
+      "status": "reported_unretained"
+    },
+    {
+      "artifact_ids": [
+        "github.referee-evidence"
+      ],
+      "id": "ci.evidence-check",
+      "statement": "The repository-retained GitHub receipt binds successful evidence checks to the final implementation head.",
+      "status": "verified"
+    }
+  ],
+  "github_pr": 52,
+  "identity": {
+    "base_commit": "1b8a35568bc0910a898a2b9b19165cbe956d23c7",
+    "implementation_commit": "dabcbb733356aa0ee2109ba05b1e8b7add84b550",
+    "implementation_tree": "e8b43b778c895b1978619afd04cc5c4a01ccd711",
+    "merge_commit": "3606a95cf675e1d08a9f2b9117fbbca8e36fbda0"
+  },
+  "nonclaims": [
+    "b300.performance",
+    "chain.integration",
+    "crown.authority",
+    "discovery.throughput-win",
+    "settlement.authority",
+    "target.mutation"
+  ],
+  "record_type": "pr_evidence",
+  "reviews": [
+    {
+      "artifact_id": "review.discovery",
+      "phase": "implementation",
+      "status": "reported_unretained",
+      "summary": "A clean whole-scope implementation review was reported; no report bytes were retained."
+    },
+    {
+      "artifact_id": "review.discovery",
+      "phase": "adversarial",
+      "status": "reported_unretained",
+      "summary": "A clean trust-boundary adversarial review was reported; no report bytes were retained."
+    },
+    {
+      "artifact_id": "review.discovery",
+      "phase": "confirmation",
+      "status": "reported_unretained",
+      "summary": "A clean receipt-semantics confirmation was reported; no report bytes were retained."
+    }
+  ],
+  "schema_version": 2
+}

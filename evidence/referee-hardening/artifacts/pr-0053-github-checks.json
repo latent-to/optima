@@ -1,0 +1,52 @@
+{
+  "check_runs": [
+    {
+      "app": "github-advanced-security",
+      "completed_at": "2026-07-13T00:17:00Z",
+      "conclusion": "success",
+      "details_url": "https://github.com/latent-to/optima/runs/86709124368",
+      "head_sha": "9290ce30e9647d9905fb801f96b308320af2ba39",
+      "id": 86709124368,
+      "name": "CodeQL",
+      "started_at": "2026-07-13T00:16:58Z",
+      "status": "completed"
+    },
+    {
+      "app": "github-actions",
+      "completed_at": "2026-07-13T00:16:43Z",
+      "conclusion": "success",
+      "details_url": "https://github.com/latent-to/optima/actions/runs/29215009289/job/86709070968",
+      "head_sha": "9290ce30e9647d9905fb801f96b308320af2ba39",
+      "id": 86709070968,
+      "name": "validate",
+      "started_at": "2026-07-13T00:16:30Z",
+      "status": "completed"
+    },
+    {
+      "app": "github-actions",
+      "completed_at": "2026-07-13T00:17:14Z",
+      "conclusion": "success",
+      "details_url": "https://github.com/latent-to/optima/actions/runs/29215007817/job/86709068838",
+      "head_sha": "9290ce30e9647d9905fb801f96b308320af2ba39",
+      "id": 86709068838,
+      "name": "Analyze (python)",
+      "started_at": "2026-07-13T00:16:28Z",
+      "status": "completed"
+    },
+    {
+      "app": "github-actions",
+      "completed_at": "2026-07-13T00:17:06Z",
+      "conclusion": "success",
+      "details_url": "https://github.com/latent-to/optima/actions/runs/29215007817/job/86709068813",
+      "head_sha": "9290ce30e9647d9905fb801f96b308320af2ba39",
+      "id": 86709068813,
+      "name": "Analyze (actions)",
+      "started_at": "2026-07-13T00:16:28Z",
+      "status": "completed"
+    }
+  ],
+  "pull_request": 53,
+  "repository": "latent-to/optima",
+  "source_endpoint": "GET /repos/latent-to/optima/commits/9290ce30e9647d9905fb801f96b308320af2ba39/check-runs",
+  "total_count": 4
+}

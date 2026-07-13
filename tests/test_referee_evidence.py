@@ -12,6 +12,7 @@ from scripts.check_referee_evidence import (
     load_json,
     validate_authority_boundary,
     validate_contract_document,
+    validate_donor_disposition,
     validate_record,
     validate_repository,
     validate_scope,
@@ -36,6 +37,10 @@ def test_exact_historical_classification() -> None:
     assert counts["production"] == {"added": 791, "deleted": 3}
     assert counts["test"] == {"added": 910, "deleted": 0}
     assert classify("optima/eval/seccomp_moby_v0_2_1.json") == "vendor"
+
+
+def test_donor_disposition_is_path_complete_and_git_bound() -> None:
+    validate_donor_disposition(ROOT)
 
 
 def test_pr43_preserves_invalid_exact_head_claim() -> None:

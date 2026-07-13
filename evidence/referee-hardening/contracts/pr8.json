@@ -25,6 +25,8 @@
       "optima/eval/qualification_runner.py",
       "optima/model_provision.py",
       "optima/release.py",
+      "optima/release_runtime.py",
+      "optima/seam.py",
       "optima/settlement.py",
       "optima/stack_manifest.py",
       "pyproject.toml"
@@ -104,6 +106,14 @@
     {
       "change": "add",
       "path": "optima/release.py"
+    },
+    {
+      "change": "add",
+      "path": "optima/release_runtime.py"
+    },
+    {
+      "change": "modify",
+      "path": "optima/seam.py"
     },
     {
       "change": "modify",

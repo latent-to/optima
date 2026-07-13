@@ -52,6 +52,25 @@ the noise term is what guards an unstable box), and a round whose baselines disa
 tolerance is **NO-DECISION** (never crowns). `ignore_eos` is on for scoring so both sides emit
 identical token counts.
 
+**The production referee authority is isolated and fail-closed.** Finalized submissions
+move from validator-private fetch storage into immutable, hash-complete worker
+publications. Candidate import, hermetic native compilation, engine construction, and
+execution occur inside validator-owned OCI sessions with no network egress, read-only
+root filesystems, bounded mounts/protocols, and controller-owned teardown. The trusted
+controller supplies the incumbent, candidate delta, workload, role schedule, and evidence
+schema; it does not load miner Python or native extensions. Qualification is B/C/B′ with a
+separate pristine teacher-forced T authority, including graph-capture/replay and raw quality
+evidence.
+
+**The production intake and arena path uses SQLite and explicit target/stack identity.**
+`FinalizedIntakeStore` persists finalized ordering, copy disposition, screen receipts,
+qualification attempts, stack transitions, settlement, and weight-publication state. A
+trusted `ArenaServiceRegistry` binds runtime/model/topology identity, decode and
+long-prefill workload regimes, capacity/retry policy, and the fixed non-crown
+static/build/ABI/graph/abbreviated-serving screen. A first passing qualification is retained
+as `reproduction_pending`; settlement requires a second independent passing authority for
+the same candidate identity and conservatively uses the lower speedup.
+
 **First gate-passing submission (2026-07-07): a submitted kernel measured faster than
 stock sglang through the referee at equal fidelity.** The `miner_m3_fused_epilogue` bundle (fused AR+residual+RMSNorm collective, the
 July-2 MiniMax-M3 campaign kernel) scored **1.044× against the noise-derived bar 1.038 —
@@ -85,14 +104,21 @@ on the GPU box, and crowned it: **1.072× vs bar 1.026, in-engine audit 12,824 c
 0 violations — SCORE 1.0717**, the third independent reproduction of the deep win
 (1.074 / 1.071 / 1.072), this one with no human in the path. `optima chain-package/
 chain-submit/chain-status/chain-validate/chain-register` are the operator surface;
-`docs/TESTNET.md` is the runbook. Weight policy is read from ONE seam
-(`Ledger.current_weights`) so the planned relative-improvement emission scheme swaps
-in without touching chain I/O.
+`docs/TESTNET.md` is the runbook. Weight publication is a separate, journaled control-
+plane reconciliation over the transactional global reward projection.
 
-**Still open:** isolation for untrusted miners; a tiered eval scheduler; a real DB;
-mainnet economics (own subnet, stake/permits, hosted bundle storage); bigger slots
-(MLA / weight-absorbed attention, GEMM, comms-overlap blocks); and **eval
-calibration** (see "Calibration findings").
+**The serving release is separate from evaluation and chain state.** Approved
+`IntegrationReviewRecord`s authorize exact contributions in an
+`EngineReleaseManifest`; deterministic model provisioning seals every file in the model
+tree. The chain-independent release module emits signed descriptors, deterministic source
+and wheel artifacts, SPDX SBOM, provenance, a pinned serve specification, and an OCI build
+context. The serving wheel excludes chain, wallet, settlement, and evaluation-control code.
+
+**Still open:** mainnet economics and operations (owned subnet, stake/permits, hosted
+bundle storage); broader optimization targets (MLA / weight-absorbed attention, GEMM,
+comms-overlap blocks); and B300-only proof for SM103/CuTe, NVLink/custom collectives,
+topology-specific calibration, TP4 role swaps, and the existing MiniMax-M3 campaign
+kernels. The earlier measured calibration findings remain below.
 
 ## Status: validated end-to-end
 
@@ -202,10 +228,18 @@ optima/
     throughput_kl.py        # bookended throughput + fidelity (audit|kl modes; calibration smoke)
     capability.py           # throughput + fidelity + benchmark accuracy (the real-task scoring path)
     benchmarks.py           # Benchmark protocol + GSM8K & MMLU (HF), answer extraction
+    oci_backend.py          # validator-owned no-egress worker lifecycle and native prebuild
+    qualification_runner.py # B/C/B'/pristine-T authority and aggregate verdict
     kl.py / prompts.py / _launch.py
+  arena_service.py          # registered runtime/model/topology/workload + non-crown screen
+  stack_manifest.py         # evaluation/release stack identity + integration review
+  settlement.py             # paired reproduction and transactional target settlement
+  model_provision.py        # exact model-tree content receipt
+  release.py                # signed chain-independent Engine release artifacts
+  chain/intake.py           # SQLite production authority
   bundle_hash.py            # deterministic bundle identity
-  commit_reveal.py          # commit-reveal + king-of-the-hill ledger
-  cli.py                    # slots|compat|scan|verify|evaluate|bench|hash|commit|reveal|ledger|settle
+  commit_reveal.py          # legacy local mechanism simulator
+  cli.py                    # developer, chain-intake, weights, model and release commands
 optima_kernels/
   collective/               # validator-owned reference lib for the fused AR+norm family (sm103 CUDA + wrapper)
 examples/
@@ -238,15 +272,17 @@ added by PR #21388 — present at the pin), so migrating the seam to a sanctione
 is the shim); the `.pth` path is kept primary today because it is version-independent and
 known spawn-safe.
 
-The validator does **two launches** of the same model (identical weights/seed):
-baseline (`OPTIMA_ACTIVE=0`, stock kernels) and candidate (`OPTIMA_ACTIVE=1`,
-miner kernel). Only the one op differs, so the throughput delta and the KL/accuracy
-deltas are attributable to the kernel.
+The direct developer evaluator retains baseline/candidate launches. Crownable
+qualification uses B/C/B′ bookends plus a separately launched pristine T quality
+authority, and repeats a passing candidate under independent authority before settlement.
+The exact evaluation stack differs from its incumbent by one registered singleton or
+atomic target.
 
-**Tamper-resistant timing:** the driver/timer process calls `seam.mark_driver()`
-*before* importing sglang, so it never imports miner code; the kernel runs only in
-the spawned scheduler, which the driver times over IPC. A malicious kernel can't
-reach the clock.
+**Tamper-resistant timing and evidence:** candidate import, build and engine execution
+remain inside a disposable no-egress OCI worker. The trusted controller assigns roles,
+times requests, authenticates bounded evidence, launches the pristine T worker, and owns
+teardown; it never imports candidate code or trusts the candidate as its own grading
+oracle.
 
 ## Run it
 
@@ -390,22 +426,16 @@ count), a `max_running_requests` knob to score at a serving-realistic batch, and
 
 ## Security model
 
-With Triton/CuteDSL the miner's kernel is **Python that runs in the model
-process**, so there's no artifact we can prove safe. The boundary must come from
-how you run it (and the model is public, so there's no IP to steal):
+Triton/CuteDSL submissions contain Python host launch code and generated device code;
+static inspection is therefore a tripwire, not the trust boundary. Production candidate
+execution runs in an ephemeral, validator-owned OCI worker with no network, read-only root,
+bounded mounts, dropped privileges/capabilities, seccomp/resource policy, a separate CUDA
+context, and authoritative teardown. The controller owns timing, arm identity, evidence
+frames, and the pristine T quality authority, and never imports candidate code. Chain keys
+and weight publication remain in the separate control plane.
 
-- the kernel runs on the GPU box, **not** the process that holds chain keys / sets
-  weights — those live on a separate CPU control box (Affine's SSH pattern);
-- **no network egress** from the GPU box; **ephemeral** per-eval, wiped after;
-- a **per-eval CUDA context + watchdog** (DoS / out-of-bounds writes);
-- timing is already out-of-process (`mark_driver`); the static scan
-  (`sandbox.scan_source`) is a tripwire, not the boundary.
-
-`--framework-mode` and `--isolate` now fail closed if the candidate process
-cannot prove no-egress network isolation. Use `--allow-unsafe-no-isolation` only
-for local throughput debugging on dev pods that lack `CAP_SYS_ADMIN`; production
-scoring should run the eval worker with real namespace support, or inside a
-container/VM whose candidate side has `--network=none`.
+Unsafe direct execution flags exist only for non-crownable development diagnostics on
+pods that cannot provide the required OCI or namespace boundary.
 
 Worst case for a fully-compromised kernel is one wrong score for itself;
 cross-validator consensus catches a rogue validator.
@@ -419,10 +449,11 @@ cross-validator consensus catches a rogue validator.
 | Model | gpt-oss-120b (1×H100); MiniMax-M3-NVFP4 (4×B300, TP4) | DSV4-scale (multi-GPU, TP/PD/EP) |
 | Quality gate | in-engine audit (nondet arenas) / calibrated KL (det arenas) + coverage/argmax/per-slot-threshold + GSM8K/MMLU | full-vocab KL at a reference seam + large-n (100–200) benchmarks |
 | Scoring noise | noise-derived margin + bookended A/B + no-decision (no clock-lock needed) | + interleaved per-iter A/B + locked clocks where available |
-| Isolation | scan (hardened) + **out-of-process** verify | namespaces + no-egress + per-eval ctx + watchdog (needs Linux/root) |
-| Champion | per-round, pin-staleness flagged | head-to-head re-eval vs a content-addressed bundle store |
-| Chain | **native timelock commit-reveal + hash-verified fetch + the validator loop, run live on testnet** (`optima chain-*`, docs/TESTNET.md); weights dry-run (permit-gated) | own subnet, staked permits, real set_weights cadence, hosted bundle store |
-| State | JSON | a real DB, single-writer weights |
+| Isolation | validator-owned no-egress OCI worker; trusted controller never loads candidate code | deploy the same policy on each validator's production runtime |
+| Champion | explicit singleton/atomic targets; two independent PASSes; transactional stack settlement | continued whole-stack regression and re-baseline on pin changes |
+| Chain | **native timelock commit-reveal + hash-verified finalized intake + SQLite authority + journaled weights**, with chain behavior run on testnet | own subnet, production permits/cadence, hosted bundle store |
+| State | SQLite, transactional single-writer authority | operational backup/replication and monitoring |
+| Release | signed, chain-independent Engine release with model seal, SBOM/provenance and deterministic OCI context | registry publication and serving-fleet rollout policy |
 
 ## Adding a slot
 

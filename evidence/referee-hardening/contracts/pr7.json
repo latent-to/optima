@@ -1,0 +1,100 @@
+{
+  "allowed_paths": {
+    "control_exact": [
+      ".github/workflows/referee-evidence.yml",
+      "scripts/check_referee_evidence.py",
+      "tests/test_referee_evidence.py"
+    ],
+    "control_prefixes": [
+      "evidence/referee-hardening/"
+    ],
+    "production": [
+      "docs/EMISSIONS_POLICY.md",
+      "optima/chain/__init__.py",
+      "optima/chain/intake.py",
+      "optima/chain/validator_loop.py",
+      "optima/chain/weights.py",
+      "optima/cli.py",
+      "optima/commit_reveal.py",
+      "optima/economics.py",
+      "optima/eval/qualification_intake.py",
+      "optima/settlement.py"
+    ],
+    "test": [
+      "tests/test_chain.py",
+      "tests/test_chain_intake.py",
+      "tests/test_chain_validator_loop.py",
+      "tests/test_cli_chain.py",
+      "tests/test_commit_reveal.py",
+      "tests/test_economics.py",
+      "tests/test_qualification_intake.py",
+      "tests/test_settlement.py",
+      "tests/test_weight_publication.py"
+    ]
+  },
+  "architectural_unit": "7",
+  "authority_boundary": {
+    "forbidden_modules": [
+      "optima.audit",
+      "optima.commit_reveal",
+      "optima.eval._launch",
+      "optima.eval.capability",
+      "optima.eval.throughput_kl"
+    ],
+    "roots": [
+      "optima.chain.intake",
+      "optima.chain.validator_loop",
+      "optima.chain.weights",
+      "optima.economics",
+      "optima.eval.qualification_intake",
+      "optima.settlement"
+    ]
+  },
+  "base_commit": "b58259135dcfdbb654bb5de87415e53e36487cc0",
+  "budget": {
+    "exemption_policy": "none",
+    "production_additions_max": 4200,
+    "test_additions_max": 3500
+  },
+  "contract_id": "pr7",
+  "record_type": "scope_contract",
+  "required_in_place": [
+    {
+      "change": "modify",
+      "path": "optima/chain/__init__.py"
+    },
+    {
+      "change": "modify",
+      "path": "optima/chain/intake.py"
+    },
+    {
+      "change": "modify",
+      "path": "optima/chain/validator_loop.py"
+    },
+    {
+      "change": "add",
+      "path": "optima/chain/weights.py"
+    },
+    {
+      "change": "modify",
+      "path": "optima/cli.py"
+    },
+    {
+      "change": "modify",
+      "path": "optima/commit_reveal.py"
+    },
+    {
+      "change": "add",
+      "path": "optima/economics.py"
+    },
+    {
+      "change": "modify",
+      "path": "optima/eval/qualification_intake.py"
+    },
+    {
+      "change": "add",
+      "path": "optima/settlement.py"
+    }
+  ],
+  "schema_version": 2
+}

@@ -299,6 +299,28 @@ def test_pr6_contract_replaces_chain_grading_with_finalized_intake() -> None:
         validate_scope(contract, over_budget)
 
 
+def test_pr7_contract_bounds_transactional_settlement_and_weights() -> None:
+    contract = load_json(EVIDENCE / "contracts/pr7.json")
+    validate_contract_document(contract)
+    changes = {
+        item["path"]: ({"add": "A", "modify": "M"}[item["change"]], 1, 0)
+        for item in contract["required_in_place"]
+    }
+    validate_scope(contract, changes)
+    schema = load_json(EVIDENCE / "schema-v2.json")
+    validate_v2_schema_contract(schema, contract)
+
+    outside = dict(changes)
+    outside["optima/eval/qualification_runner.py"] = ("M", 1, 0)
+    with pytest.raises(EvidenceError, match="outside frozen pr7"):
+        validate_scope(contract, outside)
+
+    over_budget = dict(changes)
+    over_budget["optima/settlement.py"] = ("A", 4201, 0)
+    with pytest.raises(EvidenceError, match="pr7 line budget"):
+        validate_scope(contract, over_budget)
+
+
 def test_authority_boundary_walks_transitive_and_relative_repo_imports(tmp_path: Path) -> None:
     eval_dir = tmp_path / "optima/eval"
     eval_dir.mkdir(parents=True)

@@ -12,7 +12,10 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Callable
+from typing import TYPE_CHECKING, Callable
+
+if TYPE_CHECKING:
+    from optima.settlement import SettlementCandidate
 
 from optima.discovery import DiscoveryArmPlan
 from optima.eval.evidence_store import EvidenceArtifactRef, publish_evidence
@@ -91,6 +94,11 @@ class QualificationReservation:
     target_id: str
     selected_delta_digest: str
     arrival_order: int
+    hotkey: str
+    finalized_block: int
+    finalized_event_index: int
+    finalized_event_subindex: int
+    target_members: tuple[str, ...]
 
     def __post_init__(self) -> None:
         for field in (
@@ -103,28 +111,62 @@ class QualificationReservation:
         object.__setattr__(
             self, "arrival_order", _integer(self.arrival_order, "arrival_order")
         )
+        if (
+            not isinstance(self.hotkey, str)
+            or not self.hotkey
+            or self.hotkey.strip() != self.hotkey
+            or len(self.hotkey) > 256
+            or any(char in self.hotkey for char in "\x00\r\n")
+        ):
+            raise QualificationIntakeError("reservation hotkey is malformed")
+        for field in (
+            "finalized_block",
+            "finalized_event_index",
+            "finalized_event_subindex",
+        ):
+            object.__setattr__(self, field, _integer(getattr(self, field), field))
+        members = tuple(self.target_members)
+        if (
+            not members
+            or members != tuple(sorted(set(members)))
+            or any(_identifier(member, "target member") != member for member in members)
+        ):
+            raise QualificationIntakeError("reservation target members are not canonical")
+        object.__setattr__(self, "target_members", members)
 
     def to_dict(self) -> dict[str, object]:
         return {
             "arrival_order": self.arrival_order,
+            "finalized_block": self.finalized_block,
+            "finalized_event_index": self.finalized_event_index,
+            "finalized_event_subindex": self.finalized_event_subindex,
+            "hotkey": self.hotkey,
             "reservation_digest": self.reservation_digest,
             "selected_delta_digest": self.selected_delta_digest,
             "submission_digest": self.submission_digest,
             "target_id": self.target_id,
+            "target_members": list(self.target_members),
         }
 
     @classmethod
     def from_dict(cls, value: object) -> "QualificationReservation":
         fields = {
             "arrival_order",
+            "finalized_block",
+            "finalized_event_index",
+            "finalized_event_subindex",
+            "hotkey",
             "reservation_digest",
             "selected_delta_digest",
             "submission_digest",
             "target_id",
+            "target_members",
         }
         if type(value) is not dict or set(value) != fields:
             raise QualificationIntakeError("reservation fields do not match the schema")
-        return cls(**value)  # type: ignore[arg-type]
+        if type(value["target_members"]) is not list:
+            raise QualificationIntakeError("reservation target members are malformed")
+        return cls(**{**value, "target_members": tuple(value["target_members"])})  # type: ignore[arg-type]
 
 
 @dataclass(frozen=True)
@@ -530,6 +572,7 @@ class QualificationIntakeOutcome:
     attempt_artifact_sha256: str | None = None
     report_digest: str | None = None
     failure_digest: str | None = None
+    settlement_candidate: SettlementCandidate | None = None
 
     def __post_init__(self) -> None:
         for field in (
@@ -564,6 +607,31 @@ class QualificationIntakeOutcome:
             raise QualificationIntakeError(
                 "PASS/FAIL requires a complete attempt and report product"
             )
+        from optima.settlement import SettlementCandidate
+
+        if self.settlement_candidate is not None:
+            if type(self.settlement_candidate) is not SettlementCandidate:
+                raise QualificationIntakeError(
+                    "settlement projection is not exactly typed"
+                )
+            if self.decision is not QualificationDecision.PASS:
+                raise QualificationIntakeError(
+                    "non-PASS outcome cannot carry settlement authority"
+                )
+            if (
+                self.settlement_candidate.reservation_digest != self.reservation_digest
+                or self.settlement_candidate.selected_delta_digest
+                != self.selected_delta_digest
+                or self.settlement_candidate.qualification_authority_digest
+                != self.authority_manifest_digest
+                or self.settlement_candidate.qualification_attempt_digest
+                != self.attempt_artifact_sha256
+                or self.settlement_candidate.qualification_report_digest
+                != self.report_digest
+            ):
+                raise QualificationIntakeError(
+                    "settlement projection differs from qualification outcome"
+                )
 
 
 @dataclass(frozen=True)
@@ -738,14 +806,41 @@ def run_qualification_intake(
     )
     outcomes = []
     retry_reservations = []
-    for reservation, report in zip(
-        manifest.reservations, attempt.reports, strict=True
+    from optima.eval.marginal_runtime import PreparedMarginalRuntime
+
+    prepared_candidates = (
+        value.prepared.candidates
+        if type(value.prepared) is PreparedMarginalRuntime
+        else ()
+    )
+    for index, (reservation, report) in enumerate(
+        zip(manifest.reservations, attempt.reports, strict=True)
     ):
         if (
             type(report) is not expected_report_type
             or report.selected_delta_digest != reservation.selected_delta_digest
         ):
             raise QualificationIntakeError("qualification report order differs")
+        settlement_candidate = None
+        if (
+            report.decision is QualificationDecision.PASS
+            and prepared_candidates
+        ):
+            from optima.settlement import SettlementCandidate
+
+            settlement_candidate = SettlementCandidate.from_qualification(
+                reservation_digest=reservation.reservation_digest,
+                finalized_block=reservation.finalized_block,
+                event_index=reservation.finalized_event_index,
+                event_subindex=reservation.finalized_event_subindex,
+                hotkey=reservation.hotkey,
+                target_id=reservation.target_id,
+                members=reservation.target_members,
+                prepared=prepared_candidates[index],
+                report=report,
+                authority=manifest,
+                attempt_ref=reference,
+            )
         outcomes.append(
             QualificationIntakeOutcome(
                 reservation.reservation_digest,
@@ -756,6 +851,7 @@ def run_qualification_intake(
                 report.retryable,
                 attempt_artifact_sha256=reference.sha256,
                 report_digest=report.digest,
+                settlement_candidate=settlement_candidate,
             )
         )
         if report.decision is QualificationDecision.NO_DECISION:

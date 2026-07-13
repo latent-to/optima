@@ -31,6 +31,11 @@ def _reservation(index: int, delta: str | None = None) -> intake.QualificationRe
         f"target.{index}",
         delta or _d(f"delta-{index}"),
         index,
+        f"miner-{index}",
+        100 + index,
+        index,
+        0,
+        (f"target.{index}",),
     )
 
 

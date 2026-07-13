@@ -12,21 +12,24 @@ from optima import chain
 # --- a minimal stand-in for bittensor's subtensor (records what was called) ---
 
 class _MockMetagraph:
-    def __init__(self, hotkeys, permits=None):
+    def __init__(self, hotkeys, permits=None, last_updates=None):
         self.uids = list(range(len(hotkeys)))
         self.hotkeys = list(hotkeys)
         self.validator_permit = list(permits) if permits is not None else [True] * len(hotkeys)
+        self.last_update = list(last_updates) if last_updates is not None else [0] * len(hotkeys)
 
 
 class _MockSubtensor:
     def __init__(self, *, hotkeys, commitments=None, revealed=None, block=100,
-                 registered=None, events=None):
+                 registered=None, events=None, weight_rows=None, last_updates=None):
         self._hotkeys = list(hotkeys)
         self._commitments = dict(commitments or {})
         self._revealed = dict(revealed or {})  # hotkey -> ((block, data), ...)
         self._block = block
         self._registered = set(hotkeys if registered is None else registered)
         self._events = events
+        self._weight_rows = list(weight_rows or [])
+        self._last_updates = last_updates
         self.substrate = types.SimpleNamespace(
             get_events=self._get_events,
             get_chain_finalised_head=lambda: self.get_block_hash(self._block),
@@ -37,7 +40,10 @@ class _MockSubtensor:
         self.set_reveal_commitment_calls: list[tuple] = []
 
     def metagraph(self, netuid=None):
-        return _MockMetagraph(self._hotkeys)
+        return _MockMetagraph(self._hotkeys, last_updates=self._last_updates)
+
+    def weights(self, netuid=None):
+        return list(self._weight_rows)
 
     def get_current_block(self):
         return self._block
@@ -119,11 +125,11 @@ def test_weights_map_to_uids():
     assert chain.weights_to_uid_vector({"b": 1.0}, mg) == ([1], [1.0])
 
 
-def test_weights_drop_deregistered_and_renormalize():
+def test_weights_refuse_to_redistribute_deregistered_recipient():
     mg = chain.MetagraphView(1, 1, "h", uids=[5, 6], hotkeys=["a", "b"],
                              validator_permit=[True, True])
-    # "ghost" isn't on the metagraph -> dropped; "a" renormalized to 1.0
-    assert chain.weights_to_uid_vector({"a": 1.0, "ghost": 3.0}, mg) == ([5], [1.0])
+    with pytest.raises(chain.ChainWeightStateError, match="absent"):
+        chain.weights_to_uid_vector({"a": 1.0, "ghost": 3.0}, mg)
 
 
 def test_uid_of():
@@ -180,9 +186,46 @@ def test_set_weights_chain_side_failure_reported():
 
 def test_set_weights_deregistered_champion_does_not_submit():
     st = _MockSubtensor(hotkeys=["a", "b"])
-    res = chain.set_weights(st, wallet=object(), netuid=1, weights_by_hotkey={"ghost": 1.0})
-    assert res["submitted"] is False and res["uids"] == []
+    with pytest.raises(chain.ChainWeightStateError, match="absent"):
+        chain.set_weights(
+            st, wallet=object(), netuid=1, weights_by_hotkey={"ghost": 1.0}
+        )
     assert st.set_weights_calls == []
+
+
+def test_read_validator_weights_uses_authoritative_sparse_sdk_row():
+    st = _MockSubtensor(
+        hotkeys=["validator", "alice", "bob"],
+        weight_rows=[(0, [(1, 10_000), (2, 30_000)])],
+        last_updates=[91, 0, 0],
+    )
+    snapshot = chain.read_validator_weight_snapshot(st, 1, "validator")
+    assert snapshot.last_update_block == 91
+    assert snapshot.weights == pytest.approx({"alice": 0.25, "bob": 0.75})
+
+
+def test_read_validator_weights_fails_closed_without_sparse_weight_api():
+    st = _MockSubtensor(hotkeys=["validator"], last_updates=[1])
+    st.weights = None
+    with pytest.raises(chain.ChainWeightStateError, match="on-chain weights"):
+        chain.read_validator_weight_snapshot(st, 1, "validator")
+
+
+@pytest.mark.parametrize(
+    "rows",
+    [
+        [(0, [(1, 1)]), (0, [(1, 1)])],
+        [(0, [(1, 1), (1, 2)])],
+        [(0, [(9, 1)])],
+        [(0, [(1, 65_536)])],
+    ],
+)
+def test_read_validator_weights_rejects_ambiguous_or_invalid_sparse_rows(rows):
+    st = _MockSubtensor(
+        hotkeys=["validator", "alice"], weight_rows=rows, last_updates=[1, 0]
+    )
+    with pytest.raises(chain.ChainWeightStateError):
+        chain.read_validator_weight_snapshot(st, 1, "validator")
 
 
 def test_post_commitment_dry_run_and_submit():

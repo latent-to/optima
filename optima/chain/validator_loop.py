@@ -1,10 +1,11 @@
-"""Finalized chain intake, immutable publication, and causal qualification.
+"""Finalized chain intake, immutable publication, qualification, and settlement.
 
-This production loop deliberately stops before settlement and weights.  It reserves
+This production loop deliberately stops before weight signing.  It reserves
 the complete finalized event order before network transport, publishes submitted bytes
-into a separate immutable worker tree, and optionally invokes the current batch causal
-qualification authority.  The old shell/CPU fake-score evaluator and immediate JSON
-Ledger settlement do not exist on this path.
+into a separate immutable worker tree, optionally invokes the current batch causal
+qualification authority, and transactionally adopts its retained PASS projection. The
+old shell/CPU fake-score evaluator and JSON Ledger settlement do not exist on this path;
+wallet access belongs only to the separate control-plane signer.
 """
 
 from __future__ import annotations
@@ -36,6 +37,7 @@ from optima.chain.publication import (
 )
 from optima.copy_fingerprint import fingerprint_submitted_delta
 from optima.eval.qualification_intake import (
+    QualificationAuthorityManifest,
     QualificationIntakeBatch,
     QualificationPlanFactory,
     QualificationReservation,
@@ -96,6 +98,7 @@ class PassResult:
     rejected: dict[str, str] = field(default_factory=dict)
     decisions: dict[str, str] = field(default_factory=dict)
     held: list[str] = field(default_factory=list)
+    settlements: dict[str, str] = field(default_factory=dict)
 
 
 def _finalized_arrivals(snapshot) -> tuple[FinalizedArrival, ...]:
@@ -174,6 +177,11 @@ def _qualification_reservations(
                 fingerprint.target_id,
                 fingerprint.selected_delta_digest,
                 index,
+                reservation.arrival.hotkey,
+                reservation.arrival.block,
+                reservation.arrival.event_index,
+                reservation.arrival.event_subindex,
+                reservation.target_members,
             )
         )
     return tuple(rows)
@@ -198,6 +206,20 @@ def _apply_qualification(
     authority_rows = _qualification_reservations(reservations, publications)
     work = planner(reservations, publications, authority_rows)
     _validate_work(work, authority_rows)
+    prepared = None
+    if type(work.factory.manifest) is QualificationAuthorityManifest:
+        prepared = work.factory.build()
+        arms = tuple(row.arm for row in prepared.prepared.candidates)
+        if (
+            not arms
+            or len({row.baseline_before for row in arms}) != 1
+            or any(row.incumbent != arms[0].incumbent for row in arms)
+        ):
+            raise IntakeControllerError("qualification planner has no single incumbent")
+        store.initialize_evaluation_stack(
+            arms[0].incumbent,
+            tree_digest=arms[0].baseline_before.tree_digest,
+        )
     authority_digest = work.factory.manifest.digest
     authority_manifest = work.factory.manifest.to_dict()
     for row in reservations:
@@ -220,8 +242,49 @@ def _apply_qualification(
         != tuple(row.selected_delta_digest for row in authority_rows)
     ):
         raise IntakeControllerError("qualification outcomes changed cohort authority")
-    store.apply_qualification_batch(batch)
+    store.apply_qualification_batch(
+        batch,
+        evidence_root=None if prepared is None else prepared.evidence_root,
+    )
     return batch
+
+
+def _settle_pending(
+    store: FinalizedIntakeStore,
+    *,
+    current_block: int,
+    finalized_block_provider: Callable[[], int],
+) -> dict[str, str]:
+    """Settle every causally ready retained PASS without chain or wallet access."""
+
+    from optima.settlement import plan_settlement
+
+    committed: dict[str, str] = {}
+    while True:
+        lease = store.lease_settlement_cohort(current_block=current_block)
+        if lease is None:
+            return committed
+        plan = plan_settlement(
+            lease.candidates,
+            current_manifest=lease.stack.manifest,
+            current_tree_digest=lease.stack.tree_digest,
+            initial_event_sequence=lease.initial_event_sequence,
+            previous_event_digest=lease.previous_event_digest,
+        )
+        evidence = tuple(
+            store.reopen_settlement_evidence(candidate)
+            for candidate in lease.candidates
+        )
+        refreshed_block = finalized_block_provider()
+        if type(refreshed_block) is not int or refreshed_block < current_block:
+            raise IntakeControllerError("finalized settlement clock regressed")
+        store.commit_settlement(
+            lease,
+            plan,
+            evidence,
+            current_block=refreshed_block,
+        )
+        committed[lease.lease_id] = plan.digest
 
 
 def run_pass(
@@ -331,6 +394,13 @@ def run_pass(
                     (row.reservation_digest, row.decision.value)
                     for row in batch.outcomes
                 )
+            result.settlements.update(
+                _settle_pending(
+                    store,
+                    current_block=snapshot.finalized_block,
+                    finalized_block_provider=lambda: chain.read_finalized_head(subtensor)[0],
+                )
+            )
         result.rejected.update(
             (row.reservation_id, row.reason)
             for row in inserted
@@ -374,7 +444,7 @@ def run_validator(
             failures = 0
             logger.info(
                 "intake @finalized %d: seen=%d reserved=%d published=%d copies=%d "
-                "rejected=%d decisions=%d held=%d",
+                "rejected=%d decisions=%d settlements=%d held=%d",
                 last.finalized_block,
                 last.seen,
                 len(last.reserved),
@@ -382,6 +452,7 @@ def run_validator(
                 len(last.copies),
                 len(last.rejected),
                 len(last.decisions),
+                len(last.settlements),
                 len(last.held),
             )
         except Exception:  # validator-side fault; a supervisor may restart cleanly

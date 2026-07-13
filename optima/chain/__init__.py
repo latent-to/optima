@@ -1,4 +1,4 @@
-"""On-chain I/O: read commitments, push king-of-the-hill weights, preflight checks.
+"""On-chain I/O: finalized submissions, global weights, and preflight checks.
 
 Architecture mirrors the sglang seam. **Pure helpers** (weight-vector math, hotkey↔uid
 mapping) carry no SDK and no network, so they are unit-tested directly. **Thin RPC
@@ -13,16 +13,16 @@ Submissions ride the chain's NATIVE commit-reveal (SUBNET_BLUEPRINT §3): a mine
 posts a timelock-encrypted payload (``set_reveal_commitment``, ≤1024 bytes,
 drand-encrypted until the reveal round — nobody can read the bundle URL before
 reveal, and the reveal block is the anti-copy priority timestamp). The validator
-reads ``get_all_revealed_commitments`` and replays them into the Ledger in chain
-order; the Ledger keeps the off-chain half (copy detection + king-of-the-hill).
+reads finalized storage and events in canonical order before transactional intake.
 The older salted-hash transport (``set_commitment``/``get_all_commitments``)
-remains for compatibility. The chain is the durable, consensus source of *what was
-committed* and *who won*; the Ledger is the scoring half.
+remains for compatibility. Settlement and weight-publication authority live in
+their dedicated control-plane modules, not in these thin SDK wrappers.
 """
 
 from __future__ import annotations
 
 import logging
+import math
 import operator
 import re
 from collections import Counter
@@ -43,6 +43,13 @@ _BLOCK_HASH_RE = re.compile(r"0x[0-9a-fA-F]{64}\Z")
 
 class ChainRevealHistoryError(RuntimeError):
     """Finalized storage and event history cannot prove exact reveal order."""
+
+    validator_fault = True
+    retryable = False
+
+
+class ChainWeightStateError(RuntimeError):
+    """The validator's active on-chain vector cannot be read or projected safely."""
 
     validator_fault = True
     retryable = False
@@ -110,12 +117,21 @@ class MetagraphView:
     uids: list[int] = field(default_factory=list)
     hotkeys: list[str] = field(default_factory=list)  # index-aligned with uids
     validator_permit: list[bool] = field(default_factory=list)
+    last_update: list[int] = field(default_factory=list)
 
     def uid_of(self, hotkey: str) -> Optional[int]:
         try:
             return self.uids[self.hotkeys.index(hotkey)]
         except ValueError:
             return None
+
+
+@dataclass(frozen=True)
+class ValidatorWeightSnapshot:
+    """One validator's authoritative sparse vector and last-update block."""
+
+    weights: dict[str, float]
+    last_update_block: int
 
 
 # --------------------------------------------------------------------------- #
@@ -134,14 +150,163 @@ def normalize(weights: dict[str, float]) -> dict[str, float]:
 def weights_to_uid_vector(weights_by_hotkey: dict[str, float],
                           metagraph: MetagraphView) -> tuple[list[int], list[float]]:
     """Map ``{hotkey: weight}`` to ``(uids, weights)`` for set_weights, aligned to the
-    *live* metagraph. Hotkeys absent from the metagraph (deregistered since the eval)
-    are dropped; the remainder is renormalized to sum 1.0."""
-    on_chain = {hk: w for hk, w in weights_by_hotkey.items()
-                if metagraph.uid_of(hk) is not None}
-    norm = normalize(on_chain)
+    *live* metagraph. A missing positive recipient is an authority fault: silently
+    redistributing its share would change the validator's settled policy."""
+    positive: dict[str, float] = {}
+    for hotkey, raw_weight in weights_by_hotkey.items():
+        if (
+            not isinstance(hotkey, str)
+            or not hotkey
+            or isinstance(raw_weight, bool)
+            or not isinstance(raw_weight, (int, float))
+        ):
+            raise ChainWeightStateError("weight projection contains an invalid entry")
+        weight = float(raw_weight)
+        if not math.isfinite(weight) or weight < 0:
+            raise ChainWeightStateError(
+                f"weight projection contains an invalid value for {hotkey!r}"
+            )
+        if weight > 0:
+            positive[hotkey] = weight
+    missing = sorted(
+        hotkey for hotkey in positive if metagraph.uid_of(hotkey) is None
+    )
+    if missing:
+        raise ChainWeightStateError(
+            "positive-weight hotkeys are absent from the live metagraph: "
+            + ", ".join(missing[:16])
+        )
+    norm = normalize(positive)
     uids = [metagraph.uid_of(hk) for hk in norm]
+    if (
+        any(type(uid) is not int or uid < 0 for uid in uids)
+        or len(set(uids)) != len(uids)
+    ):
+        raise ChainWeightStateError(
+            "live metagraph maps weight recipients to invalid or duplicate UIDs"
+        )
     weights = [norm[hk] for hk in norm]
     return uids, weights
+
+
+def _weight_uint(raw: object, field: str, *, maximum: int | None = None) -> int:
+    if isinstance(raw, bool):
+        raise ChainWeightStateError(f"invalid {field}")
+    try:
+        value = operator.index(raw)
+    except (TypeError, OverflowError):
+        raise ChainWeightStateError(f"invalid {field}") from None
+    if value < 0 or (maximum is not None and value > maximum):
+        raise ChainWeightStateError(f"invalid {field}")
+    return value
+
+
+def read_validator_weight_snapshot(
+    subtensor,
+    netuid: int,
+    validator_hotkey: str,
+    *,
+    metagraph_view: MetagraphView | None = None,
+) -> ValidatorWeightSnapshot:
+    """Read one validator's live sparse row without trusting a local journal.
+
+    Bittensor 10's default lite metagraph may omit the dense ``W`` matrix. The
+    authoritative API is ``subtensor.weights()``, paired with metagraph UIDs and
+    ``last_update`` for reconciliation after process restarts.
+    """
+
+    if type(netuid) is not int or netuid < 0:
+        raise ChainWeightStateError("netuid must be a non-negative integer")
+    if not isinstance(validator_hotkey, str) or not validator_hotkey:
+        raise ChainWeightStateError("validator hotkey must be non-empty")
+    if metagraph_view is not None:
+        if type(metagraph_view) is not MetagraphView or metagraph_view.netuid != netuid:
+            raise ChainWeightStateError("supplied metagraph view is not authoritative")
+        hotkeys = list(metagraph_view.hotkeys)
+        raw_uids = list(metagraph_view.uids)
+        raw_last_updates = list(metagraph_view.last_update)
+    else:
+        try:
+            metagraph = subtensor.metagraph(netuid=netuid)
+            hotkeys = list(metagraph.hotkeys)
+            raw_uids = list(metagraph.uids)
+            raw_last_updates = list(metagraph.last_update)
+        except Exception as exc:
+            raise ChainWeightStateError(
+                f"cannot fetch metagraph for active-weight verification: {exc}"
+            ) from None
+    if len(raw_uids) != len(hotkeys) or len(raw_last_updates) != len(hotkeys):
+        raise ChainWeightStateError("metagraph UID/hotkey/last-update widths differ")
+    if any(not isinstance(hotkey, str) or not hotkey for hotkey in hotkeys):
+        raise ChainWeightStateError("metagraph contains an invalid hotkey")
+    if len(set(hotkeys)) != len(hotkeys):
+        raise ChainWeightStateError("metagraph contains duplicate hotkeys")
+    uids = [_weight_uint(raw, "metagraph UID") for raw in raw_uids]
+    last_updates = [
+        _weight_uint(raw, "metagraph last-update block") for raw in raw_last_updates
+    ]
+    if len(set(uids)) != len(uids):
+        raise ChainWeightStateError("metagraph contains duplicate UIDs")
+    uid_to_hotkey = dict(zip(uids, hotkeys, strict=True))
+    try:
+        validator_index = hotkeys.index(validator_hotkey)
+        validator_uid = uids[validator_index]
+    except ValueError:
+        return ValidatorWeightSnapshot({}, 0)
+    try:
+        raw_rows = list(subtensor.weights(netuid=netuid))
+    except Exception as exc:
+        raise ChainWeightStateError(
+            f"cannot fetch validator on-chain weights: {exc}"
+        ) from None
+    rows: dict[int, dict[int, int]] = {}
+    for raw_row in raw_rows:
+        if not isinstance(raw_row, (list, tuple)) or len(raw_row) != 2:
+            raise ChainWeightStateError("chain weight state contains a malformed row")
+        source_uid = _weight_uint(raw_row[0], "chain weight source UID")
+        if source_uid not in uid_to_hotkey:
+            raise ChainWeightStateError(
+                "chain weight state contains a source UID absent from the metagraph"
+            )
+        if source_uid in rows:
+            raise ChainWeightStateError("chain weight state contains duplicate source rows")
+        if not isinstance(raw_row[1], (list, tuple)):
+            raise ChainWeightStateError("chain weight state contains malformed targets")
+        targets: dict[int, int] = {}
+        for raw_target in raw_row[1]:
+            if not isinstance(raw_target, (list, tuple)) or len(raw_target) != 2:
+                raise ChainWeightStateError(
+                    "chain weight state contains a malformed target row"
+                )
+            target_uid = _weight_uint(raw_target[0], "chain weight target UID")
+            if target_uid not in uid_to_hotkey:
+                raise ChainWeightStateError(
+                    "chain weight state contains a target UID absent from the metagraph"
+                )
+            if target_uid in targets:
+                raise ChainWeightStateError(
+                    "chain weight state contains duplicate target UIDs"
+                )
+            targets[target_uid] = _weight_uint(
+                raw_target[1], "uint16 weight", maximum=65_535
+            )
+        rows[source_uid] = targets
+    result = {
+        uid_to_hotkey[target_uid]: float(weight)
+        for target_uid, weight in rows.get(validator_uid, {}).items()
+        if weight > 0
+    }
+    return ValidatorWeightSnapshot(
+        normalize(result), last_updates[validator_index]
+    )
+
+
+def read_validator_weights(
+    subtensor, netuid: int, validator_hotkey: str
+) -> dict[str, float]:
+    """Compatibility projection of :func:`read_validator_weight_snapshot`."""
+
+    return read_validator_weight_snapshot(subtensor, netuid, validator_hotkey).weights
 
 
 # --------------------------------------------------------------------------- #
@@ -175,6 +340,7 @@ def fetch_metagraph(subtensor, netuid: int) -> MetagraphView:
         uids=[int(u) for u in mg.uids],
         hotkeys=list(mg.hotkeys),
         validator_permit=[bool(p) for p in getattr(mg, "validator_permit", [])],
+        last_update=[int(value) for value in getattr(mg, "last_update", [])],
     )
 
 
@@ -248,6 +414,12 @@ def _finalized_head(subtensor) -> tuple[int, str]:
     if _block_hash(subtensor, block) != head_hash:
         raise ChainRevealHistoryError("finalized height/hash pair is inconsistent")
     return block, head_hash
+
+
+def read_finalized_head(subtensor) -> tuple[int, str]:
+    """Return the exact current finalized height/hash for control-plane leases."""
+
+    return _finalized_head(subtensor)
 
 
 def _unwrap(value: object) -> object:
@@ -538,11 +710,11 @@ def read_revealed_commitments(subtensor, netuid: int) -> dict[str, RevealedCommi
 def set_weights(subtensor, wallet, netuid: int, weights_by_hotkey: dict[str, float], *,
                 version_key: int = WEIGHTS_VERSION_KEY, dry_run: bool = False,
                 wait_for_inclusion: bool = True, wait_for_finalization: bool = False) -> dict:
-    """Push the king-of-the-hill weights on-chain.
+    """Submit one already-authorized global weight projection on-chain.
 
     ``dry_run=True`` builds the ``(uids, weights)`` payload from the live metagraph and
     logs it WITHOUT signing or submitting — so the payload can be eyeballed before going
-    live. Returns a structured result either way (never raises on an empty champion).
+    live. The control-plane publication state machine owns intent and readback.
     """
     mg = fetch_metagraph(subtensor, netuid)
     uids, weights = weights_to_uid_vector(weights_by_hotkey, mg)

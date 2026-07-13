@@ -1,6 +1,11 @@
-"""Commit-reveal + king-of-the-hill scoring — the anti-copy mechanism.
+"""Development-only commit/reveal and historical JSON-ledger simulation.
 
-The problem in any open competition where submissions are evaluated in the open:
+Production validators use native finalized chain reveals, ``FinalizedIntakeStore``,
+and transactional settlement. Nothing in this module is accepted as crown or weight
+authority. The compatibility surface remains for local examples and migration tests;
+it deliberately has no chain-publication API.
+
+The historical problem in any open competition where submissions are evaluated in the open:
 a lazy miner copies the current leader's submission (it's just code shipped to
 the validator) and resubmits it, splitting reward for no work. Two mechanisms
 defeat that here:
@@ -22,10 +27,9 @@ defeat that here:
    measurement noise). A copy ties the champion — it never clears the margin — so
    it earns zero. The only way to earn is to genuinely beat the best.
 
-This module is pure-Python and persists to a JSON ledger so it can be tested and
-reasoned about without a GPU. In a real Bittensor subnet the commitments live
-on-chain, the bundles are fetched from a content-addressed store, and ``hotkey``
-is the miner's SS58 address; the semantics here are the same.
+This module is pure Python and persists to a JSON ledger solely for deterministic
+simulation. Its state is not production-equivalent and must never be projected to
+on-chain weights.
 """
 
 from __future__ import annotations
@@ -43,6 +47,7 @@ logger = logging.getLogger("optima.ledger")
 
 # Bump when the on-disk ledger format changes in a way older code cannot read.
 SCHEMA_VERSION = 1
+LEGACY_DEVELOPMENT_ONLY = True
 
 
 def make_commitment(content_hash: str, hotkey: str, salt: str) -> str:

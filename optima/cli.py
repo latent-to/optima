@@ -78,27 +78,79 @@ def cmd_chain_compat(_: argparse.Namespace) -> int:
 
 def cmd_set_weights(args: argparse.Namespace) -> int:
     from optima import chain
-    from optima.commit_reveal import Ledger
+    from optima.chain.intake import (
+        FinalizedIntakeStore,
+        IntakeScope,
+        SQLiteWeightPublicationJournal,
+    )
+    from optima.chain.weights import (
+        reconcile_weight_publication,
+        release_weight_publication_hold,
+    )
+    from optima.economics import (
+        EmissionsPolicyManifest,
+        GlobalRewardProjectionContext,
+        MetagraphMember,
+    )
+    from optima.target_catalog import default_target_catalog
 
-    led = Ledger.load(args.ledger)
-    # THE emission-policy seam: the ledger says who earns what; this command only
-    # relays it. (Never re-derive winner-take-all here — see Ledger.current_weights.)
-    weights = led.current_weights(per_slot=args.per_slot)
-    if not weights:
-        print(f"no champion(s) in {args.ledger}; nothing to weight")
-        return 1
     subtensor = chain.connect(args.network)
-    if args.dry_run:
-        res = chain.set_weights(subtensor, None, args.netuid, weights, dry_run=True)
-        print(f"DRY RUN (network={args.network}, netuid={args.netuid}): "
-              f"would set uids={res['uids']} weights={res['weights']}")
-        return 0
     import bittensor as bt
 
     wallet = bt.Wallet(name=args.wallet, hotkey=args.hotkey)
-    res = chain.set_weights(subtensor, wallet, args.netuid, weights)
-    print(f"set_weights submitted={res.get('submitted')} uids={res.get('uids')}")
-    return 0 if res.get("submitted") else 1
+    validator_hotkey = wallet.hotkey.ss58_address
+    scope = IntakeScope(str(subtensor.get_block_hash(0)).lower(), args.netuid)
+    metagraph = chain.fetch_metagraph(subtensor, args.netuid)
+    context = GlobalRewardProjectionContext(
+        scope.digest,
+        validator_hotkey,
+        metagraph.block,
+        metagraph.block_hash.lower(),
+        tuple(
+            MetagraphMember(uid, hotkey)
+            for uid, hotkey in zip(metagraph.uids, metagraph.hotkeys, strict=True)
+        ),
+    )
+    policy = EmissionsPolicyManifest(
+        args.half_life_blocks,
+        args.discovery_lifetime_blocks,
+        args.discovery_pool_ppm,
+    )
+    catalog = default_target_catalog()
+    with FinalizedIntakeStore(args.intake_db, scope=scope) as store:
+        states = store.evaluation_stacks()
+        catalogs = {state.arena_digest: catalog for state in states}
+        projection = store.build_weight_projection(
+            policy=policy,
+            context=context,
+            catalogs=catalogs,
+            netuid=args.netuid,
+        )
+        journal = SQLiteWeightPublicationJournal(store, projection)
+        if args.release_hold:
+            if args.dry_run:
+                raise SystemExit("--release-hold cannot be combined with --dry-run")
+            released = release_weight_publication_hold(
+                journal, reason=args.release_hold
+            )
+            print(
+                f"released held weight publication {released.projection_digest}; "
+                "run set-weights again to refresh and reconcile"
+            )
+            return 0
+        result = reconcile_weight_publication(
+            subtensor,
+            None if args.dry_run else wallet,
+            projection,
+            journal,
+            refresh_blocks=args.refresh_blocks,
+            dry_run=args.dry_run,
+        )
+    print(
+        f"weight projection={projection.digest} status={result.status} "
+        f"chain_matches={result.chain_matches} submitted={result.submitted}"
+    )
+    return 0 if result.status in {"dry_run", "confirmed", "pending"} else 2
 
 
 def cmd_chain_package(args: argparse.Namespace) -> int:
@@ -770,6 +822,11 @@ def cmd_settle(args: argparse.Namespace) -> int:
     from optima.commit_reveal import Ledger
     from optima.compat import PINNED_SGLANG
 
+    if not args.development_only:
+        raise SystemExit(
+            "legacy JSON settlement is development-only; production settlement is "
+            "transactional inside chain-validate"
+        )
     led = Ledger.load(args.ledger)
     if getattr(args, "per_slot", False):
         res = led.settle_per_slot(args.round, margin=args.margin, current_sglang_version=PINNED_SGLANG)
@@ -807,8 +864,8 @@ def build_parser() -> argparse.ArgumentParser:
             "  develop a kernel (miner) ... slots, scan, verify, evaluate, bench\n"
             "  submit on-chain (miner) .... hash, chain-register, chain-package,\n"
             "                               chain-submit, chain-status\n"
-            "  referee + settlement ....... chain-validate, settle, ledger, set-weights,\n"
-            "                               commit, reveal (local-ledger simulation)\n"
+            "  referee + settlement ....... chain-validate, set-weights\n"
+            "  local simulation ........... commit, reveal, ledger, legacy-settle\n"
             "  environment checks ......... compat, chain-compat\n"
             "\n"
             "New to Optima? Start with docs/MINER_GUIDE.md."
@@ -827,17 +884,26 @@ def build_parser() -> argparse.ArgumentParser:
                         help="check the installed bittensor SDK exposes the chain API we use")
     sp.set_defaults(func=cmd_chain_compat)
 
-    sp = sub.add_parser("set-weights",
-                        help="push the ledger champion's weights on-chain (king of the hill)")
-    sp.add_argument("--ledger", default="optima_ledger.json")
+    sp = sub.add_parser(
+        "set-weights",
+        help="control-plane reconcile of the transactional global reward projection",
+    )
+    sp.add_argument("--intake-db", default="chain_intake/intake.sqlite3")
     sp.add_argument("--netuid", type=int, required=True)
     sp.add_argument("--network", default="finney",
                     help="named network or an explicit wss:// endpoint URL")
     sp.add_argument("--wallet", default="default")
     sp.add_argument("--hotkey", default="default")
-    sp.add_argument("--per-slot", action="store_true",
-                    help="weights from the per-slot championships (emission split), "
-                         "matching settle --per-slot")
+    sp.add_argument("--half-life-blocks", type=int, required=True)
+    sp.add_argument("--discovery-lifetime-blocks", type=int, required=True)
+    sp.add_argument("--discovery-pool-ppm", type=int, required=True)
+    sp.add_argument("--refresh-blocks", type=int, required=True)
+    sp.add_argument(
+        "--release-hold",
+        default="",
+        metavar="REASON",
+        help="append an audited release of the current held publication; does not submit",
+    )
     sp.add_argument("--dry-run", action="store_true",
                     help="build + print the (uids, weights) payload, do NOT submit")
     sp.set_defaults(func=cmd_set_weights)
@@ -1106,13 +1172,17 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--ledger", default="optima_ledger.json")
     sp.set_defaults(func=cmd_ledger)
 
-    sp = sub.add_parser("settle", help="settle a round: king-of-the-hill + weights")
+    sp = sub.add_parser(
+        "legacy-settle",
+        help="development-only JSON-ledger settlement simulation",
+    )
     sp.add_argument("--round", type=int, default=0)
     sp.add_argument("--margin", type=float, default=0.02)
     sp.add_argument("--ledger", default="optima_ledger.json")
     sp.add_argument("--per-slot", action="store_true",
                     help="per-slot championships (one champion per slot, emission split) — pays "
                          "specialists, vs the winner-take-all default")
+    sp.add_argument("--development-only", action="store_true", required=True)
     sp.set_defaults(func=cmd_settle)
 
     return p

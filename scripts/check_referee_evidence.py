@@ -194,6 +194,39 @@ PR6_FORBIDDEN_MODULES = [
     "optima.eval.capability",
     "optima.eval.throughput_kl",
 ]
+PR7_BASE = "b58259135dcfdbb654bb5de87415e53e36487cc0"
+PR7_PRODUCTION = [
+    "docs/EMISSIONS_POLICY.md",
+    "optima/chain/__init__.py",
+    "optima/chain/intake.py",
+    "optima/chain/validator_loop.py",
+    "optima/chain/weights.py",
+    "optima/cli.py",
+    "optima/commit_reveal.py",
+    "optima/economics.py",
+    "optima/eval/qualification_intake.py",
+    "optima/settlement.py",
+]
+PR7_TESTS = [
+    "tests/test_chain.py",
+    "tests/test_chain_intake.py",
+    "tests/test_chain_validator_loop.py",
+    "tests/test_cli_chain.py",
+    "tests/test_commit_reveal.py",
+    "tests/test_economics.py",
+    "tests/test_qualification_intake.py",
+    "tests/test_settlement.py",
+    "tests/test_weight_publication.py",
+]
+PR7_AUTHORITY_ROOTS = [
+    "optima.chain.intake",
+    "optima.chain.validator_loop",
+    "optima.chain.weights",
+    "optima.economics",
+    "optima.eval.qualification_intake",
+    "optima.settlement",
+]
+PR7_FORBIDDEN_MODULES = PR6_FORBIDDEN_MODULES
 
 
 class EvidenceError(ValueError):
@@ -541,6 +574,26 @@ def validate_contract_document(contract: dict[str, Any], where: str = "contract"
                 {"change": "add", "path": "optima/eval/qualification_intake.py"},
             ],
             "authority": {"forbidden_modules": PR6_FORBIDDEN_MODULES, "roots": PR6_AUTHORITY_ROOTS},
+        },
+        "pr7": {
+            "schema_version": 2,
+            "architectural_unit": "7",
+            "base_commit": PR7_BASE,
+            "budget": {"exemption_policy": "none", "production_additions_max": 4200, "test_additions_max": 3500},
+            "production": PR7_PRODUCTION,
+            "test": PR7_TESTS,
+            "required": [
+                {"change": "modify", "path": "optima/chain/__init__.py"},
+                {"change": "modify", "path": "optima/chain/intake.py"},
+                {"change": "modify", "path": "optima/chain/validator_loop.py"},
+                {"change": "add", "path": "optima/chain/weights.py"},
+                {"change": "modify", "path": "optima/cli.py"},
+                {"change": "modify", "path": "optima/commit_reveal.py"},
+                {"change": "add", "path": "optima/economics.py"},
+                {"change": "modify", "path": "optima/eval/qualification_intake.py"},
+                {"change": "add", "path": "optima/settlement.py"},
+            ],
+            "authority": {"forbidden_modules": PR7_FORBIDDEN_MODULES, "roots": PR7_AUTHORITY_ROOTS},
         },
     }
     spec = specs.get(contract["contract_id"])
@@ -903,7 +956,9 @@ def validate_repository(root: Path, *, records_only: bool = False, pr_base: str 
             raise EvidenceError(f"duplicate scope contract: {contract['contract_id']}")
         contract_ids.add(contract["contract_id"])
         contracts.append((contract_path, contract))
-    if contract_ids != {"pr4a", "pr4b", "pr4c", "pr4d", "pr4e", "pr5", "pr6"}:
+    if contract_ids != {
+        "pr4a", "pr4b", "pr4c", "pr4d", "pr4e", "pr5", "pr6", "pr7"
+    }:
         raise EvidenceError(f"scope contract set differs: {sorted(contract_ids)}")
     if records_only:
         return

@@ -169,7 +169,7 @@ def test_reformatted_later_delta_is_copy_without_any_weight_edge(tmp_path, monke
         assert rows[1].reason.startswith("copy_of:")
 
 
-def test_live_loop_calls_batch_qualification_and_retains_outcome(
+def test_live_loop_calls_batch_qualification_and_retains_fail_outcome(
     tmp_path, monkeypatch
 ):
     source = _bundle(
@@ -202,8 +202,8 @@ def test_live_loop_calls_batch_qualification_and_retains_outcome(
             authority.reservation_digest,
             authority.selected_delta_digest,
             factory.manifest.digest,
-            QualificationDecision.PASS,
-            "qualified",
+            QualificationDecision.FAIL,
+            "rejected",
             False,
             attempt_artifact_sha256="b" * 64,
             report_digest="c" * 64,
@@ -223,11 +223,11 @@ def test_live_loop_calls_batch_qualification_and_retains_outcome(
         qualification_planner=planner,
     )
     assert calls == ["a" * 64]
-    assert set(result.decisions.values()) == {"PASS"}
+    assert set(result.decisions.values()) == {"FAIL"}
     with FinalizedIntakeStore(options["intake_db"], scope=SCOPE) as store:
         row = store.all()[0]
-        assert row.status == "qualified" and row.decision == "PASS"
-        assert store.qualification_dispositions(row.reservation_id)[0]["decision"] == "PASS"
+        assert row.status == "failed" and row.decision == "FAIL"
+        assert store.qualification_dispositions(row.reservation_id)[0]["decision"] == "FAIL"
 
 
 def test_once_mode_propagates_validator_fault(monkeypatch, tmp_path):

@@ -256,6 +256,7 @@ PR8_TESTS = [
     "tests/test_chain_intake.py",
     "tests/test_chain_validator_loop.py",
     "tests/test_cli_chain.py",
+    "tests/test_dep_patches.py",
     "tests/test_engine_tree.py",
     "tests/test_model_provision.py",
     "tests/test_qualification_intake.py",

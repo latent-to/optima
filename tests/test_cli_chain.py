@@ -9,7 +9,7 @@ import optima.cli as cli
 
 def test_chain_validate_refuses_implicit_fake_grading(monkeypatch):
     args = argparse.Namespace(intake_only=False)
-    with pytest.raises(SystemExit, match="requires --intake-only"):
+    with pytest.raises(SystemExit, match="requires --intake-only or"):
         cli.cmd_chain_validate(args)
 
 
@@ -29,6 +29,7 @@ def test_chain_validate_intake_path_has_no_wallet_or_weight_arguments():
         for option in action.option_strings
     }
     assert "--intake-only" in options
+    assert "--arena-id" in options
     assert not {
         "--eval-cmd", "--eval-device", "--eval-timeout", "--margin",
         "--wallet", "--hotkey", "--dry-run-weights",

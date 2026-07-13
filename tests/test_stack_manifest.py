@@ -8,6 +8,7 @@ from dataclasses import replace
 
 import pytest
 
+from optima.eval.evidence_store import EvidenceArtifactRef
 from optima.stack_identity import (
     StackIdentityError,
     canonical_digest,
@@ -20,6 +21,8 @@ from optima.stack_manifest import (
     EvaluationStackContext,
     EvaluationStackManifest,
     IntegratedContributionRef,
+    IntegrationReviewArtifacts,
+    IntegrationReviewRecord,
     ProposalContributionRef,
     ReleaseStackContext,
     StackManifestError,
@@ -30,6 +33,12 @@ from optima.stack_manifest import (
 
 def _d(char: str) -> str:
     return char * 64
+
+
+def _evidence(domain: str, digest: str) -> EvidenceArtifactRef:
+    return EvidenceArtifactRef(
+        domain, digest, 1, "application/json", f"optima.{domain}.v1"
+    )
 
 
 TARGET_A = "attention.msa_prefill_block_score"
@@ -368,6 +377,73 @@ def test_release_is_integrated_only_round_trips_and_has_no_arena() -> None:
             catalog_snapshot=snapshot,
             catalog_digest=_catalog_digest(snapshot),
             entries={TARGET_A: _proposal()},  # type: ignore[dict-item]
+        )
+
+
+def test_integration_review_is_exact_reproduced_and_authorizes_one_ref() -> None:
+    record = IntegrationReviewRecord(
+        target_id=TARGET_B,
+        target_spec_digest=SPEC_B,
+        proposal_contribution_digest=_d("1"),
+        settlement_candidate_digest=_d("e"),
+        settlement_evidence_digest=_d("f"),
+        crown_event_digest=_d("2"),
+        primary_attempt_digest=_d("3"),
+        reproduction_attempt_digest=_d("4"),
+        integrated_source_tree_digest=_d("5"),
+        selected_payload_digest=_d("6"),
+        attribution_digest=_d("7"),
+        license_evidence_digest=_d("8"),
+        provenance_evidence_digest=_d("9"),
+        security_review_digest=_d("a"),
+        compatibility_evidence_digest=_d("b"),
+        test_evidence_digest=_d("c"),
+        artifacts=IntegrationReviewArtifacts(
+            _evidence("qualification.cohort-attempt", _d("3")),
+            _evidence("qualification.cohort-attempt", _d("4")),
+            _evidence("integration.license", _d("8")),
+            _evidence("integration.provenance", _d("9")),
+            _evidence("integration.security-review", _d("a")),
+            _evidence("integration.compatibility", _d("b")),
+            _evidence("integration.tests", _d("c")),
+        ),
+        reviewer="release-reviewer",
+        review_commit="d" * 40,
+    )
+    ref = record.integrated_ref()
+    assert IntegrationReviewRecord.from_dict(record.to_dict()) == record
+    assert ref.integration_record_digest == record.digest
+    record.require_ref(ref)
+    with pytest.raises(StackManifestError, match="wrong domain/schema"):
+        replace(
+            record.artifacts,
+            license_evidence_ref=_evidence("integration.tests", _d("f")),
+        )
+    with pytest.raises(StackManifestError, match="pairwise distinct"):
+        replace(
+            record.artifacts,
+            test_evidence_ref=_evidence(
+                "integration.tests",
+                record.artifacts.license_evidence_ref.sha256,
+            ),
+        )
+
+    snapshot = _catalog()
+    release = EngineReleaseManifest(
+        runtime_digest=_d("d"),
+        base_engine_digest=_d("e"),
+        catalog_snapshot=snapshot,
+        catalog_digest=_catalog_digest(snapshot),
+        entries={TARGET_B: ref},
+    )
+    release.validate_integrations({TARGET_B: record})
+    with pytest.raises(StackManifestError, match="coverage"):
+        release.validate_integrations({})
+    with pytest.raises(StackManifestError, match="independent attempts"):
+        replace(record, reproduction_attempt_digest=record.primary_attempt_digest)
+    with pytest.raises(StackManifestError, match="differs"):
+        release.validate_integrations(
+            {TARGET_B: replace(record, security_review_digest=_d("f"))}
         )
     hostile = release.to_dict()
     hostile["entries"] = {TARGET_A: _proposal().to_dict()}

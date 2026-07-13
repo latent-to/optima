@@ -49,6 +49,17 @@ _REBUILD_ORDER = {
 _SKIP_DIRS = frozenset({".git", "__pycache__"})
 _SKIP_SUFFIXES = frozenset({".pyc", ".pyo"})
 _SAFE_NAME_RE = re.compile(r"[^0-9A-Za-z_]+")
+# CuTe DSL carve-out for the dynamic-import policy below. A CuTe kernel's ONLY
+# public compile entrypoint is ``cute.compile(<@cute.jit callable>, ...)`` — it
+# traces a decorated function OBJECT defined in the (already-scanned) bundle
+# source; there is no string-to-code path, so the inspectability property the
+# ``compile`` ban protects is preserved. The attribute-call ban therefore admits
+# ``X.compile(...)`` iff X is bound EXACTLY ONCE in the whole module, by a plain
+# import alias of one of these modules, and that module does not resolve inside
+# the contribution tree (a vendored ``cutlass/`` withdraws the admission). Any
+# other binding of X anywhere in the file — assignment, parameter, def/class,
+# for/with/except target, del, a second import — withdraws it too: fail closed.
+_DSL_COMPILE_MODULES = frozenset({"cutlass.cute"})
 _INCLUDE_RE = re.compile(rb"(?m)^[ \t]*#[ \t]*include\b[ \t]*(.*)$")
 _UNSUPPORTED_INCLUDE_RE = re.compile(
     rb"(?m)^[ \t]*(?:#[ \t]*include_next\b|%:[ \t]*include(?:_next)?\b)"
@@ -449,6 +460,70 @@ def _validate_cuda_closure(root: Path, cuda_files: tuple[str, ...]) -> None:
                 )
 
 
+def _dsl_compile_receivers(root: Path, tree: ast.Module) -> frozenset[str]:
+    """Names admitted as ``X.compile(...)`` receivers (see _DSL_COMPILE_MODULES).
+
+    Conservative whole-module binding analysis: a name qualifies only when its
+    single binding in the entire file is a plain, absolute import alias of an
+    allowlisted DSL module that does not resolve contribution-locally. Every
+    binding construct counts (including declarations), so any shadowing or
+    rebinding anywhere — even in an unrelated scope — withdraws the admission.
+    """
+
+    bound_counts: dict[str, int] = {}
+    dsl_aliases: dict[str, str] = {}
+
+    def _bind(name: str) -> None:
+        bound_counts[name] = bound_counts.get(name, 0) + 1
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name):
+            if isinstance(node.ctx, (ast.Store, ast.Del)):
+                _bind(node.id)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            _bind(node.name)
+        elif isinstance(node, ast.arg):
+            _bind(node.arg)
+        elif isinstance(node, ast.ExceptHandler):
+            if node.name:
+                _bind(node.name)
+        elif isinstance(node, (ast.Global, ast.Nonlocal)):
+            for name in node.names:
+                _bind(name)
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                _bind(alias.asname or alias.name.split(".", 1)[0])
+                if alias.asname and alias.name in _DSL_COMPILE_MODULES:
+                    dsl_aliases[alias.asname] = alias.name
+        elif isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                bound = alias.asname or alias.name
+                _bind(bound)
+                dotted = f"{node.module}.{alias.name}" if node.module else alias.name
+                if node.level == 0 and dotted in _DSL_COMPILE_MODULES:
+                    dsl_aliases[bound] = dotted
+        elif isinstance(node, (ast.MatchAs, ast.MatchStar)):
+            if node.name:
+                _bind(node.name)
+        elif isinstance(node, ast.MatchMapping):
+            if node.rest:
+                _bind(node.rest)
+
+    admitted: set[str] = set()
+    for name, dotted in dsl_aliases.items():
+        if bound_counts.get(name, 0) != 1:
+            continue
+        parts = tuple(dotted.split("."))
+        if any(
+            _existing_module(root, parts[:end]) is not None
+            or _local_namespace(root, parts[:end])
+            for end in range(1, len(parts) + 1)
+        ):
+            continue
+        admitted.add(name)
+    return frozenset(admitted)
+
+
 def _parse_python(root: Path, relative: str) -> tuple[bytes, ast.Module]:
     raw = _stable_read(root, relative)
     try:
@@ -459,6 +534,7 @@ def _parse_python(root: Path, relative: str) -> tuple[bytes, ast.Module]:
         tree = ast.parse(text, filename=relative, type_comments=True)
     except SyntaxError as exc:
         raise EngineTreeError(f"python source {relative!r} does not parse: {exc}") from exc
+    dsl_compile_receivers = _dsl_compile_receivers(root, tree)
     for node in ast.walk(tree):
         if isinstance(node, ast.Name) and node.id in {
             "__import__",
@@ -467,7 +543,13 @@ def _parse_python(root: Path, relative: str) -> tuple[bytes, ast.Module]:
             "exec",
         }:
             raise EngineTreeError(f"dynamic import is unsupported in {relative!r}")
-        if isinstance(node, ast.alias) and node.name in {"__import__", "import_module"}:
+        if isinstance(node, ast.alias) and node.name in {
+            "__import__",
+            "import_module",
+            # ``import builtins`` (or aliasing it) reaches ``builtins.compile``/
+            # ``builtins.eval`` as plain attributes, bypassing the bare-name bans.
+            "builtins",
+        }:
             raise EngineTreeError(f"dynamic import is unsupported in {relative!r}")
         if isinstance(node, ast.Constant) and node.value in {"__import__", "import_module"}:
             raise EngineTreeError(f"dynamic import is unsupported in {relative!r}")
@@ -490,6 +572,12 @@ def _parse_python(root: Path, relative: str) -> tuple[bytes, ast.Module]:
                 "exec_module",
                 "spec_from_file_location",
             }:
+                if (
+                    node.func.attr == "compile"
+                    and isinstance(node.func.value, ast.Name)
+                    and node.func.value.id in dsl_compile_receivers
+                ):
+                    continue  # admitted DSL compile (see _DSL_COMPILE_MODULES)
                 raise EngineTreeError(f"dynamic import is unsupported in {relative!r}")
     return raw, tree
 

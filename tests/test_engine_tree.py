@@ -1058,6 +1058,89 @@ def test_dynamic_imports_fail_closed(tmp_path: Path, source_text: str) -> None:
         inspect_contribution(source, catalog=default_target_catalog())
 
 
+@pytest.mark.parametrize(
+    "source_text",
+    [
+        # The CuTe DSL compile idiom: a single import-alias binding of
+        # cutlass.cute + a compile call on that module alias.
+        "import cutlass.cute as cute\n\n"
+        "def blockscore(q, k, out):\n"
+        "    kernel = cute.compile(blockscore, q, k, out)\n"
+        "    out.copy_(q @ k.transpose(-1, -2))\n",
+        "from cutlass import cute\n\n"
+        "def blockscore(q, k, out):\n"
+        "    kernel = cute.compile(blockscore)\n"
+        "    out.copy_(q @ k.transpose(-1, -2))\n",
+    ],
+)
+def test_cute_dsl_compile_alias_is_admitted(tmp_path: Path, source_text: str) -> None:
+    source = tmp_path / "source"
+    shutil.copytree(MSA, source)
+    (source / "kernels" / "blockscore.py").write_text(source_text)
+    inspected = inspect_contribution(source, catalog=default_target_catalog())
+    assert "kernels/blockscore.py" in inspected.python_files
+
+
+@pytest.mark.parametrize(
+    "source_text",
+    [
+        # rebinding the alias anywhere withdraws the admission
+        "import cutlass.cute as cute\n"
+        "cute = cute\n\n"
+        "def blockscore(q, k, out):\n"
+        "    return cute.compile(blockscore)\n",
+        # so does shadowing it via a parameter in any scope
+        "import cutlass.cute as cute\n\n"
+        "def blockscore(q, k, out, cute=None):\n"
+        "    return cute.compile(blockscore)\n",
+        # a second import binding the same name
+        "import cutlass.cute as cute\n"
+        "import types as cute\n\n"
+        "def blockscore(q, k, out):\n"
+        "    return cute.compile(blockscore)\n",
+        # a non-allowlisted module behind the alias
+        "import types as cute\n\n"
+        "def blockscore(q, k, out):\n"
+        "    return cute.compile(blockscore)\n",
+        # .compile on anything that is not the allowlisted module alias
+        "def blockscore(q, k, out):\n"
+        "    gemm = object()\n"
+        "    return gemm.compile(q)\n",
+        # builtins reached as a module: builtins.compile is a plain attribute
+        "import builtins\n\n"
+        "def blockscore(q, k, out):\n"
+        "    f = builtins.compile\n"
+        "    return f\n",
+    ],
+)
+def test_cute_dsl_compile_admission_fails_closed(
+    tmp_path: Path, source_text: str
+) -> None:
+    source = tmp_path / "source"
+    shutil.copytree(MSA, source)
+    (source / "kernels" / "blockscore.py").write_text(source_text)
+    with pytest.raises(EngineTreeError, match="dynamic import"):
+        inspect_contribution(source, catalog=default_target_catalog())
+
+
+def test_cute_dsl_compile_vendored_local_module_fails_closed(tmp_path: Path) -> None:
+    # A bundle-local ``cutlass/`` package must withdraw the carve-out: the
+    # admitted receiver has to be the EXTERNAL pinned DSL, never bundle code.
+    source = tmp_path / "source"
+    shutil.copytree(MSA, source)
+    vendored = source / "cutlass"
+    vendored.mkdir()
+    (vendored / "__init__.py").write_text("VALUE = 1\n")
+    (vendored / "cute.py").write_text("VALUE = 2\n")
+    (source / "kernels" / "blockscore.py").write_text(
+        "import cutlass.cute as cute\n\n"
+        "def blockscore(q, k, out):\n"
+        "    return cute.compile(blockscore)\n"
+    )
+    with pytest.raises(EngineTreeError, match="dynamic import"):
+        inspect_contribution(source, catalog=default_target_catalog())
+
+
 def test_package_imports_are_closed_rewritten_and_executable(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

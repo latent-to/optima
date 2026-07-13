@@ -95,19 +95,31 @@ def mark_driver() -> None:
     _IS_DRIVER = True
 
 
-# Bundle is loaded once per process even though activate() may run twice (once
-# per watched module: activation, then layernorm).
+# Bundle is loaded once per process even though activate() may run many times
+# (once per watched module import) and load_candidate_bundle() is re-entrant.
 _bundle_loaded = False
 
 
 def activate() -> None:
-    """Install all seams; load + enable the bundle iff this process is active.
+    """Install all seams; ARM (but never load) the bundle in active processes.
 
     Called by the bootstrap post-import hook after ANY seamed module loads. Each
     install no-ops until its module is present, so calling activate repeatedly patches
     whatever is available each time. The adapter list comes from the single seam table
     (optima/seams.py) — the same table the bootstrap watch-list and the compat canary
     use, so there is no parallel list to keep in sync.
+
+    Miner code is NEVER imported here. Watched modules are imported by
+    non-execution engine children too — sglang's spawned detokenizer transitively
+    imports parallel_state and five other watched modules (measured on the
+    B300 worker image, 2026-07-13) — and miner module-level code in an
+    output-path process is the output-substitution surface (a bundle could
+    patch detokenization and spoof benchmark-accuracy text downstream of the
+    sampler). The load happens only in load_candidate_bundle(), invoked by the
+    scheduler_gate adapter at run_scheduler_process entry: positive
+    scheduler-role identification, before the Scheduler/ModelRunner exist. The
+    engine-side active-member coverage gate then counts exactly the scheduler
+    ranks (tp_size), and any extra armed process is a refusal.
     """
     release_required = _truthy(os.environ.get("OPTIMA_RELEASE_REQUIRED"))
     if not _IS_DRIVER:
@@ -115,6 +127,31 @@ def activate() -> None:
         if release_required and not namespace_installed:
             _release_abort("materialized namespace did not reopen")
 
+    from optima.registry import REGISTRY
+
+    _install_adapters(release_required)
+
+    if _IS_DRIVER:
+        # Timing process: seams installed (pass-through) but we never load the
+        # miner module here, so the timer is out of the miner's reach.
+        REGISTRY.disable()
+        return
+
+    if _bundle_loaded:
+        # A watched module imported after the scheduler-entry load (lazy model
+        # imports): adapters were (re)installed above; keep the registry live.
+        return
+
+    bundle = os.environ.get("OPTIMA_BUNDLE_PATH", "").strip()
+    if not bundle or not _truthy(os.environ.get("OPTIMA_ACTIVE")):
+        if release_required:
+            _release_abort("candidate activation was not armed")
+    # Armed or baseline: stay pass-through until (unless) this process proves it
+    # is a scheduler execution rank via load_candidate_bundle().
+    REGISTRY.disable()
+
+
+def _install_adapters(release_required: bool) -> None:
     from optima.registry import REGISTRY
     from optima.seams import SEAM_ADAPTERS
 
@@ -127,15 +164,19 @@ def activate() -> None:
             if release_required:
                 _release_abort(f"seam {adapter.name} did not install")
 
-    if _IS_DRIVER:
-        # Timing process: seams installed (pass-through) but we never load the
-        # miner module here, so the timer is out of the miner's reach.
-        REGISTRY.disable()
+
+def load_candidate_bundle() -> None:
+    """Load + enable the vetted bundle in THIS process; scheduler ranks only.
+
+    The single caller is the scheduler_gate seam (optima/integrations/
+    sglang_scheduler_gate.py) wrapping run_scheduler_process entry. Idempotent;
+    a no-op in the driver, in baseline processes, and once loaded.
+    """
+    release_required = _truthy(os.environ.get("OPTIMA_RELEASE_REQUIRED"))
+    if _IS_DRIVER or _bundle_loaded:
         return
 
-    global _bundle_loaded
-    if _bundle_loaded:
-        return
+    from optima.registry import REGISTRY
 
     bundle = os.environ.get("OPTIMA_BUNDLE_PATH", "").strip()
     if not bundle or not _truthy(os.environ.get("OPTIMA_ACTIVE")):
@@ -144,6 +185,11 @@ def activate() -> None:
         REGISTRY.disable()
         return
 
+    _load_candidate_bundle_locked(bundle, REGISTRY, release_required)
+
+
+def _load_candidate_bundle_locked(bundle, REGISTRY, release_required: bool) -> None:
+    global _bundle_loaded
     try:
         _load_bundle_into_registry(bundle)
         REGISTRY.enable()
@@ -166,6 +212,11 @@ def activate() -> None:
             receipts.write("load_failed", {"bundle": bundle, "reason": "no slots registered"})
             if release_required:
                 _release_abort("bundle registered no slots")
+        # Registry-conditional adapters (defer_gate/moe_export install only once
+        # the deep slot is registered) saw an empty registry on every pre-load
+        # activate() pass. Retry them NOW rather than hoping a later watched
+        # module import re-triggers activate() after this load.
+        _install_adapters(release_required)
     except Exception:  # noqa: BLE001 - a bad bundle must not wedge the engine
         logger.exception("optima: bundle load failed for %s", bundle)
         from optima import receipts

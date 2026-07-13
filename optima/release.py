@@ -1679,6 +1679,9 @@ def container_context(
         raise ReleaseError("container context destination already exists")
     dest.mkdir(parents=True)
     shutil.copytree(reopened.root, dest / "release", copy_function=shutil.copyfile)
+    # This is the Ed25519 public verification key; private signing material never
+    # enters the container context.
+    # codeql[py/clear-text-storage-sensitive-data]
     (dest / "trusted-release-key").write_text(trusted_key + "\n", encoding="ascii")
     shutil.copyfile(
         reopened.root / "artifacts" / reopened.descriptor.seccomp.name,
@@ -1689,6 +1692,8 @@ def container_context(
         expected_upstream_revision=reopened.descriptor.upstream_revision,
     )
     (dest / "deployment.json").write_bytes(
+        # The deployment policy intentionally carries the same public verifier.
+        # codeql[py/clear-text-storage-sensitive-data]
         canonical_json_bytes(
             _container_deployment(reopened, trusted_key, overlay_digest)
         )

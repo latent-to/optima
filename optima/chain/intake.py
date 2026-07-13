@@ -1740,14 +1740,7 @@ class FinalizedIntakeStore:
             or netuid < 0
         ):
             raise IntakeError("weight projection authority is malformed")
-        self._bind_emissions_policy(policy.digest)
         standing, discovery = self.active_reward_claims()
-        for claim in standing:
-            self._reopen_claim_evidence(claim.retained_evidence_digest, "crowned")
-        for claim in discovery:
-            self._reopen_claim_evidence(
-                claim.retained_evidence_digest, "discovery_bounty"
-            )
         by_arena: dict[str, list[object]] = {}
         for claim in standing:
             by_arena.setdefault(claim.arena_digest, []).append(claim)
@@ -1756,6 +1749,12 @@ class FinalizedIntakeStore:
             raise IntakeError("active reward claim belongs to an absent evaluation arena")
         if set(catalogs) != {row.arena_digest for row in states}:
             raise IntakeError("reward catalogs do not cover every evaluation arena")
+        for claim in standing:
+            self._reopen_claim_evidence(claim.retained_evidence_digest, "crowned")
+        for claim in discovery:
+            self._reopen_claim_evidence(
+                claim.retained_evidence_digest, "discovery_bounty"
+            )
         authorities = []
         for state in states:
             catalog = catalogs[state.arena_digest]
@@ -1772,6 +1771,7 @@ class FinalizedIntakeStore:
         projection = project_global_rewards(
             policy, context, tuple(authorities), discovery
         )
+        self._bind_emissions_policy(policy.digest)
         evidence = tuple(
             sorted(
                 {

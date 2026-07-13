@@ -50,7 +50,8 @@ metagraph membership have been bound into one projection.
 
 Only the control-plane signer may publish a projection. It refreshes chain authority
 immediately before reconciliation and again after submission. Publication is journaled
-as `intent`, `pending`, `held`, or `confirmed`; an SDK return value alone never confirms
-weights. A real extrinsic requires at least one genuine current-schema crown. Dry runs
-may exercise projection and reconciliation but cannot create publication intent.
-
+as `intent`, `pending`, `held`, `released`, or `confirmed`; an SDK return value alone
+never confirms weights. A held publication requires an explicit audited release event
+before another intent. A real extrinsic requires at least one genuine current-schema
+crown. Dry runs may exercise projection and reconciliation but cannot create publication
+intent.

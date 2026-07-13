@@ -403,6 +403,12 @@ def _finalized_head(subtensor) -> tuple[int, str]:
     return block, head_hash
 
 
+def read_finalized_head(subtensor) -> tuple[int, str]:
+    """Return the exact current finalized height/hash for control-plane leases."""
+
+    return _finalized_head(subtensor)
+
+
 def _unwrap(value: object) -> object:
     seen: set[int] = set()
     while not isinstance(value, (str, bytes, bytearray, dict, list, tuple, int)):

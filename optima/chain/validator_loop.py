@@ -253,6 +253,7 @@ def _settle_pending(
     store: FinalizedIntakeStore,
     *,
     current_block: int,
+    finalized_block_provider: Callable[[], int],
 ) -> dict[str, str]:
     """Settle every causally ready retained PASS without chain or wallet access."""
 
@@ -274,11 +275,14 @@ def _settle_pending(
             store.reopen_settlement_evidence(candidate)
             for candidate in lease.candidates
         )
+        refreshed_block = finalized_block_provider()
+        if type(refreshed_block) is not int or refreshed_block < current_block:
+            raise IntakeControllerError("finalized settlement clock regressed")
         store.commit_settlement(
             lease,
             plan,
             evidence,
-            current_block=current_block,
+            current_block=refreshed_block,
         )
         committed[lease.lease_id] = plan.digest
 
@@ -391,7 +395,11 @@ def run_pass(
                     for row in batch.outcomes
                 )
             result.settlements.update(
-                _settle_pending(store, current_block=snapshot.finalized_block)
+                _settle_pending(
+                    store,
+                    current_block=snapshot.finalized_block,
+                    finalized_block_provider=lambda: chain.read_finalized_head(subtensor)[0],
+                )
             )
         result.rejected.update(
             (row.reservation_id, row.reason)

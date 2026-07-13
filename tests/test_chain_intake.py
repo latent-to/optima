@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import json
 
 import pytest
 
@@ -21,6 +22,7 @@ from optima.economics import (
     EmissionsPolicyManifest,
     GlobalRewardProjectionContext,
     MetagraphMember,
+    StandingRewardClaim,
 )
 from optima.settlement import SettlementCandidate, plan_settlement
 from optima.stack_identity import sha256_hex
@@ -630,14 +632,65 @@ def test_weight_projection_reopens_every_active_crown_and_holds_on_loss(tmp_path
             "0x" + f"{12:064x}",
             (MetagraphMember(0, "validator"), MetagraphMember(1, "miner")),
         )
+        policy = EmissionsPolicyManifest(100, 20, 100_000)
+        with pytest.raises(IntakeError, match="catalogs"):
+            store.build_weight_projection(
+                policy=policy,
+                context=context,
+                catalogs={},
+                netuid=SCOPE.netuid,
+            )
+        assert store._db.execute(
+            "SELECT value FROM metadata WHERE key='emissions_policy_digest'"
+        ).fetchone() is None
         projection = store.build_weight_projection(
-            policy=EmissionsPolicyManifest(100, 20, 100_000),
+            policy=policy,
             context=context,
             catalogs={candidate.arena_digest: catalog},
             netuid=SCOPE.netuid,
         )
         assert projection.crown_count == 1
         assert projection.weights_ppm == (("miner", 1_000_000),)
+        standing = store.active_reward_claims()[0][0]
+        orphan = StandingRewardClaim(
+            _h("orphan-arena"),
+            standing.target_id,
+            standing.target_spec_digest,
+            standing.contribution_digest,
+            standing.hotkey,
+            standing.speedup_ppm,
+            standing.crowned_block,
+            standing.retained_evidence_digest,
+        )
+        store._db.execute(
+            "INSERT INTO standing_reward_claims(arena_id,target_id,claim_digest,"
+            "claim_json,status,event_id) VALUES(?,?,?,?, 'active',?)",
+            (
+                orphan.arena_digest,
+                orphan.target_id,
+                orphan.digest,
+                json.dumps(orphan.to_dict(), separators=(",", ":"), sort_keys=True),
+                _h("orphan-event"),
+            ),
+        )
+        with pytest.raises(IntakeError, match="absent evaluation arena"):
+            store.build_weight_projection(
+                policy=policy,
+                context=context,
+                catalogs={candidate.arena_digest: catalog},
+                netuid=SCOPE.netuid,
+            )
+        store._db.execute(
+            "DELETE FROM standing_reward_claims WHERE arena_id=?",
+            (orphan.arena_digest,),
+        )
+        with pytest.raises(IntakeError, match="emissions policy"):
+            store.build_weight_projection(
+                policy=EmissionsPolicyManifest(101, 20, 100_000),
+                context=context,
+                catalogs={candidate.arena_digest: catalog},
+                netuid=SCOPE.netuid,
+            )
 
         artifact = (
             store.path.parent
@@ -649,7 +702,7 @@ def test_weight_projection_reopens_every_active_crown_and_holds_on_loss(tmp_path
         artifact.unlink()
         with pytest.raises(IntakeError, match="cannot reopen"):
             store.build_weight_projection(
-                policy=EmissionsPolicyManifest(100, 20, 100_000),
+                policy=policy,
                 context=context,
                 catalogs={candidate.arena_digest: catalog},
                 netuid=SCOPE.netuid,

@@ -51,7 +51,11 @@ from optima.release import (
     verify_release_signature,
     verify_serve_receipts,
 )
-from optima.release_runtime import ReleaseRuntimeError, verify_serving_release
+from optima.release_runtime import (
+    ReleaseRuntimeError,
+    _closed_serving_environment,
+    verify_serving_release,
+)
 from optima.stack_identity import canonical_json_bytes
 from optima.stack_manifest import (
     EngineReleaseManifest,
@@ -329,7 +333,7 @@ def test_signed_release_reopens_native_model_and_chain_free_context(tmp_path: Pa
         release_root=reopened.root,
         expected_public_key=signature.public_key,
         model_root=model_root,
-        command=("python", "-m", "sglang.launch_server", *descriptor.serve.command_arguments),
+        command=("/usr/bin/python3", "-m", "sglang.launch_server", *descriptor.serve.command_arguments),
         require_seccomp=False,
     )
     env = dict(verified.environment)
@@ -339,8 +343,24 @@ def test_signed_release_reopens_native_model_and_chain_free_context(tmp_path: Pa
     assert env["OPTIMA_REBUILD_PHASE"] == "load"
     assert env["OPTIMA_PREBUILT_ARTIFACTS"] == "1"
     assert env["OPTIMA_TARGET_GPU_ARCH"] == "sm120"
+    assert env["OPTIMA_MSA_PREFILL_SEAM"] == "1"
+    assert env["OPTIMA_ARFUSION_SEAM"] == "0"
+    assert env["OPTIMA_ATTENTION_SEAM"] == "0"
+    assert env["OPTIMA_COLLECTIVE_SEAM"] == "0"
+    assert env["OPTIMA_MOE_SEAM"] == "0"
     assert "OPTIMA_NATIVE_ARTIFACT_STAGE" not in env
     assert "OPTIMA_NATIVE_COMPILE_TIMEOUT_S" not in env
+    closed = _closed_serving_environment(
+        verified,
+        {
+            "PATH": "/host-controlled",
+            "AWS_SECRET_ACCESS_KEY": "must-not-cross",
+            "NVIDIA_VISIBLE_DEVICES": "all",
+        },
+    )
+    assert closed["PATH"] == "/usr/local/cuda/bin:/usr/local/bin:/usr/bin:/bin"
+    assert closed["NVIDIA_VISIBLE_DEVICES"] == "all"
+    assert "AWS_SECRET_ACCESS_KEY" not in closed
 
     context = container_context(
         reopened, tmp_path / "container-context",
@@ -352,6 +372,9 @@ def test_signed_release_reopens_native_model_and_chain_free_context(tmp_path: Pa
     assert "wallet" not in dockerfile.lower()
     assert "OPTIMA_ACTIVE=1" not in dockerfile
     assert "optima.release_runtime" in dockerfile
+    assert "install-reviewed-overlays" in dockerfile
+    assert "org.optima.runtime-overlays" in dockerfile
+    assert 'ENTRYPOINT ["/usr/bin/python3"' in dockerfile
     assert '"--model-path"' in dockerfile and '"--tp-size"' in dockerfile
     deployment = json.loads((context / "deployment.json").read_bytes())
     assert deployment["required_seccomp_profile"] == "seccomp.json"
@@ -367,6 +390,8 @@ def test_public_key_model_native_and_canonical_evidence_fail_closed(tmp_path: Pa
             signature,
             expected_public_key="00" * 32,
         )
+    with pytest.raises(ReleaseError, match="native build product"):
+        replace(prepared.descriptor, engine_tree_digest=_d("another-engine-tree"))
     bad_payloads = prepared.payloads
     bad_payloads[prepared.descriptor.sbom.name] = b"{}\n"
     with pytest.raises(ReleaseError, match="(?:SBOM|sbom)"):
@@ -398,7 +423,7 @@ def test_public_key_model_native_and_canonical_evidence_fail_closed(tmp_path: Pa
             expected_public_key=signature.public_key,
             model_root=model_root,
             command=(
-                "python", "-m", "sglang.launch_server",
+                "/usr/bin/python3", "-m", "sglang.launch_server",
                 *prepared.descriptor.serve.command_arguments,
             ),
             require_seccomp=False,
@@ -414,7 +439,9 @@ def test_serve_spec_reserves_model_tp_runtime_and_injection_environment() -> Non
     for arguments in (("--model-path", "/other"), ("--tp-size=1",)):
         with pytest.raises(ReleaseError, match="override"):
             replace(base, engine_arguments=arguments)
-    for key in ("OPTIMA_ACTIVE", "PYTHONPATH", "LD_PRELOAD", "SGLANG_PLUGINS"):
+    for key in (
+        "OPTIMA_ACTIVE", "PYTHONPATH", "LD_PRELOAD", "SGLANG_PLUGINS", "PATH",
+    ):
         with pytest.raises(ReleaseError, match="override"):
             replace(base, environment=((key, "x"),))
 
@@ -434,7 +461,7 @@ def test_release_artifact_roles_and_runtime_command_are_exact(tmp_path: Path, mo
             release_root=published.root,
             expected_public_key=signature.public_key,
             model_root=model_root,
-            command=("python", "-m", "sglang.launch_server", "--tp-size", "1"),
+            command=("/usr/bin/python3", "-m", "sglang.launch_server", "--tp-size", "1"),
             require_seccomp=False,
         )
 

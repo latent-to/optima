@@ -15,6 +15,7 @@ import io
 import json
 import os
 import re
+import shlex
 import shutil
 import stat
 import tarfile
@@ -59,7 +60,12 @@ _ARTIFACT_ROLES = {
 _FORBIDDEN_ENV_PREFIXES = (
     "OPTIMA_", "PYTHON", "LD_", "BT_", "BITTENSOR", "WALLET", "MINER",
 )
-_FORBIDDEN_ENV_KEYS = frozenset({"SGLANG_PLUGINS", "SGLANG_PLUGIN_PATH"})
+_FORBIDDEN_ENV_KEYS = frozenset(
+    {
+        "HOME", "LANG", "LC_ALL", "PATH", "SGLANG_PLUGINS",
+        "SGLANG_PLUGIN_PATH", "TMPDIR",
+    }
+)
 _RESERVED_ENGINE_FLAGS = frozenset(
     {
         "--model", "--model-path", "--served-model-name", "--tp", "--tp-size",
@@ -498,6 +504,10 @@ class EngineReleaseDescriptor:
             or self.schema_version != RELEASE_SCHEMA_VERSION
         ):
             raise ReleaseError("release descriptor identity is malformed")
+        if self.native.build_spec.get("tree_digest") != self.engine_tree_digest:
+            raise ReleaseError(
+                "native build product is not bound to the released engine tree"
+            )
         records = tuple(self.integration_records)
         if any(not isinstance(row, IntegrationReviewRecord) for row in records):
             raise ReleaseError("release integration records are untyped")
@@ -1610,6 +1620,8 @@ def container_context(
 ) -> Path:
     """Create one deterministic BuildKit context; no chain or credentials enter it."""
 
+    from optima.release_runtime import reviewed_runtime_overlay_digest
+
     trusted_key = _expected_public_key(expected_public_key)
     reopened = reopen_release(
         release.root,
@@ -1626,12 +1638,17 @@ def container_context(
         reopened.root / "artifacts" / reopened.descriptor.seccomp.name,
         dest / "seccomp.json",
     )
+    overlay_digest = reviewed_runtime_overlay_digest(
+        expected_sglang_version=reopened.descriptor.sglang_version,
+        expected_upstream_revision=reopened.descriptor.upstream_revision,
+    )
     deployment = {
         "descriptor_digest": reopened.descriptor.digest,
         "required_read_only_rootfs": True,
         "required_writable_tmpfs": "/tmp",
         "serve_receipt_directory": "/tmp/optima-release-receipts",
         "required_seccomp_profile": "seccomp.json",
+        "runtime_overlay_digest": overlay_digest,
         "seccomp_sha256": reopened.descriptor.seccomp.sha256,
         "trusted_release_public_key": trusted_key,
     }
@@ -1641,7 +1658,11 @@ def container_context(
     dockerfile = (
         f"FROM {reopened.descriptor.serve.base_image}\n"
         "COPY release/artifacts/" + RUNTIME_WHEEL + " /tmp/optima-engine.whl\n"
-        "RUN python -m pip install --no-deps /tmp/optima-engine.whl && rm /tmp/optima-engine.whl\n"
+        "RUN /usr/bin/python3 -m pip install --no-deps /tmp/optima-engine.whl && rm /tmp/optima-engine.whl\n"
+        + "RUN /usr/bin/python3 -m optima.release_runtime install-reviewed-overlays"
+        + " --expected-sglang-version " + shlex.quote(reopened.descriptor.sglang_version)
+        + " --expected-upstream-revision " + shlex.quote(reopened.descriptor.upstream_revision)
+        + " --expected-overlay-digest " + overlay_digest + "\n"
         "COPY release /optima\n"
         "COPY trusted-release-key /etc/optima/trusted-release-key\n"
         "COPY seccomp.json /etc/optima/seccomp.json\n"
@@ -1650,12 +1671,13 @@ def container_context(
             for key, value in reopened.descriptor.serve.environment
         )
         + "LABEL org.optima.release.descriptor=\"" + reopened.descriptor.digest + "\" "
-        + "org.optima.seccomp.sha256=\"" + reopened.descriptor.seccomp.sha256 + "\"\n"
-        + "ENTRYPOINT [\"python\",\"-m\",\"optima.release_runtime\","
+        + "org.optima.seccomp.sha256=\"" + reopened.descriptor.seccomp.sha256 + "\" "
+        + "org.optima.runtime-overlays=\"" + overlay_digest + "\"\n"
+        + "ENTRYPOINT [\"/usr/bin/python3\",\"-m\",\"optima.release_runtime\","
         + "\"--release-root\",\"/optima\","
         + "\"--expected-public-key-file\",\"/etc/optima/trusted-release-key\","
         + "\"--model-root\"," + json.dumps(reopened.descriptor.serve.model_mount) + ","
-        + "\"--require-seccomp\",\"--\",\"python\",\"-m\",\"sglang.launch_server\"]\n"
+        + "\"--require-seccomp\",\"--\",\"/usr/bin/python3\",\"-m\",\"sglang.launch_server\"]\n"
         + "CMD "
         + json.dumps(list(reopened.descriptor.serve.command_arguments), ensure_ascii=True)
         + "\n"

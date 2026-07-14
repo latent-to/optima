@@ -38,7 +38,9 @@ CHAIN_REVEAL_HISTORY_CAP = 10
 MAX_REVEAL_HISTORY_PAGES = 4_096
 MAX_REVEAL_HISTORY_ROWS = 1_000_000
 MAX_REVEAL_EVENT_BLOCKS = 4_096
+MAX_REVEAL_MESSAGE_BYTES = 4_096
 _BLOCK_HASH_RE = re.compile(r"0x[0-9a-fA-F]{64}\Z")
+_HEX_BYTES_RE = re.compile(r"0x(?:[0-9a-fA-F]{2})+\Z")
 
 
 class ChainRevealHistoryError(RuntimeError):
@@ -433,6 +435,64 @@ def _unwrap(value: object) -> object:
     return value
 
 
+def _reveal_byte_candidates(value: object) -> tuple[bytes, ...]:
+    """Normalize the SDK's hex-or-UTF-8 representation below a strict boundary."""
+    value = _unwrap(value)
+    limit = MAX_REVEAL_MESSAGE_BYTES + 2
+    if type(value) is str:
+        if len(value) > 2 + 2 * limit:
+            return ()
+        try:
+            candidates = [value.encode("utf-8")]
+        except UnicodeEncodeError:
+            return ()
+        if _HEX_BYTES_RE.fullmatch(value) is not None:
+            candidates.append(bytes.fromhex(value[2:]))
+    elif type(value) in (bytes, bytearray) and len(value) <= limit:
+        candidates = [bytes(value)]
+    elif isinstance(value, (list, tuple)) and len(value) <= limit and all(
+        type(item) is int and 0 <= item <= 255 for item in value
+    ):
+        candidates = [bytes(value)]
+    else:
+        return ()
+    return tuple(dict.fromkeys(row for row in candidates if len(row) <= limit))
+
+
+def _decode_reveal_candidates(candidates: tuple[bytes, ...]) -> str:
+    decoded: list[str] = []
+    for encoded in candidates:
+        if not encoded:
+            continue
+        mode = encoded[0] & 0b11
+        if mode == 0:
+            offset, size = 1, encoded[0] >> 2
+        elif mode == 1 and len(encoded) >= 2:
+            offset, size = 2, int.from_bytes(encoded[:2], "little") >> 2
+        else:
+            # Modes 2/3 encode at least 16 KiB, beyond Optima's 4 KiB bound.
+            continue
+        if (
+            (mode == 1 and size < 64)
+            or size > MAX_REVEAL_MESSAGE_BYTES
+            or len(encoded) != offset + size
+        ):
+            continue
+        try:
+            decoded.append(encoded[offset:].decode("utf-8"))
+        except UnicodeDecodeError:
+            continue
+    if len(decoded) != 1:
+        raise ChainRevealHistoryError(
+            "chain reveal history has malformed or ambiguous SCALE bytes"
+        )
+    return decoded[0]
+
+
+def _decode_raw_reveal(value: object) -> str:
+    return _decode_reveal_candidates(_reveal_byte_candidates(value))
+
+
 def _event_text(value: object, *, field: str, allow_hex: bool) -> str:
     value = _unwrap(value)
     if isinstance(value, str):
@@ -543,6 +603,54 @@ def _reveal_events_at(
     return tuple(rows)
 
 
+def _raw_reveal_page(subtensor, netuid: int, block: int) -> dict[str, tuple]:
+    query_map = getattr(subtensor, "query_map", None)
+    if not callable(query_map):
+        raise ChainRevealHistoryError("subtensor exposes no raw reveal-storage API")
+    decoded: dict[str, tuple] = {}
+    map_rows = history_entries = 0
+    try:
+        page = query_map(
+            module="Commitments", name="RevealedCommitments",
+            params=[netuid], block=block,
+        )
+        for row in page:
+            map_rows += 1
+            if map_rows > MAX_REVEAL_HISTORY_ROWS:
+                raise ChainRevealHistoryError("historical reveal map-row budget exceeded")
+            row = _unwrap(row)
+            if not isinstance(row, (list, tuple)) or len(row) != 2:
+                raise ChainRevealHistoryError("chain reveal storage has a malformed row")
+            hotkey, history = _unwrap(row[0]), _unwrap(row[1])
+            if (
+                not isinstance(hotkey, str)
+                or hotkey in decoded
+                or not isinstance(history, (list, tuple))
+            ):
+                raise ChainRevealHistoryError("chain reveal storage has a malformed row")
+            if len(history) > CHAIN_REVEAL_HISTORY_CAP:
+                raise ChainRevealHistoryError("per-hotkey reveal history cap exceeded")
+            history_entries += len(history)
+            if history_entries > MAX_REVEAL_HISTORY_ROWS:
+                raise ChainRevealHistoryError("historical reveal row budget exceeded")
+            entries: list[tuple[int, str]] = []
+            for entry in history:
+                entry = _unwrap(entry)
+                if not isinstance(entry, (list, tuple)) or len(entry) != 2:
+                    raise ChainRevealHistoryError("chain reveal storage has a malformed row")
+                reveal_block = _chain_uint(_unwrap(entry[1]), field="reveal block")
+                entries.append((reveal_block, _decode_raw_reveal(entry[0])))
+            decoded[hotkey] = tuple(entries)
+    except ChainRevealHistoryError:
+        raise
+    except Exception as exc:
+        raise ChainRevealHistoryError(
+            "cannot retrieve complete historical reveal state: "
+            f"{type(exc).__name__}: {exc}"
+        ) from None
+    return decoded
+
+
 def _storage_history(
     subtensor, netuid: int, *, finalized_block: int, after_block: int | None = None
 ) -> Counter[tuple[int, str, str]]:
@@ -555,16 +663,7 @@ def _storage_history(
         raise ChainRevealHistoryError("incremental reveal cursor is invalid")
     query_block = finalized_block
     for _page in range(MAX_REVEAL_HISTORY_PAGES):
-        try:
-            raw = subtensor.get_all_revealed_commitments(
-                netuid=netuid, block=query_block
-            )
-            page_items = list(dict(raw).items())
-        except Exception as exc:
-            raise ChainRevealHistoryError(
-                "cannot retrieve complete historical reveal state: "
-                f"{type(exc).__name__}: {exc}"
-            ) from None
+        page_items = list(_raw_reveal_page(subtensor, netuid, query_block).items())
         saturated_oldest: list[int] = []
         page_counts: Counter[tuple[int, str, str]] = Counter()
         for hotkey, history in page_items:

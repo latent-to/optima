@@ -41,12 +41,13 @@ _EXPECTED_SUBTENSOR_METHODS: tuple[tuple[str, str], ...] = (
     ("get_all_commitments", "read every hotkey's commitment (the salted commit hash)"),
     ("set_commitment", "miner posts a commitment on-chain"),
     ("set_reveal_commitment", "miner posts the timelock-encrypted submission payload"),
-    ("get_all_revealed_commitments", "validator reads every hotkey's revealed submissions"),
+    ("query_map", "validator reads raw finalized reveal storage without lossy SDK decoding"),
     ("is_hotkey_registered", "preflight: this validator is registered"),
     ("burned_register", "join a subnet (validator/miner onboarding)"),
     ("get_current_block", "current block height"),
     ("get_block_hash", "block hash -> prompt seed (consensus + anti-prebake)"),
 )
+_REVEAL_STORAGE_ABI_VERSIONS = frozenset({"10.3.2"})
 
 
 def run_checks() -> list[Check]:
@@ -61,8 +62,13 @@ def run_checks() -> list[Check]:
         add("import bittensor", False, repr(exc))
         return checks
 
-    ver = getattr(bt, "__version__", "?")
+    ver = str(getattr(bt, "__version__", "?"))
     add("bittensor installed", True, f"version {ver}")
+    add(
+        "raw reveal-storage ABI",
+        ver in _REVEAL_STORAGE_ABI_VERSIONS,
+        f"version {ver}; allowed: {sorted(_REVEAL_STORAGE_ABI_VERSIONS)}",
+    )
 
     # Wallet class (we sign extrinsics + set weights with a wallet). Prefer the
     # capitalized `Wallet` (the live class); `wallet` is a deprecated lowercase alias.

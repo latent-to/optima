@@ -1582,10 +1582,12 @@ def make_msa_prefill_dispatcher(
         selected = False
         try:
             num_kv_heads = k_cache.shape[1]
-            contract_top_k = int(output_slot.correctness.top_k)
+            verification_top_k = int(output_slot.correctness.top_k)
+            # ``topk`` controls the validator-owned selector after the miner has
+            # filled the complete score sheet. It is not part of the miner entry
+            # ABI and must not gate score-kernel routing.
             if not (disable_index_value and score_type == "max" and sink is None
-                    and num_kv_heads == 1 and q.is_cuda and q.dim() == 3
-                    and int(topk) == contract_top_k):
+                    and num_kv_heads == 1 and q.is_cuda and q.dim() == 3):
                 return stock()
             total_q, num_heads, head_dim = q.shape
             batch_size = cu_seqlens.shape[0] - 1
@@ -1630,7 +1632,9 @@ def make_msa_prefill_dispatcher(
                     block_size=int(block_size_k),
                     q_len=q_len_b,
                     kv_len=seq_b,
-                    top_k=contract_top_k,
+                    # This is the verifier's sampled overlap width, not the
+                    # downstream engine selector's runtime width.
+                    top_k=verification_top_k,
                     num_kv_heads=num_kv_heads,
                     tp_size=tp_size,
                     world_size=world_size,

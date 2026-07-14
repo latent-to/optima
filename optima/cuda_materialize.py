@@ -908,9 +908,17 @@ def _make_driver_tma_encoder(
 
     encoder = getattr(driver, "cuTensorMapEncodeTiled", None)
     tensor_map_type = getattr(driver, "CUtensorMap", None)
-    if not callable(encoder) or not isinstance(tensor_map_type, type):
+    uint32_type = getattr(driver, "cuuint32_t", None)
+    uint64_type = getattr(driver, "cuuint64_t", None)
+    if (
+        not callable(encoder)
+        or not isinstance(tensor_map_type, type)
+        or not isinstance(uint32_type, type)
+        or not isinstance(uint64_type, type)
+    ):
         raise CudaMaterializeError(
-            "CUDA driver lacks cuTensorMapEncodeTiled/CUtensorMap"
+            "CUDA driver lacks cuTensorMapEncodeTiled/CUtensorMap/"
+            "cuuint32_t/cuuint64_t"
         )
     # Resolve every closed enum now, before any candidate invocation can mutate
     # module attributes.  Duplicate logical values (FP8/zero) are intentional.
@@ -943,10 +951,10 @@ def _make_driver_tma_encoder(
                 element[descriptor.element_type],
                 len(descriptor.global_dims),
                 descriptor.address,
-                list(descriptor.global_dims),
-                list(descriptor.global_strides),
-                list(descriptor.box_dims),
-                list(descriptor.element_strides),
+                [uint64_type(value) for value in descriptor.global_dims],
+                [uint64_type(value) for value in descriptor.global_strides],
+                [uint32_type(value) for value in descriptor.box_dims],
+                [uint32_type(value) for value in descriptor.element_strides],
                 interleave[descriptor.interleave],
                 swizzle[descriptor.swizzle],
                 l2[descriptor.l2_promotion],
@@ -977,9 +985,17 @@ def _make_driver_tma_encoder(
             ) from None
         if len(opaque) != 16:
             raise CudaMaterializeError("CUDA tensor map opaque word count is not 16")
-        words = tuple(
-            _driver_integer(value, field="tensor-map opaque word") for value in opaque
-        )
+        try:
+            words = tuple(
+                int(value)
+                if type(value) is uint64_type
+                else _driver_integer(value, field="tensor-map opaque word")
+                for value in opaque
+            )
+        except (TypeError, ValueError, OverflowError):
+            raise CudaMaterializeError(
+                "CUDA driver returned malformed tensor-map opaque word"
+            ) from None
         if any(not 0 <= value <= _UINT64_MAX for value in words):
             raise CudaMaterializeError("CUDA tensor map opaque word is outside uint64")
         return struct.pack("<16Q", *words)

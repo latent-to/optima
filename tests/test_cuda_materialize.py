@@ -271,7 +271,29 @@ def test_packed_tensor_pointer_rejects_raw_or_non_tensor_authority() -> None:
         )
 
 
+class _FakeCuuint32:
+    def __init__(self, value: object) -> None:
+        if type(value) is not int or not 0 <= value < 2**32:
+            raise OverflowError("outside cuuint32_t")
+        self._value = value
+
+    def __int__(self) -> int:
+        return self._value
+
+
+class _FakeCuuint64:
+    def __init__(self, value: object) -> None:
+        if type(value) is not int or not 0 <= value < 2**64:
+            raise OverflowError("outside cuuint64_t")
+        self._value = value
+
+    def __int__(self) -> int:
+        return self._value
+
+
 class _FakeTmaDriver:
+    cuuint32_t = _FakeCuuint32
+    cuuint64_t = _FakeCuuint64
     CUresult = type("CUresult", (), {"CUDA_SUCCESS": 0})
     CUtensorMapDataType = type(
         "CUtensorMapDataType",
@@ -336,7 +358,7 @@ class _FakeTmaDriver:
 
     class CUtensorMap:
         def __init__(self) -> None:
-            self.opaque = tuple(range(16))
+            self.opaque = tuple(_FakeCuuint64(value) for value in range(16))
 
     def __init__(self) -> None:
         self.encode_calls: list[tuple[object, ...]] = []
@@ -384,9 +406,49 @@ def test_real_driver_tma_materializer_uses_live_byte_strides_and_exact_128_bytes
     assert materialized == CudaOpaqueBytes(struct.pack("<16Q", *range(16)))
     assert len(driver.encode_calls) == 1
     call = driver.encode_calls[0]
-    assert call[1:7] == (2, 0x8000, [3, 4], [8], [1, 4], [1, 1])
+    assert call[1:3] == (2, 0x8000)
+    assert tuple(tuple(int(value) for value in row) for row in call[3:7]) == (
+        (3, 4),
+        (8,),
+        (1, 4),
+        (1, 1),
+    )
+    assert all(type(value) is driver.cuuint64_t for value in call[3])
+    assert all(type(value) is driver.cuuint64_t for value in call[4])
+    assert all(type(value) is driver.cuuint32_t for value in call[5])
+    assert all(type(value) is driver.cuuint32_t for value in call[6])
     registry.synchronize()
     assert driver.sync_calls == 1
+
+
+@pytest.mark.parametrize("field", ("cuuint32_t", "cuuint64_t"))
+def test_real_driver_tma_materializer_requires_unsigned_wrapper_types(field) -> None:
+    driver = _FakeTmaDriver()
+    setattr(driver, field, None)
+
+    with pytest.raises(CudaMaterializeError, match="cuuint32_t/cuuint64_t"):
+        make_cuda_primitive_registry(driver=driver)
+
+
+def test_real_driver_tma_materializer_rejects_wrapper_overflow_before_encode() -> None:
+    driver = _FakeTmaDriver()
+    registry = make_cuda_primitive_registry(driver=driver)
+    tma = CudaTmaDescriptorPlan(
+        binding=0,
+        element_type="f16",
+        global_dims=(_const(3), _const(4)),
+        global_strides=(_const(8),),
+        box_dims=(_const(2**32), _const(4)),
+        element_strides=(_const(1), _const(1)),
+    )
+
+    with pytest.raises(CudaMaterializeError, match="OverflowError"):
+        materialize_cuda_parameter(
+            CudaParameterPlan(kind="tma_descriptor", size=128, tma=tma),
+            (_Tensor((3, 4), (4, 1), pointer=0x8000, element_size=2),),
+            registry,
+        )
+    assert driver.encode_calls == []
 
 
 def test_group_handle_is_a_closed_validator_resolver() -> None:

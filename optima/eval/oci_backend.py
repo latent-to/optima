@@ -881,6 +881,7 @@ class OCIEngineExecutor:
         )
         self.session_runner = session_runner
         self.reference_session_runner = reference_session_runner
+        # One executor owns one manager, so its transaction lock serializes every lifecycle.
         self._lock = self.manager.transaction_lock
         self._recovered: tuple[str, ...] | None = None
 

@@ -285,7 +285,11 @@ def _settle_pending(
     from optima.settlement import plan_settlement
 
     committed: dict[str, str] = {}
-    while True:
+    while store.has_pending_settlement():
+        lease_block = finalized_block_provider()
+        if type(lease_block) is not int or lease_block < current_block:
+            raise IntakeControllerError("finalized settlement clock regressed")
+        current_block = lease_block
         lease = store.lease_settlement_cohort(current_block=current_block)
         if lease is None:
             return committed
@@ -309,7 +313,9 @@ def _settle_pending(
             evidence,
             current_block=refreshed_block,
         )
+        current_block = refreshed_block
         committed[lease.lease_id] = plan.digest
+    return committed
 
 
 def run_pass(

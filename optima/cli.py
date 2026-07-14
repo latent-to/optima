@@ -141,6 +141,7 @@ def cmd_set_weights(args: argparse.Namespace) -> int:
     from optima.chain.weights import (
         reconcile_weight_publication,
         release_weight_publication_hold,
+        resume_weight_projection,
     )
     from optima.economics import (
         EmissionsPolicyManifest,
@@ -193,6 +194,9 @@ def cmd_set_weights(args: argparse.Namespace) -> int:
                 "run set-weights again to refresh and reconcile"
             )
             return 0
+        if not args.dry_run:
+            projection = resume_weight_projection(projection, journal)
+            journal = SQLiteWeightPublicationJournal(store, projection)
         result = reconcile_weight_publication(
             subtensor,
             None if args.dry_run else wallet,

@@ -10,6 +10,7 @@ from optima.chain.weights import (
     WeightPublicationRecord,
     release_weight_publication_hold,
     reconcile_weight_publication,
+    resume_weight_projection,
 )
 from optima.stack_identity import canonical_digest
 
@@ -19,9 +20,10 @@ def _d(char: str) -> str:
 
 
 class Journal:
-    def __init__(self, row=None):
+    def __init__(self, row=None, retained=()):
         self.row = row
         self.history = []
+        self.retained = {projection.digest: projection for projection in retained}
 
     def load(self):
         return self.row
@@ -30,6 +32,9 @@ class Journal:
         assert expected_record_digest == (self.row.digest if self.row else None)
         self.row = replacement
         self.history.append(replacement)
+
+    def retained_projection(self, projection_digest):
+        return self.retained[projection_digest]
 
 
 class Chain:
@@ -135,6 +140,50 @@ def test_pending_is_not_resubmitted_and_confirms_only_after_exact_readback():
         chain, _wallet(), projection, journal, refresh_blocks=20
     )
     assert second.status == "confirmed" and chain.submit_calls == 1
+
+
+def test_restart_reopens_pending_projection_and_confirms_after_chain_head_advances():
+    chain = Chain()
+    original = _projection()
+    journal = Journal(retained=(original,))
+    first = reconcile_weight_publication(
+        chain, _wallet(), original, journal, refresh_blocks=20
+    )
+    assert first.status == "pending" and chain.submit_calls == 1
+
+    chain.block = 101
+    chain.install(original.weights, update=100)
+    rebuilt = _projection(block=101)
+    resumed = resume_weight_projection(rebuilt, journal)
+    second = reconcile_weight_publication(
+        chain, _wallet(), resumed, journal, refresh_blocks=20
+    )
+
+    assert resumed == original
+    assert second.status == "confirmed" and second.projection_digest == original.digest
+    assert chain.submit_calls == 1
+    assert [row.status for row in journal.history] == [
+        "intent", "pending", "confirmed"
+    ]
+    assert {row.projection_digest for row in journal.history} == {original.digest}
+
+
+def test_pending_resume_rejects_a_different_chain_authority():
+    original = _projection()
+    pending = WeightPublicationRecord(
+        original.digest,
+        "pending",
+        submit_block=100,
+        retry_after_block=120,
+        reason="sdk_result_unconfirmed",
+    )
+    journal = Journal(pending, retained=(original,))
+    proposed = WeightProjection.from_dict(
+        {**_projection(block=101).to_dict(), "validator_hotkey": "other"}
+    )
+
+    with pytest.raises(WeightPublicationError, match="current chain authority"):
+        resume_weight_projection(proposed, journal)
 
 
 def test_unresolved_or_changed_pending_projection_holds_without_signing():

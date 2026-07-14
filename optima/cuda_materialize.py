@@ -464,6 +464,34 @@ _TMA_SWIZZLES = frozenset(
 )
 _TMA_L2 = frozenset({"none", "l2_64b", "l2_128b", "l2_256b"})
 _TMA_OOB = frozenset({"none", "zero", "nan_request_zero_fma"})
+_TMA_ELEMENT_BYTES = MappingProxyType(
+    {
+        "u8": 1,
+        "u16": 2,
+        "u32": 4,
+        "i32": 4,
+        "i64": 8,
+        "f16": 2,
+        "f32": 4,
+        "f64": 8,
+        "bf16": 2,
+        "tf32": 4,
+        "tf32_32b": 4,
+        "f8e4m3": 1,
+        "f8e5m2": 1,
+    }
+)
+_TMA_FLOAT_ELEMENTS = frozenset(
+    {"f16", "f32", "f64", "bf16", "tf32", "tf32_32b"}
+)
+_TMA_SWIZZLE_BYTES = MappingProxyType(
+    {
+        "swizzle_32b": 32,
+        "swizzle_64b": 64,
+        "swizzle_128b": 128,
+        "swizzle_128b_atom_32b": 128,
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -752,6 +780,70 @@ class CudaResolvedTmaDescriptor:
     swizzle: str
     l2_promotion: str
     oob_fill: str
+
+
+def _validate_resolved_tma_descriptor(
+    descriptor: CudaResolvedTmaDescriptor,
+) -> None:
+    """Reject CUDA-invalid tiled tensor maps before crossing the driver API."""
+
+    if type(descriptor) is not CudaResolvedTmaDescriptor:
+        raise CudaMaterializeError("CUDA TMA validator received the wrong type")
+    rank = len(descriptor.global_dims)
+    if not 1 <= rank <= 5:
+        raise CudaMaterializeError("TMA rank is outside CUDA limits")
+    if descriptor.interleave != "none" and rank < 3:
+        raise CudaMaterializeError("interleaved TMA rank must be at least three")
+
+    address_alignment = 32 if descriptor.interleave == "interleave_32b" else 16
+    if descriptor.address % address_alignment:
+        raise CudaMaterializeError(
+            f"TMA global address must be {address_alignment}-byte aligned"
+        )
+    if any(dimension > 1 << 32 for dimension in descriptor.global_dims):
+        raise CudaMaterializeError("TMA global dimension exceeds CUDA's 2^32 limit")
+    if any(stride >= 1 << 40 for stride in descriptor.global_strides):
+        raise CudaMaterializeError("TMA global stride exceeds CUDA's 2^40 limit")
+    stride_alignment = 32 if descriptor.interleave == "interleave_32b" else 16
+    if any(stride % stride_alignment for stride in descriptor.global_strides):
+        raise CudaMaterializeError(
+            f"TMA global stride must be {stride_alignment}-byte aligned"
+        )
+
+    element_bytes = _TMA_ELEMENT_BYTES[descriptor.element_type]
+    minimum_stride = descriptor.global_dims[0] * element_bytes
+    for ordinal, stride in enumerate(descriptor.global_strides):
+        if stride < minimum_stride:
+            raise CudaMaterializeError(
+                "TMA global strides do not describe nested tensor dimensions"
+            )
+        minimum_stride = stride * descriptor.global_dims[ordinal + 1]
+    if any(dimension > 256 for dimension in descriptor.box_dims):
+        raise CudaMaterializeError("TMA box dimension exceeds CUDA's 256 limit")
+    if any(stride > 8 for stride in descriptor.element_strides):
+        raise CudaMaterializeError("TMA element stride exceeds CUDA's 8 limit")
+
+    inner_bytes = descriptor.box_dims[0] * element_bytes
+    if descriptor.interleave == "none":
+        if inner_bytes % 16:
+            raise CudaMaterializeError(
+                "TMA non-interleaved inner box must span a multiple of 16 bytes"
+            )
+        swizzle_limit = _TMA_SWIZZLE_BYTES.get(descriptor.swizzle)
+        if swizzle_limit is not None and inner_bytes > swizzle_limit:
+            raise CudaMaterializeError(
+                f"TMA inner box exceeds {swizzle_limit}-byte swizzle limit"
+            )
+    if (
+        descriptor.interleave == "interleave_32b"
+        and descriptor.swizzle != "swizzle_32b"
+    ):
+        raise CudaMaterializeError("TMA 32-byte interleave requires 32-byte swizzle")
+    if (
+        descriptor.oob_fill == "nan_request_zero_fma"
+        and descriptor.element_type not in _TMA_FLOAT_ELEMENTS
+    ):
+        raise CudaMaterializeError("TMA NaN OOB fill requires a floating element type")
 
 
 @dataclass(frozen=True)
@@ -1294,6 +1386,7 @@ def materialize_cuda_parameter(
         l2_promotion=tma.l2_promotion,
         oob_fill=tma.oob_fill,
     )
+    _validate_resolved_tma_descriptor(resolved)
     raw = encoder(resolved)
     if type(raw) is not bytes or len(raw) != 128:
         raise CudaMaterializeError("CUDA TMA provider returned a malformed descriptor")

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import struct
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -388,18 +389,18 @@ def test_real_driver_tma_materializer_uses_live_byte_strides_and_exact_128_bytes
         binding=0,
         element_type="f16",
         global_dims=(
-            _source("tensor_dim", 0, 0),
             _source("tensor_dim", 0, 1),
+            _source("tensor_dim", 0, 0),
         ),
         global_strides=(byte_stride,),
-        box_dims=(_const(1), _const(4)),
+        box_dims=(_const(8), _const(4)),
         element_strides=(_const(1), _const(1)),
     )
     plan = CudaParameterPlan(kind="tma_descriptor", size=128, tma=tma)
 
     materialized = materialize_cuda_parameter(
         plan,
-        (_Tensor((3, 4), (4, 1), pointer=0x8000, element_size=2),),
+        (_Tensor((3, 8), (8, 1), pointer=0x8000, element_size=2),),
         registry,
     )
 
@@ -408,9 +409,9 @@ def test_real_driver_tma_materializer_uses_live_byte_strides_and_exact_128_bytes
     call = driver.encode_calls[0]
     assert call[1:3] == (2, 0x8000)
     assert tuple(tuple(int(value) for value in row) for row in call[3:7]) == (
-        (3, 4),
-        (8,),
-        (1, 4),
+        (8, 3),
+        (16,),
+        (8, 4),
         (1, 1),
     )
     assert all(type(value) is driver.cuuint64_t for value in call[3])
@@ -430,22 +431,93 @@ def test_real_driver_tma_materializer_requires_unsigned_wrapper_types(field) -> 
         make_cuda_primitive_registry(driver=driver)
 
 
-def test_real_driver_tma_materializer_rejects_wrapper_overflow_before_encode() -> None:
+def test_real_driver_tma_materializer_rejects_box_overflow_before_encode() -> None:
     driver = _FakeTmaDriver()
     registry = make_cuda_primitive_registry(driver=driver)
     tma = CudaTmaDescriptorPlan(
         binding=0,
         element_type="f16",
         global_dims=(_const(3), _const(4)),
-        global_strides=(_const(8),),
+        global_strides=(_const(16),),
         box_dims=(_const(2**32), _const(4)),
         element_strides=(_const(1), _const(1)),
     )
 
-    with pytest.raises(CudaMaterializeError, match="OverflowError"):
+    with pytest.raises(CudaMaterializeError, match="256 limit"):
         materialize_cuda_parameter(
             CudaParameterPlan(kind="tma_descriptor", size=128, tma=tma),
             (_Tensor((3, 4), (4, 1), pointer=0x8000, element_size=2),),
+            registry,
+        )
+    assert driver.encode_calls == []
+
+
+def _valid_tma_plan() -> CudaTmaDescriptorPlan:
+    return CudaTmaDescriptorPlan(
+        binding=0,
+        element_type="bf16",
+        global_dims=(_const(64), _const(128)),
+        global_strides=(_const(128),),
+        box_dims=(_const(64), _const(128)),
+        element_strides=(_const(1), _const(1)),
+        swizzle="swizzle_128b",
+    )
+
+
+_INTERLEAVED_TMA = {
+    "global_dims": (_const(64), _const(128), _const(2)),
+    "global_strides": (_const(128), _const(16384)),
+    "box_dims": (_const(64), _const(128), _const(1)),
+    "element_strides": (_const(1), _const(1), _const(1)),
+    "interleave": "interleave_32b",
+    "swizzle": "swizzle_32b",
+}
+
+
+@pytest.mark.parametrize(
+    ("changes", "pointer", "message"),
+    (
+        ({}, 0x8008, "16-byte aligned"),
+        ({"global_dims": (_const((1 << 32) + 1), _const(128))}, 0x8000, "2\\^32 limit"),
+        ({"global_strides": (_const(136),)}, 0x8000, "16-byte aligned"),
+        ({"global_strides": (_const(1 << 40),)}, 0x8000, "2\\^40 limit"),
+        ({"global_strides": (_const(112),)}, 0x8000, "nested tensor dimensions"),
+        ({"box_dims": (_const(257), _const(128))}, 0x8000, "256 limit"),
+        ({"element_strides": (_const(9), _const(1))}, 0x8000, "8 limit"),
+        ({"box_dims": (_const(63), _const(128))}, 0x8000, "multiple of 16 bytes"),
+        ({"box_dims": (_const(128), _const(64))}, 0x8000, "128-byte swizzle limit"),
+        ({"interleave": "interleave_16b"}, 0x8000, "rank must be at least three"),
+        ({**_INTERLEAVED_TMA, "swizzle": "swizzle_128b"}, 0x8000, "requires 32-byte swizzle"),
+        ({**_INTERLEAVED_TMA, "global_strides": (_const(128), _const(16400))}, 0x8000, "32-byte aligned"),
+        ({**_INTERLEAVED_TMA}, 0x8010, "32-byte aligned"),
+        (
+            {
+                "element_type": "i32",
+                "global_dims": (_const(32), _const(128)),
+                "global_strides": (_const(128),),
+                "box_dims": (_const(32), _const(128)),
+                "oob_fill": "nan_request_zero_fma",
+            },
+            0x8000,
+            "floating element type",
+        ),
+    ),
+)
+def test_tma_constraints_fail_before_driver_encode(
+    changes: dict[str, object], pointer: int, message: str
+) -> None:
+    driver = _FakeTmaDriver()
+    registry = make_cuda_primitive_registry(driver=driver)
+    plan = CudaParameterPlan(
+        kind="tma_descriptor",
+        size=128,
+        tma=replace(_valid_tma_plan(), **changes),
+    )
+
+    with pytest.raises(CudaMaterializeError, match=message):
+        materialize_cuda_parameter(
+            plan,
+            (_Tensor((128, 128), (128, 1), pointer=pointer, element_size=2),),
             registry,
         )
     assert driver.encode_calls == []

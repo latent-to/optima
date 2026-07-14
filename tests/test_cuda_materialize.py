@@ -125,10 +125,15 @@ def test_checked_expression_derives_dynamic_geometry_and_tensor_element_size() -
     ) == 4
 
 
-def test_cutlass_fast_divmod_and_static_packed_atoms_have_exact_layout() -> None:
+def test_fast_divmod_families_and_static_packed_atoms_have_exact_layout() -> None:
     registry = _registry()
-    fast_divmod = CudaParameterPlan(
+    cutlass_fast_divmod = CudaParameterPlan(
         kind="cutlass_fast_divmod_i32_v1",
+        size=12,
+        expression=_const(128),
+    )
+    cute_fast_divmod = CudaParameterPlan(
+        kind="cute_fast_divmod_i32_v1",
         size=12,
         expression=_const(128),
     )
@@ -145,8 +150,13 @@ def test_cutlass_fast_divmod_and_static_packed_atoms_have_exact_layout() -> None
         ),
     )
 
-    assert materialize_cuda_parameter(fast_divmod, (), registry) == CudaOpaqueBytes(
-        struct.pack("<iII", 128, 0x8000_0000, 6)
+    assert materialize_cuda_parameter(
+        cutlass_fast_divmod, (), registry
+    ) == CudaOpaqueBytes(struct.pack("<iII", 128, 0x8000_0000, 6))
+    assert materialize_cuda_parameter(
+        cute_fast_divmod, (), registry
+    ) == CudaOpaqueBytes(
+        struct.pack("<iIBB2x", 128, 1, 1, 6)
     )
     assert materialize_cuda_parameter(packed, (), registry) == CudaOpaqueBytes(
         b"\x01\x02\x03\x00" + struct.pack("<i", 7)
@@ -172,6 +182,51 @@ def test_cutlass_fast_divmod_and_static_packed_atoms_have_exact_layout() -> None
     ).size == 4096
     with pytest.raises(CudaMaterializeError, match="literal field"):
         CudaPackedField(offset=0, data_hex="00" * 4097)
+
+
+@pytest.mark.parametrize(
+    ("divisor", "multiplier", "shift_1", "shift_2"),
+    (
+        (1, 0x0000_0001, 0, 0),
+        (2, 0x0000_0001, 1, 0),
+        (3, 0x5555_5556, 1, 1),
+        (5, 0x9999_999A, 1, 2),
+        (7, 0x2492_4925, 1, 2),
+        (10, 0x9999_999A, 1, 3),
+        (32, 0x0000_0001, 1, 4),
+        (127, 0x0204_0811, 1, 6),
+        (128, 0x0000_0001, 1, 6),
+        (129, 0xFC07_F020, 1, 7),
+        (148, 0xBACF_914D, 1, 7),
+        (256, 0x0000_0001, 1, 7),
+        (1000, 0x0624_DD30, 1, 9),
+    ),
+)
+def test_cute_fast_divmod_exact_bytes_and_device_formula(
+    divisor: int, multiplier: int, shift_1: int, shift_2: int
+) -> None:
+    plan = CudaParameterPlan(
+        kind="cute_fast_divmod_i32_v1",
+        size=12,
+        expression=_const(divisor),
+    )
+    materialized = materialize_cuda_parameter(plan, (), _registry())
+    assert materialized == CudaOpaqueBytes(
+        struct.pack("<iIBB2x", divisor, multiplier, shift_1, shift_2)
+    )
+    for dividend in {
+        0,
+        1,
+        divisor - 1,
+        divisor,
+        min((1 << 32) - 1, divisor + 1),
+        (1 << 31) - 1,
+        (1 << 32) - 1,
+    }:
+        high = (dividend * multiplier) >> 32
+        quotient = (high + ((dividend - high) >> shift_1)) >> shift_2
+        remainder = dividend - quotient * divisor
+        assert (quotient, remainder) == divmod(dividend, divisor)
 
 
 def test_packed_memref_uses_only_live_tensor_pointer_shape_and_stride() -> None:

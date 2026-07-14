@@ -34,6 +34,7 @@ from optima.cuda_materialize import (
     CUDA_PACKED_STRUCT_CAPABILITY,
     CUDA_TMA_DESCRIPTOR_CAPABILITY,
     CUTLASS_FAST_DIVMOD_CAPABILITY,
+    CUTE_FAST_DIVMOD_CAPABILITY,
     CudaCheckedExpression,
     CudaMaterializeError,
     CudaParameterPlan,
@@ -59,6 +60,7 @@ _KERNEL_INTRINSIC_CAPABILITIES = frozenset(
         CUDA_PACKED_STRUCT_CAPABILITY,
         CUDA_TMA_DESCRIPTOR_CAPABILITY,
         CUTLASS_FAST_DIVMOD_CAPABILITY,
+        CUTE_FAST_DIVMOD_CAPABILITY,
     }
 )
 

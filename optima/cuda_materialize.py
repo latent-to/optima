@@ -27,6 +27,7 @@ from optima.cuda_launch import (
 CUDA_EXPRESSION_SCHEMA = "optima.cuda-expression-dag.v1"
 CUDA_TMA_DESCRIPTOR_CAPABILITY = "cuda.tma_descriptor.v1"
 CUTLASS_FAST_DIVMOD_CAPABILITY = "cutlass.fast_divmod.i32.v1"
+CUTE_FAST_DIVMOD_CAPABILITY = "cute.fast_divmod.i32.v1"
 CUDA_PACKED_STRUCT_CAPABILITY = "cuda.packed_struct.v1"
 CUDA_CHECKED_EXPRESSION_CAPABILITY = "cuda.checked_expression.v1"
 GROUP_NATIVE_HANDLE_CAPABILITY = "group.native_handle.v1"
@@ -661,6 +662,9 @@ class CudaParameterPlan:
         elif self.kind == "cutlass_fast_divmod_i32_v1":
             if type(self.expression) is not CudaCheckedExpression or self.size != 12:
                 raise CudaMaterializeError("CUTLASS FastDivmod parameter is malformed")
+        elif self.kind == "cute_fast_divmod_i32_v1":
+            if type(self.expression) is not CudaCheckedExpression or self.size != 12:
+                raise CudaMaterializeError("CuTe FastDivmod parameter is malformed")
         elif self.kind == "group_handle":
             _binding_index(self.binding, field="CUDA group binding")
             if self.group_projection not in {"native_handle", "peer_ptr_table"} or self.size != 8:
@@ -673,7 +677,12 @@ class CudaParameterPlan:
         used = {
             "binding": self.kind in {"pointer", "group_handle"},
             "scalar_type": self.kind == "scalar",
-            "expression": self.kind in {"scalar", "cutlass_fast_divmod_i32_v1"},
+            "expression": self.kind
+            in {
+                "scalar",
+                "cutlass_fast_divmod_i32_v1",
+                "cute_fast_divmod_i32_v1",
+            },
             "fields": self.kind == "packed_struct",
             "tma": self.kind == "tma_descriptor",
             "group_projection": self.kind == "group_handle",
@@ -710,6 +719,8 @@ class CudaParameterPlan:
             capabilities.add(CUDA_TMA_DESCRIPTOR_CAPABILITY)
         elif self.kind == "cutlass_fast_divmod_i32_v1":
             capabilities.add(CUTLASS_FAST_DIVMOD_CAPABILITY)
+        elif self.kind == "cute_fast_divmod_i32_v1":
+            capabilities.add(CUTE_FAST_DIVMOD_CAPABILITY)
         elif self.kind == "group_handle":
             capabilities.add(
                 {
@@ -875,6 +886,7 @@ class CudaPrimitiveRegistry:
             CUDA_CHECKED_EXPRESSION_CAPABILITY,
             CUDA_PACKED_STRUCT_CAPABILITY,
             CUTLASS_FAST_DIVMOD_CAPABILITY,
+            CUTE_FAST_DIVMOD_CAPABILITY,
         }
         if self.tma_descriptor is not None:
             expected.add(CUDA_TMA_DESCRIPTOR_CAPABILITY)
@@ -1133,6 +1145,7 @@ def make_cuda_primitive_registry(
         CUDA_CHECKED_EXPRESSION_CAPABILITY,
         CUDA_PACKED_STRUCT_CAPABILITY,
         CUTLASS_FAST_DIVMOD_CAPABILITY,
+        CUTE_FAST_DIVMOD_CAPABILITY,
     }
     if tma_descriptor is not None:
         capabilities.add(CUDA_TMA_DESCRIPTOR_CAPABILITY)
@@ -1295,9 +1308,16 @@ def _pack_scalar(scalar_type: str, value: object) -> bytes:
         raise CudaMaterializeError(f"cannot pack CUDA scalar: {exc}") from None
 
 
-def _fast_divmod_i32(divisor: object) -> bytes:
+def _checked_i32_divisor(divisor: object, *, family: str) -> int:
     if type(divisor) is not int or not 1 <= divisor <= (1 << 31) - 1:
-        raise CudaMaterializeError("CUTLASS FastDivmod divisor is outside i32 policy")
+        raise CudaMaterializeError(
+            f"{family} FastDivmod divisor is outside i32 policy"
+        )
+    return divisor
+
+
+def _cutlass_fast_divmod_i32(divisor: object) -> bytes:
+    divisor = _checked_i32_divisor(divisor, family="CUTLASS")
     multiplier = 0
     shift_right = 0
     if divisor != 1:
@@ -1306,6 +1326,19 @@ def _fast_divmod_i32(divisor: object) -> bytes:
         multiplier = ((1 << p) + divisor - 1) // divisor
         shift_right = p - 32
     return struct.pack("<iII", divisor, multiplier, shift_right)
+
+
+def _cute_fast_divmod_i32(divisor: object) -> bytes:
+    """Materialize CuTe DSL's four-field reciprocal divisor ABI."""
+
+    divisor = _checked_i32_divisor(divisor, family="CuTe")
+    ceil_log2 = (divisor - 1).bit_length()
+    multiplier = (
+        ((1 << 32) * ((1 << ceil_log2) - divisor)) // divisor
+    ) + 1
+    shift_1 = min(ceil_log2, 1)
+    shift_2 = max(ceil_log2 - 1, 0)
+    return struct.pack("<iIBB2x", divisor, multiplier, shift_1, shift_2)
 
 
 def materialize_cuda_parameter(
@@ -1348,7 +1381,14 @@ def materialize_cuda_parameter(
         return CudaOpaqueBytes(bytes(packed))
     if plan.kind == "cutlass_fast_divmod_i32_v1":
         assert plan.expression is not None
-        return CudaOpaqueBytes(_fast_divmod_i32(_eval_expression(plan.expression, context)))
+        return CudaOpaqueBytes(
+            _cutlass_fast_divmod_i32(_eval_expression(plan.expression, context))
+        )
+    if plan.kind == "cute_fast_divmod_i32_v1":
+        assert plan.expression is not None
+        return CudaOpaqueBytes(
+            _cute_fast_divmod_i32(_eval_expression(plan.expression, context))
+        )
     if plan.kind == "group_handle":
         assert plan.binding is not None and plan.group_projection is not None
         try:
@@ -1433,6 +1473,7 @@ __all__ = [
     "CUDA_PACKED_STRUCT_CAPABILITY",
     "CUDA_TMA_DESCRIPTOR_CAPABILITY",
     "CUTLASS_FAST_DIVMOD_CAPABILITY",
+    "CUTE_FAST_DIVMOD_CAPABILITY",
     "GROUP_NATIVE_HANDLE_CAPABILITY",
     "GROUP_PEER_POINTER_TABLE_CAPABILITY",
     "CudaCheckedExpression",

@@ -122,6 +122,13 @@ SEAM_ADAPTERS: tuple[SeamAdapter, ...] = (
     # identified scheduler execution processes (active receipts == tp_size exactly).
     SeamAdapter("scheduler_gate", "sglang.srt.managers.scheduler",
                 "sglang_scheduler_gate", "run_scheduler_process", ()),
+    # NOT a slot seam: direct device artifacts are staged only after the process
+    # proves it is a scheduler rank above.  SGLang selects that rank's CUDA device
+    # inside init_torch_distributed; this AFTER hook binds the sealed CUBIN before
+    # model load, kernel warmup, or graph capture.  It is inert in output-path
+    # processes because only scheduler_gate can create the pending marker.
+    SeamAdapter("artifact_context", "sglang.srt.model_executor.model_runner",
+                "sglang_artifact_context", "ModelRunner.init_torch_distributed", ()),
     # NOT a slot seam: the dep_patches runtime consume side. When the active bundle
     # declared dependency patches (materialized as a csrc OVERLAY by the reviewed
     # patcher — optima/patchers/apply_dep_patch.py), this adapter repoints

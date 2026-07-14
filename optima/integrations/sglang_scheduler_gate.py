@@ -16,10 +16,12 @@ pinning the load to positively-identified scheduler execution processes.
 ``run_scheduler_process`` is the module-level function sglang spawns one
 scheduler rank with (mp spawn pickles it by qualified name, so the child
 resolves THIS wrapper after its own bootstrap re-installs it). The wrapper
-loads the bundle at process entry — before the Scheduler (and its
-ModelRunner) is constructed, before any dist init, warmup or CUDA-graph
-capture — then delegates. Non-scheduler children never call it, never
-execute miner code, and never write an active receipt.
+loads ordinary bundles at process entry. A direct device-artifact bundle is
+only staged there, then bound by the validator-owned post-device hook after
+SGLang establishes the rank-local CUDA context and before model load, warmup,
+or graph capture. Non-scheduler children never call this gate, never acquire
+that pending authority, never execute miner code, and never write an active
+receipt.
 """
 
 from __future__ import annotations
@@ -51,8 +53,8 @@ def install(registry: KernelRegistry = REGISTRY) -> None:
     def run_scheduler_process(*args, **kwargs):
         from optima import seam
 
-        seam.load_candidate_bundle()
         try:
+            seam.load_candidate_bundle()
             result = fn(*args, **kwargs)
         except BaseException:
             # Preserve the initiating engine failure. Teardown still attempts to

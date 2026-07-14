@@ -17,12 +17,14 @@ from pathlib import Path
 import pytest
 
 from optima import receipts, seam
+from optima.integrations import sglang_artifact_context as artifact_context
 from optima.integrations import sglang_scheduler_gate as gate
 from optima.registry import REGISTRY
 
 SILU_BUNDLE = Path(__file__).parent.parent / "examples" / "miner_silu_torch"
 
 _SCHED_MODULE = "sglang.srt.managers.scheduler"
+_MODEL_RUNNER_MODULE = "sglang.srt.model_executor.model_runner"
 
 
 @pytest.fixture()
@@ -34,6 +36,7 @@ def armed_env(tmp_path, monkeypatch):
     monkeypatch.delenv("OPTIMA_RELEASE_REQUIRED", raising=False)
     monkeypatch.setattr(receipts, "_ONCE", set())
     monkeypatch.setattr(seam, "_bundle_loaded", False)
+    monkeypatch.setattr(seam, "_bundle_pending", None)
     monkeypatch.setattr(seam, "_IS_DRIVER", False)
     yield rdir
     REGISTRY.clear()
@@ -55,6 +58,25 @@ def fake_scheduler_module(monkeypatch):
     return mod
 
 
+@pytest.fixture()
+def fake_model_runner_module(monkeypatch):
+    mod = types.ModuleType(_MODEL_RUNNER_MODULE)
+    calls: list[str] = []
+
+    class ModelRunner:
+        def __init__(self, *, is_draft_worker=False):
+            self.is_draft_worker = is_draft_worker
+
+        def init_torch_distributed(self):
+            calls.append("sglang-context")
+            return "memory-snapshot"
+
+    mod.ModelRunner = ModelRunner
+    mod._calls = calls
+    monkeypatch.setitem(sys.modules, _MODEL_RUNNER_MODULE, mod)
+    return mod
+
+
 def test_activate_arms_but_never_loads(armed_env):
     seam.activate()
     assert REGISTRY.slots() == []
@@ -73,6 +95,53 @@ def test_load_candidate_bundle_loads_and_receipts(armed_env):
     # idempotent: a second call must not double-register or double-receipt
     seam.load_candidate_bundle()
     assert len(receipts.collect(armed_env, "active")) == 1
+
+
+def test_direct_bundle_stages_until_post_device_hook(
+    armed_env, monkeypatch
+):
+    from optima import manifest
+    from optima.registry import KernelImpl
+
+    observed: list[str] = []
+    monkeypatch.setattr(
+        manifest,
+        "load_manifest",
+        lambda _bundle: types.SimpleNamespace(
+            ops=(types.SimpleNamespace(aot_exports=(object(),)),)
+        ),
+    )
+
+    def load_after_context(bundle):
+        observed.append(bundle)
+        REGISTRY.register(
+            KernelImpl(
+                slot="activation.silu_and_mul",
+                bundle_id="direct-test",
+                entry=lambda *_args: None,
+            )
+        )
+
+    monkeypatch.setattr(seam, "_load_bundle_into_registry", load_after_context)
+    monkeypatch.setattr(seam, "_install_adapters", lambda _required: None)
+
+    seam.load_candidate_bundle()
+    assert seam._bundle_pending == (str(SILU_BUNDLE), False)
+    assert not seam._bundle_loaded
+    assert REGISTRY.slots() == []
+    assert observed == []
+    assert not armed_env.exists() or receipts.collect(armed_env, "active") == []
+
+    seam.finalize_pending_candidate_bundle()
+    assert seam._bundle_pending is None
+    assert seam._bundle_loaded
+    assert REGISTRY.slots() == ["activation.silu_and_mul"]
+    assert observed == [str(SILU_BUNDLE)]
+    assert len(receipts.collect(armed_env, "active")) == 1
+
+    # A draft/additional ModelRunner sees the same hook but cannot reload it.
+    seam.finalize_pending_candidate_bundle()
+    assert observed == [str(SILU_BUNDLE)]
 
 
 def test_load_candidate_bundle_is_inert_in_the_driver(armed_env, monkeypatch):
@@ -161,3 +230,48 @@ def test_gate_preserves_engine_error_and_suppresses_secondary_teardown(
     with pytest.raises(RuntimeError, match="initiating rank failure"):
         fake_scheduler_module.run_scheduler_process()
     assert observed == ["load", ("close", True)]
+
+
+def test_artifact_context_hook_finalizes_after_sglang_device_setup(
+    armed_env, monkeypatch, fake_model_runner_module
+):
+    observed = fake_model_runner_module._calls
+    monkeypatch.setattr(
+        seam,
+        "finalize_pending_candidate_bundle",
+        lambda: observed.append("optima-finalize"),
+    )
+    artifact_context.install()
+    assert artifact_context.is_installed()
+    wrapped = fake_model_runner_module.ModelRunner.init_torch_distributed
+    artifact_context.install()
+    assert fake_model_runner_module.ModelRunner.init_torch_distributed is wrapped
+
+    result = fake_model_runner_module.ModelRunner().init_torch_distributed()
+    assert result == "memory-snapshot"
+    assert observed == ["sglang-context", "optima-finalize"]
+
+    observed.clear()
+    fake_model_runner_module.ModelRunner(
+        is_draft_worker=True
+    ).init_torch_distributed()
+    assert observed == ["sglang-context"]
+
+    artifact_context.uninstall()
+    assert not artifact_context.is_installed()
+
+
+def test_artifact_context_is_inert_without_scheduler_pending_authority(
+    armed_env, monkeypatch, fake_model_runner_module
+):
+    def forbidden_load(*_args, **_kwargs):
+        raise AssertionError("output-path process attempted candidate load")
+
+    monkeypatch.setattr(seam, "_load_candidate_bundle_locked", forbidden_load)
+    artifact_context.install()
+    assert (
+        fake_model_runner_module.ModelRunner().init_torch_distributed()
+        == "memory-snapshot"
+    )
+    assert fake_model_runner_module._calls == ["sglang-context"]
+    artifact_context.uninstall()

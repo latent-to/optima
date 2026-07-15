@@ -48,6 +48,7 @@ from pathlib import Path
 
 from optima.manifest import (load_manifest, resolve_cuda_sources, resolve_dep_patches,
                              resolve_source)
+from optima.stack_identity import canonical_json_bytes
 
 
 def _strip_docstrings(tree: ast.AST) -> None:
@@ -269,7 +270,47 @@ def _closure_norm(root: Path, entry: Path, transform) -> str:
     return "\x1e".join(parts)
 
 
-def _op_identity(op) -> str:
+def _op_identity_for_slot(manifest, op, slot: str) -> str:
+    """Project one op through an explicit dispatch-slot execution identity.
+
+    Historical Python/Triton/CUDA rows retain their exact six-field projection.
+    A direct artifact does not execute ``op.entry``; it instead appends the full
+    canonical artifact/resource/lifecycle declaration that constructs its call.
+    """
+
+    if op.aot_exports:
+        from optima.artifact_identity import (
+            DIRECT_ARTIFACT_ENTRY,
+            direct_artifact_execution_identity,
+        )
+
+        artifact_identity = canonical_json_bytes(
+            direct_artifact_execution_identity(manifest, op)
+        ).decode("utf-8")
+        return "\x00".join(
+            [
+                slot,
+                DIRECT_ARTIFACT_ENTRY,
+                op.prepare or "",
+                op.setup or "",
+                op.base_kernel or "",
+                op.override_point or "",
+                artifact_identity,
+            ]
+        )
+    return "\x00".join(
+        [
+            slot,
+            op.entry,
+            op.prepare or "",
+            op.setup or "",
+            op.base_kernel or "",
+            op.override_point or "",
+        ]
+    )
+
+
+def _op_identity(op, *, manifest=None) -> str:
     """The non-source identity of an op: slot + callable names + override composition.
 
     ``base_kernel`` / ``override_point`` are INCLUDED — an M1 override submission JIT-composes
@@ -279,10 +320,9 @@ def _op_identity(op) -> str:
     label, not source identity, and renaming it must not evade copy detection. Capability metadata
     is likewise excluded, so relabeling a stolen implementation's domain does not make it fresh.
     """
-    return "\x00".join([
-        op.slot, op.entry, op.prepare or "", op.setup or "",
-        op.base_kernel or "", op.override_point or "",
-    ])
+    if op.aot_exports and manifest is None:
+        raise ValueError("direct artifact copy identity requires its manifest")
+    return _op_identity_for_slot(manifest, op, op.slot)
 
 
 def _aggregate_variant_fingerprints(parts: list[str], *, domain: str) -> str:
@@ -319,7 +359,7 @@ def bundle_slot_fingerprints(bundle_root: str | Path) -> dict[str, str]:
     try:
         for op in manifest.ops:
             closure = _closure_norm(root, resolve_source(root, op), normalized_source)
-            blob = _op_identity(op) + "\x1e" + closure
+            blob = _op_identity(op, manifest=manifest) + "\x1e" + closure
             components.setdefault(op.slot, []).append(
                 hashlib.sha256(blob.encode("utf-8")).hexdigest()
             )
@@ -646,7 +686,7 @@ class SubmittedDeltaFingerprint:
         if self.product_kind == "component":
             digest_fields += ("target_spec_digest",)
         elif self.target_spec_digest:
-            raise ValueError("discovery fingerprint cannot claim a target spec")
+            raise ValueError("discovery fingerprint cannot claim target authority")
         for field in digest_fields:
             value = getattr(self, field)
             if not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None:
@@ -730,8 +770,8 @@ def fingerprint_submitted_delta(
     """Fingerprint one target-owned proposal without canonical stack bytes.
 
     Normal component intake reuses :func:`inspect_contribution`, the same trusted
-    projection used by stack assembly.  Discovery intake fingerprints only the closed
-    discovery manifest and declared patches.  Callers must choose the lane explicitly;
+    projection used by stack assembly. Discovery intake fingerprints only the closed
+    discovery manifest and declared patches. Callers must choose the lane explicitly;
     parser failure never silently reclassifies a component as discovery.
     """
 
@@ -788,7 +828,7 @@ def fingerprint_submitted_delta(
     # definition-level containment fragment. Their exact and normalized
     # whole-delta identities remain authoritative.
     if not normalized_rows:
-        raise ValueError("submitted component delta produced incomplete fingerprints")
+        raise ValueError("submitted delta produced incomplete fingerprints")
     return SubmittedDeltaFingerprint(
         product_kind="component",
         target_id=inspected.target_id,

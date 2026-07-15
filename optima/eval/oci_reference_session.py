@@ -17,10 +17,12 @@ from typing import Callable, Protocol
 
 from optima.eval.oci_outer_session import (
     AttachedSessionTransport,
+    OuterSessionError,
     OuterSessionInfrastructureError,
     OuterSessionProtocolError,
     OuterSessionTimeoutError,
     OuterSessionWorkerError,
+    diagnostic_provider,
 )
 from optima.eval.oci_session_protocol import (
     CONTROL_MAGIC,
@@ -330,7 +332,9 @@ class AttachedReferenceTransport(AttachedSessionTransport):
             except SessionProtocolError as exc:
                 raise OuterSessionProtocolError(str(exc)) from None
             if detail is not None:
-                raise OuterSessionWorkerError(": ".join(detail))
+                raise self._diagnostic_error(
+                    OuterSessionWorkerError, ": ".join(detail)
+                )
             raise OuterSessionProtocolError("worker emitted an early control frame")
         if magic != EVIDENCE_MAGIC:
             raise OuterSessionProtocolError("worker emitted wrong reference-evidence magic")
@@ -362,7 +366,9 @@ def _control_or_error(
     except SessionProtocolError as exc:
         raise OuterSessionProtocolError(str(exc)) from None
     if detail is not None:
-        raise OuterSessionWorkerError(": ".join(detail))
+        raise OuterSessionWorkerError(
+            ": ".join(detail), diagnostic_provider(transport)
+        )
     return message
 
 
@@ -428,7 +434,11 @@ def run_reference_session(
                 expected_facts=plan.expected_preflight,
             )
         except (SessionProtocolError, OuterSessionProtocolError, OuterSessionWorkerError) as exc:
-            raise OuterSessionInfrastructureError(f"runtime preflight failed: {exc}") from None
+            detail = exc.message if isinstance(exc, OuterSessionError) else str(exc)
+            raise OuterSessionInfrastructureError(
+                f"runtime preflight failed: {detail}",
+                diagnostic_provider(transport),
+            ) from None
         transport.write_frame(
             frame_message(
                 preflight_accept_message(
@@ -485,12 +495,16 @@ def run_reference_session(
         if completed_at > deadline:
             raise OuterSessionTimeoutError("reference cleanup exceeded its absolute deadline")
     except BaseException as original:
+        if isinstance(original, OuterSessionError):
+            original.attach_diagnostic(diagnostic_provider(transport))
         try:
             transport.abort()
         except BaseException as cleanup:
-            raise OuterSessionInfrastructureError(
+            error = OuterSessionInfrastructureError(
                 f"reference cleanup could not be proven: {cleanup}"
-            ) from original
+            )
+            error.attach_diagnostic(diagnostic_provider(transport))
+            raise error from original
         raise
     if preflight is None:  # pragma: no cover - successful handshake sets it
         raise OuterSessionInfrastructureError("reference session lacks preflight evidence")

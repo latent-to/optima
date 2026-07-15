@@ -1798,6 +1798,13 @@ class FinalizedIntakeStore:
             blockers.append(row.reservation_id)
         return tuple(blockers)
 
+    def has_pending_settlement(self) -> bool:
+        """Return whether retained settlement work is waiting for a lease."""
+
+        return self._db.execute(
+            "SELECT 1 FROM settlement_candidates WHERE status='pending' LIMIT 1"
+        ).fetchone() is not None
+
     def lease_settlement_cohort(
         self,
         *,

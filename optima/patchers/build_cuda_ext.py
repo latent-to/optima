@@ -1050,16 +1050,52 @@ def _development_all(
     architecture: str,
 ) -> None:
     _log("combined build+load is a non-authoritative development path")
-    import torch
-
-    if not torch.cuda.is_available() or shutil.which("nvcc") is None or shutil.which("ptxas") is None:
-        _log("CUDA device/toolchain unavailable; skipping native development product")
+    env = _compiler_environment()
+    if any(shutil.which(tool, path=env["PATH"]) is None for tool in ("nvcc", "ptxas")):
+        # Coordinator/nsenter launches intentionally inherit a minimal host PATH.
+        # Resolve the container's validator-owned CUDA root without changing the
+        # process environment; the exact executables and the resulting compiler
+        # environment are still hashed into the development artifact identity.
+        cuda_home = os.environ.get("CUDA_HOME", "/usr/local/cuda").strip()
+        cuda_bin: Path | None = None
+        if cuda_home and Path(cuda_home).is_absolute():
+            candidate = Path(cuda_home) / "bin"
+            try:
+                resolved = candidate.resolve(strict=True)
+            except OSError:
+                resolved = None
+            if resolved is not None and resolved.is_dir():
+                cuda_bin = resolved
+        if cuda_bin is not None:
+            env = dict(env)
+            env["PATH"] = os.pathsep.join((str(cuda_bin), env["PATH"]))
+    missing_tools = tuple(
+        tool
+        for tool in ("nvcc", "ptxas")
+        if shutil.which(tool, path=env["PATH"]) is None
+    )
+    if missing_tools:
+        if architecture:
+            raise CUDAExtensionError(
+                "sealed development target lacks required CUDA toolchain "
+                f"{missing_tools!r}"
+            )
+        _log("CUDA toolchain unavailable; skipping native development product")
         return
     if not architecture:
+        # Direct development may discover an architecture from a live device,
+        # but a validator-projected target is already sufficient to compile.
+        # Spawned engine interpreters can import the bootstrap before SGLang
+        # establishes their CUDA context; requiring torch.cuda here therefore
+        # incorrectly turns a sealed target into a silent stock fallback.
+        import torch
+
+        if not torch.cuda.is_available():
+            _log("CUDA device unavailable; skipping native development product")
+            return
         major, minor = torch.cuda.get_device_capability(torch.cuda.current_device())
         architecture = _canonical_architecture(f"sm{major}{minor}")
     units, inventory, selected_sources = _declared_sources(bundle, architecture)
-    env = _compiler_environment()
     context = _build_context(architecture, env, production=False)
     if not tree_digest:
         from optima.bundle_hash import content_hash

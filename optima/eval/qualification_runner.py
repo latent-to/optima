@@ -45,7 +45,9 @@ from optima.eval.qualification import (
     selected_trajectory_projection_digest, validate_quality_binding,
 )
 from optima.eval.reference_protocol import (
-    ReferencePromptInput, ReferenceRequest, ReferenceRoleInput, request_sha256,
+    MAX_DERIVED_LOGPROBS, MAX_PROMPTS, MAX_SUPPORT_UNION, MAX_SUPPORT_WIDTH,
+    MAX_TOKENS, ROLE_NAMES, ReferencePromptInput, ReferenceRequest,
+    ReferenceRoleInput, request_sha256,
 )
 from optima.eval.reference_quality import (
     RAW_QUALITY_DOMAIN, RAW_QUALITY_SCHEMA, RawHiddenTaskResult,
@@ -296,6 +298,27 @@ class CausalQualificationInput:
         ):
             raise QualificationRunnerError("candidate authority order differs from the sealed cohort")
         object.__setattr__(self, "candidates", candidates)
+        for authority in candidates:
+            profile = authority.profile
+            support_union = min(
+                MAX_SUPPORT_UNION,
+                profile.tokens_per_prompt * profile.topk_width,
+            )
+            derived = (
+                self.commitment.select_count
+                * len(ROLE_NAMES)
+                * profile.tokens_per_prompt
+                * support_union
+            )
+            if (
+                profile.tokens_per_prompt > MAX_TOKENS
+                or profile.topk_width > MAX_SUPPORT_WIDTH
+                or self.commitment.select_count > MAX_PROMPTS
+                or derived > MAX_DERIVED_LOGPROBS
+            ):
+                raise QualificationRunnerError(
+                    "sealed qualification can exceed the pristine-reference bounds"
+                )
         for field in (
             "expected_launch_resource_policy_digest",
             "expected_runtime_resource_policy_digest",

@@ -261,6 +261,12 @@ class WeightPublicationJournal(Protocol):
     ) -> None: ...
 
 
+class ReopenableWeightPublicationJournal(WeightPublicationJournal, Protocol):
+    """Journal that can reopen the exact projection bound to a record."""
+
+    def retained_projection(self, projection_digest: str) -> WeightProjection: ...
+
+
 @dataclass(frozen=True)
 class WeightPublicationResult:
     projection_digest: str
@@ -404,6 +410,38 @@ def release_weight_publication_hold(
     )
 
 
+def resume_weight_projection(
+    proposed: WeightProjection,
+    journal: ReopenableWeightPublicationJournal,
+) -> WeightProjection:
+    """Resume an in-flight publication from its retained immutable projection."""
+
+    if type(proposed) is not WeightProjection:
+        raise WeightPublicationError("weight projection is not exactly typed")
+    current = journal.load()
+    if current is None:
+        return proposed
+    if type(current) is not WeightPublicationRecord:
+        raise WeightPublicationError("journal returned an untyped publication record")
+    if current.status not in {"intent", "pending"}:
+        return proposed
+    retained = journal.retained_projection(current.projection_digest)
+    if (
+        type(retained) is not WeightProjection
+        or retained.digest != current.projection_digest
+    ):
+        raise WeightPublicationError("journal returned an invalid retained projection")
+    if (
+        retained.chain_scope_digest != proposed.chain_scope_digest
+        or retained.netuid != proposed.netuid
+        or retained.validator_hotkey != proposed.validator_hotkey
+    ):
+        raise WeightPublicationError(
+            "in-flight publication differs from the current chain authority"
+        )
+    return retained
+
+
 def reconcile_weight_publication(
     subtensor,
     signer_wallet,
@@ -415,23 +453,40 @@ def reconcile_weight_publication(
 ) -> WeightPublicationResult:
     """Reconcile and optionally publish one exact projection.
 
-    The live sparse row is read before any journal decision and after every SDK
-    attempt. Real publication persists ``intent`` before the signer is called;
-    exact readback plus a sufficiently new ``last_update`` is the only path to
-    ``confirmed``.
+    The journal head and live sparse row are read before any journal mutation;
+    the row is read again after every SDK attempt. Real publication persists
+    ``intent`` before the signer is called; exact readback plus a sufficiently
+    new ``last_update`` is the only path to ``confirmed``.
     """
 
     if type(projection) is not WeightProjection:
         raise WeightPublicationError("weight projection is not exactly typed")
     if type(refresh_blocks) is not int or refresh_blocks <= 0:
         raise WeightPublicationError("weight refresh cadence is malformed")
+    current = None if dry_run else journal.load()
+    if current is not None and type(current) is not WeightPublicationRecord:
+        raise WeightPublicationError("journal returned an untyped publication record")
+    in_flight = (
+        current
+        if current is not None
+        and current.status in {"intent", "pending"}
+        and current.projection_digest == projection.digest
+        else None
+    )
     live_metagraph = chain.fetch_metagraph(subtensor, projection.netuid)
-    if (
+    if in_flight is None and (
         live_metagraph.block != projection.effective_block
         or _metagraph_digest(projection, live_metagraph) != projection.metagraph_digest
     ):
         raise WeightPublicationError(
             "weight projection is stale for the immediately refreshed metagraph"
+        )
+    if (
+        in_flight is not None
+        and in_flight.submit_block != projection.effective_block
+    ):
+        raise WeightPublicationError(
+            "in-flight publication does not bind its retained projection block"
         )
     pre = chain.read_validator_weight_snapshot(
         subtensor,
@@ -440,7 +495,10 @@ def reconcile_weight_publication(
         metagraph_view=live_metagraph,
     )
     observed_block = live_metagraph.block
-    if pre.last_update_block > observed_block or projection.effective_block != observed_block:
+    if (
+        pre.last_update_block > observed_block
+        or projection.effective_block > observed_block
+    ):
         raise chain.ChainWeightStateError("weight authority chronology is inconsistent")
     matches = _matches(pre, projection)
 
@@ -452,9 +510,6 @@ def reconcile_weight_publication(
             projection.digest, "dry_run", None, matches, False, True, observed_block
         )
 
-    current = journal.load()
-    if current is not None and type(current) is not WeightPublicationRecord:
-        raise WeightPublicationError("journal returned an untyped publication record")
     if current is not None and current.status in {"intent", "pending", "held"}:
         if current.projection_digest != projection.digest:
             current = _held(journal, current, "projection_changed_while_unresolved")
@@ -613,8 +668,10 @@ __all__ = [
     "WeightProjection",
     "WeightPublicationError",
     "WeightPublicationJournal",
+    "ReopenableWeightPublicationJournal",
     "WeightPublicationRecord",
     "WeightPublicationResult",
     "release_weight_publication_hold",
     "reconcile_weight_publication",
+    "resume_weight_projection",
 ]

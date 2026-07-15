@@ -34,6 +34,7 @@ def _fake_repo(tmp_path: Path, *, marker: Path | None = None) -> Path:
     for name, label in (
         ("apply_dep_patch.py", "patch"),
         ("build_cuda_ext.py", "build"),
+        ("build_cute_cubin.py", "cute-cubin"),
     ):
         body = "# reviewed\n"
         if marker is not None:
@@ -57,7 +58,13 @@ def test_parse_is_pure_and_canonicalizes_registered_order(tmp_path, monkeypatch)
     monkeypatch.setenv("OPTIMA_REPO_ROOT", str(repo))
     bundle = _bundle(
         tmp_path / "bundle",
-        {"steps": [_step("build_cuda_ext.py"), _step("apply_dep_patch.py")]},
+        {
+            "steps": [
+                _step("build_cute_cubin.py"),
+                _step("build_cuda_ext.py"),
+                _step("apply_dep_patch.py"),
+            ]
+        },
     )
 
     plan = parse_rebuild_plan(bundle)
@@ -65,11 +72,13 @@ def test_parse_is_pure_and_canonicalizes_registered_order(tmp_path, monkeypatch)
     assert [step.patcher_id for step in plan.steps] == [
         "optima.apply-dep-patch.v1",
         "optima.build-cuda-ext.v1",
+        "optima.build-cute-cubin.v1",
     ]
     assert plan.to_dict() == {
         "steps": [
             _step("optima/patchers/apply_dep_patch.py"),
             _step("optima/patchers/build_cuda_ext.py"),
+            _step("optima/patchers/build_cute_cubin.py"),
         ]
     }
     assert all(len(step.patcher_sha256) == 64 for step in plan.steps)
@@ -78,7 +87,11 @@ def test_parse_is_pure_and_canonicalizes_registered_order(tmp_path, monkeypatch)
     )
 
     assert apply_rebuild_plan(bundle) is True
-    assert marker.read_text().splitlines() == ["patch", "build"]
+    assert marker.read_text().splitlines() == [
+        "patch",
+        "build",
+        "cute-cubin",
+    ]
 
 
 @pytest.mark.parametrize("phase", ["all", "build", "load"])

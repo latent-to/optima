@@ -6,6 +6,7 @@ import os
 import sys
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -39,16 +40,19 @@ from optima.eval.oci_prebuild import (
     OCIPrebuildPolicy,
     PREBUILD_RECEIPT,
     PREBUILD_SCHEMA,
+    _write_compile_profile,
     build_prebuild_argv,
     container_build,
     run_oci_prebuild,
 )
+from optima.eval.native_compile_profile import NativeCuTeCompileProfile
+from optima.eval.native_artifact import publish_native_artifact
 from optima.eval.oci_process import (
     CommandResult,
+    OCIAttachedDiagnostic,
     OCIProcessManager,
     OCIProcessResult,
 )
-from optima.eval.native_artifact import publish_native_artifact
 from optima.eval.runtime_preflight import RuntimePreflightReceipt
 from optima.stack_identity import canonical_json_bytes
 from optima.stack_manifest import EvaluationStackContext, EvaluationStackManifest
@@ -375,6 +379,39 @@ class _Controls:
         return CommandResult(0, b"", b"")
 
 
+def _compile_profile() -> NativeCuTeCompileProfile:
+    return NativeCuTeCompileProfile(
+        logical_architecture="sm103",
+        compiler_architecture="sm_103a",
+        image_digest=_digest("profile-image"),
+        platform_digest=_digest("profile-platform"),
+        worker_distribution_digest=_digest("profile-worker"),
+        logical_hardware_digest=_digest("profile-hardware"),
+        device_policy_digest=_digest("profile-device"),
+        topology_digest=_digest("profile-topology"),
+        visible_gpu_count=8,
+        tp_size=4,
+        ep_size=1,
+        dp_size=2,
+        constants={"max_active_clusters.cluster_size_1": 148},
+        measurement_digest=_digest("profile-measurement"),
+    )
+
+
+def test_compile_profile_staging_overrides_restrictive_controller_umask(
+    tmp_path: Path,
+) -> None:
+    profile = _compile_profile()
+    destination = tmp_path / "compile-profile.json"
+    previous = os.umask(0o077)
+    try:
+        _write_compile_profile(profile, destination)
+    finally:
+        os.umask(previous)
+    assert destination.stat().st_mode & 0o777 == 0o444
+    assert destination.read_bytes() == profile.canonical_bytes
+
+
 def test_policy_binds_resource_and_native_dependency_inputs(tmp_path: Path) -> None:
     policy = _policy()
     resource_changes = {
@@ -387,7 +424,18 @@ def test_policy_binds_resource_and_native_dependency_inputs(tmp_path: Path) -> N
         "runtime_policy_digest": _digest("other runtime"),
     }
     for field, value in resource_changes.items():
-        assert replace(policy, **{field: value}).resource_policy_digest != policy.resource_policy_digest
+        assert (
+            replace(policy, **{field: value}).resource_policy_digest
+            != policy.resource_policy_digest
+        )
+    assert (
+        replace(
+            policy,
+            cpuset_cpus="0-3,8-11",
+            cpuset_mems="0",
+        ).resource_policy_digest
+        != policy.resource_policy_digest
+    )
     dependency_changes = {
         "build_path": ("/usr/bin", "/bin"),
         "build_tmpdir": "/var/tmp",
@@ -396,7 +444,10 @@ def test_policy_binds_resource_and_native_dependency_inputs(tmp_path: Path) -> N
         "pinned_build_roots": ("/usr/include", "/usr/lib"),
     }
     for field, value in dependency_changes.items():
-        assert replace(policy, **{field: value}).dependency_policy_digest != policy.dependency_policy_digest
+        assert (
+            replace(policy, **{field: value}).dependency_policy_digest
+            != policy.dependency_policy_digest
+        )
 
     _tree_row, _launch, binding, _preflight, _config_row = _case(tmp_path)
     changed_policy = replace(policy, container_python="/usr/bin/python3")
@@ -406,10 +457,24 @@ def test_policy_binds_resource_and_native_dependency_inputs(tmp_path: Path) -> N
     assert changed_native.digest != binding.native_build_spec.digest
 
 
+def test_prebuild_cpuset_policy_rejects_partial_or_noncanonical_sets() -> None:
+    policy = _policy()
+    for cpus, mems in (
+        ("0-7", None),
+        (None, "0"),
+        ("0,1", "0"),
+        ("0-7", "00"),
+        ("0-6", "0"),
+    ):
+        with pytest.raises(OCIPrebuildError, match="cpuset|cpu_millis"):
+            replace(policy, cpuset_cpus=cpus, cpuset_mems=mems)
+
+
 def test_exact_prebuild_argv_has_only_two_mounts_no_gpu_no_egress_no_caps(
     tmp_path: Path,
 ) -> None:
-    tree, launch, binding, preflight, config = _case(tmp_path)
+    isolated = _policy(cpuset_cpus="0-3,8-11", cpuset_mems="0")
+    tree, launch, binding, preflight, config = _case(tmp_path, policy=isolated)
     resolved = resolve_engine_launch(launch, binding)
     manager = OCIProcessManager(
         docker_binary=DOCKER,
@@ -439,14 +504,22 @@ def test_exact_prebuild_argv_has_only_two_mounts_no_gpu_no_egress_no_caps(
     assert not any(value.startswith("--cap-add") for value in argv)
     assert "--security-opt=no-new-privileges=true" in argv
     assert f"--security-opt=seccomp={lease.stage_paths[0]}" in argv
+    assert "--cpuset-cpus=0-3,8-11" in argv
+    assert "--cpuset-mems=0" in argv
     mounts = [value for value in argv if value.startswith("--mount=")]
     assert len(mounts) == 2
     assert str(tree.root) in mounts[0] and "readonly" in mounts[0]
     assert str(lease.mount_paths[0]) in mounts[1] and "readonly" not in mounts[1]
-    assert not any("/models" in value or "/root" in value or "docker.sock" in value for value in argv)
+    assert not any(
+        "/models" in value or "/root" in value or "docker.sock" in value
+        for value in argv
+    )
     assert not any("--gpus" in value or "--device" in value for value in argv)
     env_rows = [value for value in argv if value.startswith("--env=")]
-    assert any("OPTIMA_NATIVE_BUILD_SPEC_DIGEST=" + binding.native_build_spec.digest in value for value in env_rows)
+    assert any(
+        "OPTIMA_NATIVE_BUILD_SPEC_DIGEST=" + binding.native_build_spec.digest in value
+        for value in env_rows
+    )
     assert any("OPTIMA_BUILD_PATH=" in value for value in env_rows)
     assert any("OPTIMA_BUILD_TMPDIR=/tmp" in value for value in env_rows)
     assert any("OPTIMA_NATIVE_COMPILE_TIMEOUT_S=6000" in value for value in env_rows)
@@ -462,6 +535,58 @@ def test_exact_prebuild_argv_has_only_two_mounts_no_gpu_no_egress_no_caps(
         "optima.eval.oci_prebuild",
         "--container-build",
     )
+
+
+def test_profiled_prebuild_adds_one_read_only_profile_mount_and_digest_env(
+    tmp_path: Path,
+) -> None:
+    tree, launch, binding, preflight, config = _case(tmp_path)
+    resolved = resolve_engine_launch(launch, binding)
+    profile_digest = _digest("cute-profile")
+    profiled = replace(
+        resolved,
+        native_compile_profile=SimpleNamespace(digest=profile_digest),
+    )
+    manager = OCIProcessManager(
+        docker_binary=DOCKER,
+        recovery_root=config.recovery_root,
+        executor_id=config.executor_id,
+        runner=_Controls(),
+    )
+    lease = manager.register(
+        lease_id="profiled-prebuild-test",
+        container_name="optima-profiled-prebuild-test",
+        mount_relpaths=("stage",),
+        stage_relpaths=("seccomp.json", "cute-profile.json"),
+    )
+    argv = build_prebuild_argv(
+        lease=lease,
+        resolved=profiled,
+        preflight=preflight,
+        config=config,
+        stage_path=lease.mount_paths[0],
+        seccomp_path=lease.stage_paths[0],
+        compile_profile_path=lease.stage_paths[1],
+    )
+    profile_mounts = [
+        value
+        for value in argv
+        if value.startswith("--mount=") and "cute-compile-profile.json" in value
+    ]
+    assert len(profile_mounts) == 1
+    assert "readonly" in profile_mounts[0]
+    assert f"--env=OPTIMA_CUTE_COMPILE_PROFILE_DIGEST={profile_digest}" in argv
+    assert "--env=OPTIMA_CUTE_COMPILE_PROFILE=/optima/cute-compile-profile.json" in argv
+
+    with pytest.raises(OCIPrebuildError, match="does not match launch authority"):
+        build_prebuild_argv(
+            lease=lease,
+            resolved=profiled,
+            preflight=preflight,
+            config=config,
+            stage_path=lease.mount_paths[0],
+            seccomp_path=lease.stage_paths[0],
+        )
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="production publication uses Linux renameat2")
@@ -689,6 +814,40 @@ def test_prebuild_container_timeout_is_capped_by_absolute_deadline_and_policy(
             launch, binding, config, manager=manager, deadline=deadline
         )
     assert observed == [(expected_timeout, b"")]
+    assert list(manager.leases_root.iterdir()) == []
+
+
+def test_prebuild_failure_preserves_only_bounded_terminal_safe_stderr(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _tree_row, launch, binding, _preflight_row, config = _case(tmp_path)
+    manager = OCIProcessManager(
+        docker_binary=DOCKER,
+        recovery_root=config.recovery_root,
+        executor_id=config.executor_id,
+        runner=_Controls(),
+    )
+
+    def mount(_lease, path, **_kwargs):
+        Path(path).mkdir(parents=True)
+        return Path(path)
+
+    tail = b"compile failed: \x1b[31mTRACEBACK-TAIL\x1b[0m"
+    diagnostic = OCIAttachedDiagnostic(tail, True, True, client_returncode=9)
+
+    def run(_lease, _argv, *, timeout_s, stdin_bytes=b""):
+        assert timeout_s == config.policy.timeout_seconds and stdin_bytes == b""
+        return OCIProcessResult(9, 0.1, diagnostic)
+
+    monkeypatch.setattr(manager, "mount_tmpfs", mount)
+    monkeypatch.setattr(manager, "run", run)
+    with pytest.raises(OCIPrebuildError) as caught:
+        run_oci_prebuild(launch, binding, config, manager=manager)
+    rendered = str(caught.value)
+    assert "container exited 9" in rendered
+    assert diagnostic.stderr_sha256 in rendered
+    assert "TRACEBACK-TAIL" in rendered
+    assert "\x1b" not in rendered and "\\x1b" in rendered
     assert list(manager.leases_root.iterdir()) == []
 
 
@@ -1106,20 +1265,22 @@ def test_materialized_dep_cuda_tree_builds_publishes_and_reopens_load_only(
         assert (overlay_subtree / "fused_moe/fused_moe.cu").read_text() == (
             "export_prefinalize();\n"
         )
-        module = policy.prebuilt_modules[0]
-        relative = dep_policy.prebuilt_module_relative_path(target, module)
-        destination = artifact_root / relative
-        digest, size = apply_namespace["_copy_built_module"](
-            prebuilt_source, destination
-        )
-        return [
-            {
-                **asdict(module),
-                "path": relative,
-                "sha256": digest,
-                "size": size,
-            }
-        ]
+        rows = []
+        for module in policy.prebuilt_modules:
+            relative = dep_policy.prebuilt_module_relative_path(target, module)
+            destination = artifact_root / relative
+            digest, size = apply_namespace["_copy_built_module"](
+                prebuilt_source, destination
+            )
+            rows.append(
+                {
+                    **asdict(module),
+                    "path": relative,
+                    "sha256": digest,
+                    "size": size,
+                }
+            )
+        return rows
 
     apply_namespace["_build_prebuilt_modules"] = fake_prebuilt_modules
 

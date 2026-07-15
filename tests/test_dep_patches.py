@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import difflib
 import hashlib
+import json
 import os
 import sys
 import textwrap
@@ -301,45 +302,38 @@ def test_overlay_materialization_roundtrip(tmp_path):
 
 
 def test_dependency_prebuild_compiles_without_loading(tmp_path, monkeypatch):
-    """The hermetic phase calls JitSpec.build only and exports the exact .so."""
+    """Each arch builds in a hermetic child; the parent exports the exact .so."""
     script = Path(__file__).parent.parent / "optima/patchers/apply_dep_patch.py"
     namespace: dict = {}
     exec(compile(script.read_text().replace("\nmain()\n", "\n"), str(script), "exec"), namespace)
 
-    calls: list[tuple[str, object]] = []
-    specs = []
+    calls: list[tuple[str, str, str, str]] = []
+    scratches: list[Path] = []
 
-    class FakeSpec:
-        name = "fused_moe_103"
+    class FakeCompleted:
+        def __init__(self, returncode, stdout, stderr=""):
+            self.returncode = returncode
+            self.stdout = stdout
+            self.stderr = stderr
 
-        def __init__(self):
-            self.jit_library_path = (
-                Path(os.environ["FLASHINFER_WORKSPACE_BASE"])
-                / "cached_ops/fused_moe_103/fused_moe_103.so"
-            )
-            specs.append(self)
+    def fake_run(argv, *, env, stdout, stderr, text):
+        assert argv[0] == sys.executable and argv[1] == "-c"
+        driver, overlay_arg, generator_module, generator_attr, name = argv[2:7]
+        # The child fixes its environment before any flashinfer import and
+        # rebinds the csrc root to the patched overlay.
+        assert "flashinfer.jit.env" in driver
+        assert "spec.build(verbose=False)" in driver
+        scratch = Path(env["FLASHINFER_WORKSPACE_BASE"])
+        scratches.append(scratch)
+        calls.append((name, env["FLASHINFER_CUDA_ARCH_LIST"], overlay_arg, generator_attr))
+        built = scratch / f"cached_ops/{name}/{name}.so"
+        built.parent.mkdir(parents=True)
+        built.write_bytes(b"synthetic-elf")
+        return FakeCompleted(0, json.dumps({"built": str(built)}) + "\n")
 
-        def build(self, *, verbose):
-            calls.append(("build", verbose))
-            self.jit_library_path.parent.mkdir(parents=True)
-            self.jit_library_path.write_bytes(b"synthetic-elf")
-
-        def build_and_load(self):
-            calls.append(("build_and_load", None))
-            raise AssertionError("prebuild must not load")
-
-    environment = types.SimpleNamespace(FLASHINFER_CSRC_DIR=Path("/stock"))
-    generator_module = types.SimpleNamespace(
-        gen_cutlass_fused_moe_sm103_module=lambda use_fast_build=False: FakeSpec()
+    namespace["subprocess"] = types.SimpleNamespace(
+        run=fake_run, PIPE=object()
     )
-
-    def fake_import(name):
-        return {
-            "flashinfer.jit.env": environment,
-            "flashinfer.jit.fused_moe": generator_module,
-        }[name]
-
-    namespace["importlib"] = types.SimpleNamespace(import_module=fake_import)
     # The complete suite intentionally exercises live FlashInfer adapters before
     # this hermetic-prebuild unit test.  Restore the process boundary that the
     # production prebuild container provides, while monkeypatch retains the exact
@@ -364,13 +358,19 @@ def test_dependency_prebuild_compiles_without_loading(tmp_path, monkeypatch):
         artifact_root=artifact,
     )
 
-    assert calls == [("build", False)]
-    assert environment.FLASHINFER_CSRC_DIR == overlay
-    assert rows[0]["path"] == (
-        "dep_modules/flashinfer/fused_moe_103/fused_moe_103.so"
-    )
-    assert (artifact / rows[0]["path"]).read_bytes() == b"synthetic-elf"
-    assert not specs[0].jit_library_path.parents[2].exists()  # private scratch removed
+    # One hermetic child per declared architecture, each under its own arch list.
+    assert calls == [
+        ("fused_moe_100", "10.0", str(overlay), "gen_cutlass_fused_moe_sm100_module"),
+        ("fused_moe_103", "10.3", str(overlay), "gen_cutlass_fused_moe_sm103_module"),
+    ]
+    assert [row["path"] for row in rows] == [
+        "dep_modules/flashinfer/fused_moe_100/fused_moe_100.so",
+        "dep_modules/flashinfer/fused_moe_103/fused_moe_103.so",
+    ]
+    for row in rows:
+        assert (artifact / row["path"]).read_bytes() == b"synthetic-elf"
+    assert not scratches[0].exists()  # private scratch removed
+    # The parent process never mutates its own FlashInfer environment.
     assert "FLASHINFER_CUDA_ARCH_LIST" not in os.environ
     assert "FLASHINFER_WORKSPACE_BASE" not in os.environ
 
@@ -385,7 +385,7 @@ def test_dependency_prebuild_rejects_off_domain_arch_before_import(tmp_path, mon
     monkeypatch.setenv("OPTIMA_TARGET_GPU_ARCH", "sm120")
     from optima.dep_policy import PATCHABLE_DEPS
 
-    with pytest.raises(RuntimeError, match="requires target architecture 'sm103'"):
+    with pytest.raises(RuntimeError, match="covers target architectures .*'sm120'"):
         namespace["_build_prebuilt_modules"](
             PATCHABLE_DEPS["flashinfer"],
             target="flashinfer",
@@ -418,21 +418,23 @@ def test_build_stage_and_load_reopen_use_exact_build_identity(tmp_path, monkeypa
     import optima.dep_policy as dep_policy
 
     policy = dep_policy.PATCHABLE_DEPS["flashinfer"]
-    module = policy.prebuilt_modules[0]
 
     def fake_modules(_policy, *, target, overlay_subtree, artifact_root):
         assert (overlay_subtree / "fused_moe/kern.cu").read_text() == NEW
-        relative = dep_policy.prebuilt_module_relative_path(target, module)
-        output = artifact_root / relative
-        output.parent.mkdir(parents=True)
-        payload = b"compiled-module"
-        output.write_bytes(payload)
-        return [{
-            **asdict(module),
-            "path": relative,
-            "sha256": hashlib.sha256(payload).hexdigest(),
-            "size": len(payload),
-        }]
+        rows = []
+        for module in policy.prebuilt_modules:
+            relative = dep_policy.prebuilt_module_relative_path(target, module)
+            output = artifact_root / relative
+            output.parent.mkdir(parents=True)
+            payload = b"compiled-module"
+            output.write_bytes(payload)
+            rows.append({
+                **asdict(module),
+                "path": relative,
+                "sha256": hashlib.sha256(payload).hexdigest(),
+                "size": len(payload),
+            })
+        return rows
 
     namespace["_build_prebuilt_modules"] = fake_modules
     monkeypatch.setattr(dep_policy, "dependency_site_root", lambda _policy: site)

@@ -183,6 +183,29 @@ def test_dispatcher_routes_to_kernel(monkeypatch, _fake_group):
     assert torch.equal(out_residual, torch.full((4, 8), 2.0))
 
 
+def test_dispatcher_autotuner_stays_stock_before_selection(monkeypatch, _fake_group):
+    import optima.dispatch as dispatch
+
+    monkeypatch.setenv("OPTIMA_ARFUSION_SEAM", "1")
+    monkeypatch.setattr(dispatch._moe_export, "flashinfer_tuning", lambda: True)
+    reg = _registry()
+    monkeypatch.setattr(
+        reg,
+        "select",
+        lambda *args, **kwargs: pytest.fail("autotuning reached miner selection"),
+    )
+    monkeypatch.setattr(
+        dispatch._moe_export,
+        "has_pends",
+        lambda: pytest.fail("autotuning reached deep consume"),
+    )
+    calls = []
+    d = make_arfusion_dispatcher(_baseline_recorder(calls), registry=reg)
+    x = torch.zeros(4, 8)
+    assert d(x, x.clone(), x[0])[0] == "baseline"
+    assert calls == ["baseline"]
+
+
 def test_dispatcher_token_cap_falls_back(monkeypatch, _fake_group):
     # A kernel with a MEASURED dispatch window (decode-sized T) must not see
     # prefill-sized calls — the seam, not the kernel, enforces the cap.

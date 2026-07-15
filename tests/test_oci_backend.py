@@ -41,6 +41,7 @@ from optima.eval.oci_backend import (
     runtime_identity_from_preflight,
 )
 from optima.eval.oci_outer_session import (
+    OuterSessionProtocolError,
     SessionExecutionEvidence,
     SessionExecutionPlan,
 )
@@ -49,7 +50,13 @@ from optima.eval.oci_prebuild import (
     OCIPrebuildPolicy,
     OCIPrebuildResult,
 )
-from optima.eval.oci_process import CommandResult, OCIProcessManager
+from optima.eval.oci_process import (
+    STDERR_ARTIFACT_SCHEMA,
+    CommandResult,
+    OCIAttachedDiagnostic,
+    OCIProcessManager,
+    OCIStderrArtifactReceipt,
+)
 from optima.eval.oci_session_protocol import EngineSessionConfig
 from optima.eval.runtime_preflight import RuntimePreflightReceipt
 
@@ -621,6 +628,40 @@ def test_runtime_identity_and_backend_policy_are_closed(tmp_path: Path) -> None:
         OCIBackendConfig(prebuild=bad_prebuild, runtime=case.runtime)
 
 
+def test_runtime_cpuset_policy_is_canonical_paired_and_digest_bound(
+    tmp_path: Path,
+) -> None:
+    case = _case(tmp_path)
+    policy = case.runtime
+    isolated = replace(
+        policy,
+        cpuset_cpus="0-3,8-11",
+        cpuset_mems="0",
+    )
+    assert isolated.cpuset_cpus == "0-3,8-11"
+    assert isolated.cpuset_mems == "0"
+    assert isolated.digest != policy.digest
+    with pytest.raises(OCIBackendError, match="do not share one identity"):
+        OCIBackendConfig(prebuild=case.config.prebuild, runtime=isolated)
+
+    invalid = (
+        ("0-7", None),
+        (None, "0"),
+        ("", "0"),
+        ("00-7", "0"),
+        ("0,1", "0"),
+        ("4-7,0-3", "0"),
+        ("0-4,4-7", "0"),
+        ("7-0", "0"),
+        ("0-6", "0"),  # Seven CPUs cannot satisfy an eight-CPU quota.
+        ("1048576", "0"),
+        ("0-7", "65536"),
+    )
+    for cpus, mems in invalid:
+        with pytest.raises(OCIBackendError, match="runtime resource cpuset|cpu_millis"):
+            replace(policy, cpuset_cpus=cpus, cpuset_mems=mems)
+
+
 def test_model_mount_receipt_rejects_relative_crlf_and_replacement(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -698,6 +739,7 @@ def test_runtime_argv_is_exact_closed_and_mount_minimal(
     assert not any('"' in row or "'" in row for row in argv)
     assert argv.count("--cap-drop=ALL") == 1
     assert case.preflight.requested_image not in argv
+    assert not any(row.startswith("--cpuset-") for row in argv)
     mounts = tuple(row for row in argv if row.startswith("--mount="))
     assert len(mounts) == 4
     assert sum(",readonly" not in row for row in mounts) == 1
@@ -710,6 +752,23 @@ def test_runtime_argv_is_exact_closed_and_mount_minimal(
     encoded = "\n".join(argv).lower()
     for forbidden in (".pass", "credentials", "docker.sock", "result-output"):
         assert forbidden not in encoded
+
+    profile_digest = hashlib.sha256(b"cute-compile-profile").hexdigest()
+    profiled_argv = build_runtime_argv(
+        lease=lease,
+        resolved=replace(
+            case.resolved,
+            native_compile_profile=SimpleNamespace(digest=profile_digest),
+        ),
+        preflight=case.preflight,
+        model_root=case.model,
+        publication=case.publication,
+        cache_root=cache,
+        seccomp_path=lease.stage_paths[0],
+        runtime=case.runtime,
+    )
+    assert f"--env=OPTIMA_CUTE_COMPILE_PROFILE_DIGEST={profile_digest}" in profiled_argv
+    assert not any("OPTIMA_CUTE_COMPILE_PROFILE_DIGEST" in row for row in argv)
 
     multi_resolved = replace(
         case.resolved,
@@ -729,6 +788,24 @@ def test_runtime_argv_is_exact_closed_and_mount_minimal(
         runtime=case.runtime,
     )
     assert '--gpus="device=0,1"' in multi_argv
+
+    isolated_runtime = replace(
+        case.runtime,
+        cpuset_cpus="0-3,8-11",
+        cpuset_mems="0",
+    )
+    isolated_argv = build_runtime_argv(
+        lease=lease,
+        resolved=case.resolved,
+        preflight=case.preflight,
+        model_root=case.model,
+        publication=case.publication,
+        cache_root=cache,
+        seccomp_path=lease.stage_paths[0],
+        runtime=isolated_runtime,
+    )
+    assert "--cpuset-cpus=0-3,8-11" in isolated_argv
+    assert "--cpuset-mems=0" in isolated_argv
 
     identity = _digest("discovery-overlay")
     discovery_publication = SimpleNamespace(
@@ -1053,6 +1130,75 @@ def test_execute_failure_still_releases_lease_and_post_drains(
         ("pre", 200.0),
         ("post", 200.0),
     ]
+
+
+def test_execute_failure_attaches_finalized_stderr_artifact_after_abort(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    case = _case(tmp_path)
+    manager = _manager(case)
+    raw = b"INITIATING-TP-RANK-ERROR\n"
+    artifact_path = tmp_path / ("runtime." + "b" * 32 + ".stderr")
+    receipt = OCIStderrArtifactReceipt(
+        STDERR_ARTIFACT_SCHEMA,
+        "validator-a",
+        "runtime",
+        artifact_path,
+        artifact_path.with_name(artifact_path.name + ".json"),
+        hashlib.sha256(raw).hexdigest(),
+        hashlib.sha256(raw).hexdigest(),
+        len(raw),
+        len(raw),
+        False,
+        os.geteuid(),
+        os.getegid(),
+        0o600,
+    )
+    diagnostic = OCIAttachedDiagnostic(
+        raw,
+        False,
+        True,
+        client_returncode=1,
+        stream_bytes=len(raw),
+        stream_sha256=hashlib.sha256(raw).hexdigest(),
+        artifact=receipt,
+    )
+
+    class DiagnosticTransport:
+        def __init__(self, *_args, **_kwargs) -> None:
+            self.aborted = False
+
+        def abort(self) -> None:
+            self.aborted = True
+
+        def stderr_diagnostic(self) -> OCIAttachedDiagnostic:
+            assert self.aborted
+            return diagnostic
+
+    failure = OuterSessionProtocolError("worker protocol failed")
+
+    def fail_session(*_args, **_kwargs) -> SessionExecutionEvidence:
+        raise failure
+
+    executor = OCIEngineExecutor(
+        case.config,
+        case.device_policy,
+        manager=manager,
+        session_runner=fail_session,
+    )
+    _install_execution_fakes(case, executor, monkeypatch)
+    monkeypatch.setattr(backend, "AttachedSessionTransport", DiagnosticTransport)
+    with pytest.raises(OuterSessionProtocolError) as raised:
+        executor.execute(
+            case.launch,
+            case.binding,
+            case.mount,
+            case.plan,
+            deadline=200.0,
+        )
+    assert raised.value is failure
+    assert raised.value.diagnostic == diagnostic
+    assert receipt.receipt_sha256 in str(raised.value)
 
 
 def test_execute_reference_selects_reference_transport_and_binds_plan(

@@ -157,8 +157,23 @@ def test_completed_and_fallback_are_independently_once(receipt_dir):
     assert fallback[0]["error_type"] == "RuntimeError"
 
 
-def test_scheduler_bundle_load_uses_load_only_rebuild_phase(monkeypatch):
-    """Scheduler activation may load sealed native products, never build them."""
+@pytest.mark.parametrize(
+    ("environment", "expected_phase"),
+    (
+        ({}, "all"),
+        (
+            {
+                "OPTIMA_ENGINE_WORKER": "1",
+                "OPTIMA_PREBUILT_ARTIFACTS": "1",
+            },
+            "load",
+        ),
+    ),
+)
+def test_scheduler_bundle_rebuild_phase_matches_launch_authority(
+    monkeypatch, environment, expected_phase
+):
+    """Production is load-only; explicit direct eval reuses its dev cache."""
     from optima import manifest, rebuild, sandbox
     from optima.registry import REGISTRY
     from optima.seam import _load_bundle_into_registry
@@ -184,6 +199,10 @@ def test_scheduler_bundle_load_uses_load_only_rebuild_phase(monkeypatch):
         "apply_rebuild_plan",
         lambda bundle, *, phase: calls.append((bundle, phase)),
     )
+    for name in ("OPTIMA_ENGINE_WORKER", "OPTIMA_PREBUILT_ARTIFACTS"):
+        monkeypatch.delenv(name, raising=False)
+    for name, value in environment.items():
+        monkeypatch.setenv(name, value)
 
     REGISTRY.clear()
     try:
@@ -191,7 +210,45 @@ def test_scheduler_bundle_load_uses_load_only_rebuild_phase(monkeypatch):
     finally:
         REGISTRY.clear()
 
-    assert calls == [("/sealed/candidate-tree", "load")]
+    assert calls == [("/sealed/candidate-tree", expected_phase)]
+
+
+@pytest.mark.parametrize(
+    "environment",
+    (
+        {"OPTIMA_ENGINE_WORKER": "1"},
+        {"OPTIMA_PREBUILT_ARTIFACTS": "1"},
+    ),
+)
+def test_scheduler_rejects_partial_native_artifact_authority(
+    monkeypatch, environment
+):
+    from optima import manifest, sandbox
+    from optima.registry import REGISTRY
+    from optima.seam import _load_bundle_into_registry
+
+    class EmptyManifest:
+        ops = ()
+
+    class CleanTree:
+        ok = True
+        violations = ()
+
+    monkeypatch.setattr(manifest, "load_manifest", lambda _bundle: EmptyManifest())
+    monkeypatch.setattr(manifest, "all_declared_cuda_sources", lambda *_args: ())
+    monkeypatch.setattr(manifest, "all_declared_dep_patches", lambda *_args: ())
+    monkeypatch.setattr(sandbox, "scan_tree", lambda *_args, **_kwargs: CleanTree())
+    for name in ("OPTIMA_ENGINE_WORKER", "OPTIMA_PREBUILT_ARTIFACTS"):
+        monkeypatch.delenv(name, raising=False)
+    for name, value in environment.items():
+        monkeypatch.setenv(name, value)
+
+    REGISTRY.clear()
+    try:
+        with pytest.raises(RuntimeError, match="incomplete native-artifact authority"):
+            _load_bundle_into_registry("/sealed/candidate-tree")
+    finally:
+        REGISTRY.clear()
 
 
 def test_unprintable_fallback_error_never_breaks_receipt(receipt_dir):

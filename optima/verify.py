@@ -26,6 +26,7 @@ end-to-end gate on fresh prompts is the backstop against shape-branching there.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import Callable, Optional, Protocol
 
@@ -581,6 +582,53 @@ _MSA_PROBE_MAX_MATMUL_WORK = 300_000_000
 _MSA_PROBE_MAX_TOTAL_WORK = 600_000_000
 _MSA_MAX_CANDIDATE_COMBINATIONS = 64
 _MSA_MAX_SYNTHESIZED_SHAPES = 32
+_MSA_PREFILL_SHAPE_FIELDS = frozenset(
+    {"q_len", "prefix_blocks", "head_dim", "block_size"}
+)
+_MSA_PREFILL_INPUT_FIELDS = frozenset(
+    {"q", "index_k", "prefix_len", "scale", "block_size"}
+)
+_MSA_SYNTHESIZED_CAPABILITY_FIELDS = frozenset(
+    {"head_dim", "last_dim", "block_size", "q_len", "num_tokens", "kv_len"}
+)
+
+
+def _has_msa_prefill_probe_schema(
+    slot: SlotSpec, eligibility: Eligibility, catalog_shapes: list[dict]
+) -> bool:
+    """Recognize the semantic probe schema without consulting slot identity."""
+
+    constrained = eligibility.capabilities.constrained_fields
+    has_legacy_shape_bound = any(
+        value is not None
+        for value in (
+            eligibility.max_last_dim,
+            eligibility.min_num_tokens,
+            eligibility.max_num_tokens,
+        )
+    )
+    return (
+        slot.correctness.mode == "topk_overlap"
+        and (
+            bool(constrained & _MSA_SYNTHESIZED_CAPABILITY_FIELDS)
+            or has_legacy_shape_bound
+        )
+        and bool(catalog_shapes)
+        and all(_MSA_PREFILL_SHAPE_FIELDS <= set(shape) for shape in catalog_shapes)
+    )
+
+
+def _has_msa_prefill_call_contract(slot: SlotSpec, inputs: dict) -> bool:
+    """Recognize the canonical score-sheet call from validator-owned values."""
+
+    return (
+        slot.correctness.mode == "topk_overlap"
+        and _MSA_PREFILL_INPUT_FIELDS <= set(inputs)
+        and torch.is_tensor(inputs["q"])
+        and inputs["q"].dim() == 2
+        and torch.is_tensor(inputs["index_k"])
+        and inputs["index_k"].dim() == 2
+    )
 
 
 def _msa_shape_descriptor(
@@ -924,7 +972,9 @@ def verify_entry(
     catalog_shapes = list(shapes) if shapes is not None else list(slot.shapes)
     domain_coverage_complete = True
     domain_coverage_detail = ""
-    if eligibility is not None and slot.name == "attention.msa_prefill_block_score":
+    if eligibility is not None and _has_msa_prefill_probe_schema(
+        slot, eligibility, catalog_shapes
+    ):
         resolved_arch = architecture or _device_architecture(device)
         synthesized, domain_coverage_complete, domain_coverage_detail = (
             _synthesize_msa_capability_shapes(
@@ -1192,7 +1242,7 @@ def _verification_call_descriptor(
     """
 
     resolved_arch = architecture or _device_architecture(device)
-    if slot.name != "attention.msa_prefill_block_score":
+    if not _has_msa_prefill_call_contract(slot, inputs):
         primary = next(
             (
                 inputs[name]
@@ -1237,6 +1287,37 @@ def _device_architecture(device: str) -> Optional[str]:
     return f"sm{major}{minor}"
 
 
+def _direct_aot_prepare_boundary(
+    slot: SlotSpec,
+    entry: Callable[..., None],
+    *,
+    prepare_name: Optional[str],
+) -> Optional[Callable]:
+    """Resolve only the validator-generated lifecycle boundary of a direct entry.
+
+    Direct-AOT rows are forbidden from naming a Python ``prepare`` callable: their
+    prepare implementation is assembled from the sealed artifact plan and exposed
+    as ``entry.prepare`` by the validator runtime.  Prepare+forward slots must see
+    that exact callable or admission fails before any verification launch.
+    """
+
+    if prepare_name is not None:
+        raise ValueError(
+            "direct CuTe AOT rows cannot declare a candidate Python prepare callable"
+        )
+    prepare = getattr(entry, "prepare", None)
+    if prepare is not None and not callable(prepare):
+        raise RuntimeError("direct CuTe AOT prepare boundary is not callable")
+    if slot.invoke_prepare is not None:
+        if prepare is None:
+            raise RuntimeError(
+                f"slot {slot.name!r} requires a callable validator-generated "
+                "direct CuTe AOT prepare boundary"
+            )
+        return prepare
+    return None
+
+
 def verify_entry_from_source(
     slot_name: str,
     source_path: str,
@@ -1257,6 +1338,8 @@ def verify_entry_from_source(
     manifest_architectures: tuple[str, ...] = (),
     tp_size: Optional[int] = None,
     world_size: Optional[int] = None,
+    bundle_path: Optional[str] = None,
+    variant_name: Optional[str] = None,
 ) -> VerifyResult:
     """Load the miner module and verify it — module-level + picklable so the CLI can run
     it via ``call_in_subprocess`` in a FRESH process. This keeps the trusted validator/CLI
@@ -1273,20 +1356,50 @@ def verify_entry_from_source(
 
     slot = slot_for_model(slot_name, model_key)
     dtype = getattr(torch, dtype_name)
-    # ONE module instance: entry/prepare (or an override's device fns) must share a
-    # namespace — separate load_entry calls re-execute the body per callable.
-    module = load_module(source_path)  # runs the miner module body — in THIS child
-    if override_point is not None:
-        from optima_kernels.override import build_override
+    direct_entry = None
+    direct_op = None
+    if bundle_path:
+        from optima.rebuild import apply_rebuild_plan
 
-        def _loader(name, _mod=module):
-            fn = getattr(_mod, name, None)
-            return fn if callable(fn) else None  # absent symbol (GPU-only device fn) -> None
+        rebuild_phase = (
+            "load"
+            if os.environ.get("OPTIMA_PREBUILT_ARTIFACTS") == "1"
+            else "all"
+        )
+        apply_rebuild_plan(bundle_path, phase=rebuild_phase)
+        from optima.artifact_runtime import resolve_direct_artifact_entry
+        from optima.manifest import load_manifest
 
-        entry, prepare = build_override(slot_name, override_point, entry_name, _loader)
+        direct_op = load_manifest(bundle_path).op_for(slot_name, variant_name)
+        if direct_op is None:
+            raise ValueError(
+                f"bundle has no manifest row for {(slot_name, variant_name)!r}"
+            )
+        direct_entry = resolve_direct_artifact_entry(direct_op)
+    if direct_entry is not None:
+        if override_point is not None:
+            raise ValueError("direct CuTe AOT rows cannot use an override")
+        entry = direct_entry
+        prepare = _direct_aot_prepare_boundary(
+            slot, direct_entry, prepare_name=prepare_name
+        )
     else:
-        entry = callable_from(module, entry_name)
-        prepare = callable_from(module, prepare_name) if prepare_name else None
+        # ONE module instance: entry/prepare (or an override's device fns) must share
+        # a namespace — separate loads re-execute the candidate module body.
+        module = load_module(source_path)  # candidate code; isolated child only
+        if override_point is not None:
+            from optima_kernels.override import build_override
+
+            def _loader(name, _mod=module):
+                fn = getattr(_mod, name, None)
+                return fn if callable(fn) else None
+
+            entry, prepare = build_override(
+                slot_name, override_point, entry_name, _loader
+            )
+        else:
+            entry = callable_from(module, entry_name)
+            prepare = callable_from(module, prepare_name) if prepare_name else None
     eligibility = None
     if eligibility_metadata is not None:
         from optima.registry import eligibility_from_metadata

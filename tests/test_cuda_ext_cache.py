@@ -118,6 +118,108 @@ def _context(mod, image_root: Path, *, salt: str = "") -> dict[str, object]:
     }
 
 
+def test_development_with_sealed_architecture_does_not_probe_cuda(
+    tmp_path, monkeypatch
+):
+    mod = _patcher()
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    observed: dict[str, object] = {}
+
+    monkeypatch.setattr(
+        mod.shutil,
+        "which",
+        lambda name, path=None: (
+            f"/toolchain/{name}" if name in {"nvcc", "ptxas"} else None
+        ),
+    )
+    monkeypatch.setattr(
+        mod,
+        "_declared_sources",
+        lambda selected_bundle, architecture: (
+            observed.update(bundle=selected_bundle, architecture=architecture)
+            or ([], [], frozenset())
+        ),
+    )
+    monkeypatch.setattr(
+        mod, "_compiler_environment", lambda: {"PATH": "/toolchain"}
+    )
+    monkeypatch.setattr(
+        mod,
+        "_build_context",
+        lambda architecture, env, production: {
+            "architecture": architecture,
+            "production": production,
+        },
+    )
+    monkeypatch.setattr(mod, "_canonical_hash", lambda value: _digest("development"))
+    monkeypatch.setattr(mod, "_patcher_hash", lambda: _digest("patcher"))
+    monkeypatch.setattr(mod, "_build_set", lambda **kwargs: None)
+    monkeypatch.setattr(mod, "_validate_index", lambda **kwargs: [])
+    monkeypatch.setitem(sys.modules, "torch", None)
+    monkeypatch.setenv("OPTIMA_CUDA_EXT_CACHE", str(tmp_path / "cache"))
+
+    mod._development_all(bundle, "", _digest("tree"), "sm103")
+
+    assert observed == {"bundle": bundle, "architecture": "sm103"}
+
+
+def test_development_sealed_architecture_resolves_container_cuda_root(
+    tmp_path, monkeypatch
+):
+    mod = _patcher()
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    cuda_home = tmp_path / "cuda"
+    cuda_bin = cuda_home / "bin"
+    cuda_bin.mkdir(parents=True)
+    for tool in ("nvcc", "ptxas"):
+        path = cuda_bin / tool
+        path.write_text("tool")
+        path.chmod(0o755)
+    observed: dict[str, object] = {}
+
+    monkeypatch.setenv("CUDA_HOME", str(cuda_home))
+    monkeypatch.setenv("OPTIMA_CUDA_EXT_CACHE", str(tmp_path / "cache"))
+    monkeypatch.setattr(
+        mod, "_compiler_environment", lambda: {"PATH": "/usr/bin:/bin"}
+    )
+    real_which = mod.shutil.which
+    monkeypatch.setattr(
+        mod.shutil,
+        "which",
+        lambda name, path=None: real_which(name, path=path),
+    )
+    monkeypatch.setattr(
+        mod,
+        "_declared_sources",
+        lambda selected_bundle, architecture: (
+            observed.update(bundle=selected_bundle, architecture=architecture)
+            or ([], [], frozenset())
+        ),
+    )
+    monkeypatch.setattr(
+        mod,
+        "_build_context",
+        lambda architecture, env, production: (
+            observed.update(path=env["PATH"], production=production)
+            or {"architecture": architecture}
+        ),
+    )
+    monkeypatch.setattr(mod, "_canonical_hash", lambda value: _digest("development"))
+    monkeypatch.setattr(mod, "_patcher_hash", lambda: _digest("patcher"))
+    monkeypatch.setattr(mod, "_validate_index", lambda **kwargs: [])
+
+    mod._development_all(bundle, "", _digest("tree"), "sm103")
+
+    assert observed == {
+        "architecture": "sm103",
+        "bundle": bundle,
+        "path": f"{cuda_bin.resolve()}:/usr/bin:/bin",
+        "production": False,
+    }
+
+
 @pytest.fixture()
 def fake_build(monkeypatch, tmp_path):
     mod = _patcher()

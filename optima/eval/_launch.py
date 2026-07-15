@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import logging
 import os
+import re
+import subprocess
 from contextlib import contextmanager
 from typing import Optional
 
@@ -29,6 +31,88 @@ logger = logging.getLogger("optima.eval")
 
 class IsolationError(RuntimeError):
     """Raised when candidate isolation was requested but could not be proven."""
+
+
+_GPU_COMPUTE_CAPABILITY = re.compile(r"([0-9]{1,2})\.([0-9])\Z")
+_GPU_ARCHITECTURE = re.compile(r"sm[0-9]{2,3}\Z")
+
+
+def _direct_native_target_architecture(
+    cfg: object, *, bundle_path: str, active: bool
+) -> str | None:
+    """Measure the device family used by a direct native-artifact launch.
+
+    Hardened OCI launches receive this value from their sealed launch identity
+    and use :func:`isolated_engine_session`, not this development path.  Direct
+    eval still has to give every spawned scheduler the same validator-observed
+    architecture that its parent used to select/build the development cache.
+    Querying ``nvidia-smi`` avoids creating a CUDA context in the timing driver.
+    """
+
+    if not active or not bundle_path:
+        return None
+    from optima.rebuild import parse_rebuild_plan
+
+    if parse_rebuild_plan(bundle_path) is None:
+        return None
+
+    prebuilt = _truthy_env("OPTIMA_PREBUILT_ARTIFACTS")
+    engine_worker = _truthy_env("OPTIMA_ENGINE_WORKER")
+    ambient = os.environ.get("OPTIMA_TARGET_GPU_ARCH", "").strip().lower()
+    if prebuilt or engine_worker:
+        if prebuilt != engine_worker or _GPU_ARCHITECTURE.fullmatch(ambient) is None:
+            raise IsolationError(
+                "hardened native launch lacks its complete sealed architecture authority"
+            )
+        return ambient
+
+    command = [
+        "nvidia-smi",
+        "--query-gpu=compute_cap",
+        "--format=csv,noheader,nounits",
+    ]
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
+    if visible:
+        command.extend(("-i", visible))
+    try:
+        result = subprocess.run(
+            command,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise IsolationError(
+            f"cannot measure direct native target architecture: {exc}"
+        ) from None
+
+    rows = [row.strip() for row in result.stdout.splitlines() if row.strip()]
+    tp_size = int(getattr(cfg, "tp_size", 1) or 1)
+    if not visible:
+        rows = rows[:tp_size]
+    if len(rows) != tp_size:
+        raise IsolationError(
+            "direct native target architecture does not cover every TP member"
+        )
+    architectures: set[str] = set()
+    for row in rows:
+        match = _GPU_COMPUTE_CAPABILITY.fullmatch(row)
+        if match is None:
+            raise IsolationError(
+                f"nvidia-smi returned malformed compute capability {row!r}"
+            )
+        architectures.add(f"sm{int(match.group(1))}{int(match.group(2))}")
+    if len(architectures) != 1:
+        raise IsolationError(
+            "direct native launch requires homogeneous TP device architectures"
+        )
+    measured = next(iter(architectures))
+    if ambient and ambient != measured:
+        raise IsolationError(
+            "ambient native target architecture differs from live TP hardware"
+        )
+    return measured
 
 
 @contextmanager
@@ -338,11 +422,16 @@ def launched_engine(cfg, *, bundle_path: str, active: bool,
     from optima import receipts, seam
 
     seam.mark_driver()
+    target_architecture = _direct_native_target_architecture(
+        cfg, bundle_path=bundle_path, active=active
+    )
     prepare_candidate_environment(cfg, bundle_path=bundle_path, active=active)
     receipt_dir = tempfile.mkdtemp(prefix="optima_receipts_") if active else ""
     # Explicitly clear an ambient directory for baseline launches so they cannot
     # contaminate a candidate's fresh evidence namespace.
     extra_env = {"OPTIMA_SEAM_RECEIPT_DIR": receipt_dir if active else ""}
+    if target_architecture is not None:
+        extra_env["OPTIMA_TARGET_GPU_ARCH"] = target_architecture
     if active and audit_rate > 0.0:
         extra_env["OPTIMA_SLOT_AUDIT"] = f"{audit_rate:g}"
         extra_env["OPTIMA_SLOT_AUDIT_SEED"] = str(random.SystemRandom().randrange(2**31))

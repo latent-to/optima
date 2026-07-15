@@ -131,7 +131,7 @@ class _Provider:
         grade, elapsed = self.grades.get(stage.stage, (ScreenGrade.PASS, 10))
         return ScreenStageResult(name, grade, _h(stage.stage), elapsed)
 
-    def build_qualification(self, request):
+    def build_qualification(self, request, state=None):
         self.plan_calls.append(request)
         reservations = tuple(row.reservation for row in request.candidates)
         authority = QualificationAuthorityManifest(
@@ -328,8 +328,8 @@ def test_only_exact_promoted_coverage_reaches_qualification(tmp_path: Path) -> N
 
 def test_provider_cannot_change_finalized_order(tmp_path: Path) -> None:
     class WrongProvider(_Provider):
-        def build_qualification(self, request):
-            work = super().build_qualification(request)
+        def build_qualification(self, request, state=None):
+            work = super().build_qualification(request, state)
             wrong = dataclasses.replace(
                 request.candidates[0].reservation, arrival_order=9
             )
@@ -351,9 +351,9 @@ def test_provider_cannot_change_finalized_order(tmp_path: Path) -> None:
 
 def test_provider_cannot_change_registered_qualification_policy(tmp_path: Path) -> None:
     class WrongPolicyProvider(_Provider):
-        def build_qualification(self, request):
+        def build_qualification(self, request, state=None):
             return dataclasses.replace(
-                super().build_qualification(request),
+                super().build_qualification(request, state),
                 qualification_policy_digest=_h("other-qualification-policy"),
             )
 

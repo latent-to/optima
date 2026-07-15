@@ -9,6 +9,22 @@ import pytest
 from optima import chain
 
 
+def _scale_reveal_frame(data: str) -> bytes:
+    payload = data.encode("utf-8")
+    size = len(payload)
+    if size < 64:
+        prefix = bytes([size << 2])
+    elif size < 16_384:
+        prefix = ((size << 2) | 1).to_bytes(2, "little")
+    else:
+        raise ValueError("test reveal exceeds the bounded production format")
+    return prefix + payload
+
+
+def _scale_reveal_hex(data: str) -> str:
+    return "0x" + _scale_reveal_frame(data).hex()
+
+
 # --- a minimal stand-in for bittensor's subtensor (records what was called) ---
 
 class _MockMetagraph:
@@ -57,13 +73,19 @@ class _MockSubtensor:
     def get_all_commitments(self, netuid=None):
         return dict(self._commitments)
 
-    def get_all_revealed_commitments(self, netuid=None, block=None):
-        return {
-            hotkey: tuple(
-                entry for entry in history if block is None or entry[0] <= block
-            )[-chain.CHAIN_REVEAL_HISTORY_CAP:]
+    def query_map(self, module, name, params=None, block=None):
+        assert (module, name, params) == ("Commitments", "RevealedCommitments", [1])
+        return [
+            (
+                hotkey,
+                [
+                    (_scale_reveal_hex(data), reveal_block)
+                    for reveal_block, data in history
+                    if block is None or reveal_block <= block
+                ][-chain.CHAIN_REVEAL_HISTORY_CAP :],
+            )
             for hotkey, history in self._revealed.items()
-        }
+        ]
 
     def _get_events(self, *, block_hash):
         block = int(block_hash[2:], 16)
@@ -236,6 +258,33 @@ def test_post_commitment_dry_run_and_submit():
     assert st.set_commitment_calls == ["thehash"]
 
 
+def test_commitment_wrappers_report_failed_extrinsics_honestly():
+    class _FailedResponse:
+        success = False
+        message = "wallet could not be deserialized"
+
+    class _SucceededResponse:
+        success = True
+        message = ""
+
+    for failed in (_FailedResponse(), (False, "rate limited"), None, False):
+        st = _MockSubtensor(hotkeys=["a"])
+        st.set_commitment = lambda *, wallet, netuid, data, _r=failed: _r
+        st.set_reveal_commitment = (
+            lambda *, wallet, netuid, data, blocks_until_reveal, _r=failed: _r
+        )
+        assert chain.post_commitment(st, object(), 1, "h")["submitted"] is False
+        assert chain.post_reveal_commitment(st, object(), 1, "p")["submitted"] is False
+
+    st = _MockSubtensor(hotkeys=["a"])
+    st.set_commitment = lambda *, wallet, netuid, data: _SucceededResponse()
+    st.set_reveal_commitment = (
+        lambda *, wallet, netuid, data, blocks_until_reveal: (True, "")
+    )
+    assert chain.post_commitment(st, object(), 1, "h")["submitted"] is True
+    assert chain.post_reveal_commitment(st, object(), 1, "p")["submitted"] is True
+
+
 def test_read_revealed_commitments_takes_latest_per_hotkey():
     st = _MockSubtensor(hotkeys=["a", "b"], revealed={
         "a": ((5, "old"), (9, "new")),
@@ -246,6 +295,117 @@ def test_read_revealed_commitments_takes_latest_per_hotkey():
     assert out["a"].data == "new" and out["a"].block == 9
     assert out["b"].data == "only" and out["b"].block == 7
     assert "c" not in out
+
+
+def test_raw_reveal_decoder_accepts_live_text_and_historical_hex_forms():
+    live = (
+        '{"v":1,"h":"af97a4f6656078784848976ecefc6ffda96bc95e20394b6f35c122a0d0cbc58c",'
+        '"u":"https://github.com/latent-to/optima/releases/download/'
+        "b300-testnet307-bfaa0511/miner_m3_blockscore_cute-"
+        'af97a4f6656078784848976ecefc6ffda96bc95e20394b6f35c122a0d0cbc58c.tar.gz"}'
+    )
+    live_frame = _scale_reveal_frame(live)
+    assert len(live.encode("utf-8")) == 260
+    assert live_frame[:2] == b"\x11\x04"
+    assert chain._decode_raw_reveal(live_frame.decode("utf-8")) == live
+    st = _MockSubtensor(
+        hotkeys=["alice"], block=12, revealed={"alice": ((9, live),)}
+    )
+    st.query_map = lambda **_kwargs: [("alice", [(live_frame.decode("utf-8"), 9)])]
+    st.get_all_revealed_commitments = lambda **_kwargs: (_ for _ in ()).throw(
+        AssertionError("lossy SDK decoder must not be called")
+    )
+    assert chain.read_finalized_reveal_history(st, 1).reveals[0].data == live
+
+    historical = "x" * 176
+    historical_frame = _scale_reveal_frame(historical)
+    assert historical_frame[:2] == b"\xc1\x02"
+    assert chain._decode_raw_reveal("0x" + historical_frame.hex()) == historical
+
+
+def test_raw_reveal_decoder_fails_closed_on_malformed_scale():
+    for raw in (
+        b"\x02",  # compact mode 2 cannot encode a bounded message
+        b"\x03",  # compact mode 3 cannot encode a bounded message
+        b"\x05\x00x",  # non-canonical mode 1 for a one-byte payload
+        b"\x10abc",  # declared length four, only three bytes present
+        b"\x04\xff",  # invalid UTF-8 payload
+        "0xnot-hex",
+        [4, 256],
+    ):
+        with pytest.raises(chain.ChainRevealHistoryError, match="SCALE bytes"):
+            chain._decode_raw_reveal(raw)
+
+
+def test_raw_reveal_decoder_fails_closed_on_ambiguous_candidates():
+    with pytest.raises(chain.ChainRevealHistoryError, match="ambiguous"):
+        chain._decode_reveal_candidates(
+            (_scale_reveal_frame("first"), _scale_reveal_frame("second"))
+        )
+
+
+def test_raw_reveal_page_rejects_duplicate_or_malformed_rows():
+    st = _MockSubtensor(hotkeys=["alice"], block=12)
+    for page in (
+        [("alice", [(_scale_reveal_hex("x"), 9)]), ("alice", [])],
+        ["not-a-map-pair"],
+        [("alice", object())],
+        [("alice", [("only-one-field",)])],
+        [("alice", [(9, _scale_reveal_hex("wrong-order"))])],
+    ):
+        st.query_map = lambda **_kwargs: page
+        with pytest.raises(chain.ChainRevealHistoryError):
+            chain._raw_reveal_page(st, 1, 12)
+
+
+def test_raw_reveal_page_streams_and_enforces_both_budgets(monkeypatch):
+    monkeypatch.setattr(chain, "MAX_REVEAL_HISTORY_ROWS", 2)
+    consumed: list[int] = []
+
+    def rows():
+        for index in range(10):
+            consumed.append(index)
+            yield (f"hotkey-{index}", [])
+
+    st = _MockSubtensor(hotkeys=[], block=12)
+    st.query_map = lambda **_kwargs: rows()
+    with pytest.raises(chain.ChainRevealHistoryError, match="map-row budget"):
+        chain._raw_reveal_page(st, 1, 12)
+    assert consumed == [0, 1, 2]
+
+    st.query_map = lambda **_kwargs: [
+        ("alice", [(object(), 1), (object(), 2), (object(), 3)])
+    ]
+    with pytest.raises(chain.ChainRevealHistoryError, match="reveal row budget"):
+        chain._raw_reveal_page(st, 1, 12)
+
+
+def test_raw_reveal_page_rejects_11_entries_before_payload_decode(monkeypatch):
+    st = _MockSubtensor(hotkeys=["alice"], block=12)
+    st.query_map = lambda **_kwargs: [
+        ("alice", [(object(), block) for block in range(11)])
+    ]
+    monkeypatch.setattr(
+        chain,
+        "_decode_raw_reveal",
+        lambda _raw: (_ for _ in ()).throw(AssertionError("payload decoded")),
+    )
+    with pytest.raises(chain.ChainRevealHistoryError, match="per-hotkey"):
+        chain._raw_reveal_page(st, 1, 12)
+
+
+def test_raw_reveal_page_normalizes_generator_exceptions():
+    def broken_page():
+        yield ("alice", [])
+        raise RuntimeError("query page broke")
+
+    st = _MockSubtensor(hotkeys=["alice"], block=12)
+    st.query_map = lambda **_kwargs: broken_page()
+    with pytest.raises(
+        chain.ChainRevealHistoryError,
+        match="cannot retrieve complete historical reveal state: RuntimeError",
+    ):
+        chain._raw_reveal_page(st, 1, 12)
 
 
 def test_finalized_snapshot_uses_event_order_not_lexical_hotkey_order():
@@ -289,6 +449,25 @@ def test_finalized_snapshot_scans_only_blocks_after_durable_cursor():
     snapshot = chain.read_finalized_reveal_history(st, netuid=1, after_block=9)
     assert [(row.block, row.data) for row in snapshot.reveals] == [(11, "new")]
     assert visited == [10, 11, 12]
+
+
+def test_stale_cursor_uses_complete_history_without_scanning_empty_blocks():
+    st = _MockSubtensor(
+        hotkeys=["alice"],
+        block=100,
+        revealed={"alice": ((7, "old"), (99, "new"))},
+    )
+    visited: list[int] = []
+    original = st.substrate.get_events
+
+    def get_events(*, block_hash):
+        visited.append(int(block_hash[2:], 16))
+        return original(block_hash=block_hash)
+
+    st.substrate.get_events = get_events
+    snapshot = chain.read_finalized_reveal_history(st, netuid=1, after_block=9)
+    assert [(row.block, row.data) for row in snapshot.reveals] == [(99, "new")]
+    assert visited == [99]
 
 
 def test_same_hotkey_same_block_payloads_use_lexical_suborder_only():

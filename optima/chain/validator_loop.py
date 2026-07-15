@@ -190,7 +190,7 @@ def _apply_qualification(
     receipts = tuple(
         store.latest_promoted_screen(row.reservation_id) for row in reservations
     )
-    work = service.plan_qualification(candidates, receipts)
+    work = service.plan_qualification(candidates, receipts, state=store)
     _validate_work(work, authority_rows)
     prepared = None
     if type(work.factory.manifest) is QualificationAuthorityManifest:
@@ -285,7 +285,11 @@ def _settle_pending(
     from optima.settlement import plan_settlement
 
     committed: dict[str, str] = {}
-    while True:
+    while store.has_pending_settlement():
+        lease_block = finalized_block_provider()
+        if type(lease_block) is not int or lease_block < current_block:
+            raise IntakeControllerError("finalized settlement clock regressed")
+        current_block = lease_block
         lease = store.lease_settlement_cohort(current_block=current_block)
         if lease is None:
             return committed
@@ -309,7 +313,9 @@ def _settle_pending(
             evidence,
             current_block=refreshed_block,
         )
+        current_block = refreshed_block
         committed[lease.lease_id] = plan.digest
+    return committed
 
 
 def run_pass(
@@ -323,11 +329,18 @@ def run_pass(
     arena_registry: ArenaServiceRegistry | None = None,
     arena_id: str | None = None,
     intake_only: bool = False,
+    retained_only: bool = False,
 ) -> PassResult:
-    """Run one non-emitting finalized intake/qualification pass."""
+    """Run one non-emitting intake/qualification pass.
 
-    if type(intake_only) is not bool:
-        raise IntakeControllerError("intake_only must be an exact boolean")
+    ``retained_only`` evaluates the already-durable queue at the current
+    finalized head without rereading or advancing reveal history.
+    """
+
+    if type(intake_only) is not bool or type(retained_only) is not bool:
+        raise IntakeControllerError("pass mode flags must be exact booleans")
+    if intake_only and retained_only:
+        raise IntakeControllerError("intake-only and retained-only modes conflict")
     if intake_only:
         if arena_registry is not None or arena_id is not None:
             raise IntakeControllerError("intake-only mode cannot receive arena authority")
@@ -342,19 +355,28 @@ def run_pass(
     scope = IntakeScope(str(subtensor.get_block_hash(0)).lower(), netuid)
     with FinalizedIntakeStore(intake_db, policy, scope=scope) as store:
         cursor = store.finalized_cursor()
-        snapshot = chain.read_finalized_reveal_history(
-            subtensor,
-            netuid,
-            after_block=None if cursor is None else cursor[0],
-        )
-        result = PassResult(snapshot.finalized_block, snapshot.finalized_block_hash)
-        arrivals = _finalized_arrivals(snapshot)
-        result.seen = len(arrivals)
-        inserted = store.reserve_finalized(
-            arrivals,
-            finalized_block=snapshot.finalized_block,
-            finalized_block_hash=snapshot.finalized_block_hash.lower(),
-        )
+        if retained_only:
+            if cursor is None:
+                raise IntakeControllerError("retained-only pass has no finalized cursor")
+            finalized_block, finalized_hash = chain.read_finalized_head(subtensor)
+            if finalized_block < cursor[0]:
+                raise IntakeControllerError("retained-only finalized head regressed")
+            result = PassResult(finalized_block, finalized_hash)
+            inserted = ()
+        else:
+            snapshot = chain.read_finalized_reveal_history(
+                subtensor,
+                netuid,
+                after_block=None if cursor is None else cursor[0],
+            )
+            result = PassResult(snapshot.finalized_block, snapshot.finalized_block_hash)
+            arrivals = _finalized_arrivals(snapshot)
+            result.seen = len(arrivals)
+            inserted = store.reserve_finalized(
+                arrivals,
+                finalized_block=snapshot.finalized_block,
+                finalized_block_hash=snapshot.finalized_block_hash.lower(),
+            )
         result.reserved.extend(row.reservation_id for row in inserted)
 
         for pending in store.pending(limit=policy.max_cohort):
@@ -419,14 +441,14 @@ def run_pass(
         if service is not None:
             result.screens.update(
                 _screen_pending(
-                    store, service, current_block=snapshot.finalized_block
+                    store, service, current_block=result.finalized_block
                 )
             )
             cohort = store.promoted(limit=policy.max_cohort)
             if cohort:
                 admission = service.admit_qualification(
                     store.arena_queue_snapshot(
-                        current_block=snapshot.finalized_block
+                        current_block=result.finalized_block
                     ),
                     cohort_size=len(cohort),
                 )
@@ -457,7 +479,7 @@ def run_pass(
             result.settlements.update(
                 _settle_pending(
                     store,
-                    current_block=snapshot.finalized_block,
+                    current_block=result.finalized_block,
                     finalized_block_provider=lambda: chain.read_finalized_head(subtensor)[0],
                 )
             )
@@ -484,6 +506,7 @@ def run_validator(
     arena_registry: ArenaServiceRegistry | None = None,
     arena_id: str | None = None,
     intake_only: bool = False,
+    retained_only: bool = False,
     interval_s: float = DEFAULT_INTERVAL_S,
     once: bool = False,
     max_consecutive_failures: int = 10,
@@ -504,6 +527,7 @@ def run_validator(
                 arena_registry=arena_registry,
                 arena_id=arena_id,
                 intake_only=intake_only,
+                retained_only=retained_only,
             )
             failures = 0
             logger.info(

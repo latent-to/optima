@@ -95,19 +95,37 @@ def mark_driver() -> None:
     _IS_DRIVER = True
 
 
-# Bundle is loaded once per process even though activate() may run twice (once
-# per watched module: activation, then layernorm).
+# Bundle is loaded once per process even though activate() may run many times
+# (once per watched module import) and load_candidate_bundle() is re-entrant.
 _bundle_loaded = False
+# A direct device artifact cannot be admitted until SGLang has selected this
+# scheduler rank's CUDA device and created its context.  Only the positive
+# scheduler-entry gate may set this marker; output-path processes can import the
+# context hook but have no authority to make it load a bundle.
+_bundle_pending: tuple[str, bool] | None = None
 
 
 def activate() -> None:
-    """Install all seams; load + enable the bundle iff this process is active.
+    """Install all seams; ARM (but never load) the bundle in active processes.
 
     Called by the bootstrap post-import hook after ANY seamed module loads. Each
     install no-ops until its module is present, so calling activate repeatedly patches
     whatever is available each time. The adapter list comes from the single seam table
     (optima/seams.py) — the same table the bootstrap watch-list and the compat canary
     use, so there is no parallel list to keep in sync.
+
+    Miner code is NEVER imported here. Watched modules are imported by
+    non-execution engine children too — sglang's spawned detokenizer transitively
+    imports parallel_state and five other watched modules (measured on the
+    B300 worker image, 2026-07-13) — and miner module-level code in an
+    output-path process is the output-substitution surface (a bundle could
+    patch detokenization and spoof benchmark-accuracy text downstream of the
+    sampler). The load authority begins only in load_candidate_bundle(), invoked
+    by scheduler_gate at run_scheduler_process entry. Ordinary bundles load
+    there; direct artifacts remain disabled until the table-tracked post-device
+    hook binds them to that scheduler rank's CUDA context. The engine-side
+    active-member coverage gate then counts exactly the scheduler ranks
+    (tp_size), and any extra armed process is a refusal.
     """
     release_required = _truthy(os.environ.get("OPTIMA_RELEASE_REQUIRED"))
     if not _IS_DRIVER:
@@ -115,6 +133,32 @@ def activate() -> None:
         if release_required and not namespace_installed:
             _release_abort("materialized namespace did not reopen")
 
+    from optima.registry import REGISTRY
+
+    _install_adapters(release_required)
+
+    if _IS_DRIVER:
+        # Timing process: seams installed (pass-through) but we never load the
+        # miner module here, so the timer is out of the miner's reach.
+        REGISTRY.disable()
+        return
+
+    if _bundle_loaded or _bundle_pending is not None:
+        # A watched module imported after the scheduler-entry load (lazy model
+        # imports): adapters were (re)installed above.  A pending direct bundle
+        # remains disabled until the post-device hook finalizes it.
+        return
+
+    bundle = os.environ.get("OPTIMA_BUNDLE_PATH", "").strip()
+    if not bundle or not _truthy(os.environ.get("OPTIMA_ACTIVE")):
+        if release_required:
+            _release_abort("candidate activation was not armed")
+    # Armed or baseline: stay pass-through until (unless) this process proves it
+    # is a scheduler execution rank via load_candidate_bundle().
+    REGISTRY.disable()
+
+
+def _install_adapters(release_required: bool) -> None:
     from optima.registry import REGISTRY
     from optima.seams import SEAM_ADAPTERS
 
@@ -127,15 +171,20 @@ def activate() -> None:
             if release_required:
                 _release_abort(f"seam {adapter.name} did not install")
 
-    if _IS_DRIVER:
-        # Timing process: seams installed (pass-through) but we never load the
-        # miner module here, so the timer is out of the miner's reach.
-        REGISTRY.disable()
+
+def load_candidate_bundle() -> None:
+    """Load + enable the vetted bundle in THIS process; scheduler ranks only.
+
+    The single caller is the scheduler_gate seam (optima/integrations/
+    sglang_scheduler_gate.py) wrapping run_scheduler_process entry. Direct
+    artifact rows are staged, not bound, until the post-device hook. Idempotent;
+    a no-op in the driver, in baseline processes, and once loaded or staged.
+    """
+    release_required = _truthy(os.environ.get("OPTIMA_RELEASE_REQUIRED"))
+    if _IS_DRIVER or _bundle_loaded or _bundle_pending is not None:
         return
 
-    global _bundle_loaded
-    if _bundle_loaded:
-        return
+    from optima.registry import REGISTRY
 
     bundle = os.environ.get("OPTIMA_BUNDLE_PATH", "").strip()
     if not bundle or not _truthy(os.environ.get("OPTIMA_ACTIVE")):
@@ -144,7 +193,105 @@ def activate() -> None:
         REGISTRY.disable()
         return
 
+    _load_candidate_bundle_locked(
+        bundle,
+        REGISTRY,
+        release_required,
+        defer_direct_artifacts=True,
+    )
+
+
+def finalize_pending_candidate_bundle() -> None:
+    """Bind a scheduler-staged direct bundle after rank-local CUDA setup.
+
+    The sole caller is the validator-owned AFTER hook on
+    ``ModelRunner.init_torch_distributed``.  That SGLang method has selected the
+    exact rank device and initialized its process groups, but model loading,
+    warmup, and CUDA-graph capture have not begun.  Non-scheduler processes
+    never acquire ``_bundle_pending`` and therefore remain inert here.
+    """
+
+    global _bundle_pending
+    if _IS_DRIVER or _bundle_loaded or _bundle_pending is None:
+        return
+
+    from optima.registry import REGISTRY
+
+    bundle, release_required = _bundle_pending
+    # Consume the authority before any CUDA-bound work.  A failed target-rank
+    # finalization is terminal; a later draft/additional runner must not retry it
+    # in another context.
+    _bundle_pending = None
+    if (
+        not _truthy(os.environ.get("OPTIMA_ACTIVE"))
+        or os.environ.get("OPTIMA_BUNDLE_PATH", "").strip() != bundle
+    ):
+        _bundle_pending = None
+        REGISTRY.clear()
+        from optima import receipts
+
+        receipts.write(
+            "load_failed",
+            {"bundle": bundle, "reason": "pending candidate authority changed"},
+        )
+        if release_required:
+            _release_abort("pending candidate authority changed before device binding")
+        return
+    _load_candidate_bundle_locked(bundle, REGISTRY, release_required)
+
+
+def teardown_candidate_bundle(*, suppress_errors: bool = False) -> None:
+    """Release sealed-artifact lifecycle state at scheduler-process exit.
+
+    The scheduler gate invokes this after the engine function unwinds, never from
+    an import hook or output-path process.  Direct artifact entries synchronize,
+    run declared destroy exports, and retain accounting on any failure.
+    """
+
+    global _bundle_pending
+    _bundle_pending = None
     try:
+        from optima.artifact_runtime import shutdown_direct_artifact_runtimes
+
+        shutdown_direct_artifact_runtimes()
+    except Exception as exc:  # noqa: BLE001 - teardown evidence must survive
+        logger.exception("optima: candidate artifact teardown failed")
+        try:
+            from optima import receipts
+
+            receipts.write("teardown_failed", {"reason": str(exc)[:4096]})
+        except Exception:  # noqa: BLE001 - preserve the initiating teardown error
+            logger.exception("optima: failed to write teardown failure receipt")
+        if not suppress_errors:
+            raise
+
+
+def _load_candidate_bundle_locked(
+    bundle,
+    REGISTRY,
+    release_required: bool,
+    *,
+    defer_direct_artifacts: bool = False,
+) -> None:
+    global _bundle_loaded, _bundle_pending
+    try:
+        if defer_direct_artifacts:
+            from optima.manifest import load_manifest
+
+            manifest = load_manifest(bundle)
+            if any(op.aot_exports for op in manifest.ops):
+                pending = (bundle, release_required)
+                if _bundle_pending not in (None, pending):
+                    raise RuntimeError(
+                        "scheduler already staged a different direct artifact bundle"
+                    )
+                _bundle_pending = pending
+                REGISTRY.disable()
+                logger.info(
+                    "optima: staged direct bundle %s until rank-local CUDA setup",
+                    bundle,
+                )
+                return
         _load_bundle_into_registry(bundle)
         REGISTRY.enable()
         if _truthy(os.environ.get("OPTIMA_STRICT")):
@@ -152,6 +299,7 @@ def activate() -> None:
             # failing kernel crashes the engine rather than masquerading as baseline).
             REGISTRY.set_strict(True)
         _bundle_loaded = True
+        _bundle_pending = None
         logger.info("optima: bundle %s active -> slots %s", bundle, REGISTRY.slots())
         from optima import receipts
 
@@ -166,7 +314,13 @@ def activate() -> None:
             receipts.write("load_failed", {"bundle": bundle, "reason": "no slots registered"})
             if release_required:
                 _release_abort("bundle registered no slots")
+        # Registry-conditional adapters (defer_gate/moe_export install only once
+        # the deep slot is registered) saw an empty registry on every pre-load
+        # activate() pass. Retry them NOW rather than hoping a later watched
+        # module import re-triggers activate() after this load.
+        _install_adapters(release_required)
     except Exception:  # noqa: BLE001 - a bad bundle must not wedge the engine
+        _bundle_pending = None
         logger.exception("optima: bundle load failed for %s", bundle)
         from optima import receipts
 
@@ -211,10 +365,29 @@ def _load_bundle_into_registry(bundle: str) -> None:
     # failure raises out to activate() -> load_failed receipt -> the eval refuses.
     from optima.rebuild import apply_rebuild_plan
 
-    # The trusted prebuild worker already compiled and materialized every native
-    # product.  Scheduler ranks may validate/load that sealed product, but must
-    # never compile or repair it as a fallback.
-    apply_rebuild_plan(bundle, phase="load")
+    # Production scheduler ranks consume only the publication produced by the
+    # trusted OCI prebuild worker.  The explicit direct-eval lane has no native
+    # publication (it uses the content-addressed development cache), so replay
+    # the already-selected development plan there.  Never infer production from
+    # one marker alone: a partial marker set must fail rather than downgrade a
+    # hardened worker into the build-capable development lane.
+    prebuilt = _truthy(os.environ.get("OPTIMA_PREBUILT_ARTIFACTS"))
+    engine_worker = _truthy(os.environ.get("OPTIMA_ENGINE_WORKER"))
+    if prebuilt != engine_worker:
+        raise RuntimeError(
+            "candidate scheduler has an incomplete native-artifact authority"
+        )
+    apply_rebuild_plan(bundle, phase="load" if prebuilt else "all")
+    from optima.artifact_runtime import resolve_direct_artifact_entry
+
+    # Resolve every direct-AOT binding before importing ANY candidate module.  A
+    # mixed/atomic bundle therefore cannot monkeypatch CuTe, torch, an artifact path,
+    # or adapter globals and redirect a later direct row.
+    direct_entries = {
+        (op.slot, op.variant): resolve_direct_artifact_entry(op)
+        for op in manifest.ops
+        if op.aot_exports
+    }
     # ONE module instance per SOURCE FILE, shared across ops: two slots declared on
     # the same source (e.g. the shallow + deep fused-epilogue entries sharing one IPC
     # workspace in module globals) must not get two module instances — each would
@@ -238,10 +411,24 @@ def _load_bundle_into_registry(bundle: str) -> None:
         # prepare and entry would vanish; sys.modules would point at the last copy
         # while entry closed over an earlier one — torch.compile re-imports by name).
         src_key = Path(src).resolve()
-        module = loaded_by_src.get(src_key)
-        if module is None:
-            module = loaded_by_src[src_key] = load_module(src)
-        if getattr(op, "override_point", None):
+        module = None
+        if op.aot_exports:
+            entry = direct_entries[(op.slot, op.variant)]
+            if entry is None:
+                raise RuntimeError("direct CuTe AOT row resolved no validator entry")
+            # Direct artifacts may carry validator-generated init/prepare/storage
+            # lifecycle.  The runtime entry owns this method; no candidate Python
+            # callable is imported in the scheduler process.
+            prepare = getattr(entry, "prepare", None)
+            if prepare is not None and not callable(prepare):
+                raise RuntimeError("direct CuTe AOT prepare boundary is not callable")
+        else:
+            module = loaded_by_src.get(src_key)
+            if module is None:
+                module = loaded_by_src[src_key] = load_module(src)
+        if op.aot_exports:
+            pass
+        elif getattr(op, "override_point", None):
             # Override submission: compose the miner's epilogue into the validator-owned base
             # kernel -> a standard (entry, prepare) that flows through the normal dispatcher.
             from optima_kernels.override import build_override
@@ -278,6 +465,7 @@ def _load_bundle_into_registry(bundle: str) -> None:
         # (framework_mode) and it MUST run in the no-egress isolation worker before the
         # subnet opens to untrusted miners.
         if getattr(op, "setup", None):
+            assert module is not None  # direct-AOT rows forbid setup at manifest load
             setup_key = (src_key, op.setup)
             if setup_key not in setup_done:
                 callable_from(module, op.setup)()

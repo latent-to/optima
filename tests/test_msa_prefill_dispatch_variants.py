@@ -52,7 +52,7 @@ class _FakeTopKKernel:
         return launch
 
 
-def _msa_batched_args():
+def _msa_batched_args(*, topk=16):
     # Request 0 has fewer blocks than the batch max, so its logical score view
     # has a padded row pitch.
     return (
@@ -69,7 +69,7 @@ def _msa_batched_args():
         3,
         1,
         1,
-        8,
+        topk,
     )
 
 
@@ -339,15 +339,15 @@ def test_msa_validator_topk_tail_failure_is_selected_path_fallback(monkeypatch):
     assert fallbacks == [("attention.msa_prefill_block_score", "RuntimeError")]
 
 
-def test_msa_noncontract_topk_is_wholly_stock(monkeypatch):
+def test_msa_runtime_topk_does_not_gate_score_kernel(monkeypatch):
     module = _install_fake_runtime(monkeypatch)
     candidate_calls = 0
 
-    def candidate(*_args):
+    def candidate(_q, _k, _prefix, _scale, _block_size, out):
         nonlocal candidate_calls
         candidate_calls += 1
+        out.fill_(1.0)
 
-    registry = _single_registry(candidate)
     stock_result = object()
     stock_calls = 0
 
@@ -356,16 +356,21 @@ def test_msa_noncontract_topk_is_wholly_stock(monkeypatch):
         stock_calls += 1
         return stock_result
 
+    registry = _variant_registry({1: candidate, 2: candidate})
     wrapped = dispatch.make_msa_prefill_dispatcher(
-        stock, module, registry=registry
+        stock,
+        module,
+        registry=registry,
     )
-    args = list(_msa_batched_args())
-    args[-1] = 4
-    result = wrapped(*args, disable_index_value=True)
+    result = _invoke(wrapped)
 
-    assert result is stock_result
-    assert stock_calls == 1
-    assert candidate_calls == 0
+    assert result[0] is None
+    assert result[1].shape[-1] == 16
+    assert stock_calls == 0
+    assert candidate_calls == 4
+    descriptors = [descriptor for descriptor, _fired in registry.decisions]
+    assert descriptors
+    assert {descriptor["top_k"] for descriptor in descriptors} == {8}
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA GPU")

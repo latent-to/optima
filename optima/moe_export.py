@@ -214,11 +214,13 @@ def _consume_will_defer() -> bool:
 # ---------------------------------------------------------------------------
 
 
-def _tuning() -> bool:
-    # NEVER toggle skip-finalize while flashinfer's autotuner is profiling: the tuner
-    # sweeps many M buckets inside one warmup forward; a single deferring forward with
-    # skip armed poisons the tactic table for ALL M (campaign, plan §22). Tuning must
-    # always see the stock pipeline.
+def flashinfer_tuning() -> bool:
+    """Whether FlashInfer is currently profiling an autotuner tactic.
+
+    Every Optima seam inside that stock pipeline must stay invisible while this is
+    true.  In particular, the deep producer must not arm skip-finalize and the
+    downstream fused-epilogue dispatcher must not select a miner collective.
+    """
     try:
         from flashinfer.autotuner import AutoTuner
 
@@ -380,6 +382,9 @@ def maybe_export(orig: Callable[..., Any], args: tuple, kwargs: dict, *,
     if _state["disabled"] or not defer:
         _dbg(f"me: pass-through (disabled={_state['disabled']} defer={defer})")
         return orig(*args, **kwargs)
+    if flashinfer_tuning():
+        _dbg("me: pass-through (autotuner active)")
+        return orig(*args, **kwargs)
 
     # LAST-LAYER VETO (root cause of the 2026-07-07 capture crash): minimax_m3 never
     # passes is_last_layer, so sglang lets the FINAL layer defer its AR — harmless in
@@ -407,10 +412,6 @@ def maybe_export(orig: Callable[..., Any], args: tuple, kwargs: dict, *,
     if type(ep_size) is not int or ep_size != 1:
         # Export layouts are TP-only (no EP reshuffle).
         _dbg("me: pass-through (ep_size != 1)")
-        return orig(*args, **kwargs)
-
-    if _tuning():
-        _dbg("me: pass-through (autotuner active)")
         return orig(*args, **kwargs)
 
     # Select from facts the validator can observe BEFORE skipping finalize.  Use the

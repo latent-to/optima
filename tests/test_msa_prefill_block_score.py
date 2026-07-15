@@ -9,6 +9,8 @@ and a kernel that mis-handles the RAGGED tail block.
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 
 torch = pytest.importorskip("torch")
@@ -16,7 +18,11 @@ torch = pytest.importorskip("torch")
 from optima.slots import get_slot  # noqa: E402
 from optima.registry import eligibility_from_metadata  # noqa: E402
 from optima.tensor_spec import validate_output_spec  # noqa: E402
-from optima.verify import format_verify, verify_entry  # noqa: E402
+from optima.verify import (  # noqa: E402
+    _has_msa_prefill_probe_schema,
+    format_verify,
+    verify_entry,
+)
 
 SLOT = get_slot("attention.msa_prefill_block_score")
 
@@ -207,13 +213,28 @@ def test_prefill_out_of_budget_domain_rejects_without_invocation():
 def test_prefill_synthesizes_bounded_probes_inside_new_q_domain(
     q_domain, expected_q
 ):
+    # Synthesis follows the declared score-sheet shape/call schema, not a slot,
+    # kernel, or artifact-provider identity.
+    renamed_slot = replace(SLOT, name="test.renamed_prefill_score_contract")
+    eligibility = _production_like_eligibility(q_len=q_domain)
+    assert _has_msa_prefill_probe_schema(
+        renamed_slot, eligibility, list(renamed_slot.shapes)
+    )
+    assert not _has_msa_prefill_probe_schema(
+        replace(
+            renamed_slot,
+            correctness=replace(renamed_slot.correctness, mode="allclose"),
+        ),
+        eligibility,
+        list(renamed_slot.shapes),
+    )
     result = verify_entry(
-        SLOT,
+        renamed_slot,
         _faithful,
         dtype=torch.float32,
         device="cpu",
         architecture="sm103",
-        eligibility=_production_like_eligibility(q_len=q_domain),
+        eligibility=eligibility,
         graph_safe=False,
         jitter_seed=5,
     )
@@ -454,6 +475,18 @@ def test_prefill_causal_probe_survives_cli_jitter_path():
 
     assert result.passed, format_verify(result)
     assert result.num_applicable == 2
+
+
+def test_prefill_causal_probe_varies_declared_graph_inputs_across_seeds():
+    shape = next(shape for shape in SLOT.shapes if shape.get("causal_probe") is True)
+    first = SLOT.make_inputs(dtype=torch.bfloat16, device="cpu", seed=1, **shape)
+    second = SLOT.make_inputs(dtype=torch.bfloat16, device="cpu", seed=2, **shape)
+
+    assert SLOT.graph_dynamic_inputs == ("q", "index_k")
+    assert all(
+        not torch.equal(first[name], second[name])
+        for name in SLOT.graph_dynamic_inputs
+    )
 
 
 def test_prefill_verify_exercises_fp32_padded_output():

@@ -45,6 +45,8 @@ from optima.eval.qualification_runner import (
     reopen_causal_qualification,
     run_causal_qualification,
 )
+from optima.eval.oci_backend import OCIBackendError
+from optima.eval.oci_outer_session import OuterSessionProcessError
 from optima.eval.scoring import RawSpeedEvidenceError
 from optima.stack_identity import (
     canonical_digest,
@@ -783,6 +785,10 @@ def run_qualification_intake(
         )
     except RawSpeedEvidenceError as exc:
         return _no_decision_batch(manifest, exc, reason="raw_speed_evidence")
+    except OuterSessionProcessError as exc:
+        return _no_decision_batch(manifest, exc, reason="outer_session_process")
+    except OCIBackendError as exc:
+        return _no_decision_batch(manifest, exc, reason="oci_backend")
     except QualificationRunnerError as exc:
         return _no_decision_batch(manifest, exc, reason="qualification_runner")
 

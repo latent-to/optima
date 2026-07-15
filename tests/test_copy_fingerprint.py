@@ -132,7 +132,7 @@ def test_shared_fragment_and_structure_are_advisory_only():
     assert decision.shared_advisory == ("1" * 64,)
 
 
-def test_different_semantic_targets_do_not_cross_demote():
+def test_different_static_targets_do_not_cross_demote():
     original = _delta()
     other = _delta(
         target_id="norm.rmsnorm",

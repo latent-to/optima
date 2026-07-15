@@ -13,6 +13,7 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
+from optima.registry import eligibility_from_metadata  # noqa: E402
 from optima.sandbox import load_entry  # noqa: E402
 from optima.slots import get_slot  # noqa: E402
 from optima.tensor_spec import OutputSpec, TensorSpec  # noqa: E402
@@ -58,6 +59,12 @@ def _faithful_silu(x, out):
     out.copy_(torch.nn.functional.silu(x[..., :d]) * x[..., d:])
 
 
+def _faithful_rmsnorm(x, weight, out, eps):
+    x32 = x.float()
+    normalized = x32 * torch.rsqrt(x32.square().mean(-1, keepdim=True) + eps)
+    out.copy_((normalized * weight).to(x.dtype))
+
+
 def test_torch_silu_passes_correctness_cpu():
     entry = load_entry(TORCH_BUNDLE, "silu_and_mul")
     slot = get_slot("activation.silu_and_mul")
@@ -85,6 +92,33 @@ def test_wrong_kernel_fails_correctness_cpu():
     slot = get_slot("activation.silu_and_mul")
     result = verify_entry(slot, broken, dtype=torch.float32, device="cpu", seed=0)
     assert not result.passed
+
+
+def test_rmsnorm_catalog_exercises_exact_6144_hidden_domain():
+    slot = get_slot("norm.rmsnorm")
+    shapes = [shape for shape in slot.shapes if shape.get("hidden") == 6144]
+    eligibility = eligibility_from_metadata(
+        {
+            "graph_safe": False,
+            "capabilities": {"dtype": "float32", "last_dim": 6144},
+        },
+        ("float32",),
+        (),
+    )
+
+    result = verify_entry(
+        slot,
+        _faithful_rmsnorm,
+        dtype=torch.float32,
+        device="cpu",
+        shapes=shapes,
+        eligibility=eligibility,
+        graph_safe=False,
+    )
+
+    assert shapes == [{"num_tokens": 64, "hidden": 6144}]
+    assert result.passed, format_verify(result)
+    assert result.num_applicable == 1
 
 
 def test_cpu_verify_reports_graph_proof_not_obtained():

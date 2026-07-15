@@ -6,6 +6,11 @@ import pytest
 
 import optima.eval.qualification_intake as intake
 from optima.eval.evidence_store import EvidenceArtifactRef
+from optima.eval.oci_backend import OCIBackendError
+from optima.eval.oci_outer_session import (
+    OuterSessionProcessError,
+    OuterSessionWorkerError,
+)
 from optima.eval.qualification import (
     GraphVariantRequirement,
     GraphVerificationBinding,
@@ -349,11 +354,19 @@ def test_batch_service_projects_per_reservation_tristate_and_retry(monkeypatch) 
 
 
 @pytest.mark.parametrize(
-    "failure",
-    [RawSpeedEvidenceError("zero throughput"), QualificationRunnerError("T died")],
+    ("failure", "reason"),
+    [
+        (RawSpeedEvidenceError("zero throughput"), "raw_speed_evidence"),
+        (QualificationRunnerError("T died"), "qualification_runner"),
+        (
+            OuterSessionProcessError("session ended before a complete response"),
+            "outer_session_process",
+        ),
+        (OCIBackendError("runtime post-drain unavailable"), "oci_backend"),
+    ],
 )
 def test_cohort_failure_is_no_decision_with_deterministic_bisection(
-    monkeypatch, failure
+    monkeypatch, failure, reason
 ) -> None:
     plan, manifest = _fake_plan(monkeypatch, count=3)
 
@@ -373,6 +386,7 @@ def test_cohort_failure_is_no_decision_with_deterministic_bisection(
         QualificationDecision.NO_DECISION
     }
     assert all(row.retryable and row.report_digest is None for row in result.outcomes)
+    assert all(row.reason == reason for row in result.outcomes)
     assert result.attempt_ref is None
     assert result.retry_plan is not None
     assert result.retry_plan.strategy == "bisect"
@@ -380,6 +394,27 @@ def test_cohort_failure_is_no_decision_with_deterministic_bisection(
         (manifest.reservations[0].reservation_digest,),
         tuple(row.reservation_digest for row in manifest.reservations[1:]),
     )
+
+
+def test_candidate_worker_error_is_not_reclassified_as_infrastructure(
+    monkeypatch,
+) -> None:
+    plan, manifest = _fake_plan(monkeypatch, count=2)
+    failure = OuterSessionWorkerError("candidate engine raised")
+    monkeypatch.setattr(
+        intake,
+        "run_causal_qualification",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(failure),
+    )
+
+    with pytest.raises(OuterSessionWorkerError, match="candidate engine"):
+        intake.run_qualification_intake(
+            _factory(plan, manifest),
+            executor=object(),
+            entropy_provider=lambda *_args: None,
+            hidden_judge=lambda **_kwargs: None,
+            deadline=100.0,
+        )
 
 
 @pytest.mark.parametrize(

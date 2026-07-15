@@ -43,6 +43,7 @@ _PATCHER_SUBDIR = ("optima", "patchers")
 _REGISTERED_PATCHERS = {
     "apply_dep_patch.py": ("optima.apply-dep-patch.v1", 0),
     "build_cuda_ext.py": ("optima.build-cuda-ext.v1", 1),
+    "build_cute_cubin.py": ("optima.build-cute-cubin.v1", 2),
 }
 
 

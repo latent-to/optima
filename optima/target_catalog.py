@@ -21,6 +21,12 @@ from functools import lru_cache
 from itertools import combinations
 from typing import Iterable, Mapping
 
+from optima.artifact_provider import (
+    ARTIFACT_PROVIDERS,
+    CUTE_CUBIN_MANIFEST_FEATURE,
+    CUTE_CUBIN_REBUILD_FEATURE,
+    ArtifactProviderPolicyError,
+)
 from optima.manifest import CompetitionEntry, DEFAULT_VARIANT, Manifest
 from optima.stack_identity import canonical_digest
 
@@ -39,9 +45,17 @@ FEATURE_PREPARE = "prepare"
 FEATURE_SETUP = "setup"
 FEATURE_OVERRIDE = "override"
 FEATURE_CUDA_SOURCES = "cuda_sources"
+FEATURE_AOT_CUTE_OBJECT = CUTE_CUBIN_MANIFEST_FEATURE
 FEATURE_REBUILD_BUILD_CUDA_EXT = "rebuild:build_cuda_ext"
+FEATURE_REBUILD_BUILD_CUTE_AOT = CUTE_CUBIN_REBUILD_FEATURE
 FEATURE_REBUILD_APPLY_DEP_PATCH = "rebuild:apply_dep_patch"
 FEATURE_DEP_PATCH_FLASHINFER = "dep_patch:flashinfer"
+
+_ARTIFACT_PROVIDER_TARGET_FEATURES = frozenset(
+    feature
+    for descriptor in ARTIFACT_PROVIDERS.descriptors()
+    for feature in descriptor.required_target_features
+)
 
 KNOWN_CONTRIBUTION_FEATURES = frozenset(
     {
@@ -55,7 +69,7 @@ KNOWN_CONTRIBUTION_FEATURES = frozenset(
         FEATURE_REBUILD_APPLY_DEP_PATCH,
         FEATURE_DEP_PATCH_FLASHINFER,
     }
-)
+) | _ARTIFACT_PROVIDER_TARGET_FEATURES
 
 _STANDARD_COMPONENT_FEATURES = frozenset(
     {
@@ -66,7 +80,7 @@ _STANDARD_COMPONENT_FEATURES = frozenset(
         FEATURE_CUDA_SOURCES,
         FEATURE_REBUILD_BUILD_CUDA_EXT,
     }
-)
+) | _ARTIFACT_PROVIDER_TARGET_FEATURES
 _FLASHINFER_FEATURES = frozenset(
     {FEATURE_DEP_PATCH_FLASHINFER, FEATURE_REBUILD_APPLY_DEP_PATCH}
 )
@@ -362,6 +376,7 @@ class ResolvedTarget:
     observed_features: frozenset[str]
     features_complete: bool
     reason: str | None = None
+    contract_digest: str | None = None
 
     def require_registered(self) -> "ResolvedTarget":
         if not self.registered:
@@ -413,6 +428,8 @@ def manifest_declared_features(manifest: Manifest) -> frozenset[str]:
             features.add(FEATURE_OVERRIDE)
         if op.cuda_sources:
             features.add(FEATURE_CUDA_SOURCES)
+        if op.aot_exports:
+            features.update(f"aot:{export.provider}" for export in op.aot_exports)
         # Unknown op keys are retained by Manifest for forward compatibility.
         # They are observable capabilities, not an implicit permission bypass.
         features.update(f"op_extra:{key}" for key in op.extra)
@@ -420,6 +437,73 @@ def manifest_declared_features(manifest: Manifest) -> frozenset[str]:
         features.add(FEATURE_VARIANTS)
     features.update(f"dep_patch:{patch.target}" for patch in manifest.dep_patches)
     return frozenset(features)
+
+
+def _validate_complete_feature_evidence(
+    manifest: Manifest, features: frozenset[str]
+) -> None:
+    """Validate trusted external build evidence for static targets."""
+
+    patches = {feature for feature in features if feature.startswith("dep_patch:")}
+    applies_patch = FEATURE_REBUILD_APPLY_DEP_PATCH in features
+    if patches and not applies_patch:
+        raise TargetResolutionError(
+            "complete feature evidence has a dependency patch without "
+            "rebuild:apply_dep_patch"
+        )
+    if applies_patch and not patches:
+        raise TargetResolutionError(
+            "complete feature evidence selects rebuild:apply_dep_patch "
+            "without a declared dependency patch"
+        )
+    has_cuda = FEATURE_CUDA_SOURCES in features
+    builds_cuda = FEATURE_REBUILD_BUILD_CUDA_EXT in features
+    if has_cuda and not builds_cuda:
+        raise TargetResolutionError(
+            "complete feature evidence has CUDA sources without "
+            "rebuild:build_cuda_ext"
+        )
+    if builds_cuda and not has_cuda:
+        raise TargetResolutionError(
+            "complete feature evidence selects rebuild:build_cuda_ext "
+            "without declared CUDA sources"
+        )
+    if builds_cuda and not any(
+        path.endswith(".cu") for op in manifest.ops for path in op.cuda_sources
+    ):
+        raise TargetResolutionError(
+            "rebuild:build_cuda_ext requires a declared .cu compilation unit"
+        )
+    declared_provider_ids = {
+        export.provider for op in manifest.ops for export in op.aot_exports
+    }
+    try:
+        declared_descriptors = tuple(
+            ARTIFACT_PROVIDERS.require(provider_id)
+            for provider_id in sorted(declared_provider_ids)
+        )
+    except ArtifactProviderPolicyError as exc:
+        raise TargetResolutionError(str(exc)) from None
+    for descriptor in declared_descriptors:
+        missing = descriptor.required_target_features - features
+        if missing:
+            raise TargetResolutionError(
+                "complete feature evidence has artifact-provider AOT exports "
+                f"without required features {tuple(sorted(missing))!r}"
+            )
+    for descriptor in ARTIFACT_PROVIDERS.descriptors():
+        if descriptor.rebuild_feature not in features:
+            continue
+        matching_declared = {
+            row.provider_id
+            for row in declared_descriptors
+            if row.rebuild_feature == descriptor.rebuild_feature
+        }
+        if not matching_declared:
+            raise TargetResolutionError(
+                f"complete feature evidence selects {descriptor.rebuild_feature} "
+                "without declared artifact-provider AOT exports"
+            )
 
 
 class TargetCatalog:
@@ -660,6 +744,7 @@ class TargetCatalog:
             raise TargetCatalogError("composition_rules must contain CompositionRule rows")
         by_rule_id: dict[str, CompositionRule] = {}
         by_rule_targets: dict[tuple[str, ...], CompositionRule] = {}
+        by_rule_pair: dict[tuple[str, str], CompositionRule] = {}
         for rule in rules:
             if rule.rule_id in by_rule_id:
                 raise TargetCatalogError(f"duplicate composition rule ID {rule.rule_id!r}")
@@ -682,6 +767,14 @@ class TargetCatalog:
                         f"composition rule {rule.rule_id!r} targets must be "
                         "explicitly compatible"
                     )
+                pair = (left, right)
+                previous = by_rule_pair.get(pair)
+                if previous is not None:
+                    raise TargetCatalogError(
+                        f"compatible target pair {pair!r} is covered by multiple "
+                        f"composition rules {previous.rule_id!r}, {rule.rule_id!r}"
+                    )
+                by_rule_pair[pair] = rule
             for target_id in rule.target_ids:
                 contract = by_id[target_id].contract_ref
                 if (
@@ -697,7 +790,7 @@ class TargetCatalog:
 
         for left, right in combinations(sorted(by_id), 2):
             compatible = right in by_id[left].compatible_with
-            rule = by_rule_targets.get((left, right))
+            rule = by_rule_pair.get((left, right))
             if compatible and rule is None:
                 raise TargetCatalogError(
                     f"compatible targets {(left, right)!r} require a CompositionRule"
@@ -733,6 +826,7 @@ class TargetCatalog:
         }
         self._composition_by_id = dict(sorted(by_rule_id.items()))
         self._composition_by_targets = by_rule_targets
+        self._composition_by_pair = by_rule_pair
         self._displacement_closures = displacement_closures
         self._requirement_closures = requirement_closures
         self._target_snapshots = {
@@ -742,6 +836,11 @@ class TargetCatalog:
         self._snapshot = {
             "schema_version": _CATALOG_SCHEMA_VERSION,
             "policy_version": _CATALOG_POLICY_VERSION,
+            # Provider admission/build/load policy is consensus-bearing. Changing
+            # crownability, artifact kind, ABI, or capability vocabulary must
+            # rotate catalog/stack authority even when target feature names do not.
+            "artifact_provider_registry": ARTIFACT_PROVIDERS.snapshot(),
+            "artifact_provider_registry_digest": ARTIFACT_PROVIDERS.digest,
             "targets": [self._target_snapshots[target_id] for target_id in ordered],
             "composition_rules": [
                 self._composition_by_id[rule_id].snapshot()
@@ -851,7 +950,7 @@ class TargetCatalog:
         self.require(left)
         self.require(right)
         try:
-            return self._composition_by_targets[targets]
+            return self._composition_by_pair[targets]
         except KeyError:
             raise TargetResolutionError(
                 f"targets {targets!r} have no registered composition rule"
@@ -864,9 +963,12 @@ class TargetCatalog:
         outgoing: dict[str, set[str]] = {target_id: set() for target_id in active}
         incoming: dict[str, int] = {target_id: 0 for target_id in active}
         for rule in self._composition_by_id.values():
-            if not set(rule.target_ids) <= active_set:
+            precedence = tuple(
+                target_id for target_id in rule.precedence if target_id in active_set
+            )
+            if len(precedence) < 2:
                 continue
-            for earlier, later in zip(rule.precedence, rule.precedence[1:]):
+            for earlier, later in zip(precedence, precedence[1:]):
                 if later not in outgoing[earlier]:
                     outgoing[earlier].add(later)
                     incoming[later] += 1
@@ -1010,40 +1112,7 @@ class TargetCatalog:
                 f"{tuple(sorted(unexpected))!r}: {detail}"
             )
         if features_complete:
-            patches = {
-                feature for feature in features if feature.startswith("dep_patch:")
-            }
-            applies_patch = FEATURE_REBUILD_APPLY_DEP_PATCH in features
-            if patches and not applies_patch:
-                raise TargetResolutionError(
-                    "complete feature evidence has a dependency patch without "
-                    "rebuild:apply_dep_patch"
-                )
-            if applies_patch and not patches:
-                raise TargetResolutionError(
-                    "complete feature evidence selects rebuild:apply_dep_patch "
-                    "without a declared dependency patch"
-                )
-            has_cuda = FEATURE_CUDA_SOURCES in features
-            builds_cuda = FEATURE_REBUILD_BUILD_CUDA_EXT in features
-            if has_cuda and not builds_cuda:
-                raise TargetResolutionError(
-                    "complete feature evidence has CUDA sources without "
-                    "rebuild:build_cuda_ext"
-                )
-            if builds_cuda and not has_cuda:
-                raise TargetResolutionError(
-                    "complete feature evidence selects rebuild:build_cuda_ext "
-                    "without declared CUDA sources"
-                )
-            if builds_cuda and not any(
-                path.endswith(".cu")
-                for op in manifest.ops
-                for path in op.cuda_sources
-            ):
-                raise TargetResolutionError(
-                    "rebuild:build_cuda_ext requires a declared .cu compilation unit"
-                )
+            _validate_complete_feature_evidence(manifest, features)
         return ResolvedTarget(
             target_id=spec.target_id,
             kind=spec.kind,

@@ -20,6 +20,7 @@ from typing import Callable, Protocol, Sequence
 from optima.discovery_overlay import DiscoveryActivationReceipt
 from optima.eval.oci_process import (
     OCIAttachedClient,
+    OCIAttachedDiagnostic,
     OCILease,
     OCIProcessError,
     OCIProcessManager,
@@ -54,6 +55,43 @@ from optima.stack_identity import require_sha256_hex
 
 class OuterSessionError(RuntimeError):
     """Base error for host transport and raw session execution."""
+
+    def __init__(
+        self,
+        message: str,
+        diagnostic_provider: Callable[[], OCIAttachedDiagnostic] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self._message = message
+        self._diagnostic_provider = diagnostic_provider
+
+    @property
+    def message(self) -> str:
+        return self._message
+
+    def attach_diagnostic(
+        self, provider: Callable[[], OCIAttachedDiagnostic] | None
+    ) -> None:
+        """Attach host-only failure evidence without copying candidate bytes."""
+
+        if self._diagnostic_provider is None and callable(provider):
+            self._diagnostic_provider = provider
+
+    @property
+    def diagnostic(self) -> OCIAttachedDiagnostic | None:
+        if self._diagnostic_provider is None:
+            return None
+        try:
+            value = self._diagnostic_provider()
+        except BaseException:
+            return None
+        return value if type(value) is OCIAttachedDiagnostic else None
+
+    def __str__(self) -> str:
+        diagnostic = self.diagnostic
+        if diagnostic is None:
+            return self._message
+        return f"{self._message}; {diagnostic.summary}"
 
 
 class OuterSessionInfrastructureError(OuterSessionError):
@@ -133,6 +171,32 @@ class AttachedSessionTransport:
             raise OuterSessionInfrastructureError("attached session is not live")
         return self.client
 
+    def _process_error(self, message: str) -> OuterSessionProcessError:
+        client = self.client
+        provider = getattr(client, "stderr_diagnostic", None)
+        return OuterSessionProcessError(
+            message,
+            provider if callable(provider) else None,
+        )
+
+    def stderr_diagnostic(self) -> OCIAttachedDiagnostic:
+        client = self.client
+        if client is None:
+            raise OuterSessionInfrastructureError(
+                "attached session has no stderr diagnostic"
+            )
+        return client.stderr_diagnostic()
+
+    def _diagnostic_provider(
+        self,
+    ) -> Callable[[], OCIAttachedDiagnostic] | None:
+        return self.stderr_diagnostic if self.client is not None else None
+
+    def _diagnostic_error(
+        self, error_type: type[OuterSessionError], message: str
+    ) -> OuterSessionError:
+        return error_type(message, self._diagnostic_provider())
+
     def _remaining(self, deadline: float) -> float:
         try:
             remaining = float(deadline) - float(self.clock())
@@ -167,11 +231,13 @@ class AttachedSessionTransport:
             except (BlockingIOError, InterruptedError):
                 continue
             except BrokenPipeError:
-                raise OuterSessionProcessError("session closed its request pipe") from None
+                raise self._process_error("session closed its request pipe") from None
             except OSError as exc:
-                raise OuterSessionProcessError(f"session request write failed: {exc}") from None
+                raise self._process_error(
+                    f"session request write failed: {exc}"
+                ) from None
             if count <= 0:
-                raise OuterSessionProcessError("session request write made no progress")
+                raise self._process_error("session request write made no progress")
             offset += count
 
     def _read_exact(self, size: int, *, deadline: float) -> bytes:
@@ -189,10 +255,14 @@ class AttachedSessionTransport:
             except (BlockingIOError, InterruptedError):
                 continue
             except OSError as exc:
-                raise OuterSessionProcessError(f"session response read failed: {exc}") from None
+                raise self._process_error(
+                    f"session response read failed: {exc}"
+                ) from None
             if not chunk:
                 # Never poll/wait here: only the manager may reap the process group.
-                raise OuterSessionProcessError("session ended before a complete response")
+                raise self._process_error(
+                    "session ended before a complete response"
+                )
             chunks.append(chunk)
             remaining -= len(chunk)
         return b"".join(chunks)
@@ -230,7 +300,9 @@ class AttachedSessionTransport:
             except SessionProtocolError as exc:
                 raise OuterSessionProtocolError(str(exc)) from None
             if detail is not None:
-                raise OuterSessionWorkerError(": ".join(detail))
+                raise self._diagnostic_error(
+                    OuterSessionWorkerError, ": ".join(detail)
+                )
             raise OuterSessionProtocolError("worker emitted an early control frame")
         if magic != EVIDENCE_MAGIC:
             raise OuterSessionProtocolError("worker emitted wrong evidence-frame magic")
@@ -249,7 +321,9 @@ class AttachedSessionTransport:
         try:
             self.client.finalize()
         except OCIProcessError as exc:
-            raise OuterSessionInfrastructureError(f"session cleanup failed: {exc}") from None
+            raise self._diagnostic_error(
+                OuterSessionInfrastructureError, f"session cleanup failed: {exc}"
+            ) from None
 
     def abort(self) -> None:
         if self.client is None or self.client.closed:
@@ -257,7 +331,9 @@ class AttachedSessionTransport:
         try:
             self.client.abort()
         except OCIProcessError as exc:
-            raise OuterSessionInfrastructureError(f"session cleanup failed: {exc}") from None
+            raise self._diagnostic_error(
+                OuterSessionInfrastructureError, f"session cleanup failed: {exc}"
+            ) from None
 
 
 @dataclass(frozen=True)
@@ -393,6 +469,15 @@ class SessionExecutionEvidence:
 BoundaryCallback = Callable[[str, int, float], None]
 
 
+def diagnostic_provider(
+    transport: object,
+) -> Callable[[], OCIAttachedDiagnostic] | None:
+    """Return only the typed host diagnostic accessor exposed by a transport."""
+
+    provider = getattr(transport, "stderr_diagnostic", None)
+    return provider if callable(provider) else None
+
+
 def _now(clock: Callable[[], float], *, previous: float | None = None) -> float:
     try:
         value = float(clock())
@@ -418,7 +503,9 @@ def _control_or_error(
     except SessionProtocolError as exc:
         raise OuterSessionProtocolError(str(exc)) from None
     if detail is not None:
-        raise OuterSessionWorkerError(": ".join(detail))
+        raise OuterSessionWorkerError(
+            ": ".join(detail), diagnostic_provider(transport)
+        )
     return message
 
 
@@ -504,7 +591,11 @@ def run_outer_session(
                 expected_facts=plan.expected_preflight,
             )
         except (SessionProtocolError, OuterSessionProtocolError, OuterSessionWorkerError) as exc:
-            raise OuterSessionInfrastructureError(f"runtime preflight failed: {exc}") from None
+            detail = exc.message if isinstance(exc, OuterSessionError) else str(exc)
+            raise OuterSessionInfrastructureError(
+                f"runtime preflight failed: {detail}",
+                diagnostic_provider(transport),
+            ) from None
         transport.write_frame(
             frame_message(
                 preflight_accept_message(
@@ -604,12 +695,16 @@ def run_outer_session(
         if session_completed_at > deadline:
             raise OuterSessionTimeoutError("session cleanup exceeded its absolute deadline")
     except BaseException as original:
+        if isinstance(original, OuterSessionError):
+            original.attach_diagnostic(diagnostic_provider(transport))
         try:
             transport.abort()
         except BaseException as cleanup:
-            raise OuterSessionInfrastructureError(
+            error = OuterSessionInfrastructureError(
                 f"session cleanup could not be proven: {cleanup}"
-            ) from original
+            )
+            error.attach_diagnostic(diagnostic_provider(transport))
+            raise error from original
         raise
 
     if preflight is None or conditioning_started_at is None or first_timed_completed_at is None:

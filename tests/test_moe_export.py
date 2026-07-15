@@ -330,10 +330,16 @@ def test_tuning_mode_never_arms(monkeypatch):
     # Toggling skip-finalize during autotuner profiling poisons the tactic table.
     raw = _FakeRaw(export=(1, 1, 2, 3, 64, 32, 32, 5, 16))
     _armed(monkeypatch, raw)
-    monkeypatch.setattr(moe_export, "_tuning", lambda: True)
+    monkeypatch.setattr(moe_export, "flashinfer_tuning", lambda: True)
+    reg = _deep_registry()
+    monkeypatch.setattr(
+        reg,
+        "select",
+        lambda *args, **kwargs: pytest.fail("autotuning reached miner selection"),
+    )
     out, kwargs = _export_kwargs()
     moe_export.maybe_export(_orig_recorder([], out), (), kwargs,
-                            registry=_deep_registry())
+                            registry=reg)
     assert raw.skip == []
 
 

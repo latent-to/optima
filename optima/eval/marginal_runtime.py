@@ -83,9 +83,28 @@ def _digest(value: object, *, field: str) -> str:
 
 
 def _native_environment(binding: TrustedLaunchBinding) -> dict[str, object]:
-    row = binding.native_build_spec.to_dict()
-    row.pop("tree_digest")
-    return row
+    """Return only the arm-invariant native toolchain authority.
+
+    ``tree_digest`` is necessarily arm-specific.  A direct CuTe-AOT candidate also
+    upgrades its native build from schema 1 to schema 2: the compile-profile digest
+    and the compiler-policy digest that incorporates it are therefore candidate
+    build inputs, not evidence that the image/toolchain changed.  Each complete
+    ``NativeBuildSpec`` is already self-validating, and ``resolve_engine_launch``
+    separately validates a trusted compile profile against the common launch
+    hardware.  Keep comparing the immutable image, platform, worker, toolchain,
+    patcher, architecture, and dependency policy exactly.
+    """
+
+    native = binding.native_build_spec
+    return {
+        "dependency_policy_digest": native.dependency_policy_digest,
+        "image_digest": native.image_digest,
+        "patcher_digest": native.patcher_digest,
+        "platform_digest": native.platform_digest,
+        "target_architecture": native.target_architecture,
+        "toolchain_digest": native.toolchain_digest,
+        "worker_distribution_digest": native.worker_distribution_digest,
+    }
 
 
 def _expected_contributions(

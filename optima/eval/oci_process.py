@@ -29,8 +29,21 @@ from typing import BinaryIO, Callable, Iterable, Protocol
 LEASE_SCHEMA = "optima.oci-process-lease.v1"
 EXECUTOR_LABEL = "optima.executor_id"
 LEASE_LABEL = "optima.lease_id"
+GPU_RESERVATION_ENV = "OPTIMA_GPU_RESERVATION_ID"
+GPU_RESERVATION_LABEL = "optima.gpu_reservation_id"
+ATTACHED_STDERR_MAX_BYTES = 64 << 10
+ATTACHED_STDERR_EXCERPT_BYTES = 2 << 10
+ATTACHED_STDERR_ARTIFACT_MAX_BYTES = 16 << 20
+STDERR_ARTIFACT_SCHEMA = "optima.oci-stderr-artifact.v1"
+_ATTACHED_STDERR_READ_BYTES = 64 << 10
+_ATTACHED_STDERR_JOIN_SECONDS = 2.0
 _SIMPLE_ID = re.compile(r"[a-z0-9][a-z0-9_.-]{0,127}\Z")
+_GPU_RESERVATION_ID = re.compile(r"[0-9a-f]{12}\Z")
 _CID = re.compile(r"[0-9a-f]{64}\Z")
+_SHA256 = re.compile(r"[0-9a-f]{64}\Z")
+_STDERR_ARTIFACT_NAME = re.compile(
+    r"(?P<lease>[a-z0-9][a-z0-9_.-]{0,127})\.(?P<nonce>[0-9a-f]{32})\.stderr\Z"
+)
 _INSPECT_FORMAT = (
     '--format={"Id":{{json .Id}},"Name":{{json .Name}},'
     '"Labels":{{json .Config.Labels}}}'
@@ -42,7 +55,481 @@ class OCIProcessError(RuntimeError):
 
 
 class OCIProcessTimeout(OCIProcessError):
-    pass
+    def __init__(
+        self, message: str, diagnostic: "OCIAttachedDiagnostic | None" = None
+    ) -> None:
+        super().__init__(message)
+        self._message = message
+        self.diagnostic = (
+            diagnostic if type(diagnostic) is OCIAttachedDiagnostic else None
+        )
+
+    def __str__(self) -> str:
+        if self.diagnostic is None:
+            return self._message
+        return f"{self._message}; {self.diagnostic.summary}"
+
+
+@dataclass(frozen=True)
+class OCIStderrArtifactReceipt:
+    """Host-owned identity for one private bounded stderr prefix artifact.
+
+    ``stream_*`` authenticates every byte drained from the pipe. ``artifact_*``
+    authenticates the retained prefix and is therefore independently reopenable
+    even when the complete stream exceeded the hard disk cap.
+    """
+
+    schema: str
+    executor_id: str
+    lease_id: str
+    artifact_path: Path
+    receipt_path: Path
+    artifact_sha256: str
+    stream_sha256: str
+    artifact_bytes: int
+    stream_bytes: int
+    truncated: bool
+    owner_uid: int
+    owner_gid: int
+    mode: int
+
+    def __post_init__(self) -> None:
+        artifact = Path(self.artifact_path)
+        receipt = Path(self.receipt_path)
+        object.__setattr__(self, "artifact_path", artifact)
+        object.__setattr__(self, "receipt_path", receipt)
+        match = _STDERR_ARTIFACT_NAME.fullmatch(artifact.name)
+        if (
+            self.schema != STDERR_ARTIFACT_SCHEMA
+            or not isinstance(self.executor_id, str)
+            or _SIMPLE_ID.fullmatch(self.executor_id) is None
+            or not isinstance(self.lease_id, str)
+            or _SIMPLE_ID.fullmatch(self.lease_id) is None
+            or match is None
+            or match.group("lease") != self.lease_id
+            or not artifact.is_absolute()
+            or not receipt.is_absolute()
+            or len(os.fsencode(artifact)) > 1024
+            or len(os.fsencode(receipt)) > 1024
+            or artifact.parent != receipt.parent
+            or receipt.name != artifact.name + ".json"
+            or any(part in ("", ".", "..") for part in artifact.parts)
+            or any(part in ("", ".", "..") for part in receipt.parts)
+            or not isinstance(self.artifact_sha256, str)
+            or _SHA256.fullmatch(self.artifact_sha256) is None
+            or not isinstance(self.stream_sha256, str)
+            or _SHA256.fullmatch(self.stream_sha256) is None
+            or type(self.artifact_bytes) is not int
+            or not 0 <= self.artifact_bytes <= ATTACHED_STDERR_ARTIFACT_MAX_BYTES
+            or type(self.stream_bytes) is not int
+            or self.stream_bytes < self.artifact_bytes
+            or type(self.truncated) is not bool
+            or self.truncated != (self.stream_bytes > self.artifact_bytes)
+            or (
+                not self.truncated
+                and self.artifact_sha256 != self.stream_sha256
+            )
+            or type(self.owner_uid) is not int
+            or self.owner_uid < 0
+            or type(self.owner_gid) is not int
+            or self.owner_gid < 0
+            or self.mode != 0o600
+        ):
+            raise OCIProcessError("OCI stderr artifact receipt is malformed")
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "artifact_bytes": self.artifact_bytes,
+            "artifact_path": str(self.artifact_path),
+            "artifact_sha256": self.artifact_sha256,
+            "executor_id": self.executor_id,
+            "lease_id": self.lease_id,
+            "mode": self.mode,
+            "owner_gid": self.owner_gid,
+            "owner_uid": self.owner_uid,
+            "receipt_path": str(self.receipt_path),
+            "schema": self.schema,
+            "stream_bytes": self.stream_bytes,
+            "stream_sha256": self.stream_sha256,
+            "truncated": self.truncated,
+        }
+
+    @property
+    def receipt_bytes(self) -> bytes:
+        return _canonical_json(self.to_dict()) + b"\n"
+
+    @property
+    def receipt_sha256(self) -> str:
+        return hashlib.sha256(self.receipt_bytes).hexdigest()
+
+    @property
+    def digest(self) -> str:
+        return self.receipt_sha256
+
+
+@dataclass(frozen=True)
+class OCIAttachedDiagnostic:
+    """One bounded, private diagnostic snapshot from an attached OCI client.
+
+    The terminal-safe tail and private prefix artifact are never part of launch
+    identity or the worker-visible protocol. The host hashes and drains the whole
+    stream while bounding both retained representations.
+    """
+
+    stderr_tail: bytes
+    stderr_truncated: bool
+    capture_complete: bool
+    capture_error: str | None = None
+    client_returncode: int | None = None
+    stream_bytes: int | None = None
+    stream_sha256: str | None = None
+    artifact: OCIStderrArtifactReceipt | None = None
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.stderr_tail, bytes)
+            or len(self.stderr_tail) > ATTACHED_STDERR_MAX_BYTES
+            or type(self.stderr_truncated) is not bool
+            or type(self.capture_complete) is not bool
+            or (
+                self.client_returncode is not None
+                and type(self.client_returncode) is not int
+            )
+            or (
+                self.capture_error is not None
+                and (
+                    not isinstance(self.capture_error, str)
+                    or not self.capture_error
+                    or len(self.capture_error) > 512
+                    or "\x00" in self.capture_error
+                )
+            )
+            or (
+                self.stream_bytes is not None
+                and (type(self.stream_bytes) is not int or self.stream_bytes < 0)
+            )
+            or (
+                self.stream_sha256 is not None
+                and (
+                    not isinstance(self.stream_sha256, str)
+                    or _SHA256.fullmatch(self.stream_sha256) is None
+                )
+            )
+            or (self.stream_bytes is None) != (self.stream_sha256 is None)
+            or (
+                self.artifact is not None
+                and (
+                    type(self.artifact) is not OCIStderrArtifactReceipt
+                    or self.stream_bytes != self.artifact.stream_bytes
+                    or self.stream_sha256 != self.artifact.stream_sha256
+                )
+            )
+        ):
+            raise OCIProcessError("attached OCI diagnostic is malformed")
+
+    @property
+    def stderr_sha256(self) -> str:
+        return hashlib.sha256(self.stderr_tail).hexdigest()
+
+    @property
+    def summary(self) -> str:
+        """A terminal-safe bounded summary; the complete bounded tail stays typed."""
+
+        fields = [
+            f"outer_oci_stderr_bytes={len(self.stderr_tail)}",
+            f"outer_oci_stderr_sha256={self.stderr_sha256}",
+            f"outer_oci_stderr_truncated={str(self.stderr_truncated).lower()}",
+            f"outer_oci_stderr_complete={str(self.capture_complete).lower()}",
+        ]
+        if self.client_returncode is not None:
+            fields.append(f"outer_oci_client_returncode={self.client_returncode}")
+        if self.stream_bytes is not None:
+            fields.extend(
+                (
+                    f"outer_oci_stderr_stream_bytes={self.stream_bytes}",
+                    f"outer_oci_stderr_stream_sha256={self.stream_sha256}",
+                )
+            )
+        if self.artifact is not None:
+            fields.extend(
+                (
+                    "outer_oci_stderr_artifact_path="
+                    f"{str(self.artifact.artifact_path)!r}",
+                    "outer_oci_stderr_artifact_sha256="
+                    f"{self.artifact.artifact_sha256}",
+                    "outer_oci_stderr_artifact_bytes="
+                    f"{self.artifact.artifact_bytes}",
+                    "outer_oci_stderr_artifact_truncated="
+                    f"{str(self.artifact.truncated).lower()}",
+                    "outer_oci_stderr_receipt_path="
+                    f"{str(self.artifact.receipt_path)!r}",
+                    "outer_oci_stderr_receipt_sha256="
+                    f"{self.artifact.receipt_sha256}",
+                )
+            )
+        if self.capture_error is not None:
+            fields.append(f"outer_oci_stderr_capture_error={self.capture_error!r}")
+        if self.stderr_tail:
+            # bytes.__repr__ escapes terminal controls.  Bound the input before
+            # formatting so even worst-case escaping remains small.
+            excerpt = self.stderr_tail[-ATTACHED_STDERR_EXCERPT_BYTES:]
+            fields.append(f"outer_oci_stderr_tail={excerpt!r}")
+        return " ".join(fields)
+
+
+class _StderrArtifactWriter:
+    """Stream only the bounded prefix to a private host-owned regular file."""
+
+    def __init__(self, manager: "OCIProcessManager", lease: "OCILease") -> None:
+        self.manager = manager
+        self.lease = lease
+        token = secrets.token_hex(16)
+        self.artifact_path = manager.diagnostics_root / (
+            f"{lease.lease_id}.{token}.stderr"
+        )
+        self.receipt_path = Path(str(self.artifact_path) + ".json")
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        self.fd = os.open(self.artifact_path, flags, 0o600)
+        self._artifact_hasher = hashlib.sha256()
+        self._artifact_bytes = 0
+        self._closed = False
+        try:
+            os.fchmod(self.fd, 0o600)
+            info = os.fstat(self.fd)
+            if (
+                not stat.S_ISREG(info.st_mode)
+                or info.st_nlink != 1
+                or stat.S_IMODE(info.st_mode) != 0o600
+                or info.st_uid != os.geteuid()
+                or info.st_gid != os.getegid()
+            ):
+                raise OCIProcessError(
+                    "OCI stderr artifact is not a private controller-owned file"
+                )
+        except BaseException:
+            os.close(self.fd)
+            self._closed = True
+            self.artifact_path.unlink(missing_ok=True)
+            raise
+
+    @staticmethod
+    def _write_all(fd: int, payload: bytes) -> None:
+        view = memoryview(payload)
+        offset = 0
+        while offset < len(view):
+            try:
+                count = os.write(fd, view[offset:])
+            except InterruptedError:
+                continue
+            if count <= 0:
+                raise OSError("stderr artifact write made no progress")
+            offset += count
+
+    def append(self, chunk: bytes) -> None:
+        remaining = ATTACHED_STDERR_ARTIFACT_MAX_BYTES - self._artifact_bytes
+        if remaining <= 0:
+            return
+        retained = chunk[:remaining]
+        self._write_all(self.fd, retained)
+        self._artifact_hasher.update(retained)
+        self._artifact_bytes += len(retained)
+
+    def finish(
+        self, *, stream_bytes: int, stream_sha256: str
+    ) -> OCIStderrArtifactReceipt:
+        if self._closed:
+            raise OCIProcessError("OCI stderr artifact writer is already closed")
+        try:
+            os.fsync(self.fd)
+            info = os.fstat(self.fd)
+            if (
+                not stat.S_ISREG(info.st_mode)
+                or info.st_nlink != 1
+                or info.st_size != self._artifact_bytes
+                or stat.S_IMODE(info.st_mode) != 0o600
+                or info.st_uid != os.geteuid()
+                or info.st_gid != os.getegid()
+            ):
+                raise OCIProcessError(
+                    "OCI stderr artifact changed before receipt publication"
+                )
+        finally:
+            os.close(self.fd)
+            self._closed = True
+        receipt = OCIStderrArtifactReceipt(
+            STDERR_ARTIFACT_SCHEMA,
+            self.lease.executor_id,
+            self.lease.lease_id,
+            self.artifact_path,
+            self.receipt_path,
+            self._artifact_hasher.hexdigest(),
+            stream_sha256,
+            self._artifact_bytes,
+            stream_bytes,
+            stream_bytes > self._artifact_bytes,
+            info.st_uid,
+            info.st_gid,
+            stat.S_IMODE(info.st_mode),
+        )
+        self.manager._publish_stderr_receipt(receipt)
+        return receipt
+
+    def abort(self) -> None:
+        if not self._closed:
+            try:
+                os.close(self.fd)
+            except OSError:
+                pass
+            self._closed = True
+        self.receipt_path.unlink(missing_ok=True)
+        self.artifact_path.unlink(missing_ok=True)
+
+
+class _AttachedStderrCapture:
+    """Drain one pipe while retaining a tail and streaming a bounded prefix."""
+
+    def __init__(
+        self,
+        stream: BinaryIO | None,
+        artifact_writer: _StderrArtifactWriter | None = None,
+        artifact_error: str | None = None,
+    ) -> None:
+        self._tail = bytearray()
+        self._truncated = False
+        self._complete = False
+        self._error: str | None = artifact_error
+        self._stream_hasher = hashlib.sha256()
+        self._stream_bytes = 0
+        self._artifact_writer = artifact_writer
+        self._artifact: OCIStderrArtifactReceipt | None = None
+        self._lock = threading.Lock()
+        self._thread: threading.Thread | None = None
+        if stream is None:
+            self._error = "attached OCI client did not expose a stderr pipe"
+            return
+        try:
+            fd = stream.fileno()
+            if type(fd) is not int or fd < 0:
+                raise OSError("invalid stderr file descriptor")
+            self._thread = threading.Thread(
+                target=self._drain,
+                args=(fd,),
+                name="optima-oci-stderr-drain",
+                daemon=True,
+            )
+            self._thread.start()
+        except (OSError, RuntimeError, ValueError) as exc:
+            if artifact_writer is not None:
+                artifact_writer.abort()
+                self._artifact_writer = None
+            self._error = self._bounded_error(exc)
+
+    @staticmethod
+    def _bounded_error(exc: BaseException) -> str:
+        detail = str(exc)
+        return f"{type(exc).__name__}: {detail[:448]}"[:512]
+
+    def _append(self, chunk: bytes) -> None:
+        with self._lock:
+            self._stream_hasher.update(chunk)
+            self._stream_bytes += len(chunk)
+            if len(chunk) >= ATTACHED_STDERR_MAX_BYTES:
+                self._tail[:] = chunk[-ATTACHED_STDERR_MAX_BYTES:]
+                self._truncated = True
+            else:
+                overflow = len(self._tail) + len(chunk) - ATTACHED_STDERR_MAX_BYTES
+                if overflow > 0:
+                    del self._tail[:overflow]
+                    self._truncated = True
+                self._tail.extend(chunk)
+        writer = self._artifact_writer
+        if writer is not None:
+            try:
+                writer.append(chunk)
+            except (OSError, OCIProcessError) as exc:
+                writer.abort()
+                self._artifact_writer = None
+                with self._lock:
+                    self._error = self._bounded_error(exc)
+
+    def _drain(self, fd: int) -> None:
+        reached_eof = False
+        try:
+            while True:
+                try:
+                    chunk = os.read(fd, _ATTACHED_STDERR_READ_BYTES)
+                except InterruptedError:
+                    continue
+                if not chunk:
+                    reached_eof = True
+                    break
+                self._append(chunk)
+        except OSError as exc:
+            with self._lock:
+                self._error = self._bounded_error(exc)
+        finally:
+            writer = self._artifact_writer
+            if writer is not None and reached_eof:
+                with self._lock:
+                    stream_bytes = self._stream_bytes
+                    stream_sha256 = self._stream_hasher.hexdigest()
+                try:
+                    artifact = writer.finish(
+                        stream_bytes=stream_bytes,
+                        stream_sha256=stream_sha256,
+                    )
+                except (OSError, OCIProcessError) as exc:
+                    writer.abort()
+                    with self._lock:
+                        self._error = self._bounded_error(exc)
+                else:
+                    with self._lock:
+                        self._artifact = artifact
+            elif writer is not None:
+                writer.abort()
+                self._artifact_writer = None
+            with self._lock:
+                self._complete = True
+
+    def finish(self) -> None:
+        thread = self._thread
+        if thread is None:
+            return
+        thread.join(timeout=_ATTACHED_STDERR_JOIN_SECONDS)
+        if thread.is_alive():
+            with self._lock:
+                self._error = "stderr drain did not reach EOF after client teardown"
+
+    def snapshot(self) -> OCIAttachedDiagnostic:
+        with self._lock:
+            return OCIAttachedDiagnostic(
+                bytes(self._tail),
+                self._truncated,
+                self._complete,
+                self._error,
+                None,
+                self._stream_bytes,
+                self._stream_hasher.copy().hexdigest(),
+                self._artifact,
+            )
+
+    def discard_artifact(self) -> None:
+        with self._lock:
+            artifact = self._artifact
+            writer = self._artifact_writer
+        if artifact is None:
+            return
+        if writer is None:
+            raise OCIProcessError("stderr artifact lacks its manager authority")
+        writer.manager.reopen_stderr_artifact(artifact)
+        artifact.receipt_path.unlink(missing_ok=True)
+        OCIProcessManager._fsync_directory(artifact.artifact_path.parent)
+        artifact.artifact_path.unlink(missing_ok=True)
+        OCIProcessManager._fsync_directory(artifact.artifact_path.parent)
+        with self._lock:
+            if self._artifact == artifact:
+                self._artifact = None
 
 
 @dataclass(frozen=True)
@@ -150,9 +637,10 @@ class OCILease:
     cid_path: Path
     mount_paths: tuple[Path, ...]
     stage_paths: tuple[Path, ...]
+    gpu_reservation_id: str | None = None
 
     def run_prefix(self, docker_binary: str) -> tuple[str, ...]:
-        return (
+        prefix = (
             docker_binary,
             "run",
             f"--name={self.container_name}",
@@ -160,12 +648,18 @@ class OCILease:
             f"--label={EXECUTOR_LABEL}={self.executor_id}",
             f"--label={LEASE_LABEL}={self.lease_id}",
         )
+        if self.gpu_reservation_id is not None:
+            prefix += (
+                f"--label={GPU_RESERVATION_LABEL}={self.gpu_reservation_id}",
+            )
+        return prefix
 
 
 @dataclass(frozen=True)
 class OCIProcessResult:
     returncode: int
     elapsed_seconds: float
+    stderr_diagnostic: OCIAttachedDiagnostic | None = None
 
 
 class OCIAttachedClient:
@@ -173,8 +667,8 @@ class OCIAttachedClient:
 
     The transport layer may use only the byte streams; pipe EOF is its liveness
     signal. It cannot replace the lease-aware cleanup sequence. ``finalize`` and ``abort``
-    intentionally have identical host cleanup semantics; protocol success is owned
-    by the caller, not this process primitive.
+    have identical process/container cleanup authority; normal completion discards
+    the diagnostic artifact while exceptional teardown retains its sealed receipt.
     """
 
     def __init__(
@@ -187,6 +681,7 @@ class OCIAttachedClient:
         self._lease = lease
         self._process = process
         self._closed = False
+        self._stderr_capture = manager._stderr_capture(process.stderr, lease)
 
     @property
     def lease(self) -> OCILease:
@@ -208,6 +703,24 @@ class OCIAttachedClient:
     def closed(self) -> bool:
         return self._closed
 
+    def stderr_diagnostic(self) -> OCIAttachedDiagnostic:
+        """Return the current bounded stderr suffix without waiting or reaping."""
+
+        snapshot = self._stderr_capture.snapshot()
+        return OCIAttachedDiagnostic(
+            snapshot.stderr_tail,
+            snapshot.stderr_truncated,
+            snapshot.capture_complete,
+            snapshot.capture_error,
+            self._process.returncode,
+            snapshot.stream_bytes,
+            snapshot.stream_sha256,
+            snapshot.artifact,
+        )
+
+    def _finish_stderr_capture(self) -> None:
+        self._stderr_capture.finish()
+
     def finalize(self) -> None:
         self._manager.finalize_attached(self)
 
@@ -222,6 +735,14 @@ def _canonical_json(value: object) -> bytes:
 def _simple_id(value: object, *, field: str) -> str:
     if not isinstance(value, str) or _SIMPLE_ID.fullmatch(value) is None:
         raise OCIProcessError(f"{field} must be a lowercase simple identifier")
+    return value
+
+
+def _gpu_reservation_id(value: object) -> str:
+    if not isinstance(value, str) or _GPU_RESERVATION_ID.fullmatch(value) is None:
+        raise OCIProcessError(
+            f"{GPU_RESERVATION_ENV} must be a 12-character lowercase hex identity"
+        )
     return value
 
 
@@ -302,8 +823,31 @@ class OCIProcessManager:
         ).hexdigest()
         self.leases_root = self.recovery_root / "leases" / self.executor_id
         self.resources_root = self.recovery_root / "resources" / self.executor_id
+        self.diagnostics_root = self.recovery_root / "diagnostics" / self.executor_id
         self.leases_root.mkdir(mode=0o700, parents=True, exist_ok=True)
         self.resources_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        self.diagnostics_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        diagnostics_info = self.diagnostics_root.lstat()
+        if (
+            not stat.S_ISDIR(diagnostics_info.st_mode)
+            or stat.S_ISLNK(diagnostics_info.st_mode)
+            or diagnostics_info.st_uid != os.geteuid()
+            or diagnostics_info.st_gid != os.getegid()
+        ):
+            raise OCIProcessError(
+                "OCI diagnostics root must be a controller-owned real directory"
+            )
+        os.chmod(self.diagnostics_root, 0o700)
+        diagnostics_info = self.diagnostics_root.stat()
+        if stat.S_IMODE(diagnostics_info.st_mode) != 0o700:
+            raise OCIProcessError("OCI diagnostics root is not private")
+        self._diagnostics_identity = (
+            diagnostics_info.st_dev,
+            diagnostics_info.st_ino,
+            diagnostics_info.st_uid,
+            diagnostics_info.st_gid,
+            stat.S_IMODE(diagnostics_info.st_mode),
+        )
         self.runner = runner
         self.clock = clock
         # A trusted controller may reserve the complete B/C/B-prime/T
@@ -403,6 +947,10 @@ class OCIProcessManager:
         self._require_namespace_owner()
         lease_id = _simple_id(lease_id, field="lease_id")
         container_name = _simple_id(container_name, field="container_name")
+        reservation_env = os.environ.get(GPU_RESERVATION_ENV)
+        gpu_reservation_id = (
+            None if reservation_env is None else _gpu_reservation_id(reservation_env)
+        )
         mount_rows = tuple(
             _relative_resource(value, field="mount path") for value in mount_relpaths
         )
@@ -427,6 +975,8 @@ class OCIProcessManager:
             "mount_relpaths": list(mount_rows),
             "stage_relpaths": list(stage_rows),
         }
+        if gpu_reservation_id is not None:
+            payload["gpu_reservation_id"] = gpu_reservation_id
         temporary = self.leases_root / (
             f".{lease_id}.{secrets.token_hex(16)}.tmp"
         )
@@ -457,6 +1007,7 @@ class OCIProcessManager:
             cid_path,
             mount_paths,
             stage_paths,
+            gpu_reservation_id,
         )
 
     def mount_tmpfs(
@@ -543,11 +1094,187 @@ class OCIProcessManager:
 
     @staticmethod
     def _fsync_directory(path: Path) -> None:
-        fd = os.open(path, os.O_RDONLY)
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(path, flags)
         try:
             os.fsync(fd)
         finally:
             os.close(fd)
+
+    def _validate_diagnostics_root(self) -> None:
+        try:
+            info = self.diagnostics_root.lstat()
+        except OSError as exc:
+            raise OCIProcessError(
+                f"cannot reopen OCI diagnostics root: {exc}"
+            ) from None
+        observed = (
+            info.st_dev,
+            info.st_ino,
+            info.st_uid,
+            info.st_gid,
+            stat.S_IMODE(info.st_mode),
+        )
+        if (
+            not stat.S_ISDIR(info.st_mode)
+            or stat.S_ISLNK(info.st_mode)
+            or observed != self._diagnostics_identity
+        ):
+            raise OCIProcessError("OCI diagnostics root identity changed")
+
+    def _new_stderr_artifact_writer(
+        self, lease: OCILease
+    ) -> _StderrArtifactWriter:
+        if not isinstance(lease, OCILease) or lease.executor_id != self.executor_id:
+            raise OCIProcessError("stderr artifact lease belongs to another executor")
+        self._validate_diagnostics_root()
+        return _StderrArtifactWriter(self, lease)
+
+    def _stderr_capture(
+        self, stream: BinaryIO | None, lease: OCILease
+    ) -> _AttachedStderrCapture:
+        if stream is None:
+            return _AttachedStderrCapture(stream)
+        try:
+            writer = self._new_stderr_artifact_writer(lease)
+        except (OSError, OCIProcessError) as exc:
+            return _AttachedStderrCapture(
+                stream,
+                artifact_error=_AttachedStderrCapture._bounded_error(exc),
+            )
+        return _AttachedStderrCapture(stream, writer)
+
+    def _publish_stderr_receipt(
+        self, receipt: OCIStderrArtifactReceipt
+    ) -> None:
+        if type(receipt) is not OCIStderrArtifactReceipt:
+            raise OCIProcessError("stderr artifact publication is not typed")
+        self._validate_diagnostics_root()
+        if (
+            receipt.executor_id != self.executor_id
+            or receipt.artifact_path.parent != self.diagnostics_root
+            or receipt.receipt_path.parent != self.diagnostics_root
+        ):
+            raise OCIProcessError("stderr artifact publication escapes its executor root")
+        temporary = self.diagnostics_root / (
+            f".{receipt.lease_id}.{secrets.token_hex(16)}.receipt.tmp"
+        )
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        fd = -1
+        temporary_created = False
+        receipt_linked = False
+        try:
+            fd = os.open(temporary, flags, 0o600)
+            temporary_created = True
+            os.fchmod(fd, 0o600)
+            _StderrArtifactWriter._write_all(fd, receipt.receipt_bytes)
+            os.fsync(fd)
+            info = os.fstat(fd)
+            if (
+                not stat.S_ISREG(info.st_mode)
+                or info.st_nlink != 1
+                or info.st_size != len(receipt.receipt_bytes)
+                or stat.S_IMODE(info.st_mode) != 0o600
+                or info.st_uid != receipt.owner_uid
+                or info.st_gid != receipt.owner_gid
+            ):
+                raise OCIProcessError("stderr receipt is not a private regular file")
+            os.close(fd)
+            fd = -1
+            os.link(temporary, receipt.receipt_path, follow_symlinks=False)
+            receipt_linked = True
+            temporary.unlink()
+            temporary_created = False
+            self._fsync_directory(self.diagnostics_root)
+        except BaseException:
+            if fd >= 0:
+                os.close(fd)
+            if receipt_linked:
+                receipt.receipt_path.unlink(missing_ok=True)
+            if temporary_created:
+                temporary.unlink(missing_ok=True)
+            raise
+
+    def reopen_stderr_artifact(
+        self, receipt: OCIStderrArtifactReceipt
+    ) -> Path:
+        """Reopen and authenticate one persisted failure diagnostic."""
+
+        if type(receipt) is not OCIStderrArtifactReceipt:
+            raise OCIProcessError("stderr artifact receipt is not typed")
+        self._validate_diagnostics_root()
+        if (
+            receipt.executor_id != self.executor_id
+            or receipt.artifact_path.parent != self.diagnostics_root
+            or receipt.receipt_path.parent != self.diagnostics_root
+        ):
+            raise OCIProcessError("stderr artifact receipt escapes its executor root")
+
+        def open_regular(path: Path) -> tuple[int, os.stat_result]:
+            flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+            flags |= getattr(os, "O_NOFOLLOW", 0)
+            try:
+                fd = os.open(path, flags)
+            except OSError as exc:
+                raise OCIProcessError(
+                    f"cannot securely reopen stderr artifact: {exc}"
+                ) from None
+            info = os.fstat(fd)
+            if (
+                not stat.S_ISREG(info.st_mode)
+                or info.st_nlink != 1
+                or stat.S_IMODE(info.st_mode) != 0o600
+                or info.st_uid != receipt.owner_uid
+                or info.st_gid != receipt.owner_gid
+            ):
+                os.close(fd)
+                raise OCIProcessError("stderr artifact is not a private regular file")
+            return fd, info
+
+        receipt_fd, receipt_info = open_regular(receipt.receipt_path)
+        try:
+            if receipt_info.st_size != len(receipt.receipt_bytes):
+                raise OCIProcessError("stderr artifact receipt size changed")
+            chunks: list[bytes] = []
+            remaining = len(receipt.receipt_bytes) + 1
+            while remaining:
+                try:
+                    chunk = os.read(receipt_fd, remaining)
+                except InterruptedError:
+                    continue
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            payload = b"".join(chunks)
+            if payload != receipt.receipt_bytes:
+                raise OCIProcessError("stderr artifact receipt content changed")
+        finally:
+            os.close(receipt_fd)
+
+        artifact_fd, artifact_info = open_regular(receipt.artifact_path)
+        observed = hashlib.sha256()
+        observed_bytes = 0
+        try:
+            while True:
+                chunk = os.read(artifact_fd, _ATTACHED_STDERR_READ_BYTES)
+                if not chunk:
+                    break
+                observed.update(chunk)
+                observed_bytes += len(chunk)
+                if observed_bytes > ATTACHED_STDERR_ARTIFACT_MAX_BYTES:
+                    raise OCIProcessError("stderr artifact exceeds its hard cap")
+        finally:
+            os.close(artifact_fd)
+        if (
+            artifact_info.st_size != receipt.artifact_bytes
+            or observed_bytes != receipt.artifact_bytes
+            or observed.hexdigest() != receipt.artifact_sha256
+        ):
+            raise OCIProcessError("stderr artifact content changed")
+        return receipt.artifact_path
 
     def _run_control(self, argv: tuple[str, ...], *, allow_failure: bool) -> CommandResult:
         result = self.runner(argv, timeout_s=30.0, max_output_bytes=4096)
@@ -612,6 +1339,10 @@ class OCIProcessManager:
             or not isinstance(labels, dict)
             or labels.get(EXECUTOR_LABEL) != lease.executor_id
             or labels.get(LEASE_LABEL) != lease.lease_id
+            or (
+                lease.gpu_reservation_id is not None
+                and labels.get(GPU_RESERVATION_LABEL) != lease.gpu_reservation_id
+            )
         ):
             raise OCIProcessError(
                 "refusing to remove a container without the exact lease labels"
@@ -705,7 +1436,7 @@ class OCIProcessManager:
                 list(argv),
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
                 bufsize=0,
                 close_fds=True,
                 start_new_session=True,
@@ -719,7 +1450,9 @@ class OCIProcessManager:
             raise OCIProcessError("attached OCI client did not expose byte streams")
         return OCIAttachedClient(self, lease, process)
 
-    def _close_attached(self, client: OCIAttachedClient) -> None:
+    def _close_attached(
+        self, client: OCIAttachedClient, *, retain_stderr_artifact: bool
+    ) -> None:
         if not isinstance(client, OCIAttachedClient) or client._manager is not self:
             raise OCIProcessError("attached OCI client belongs to another manager")
         if client.closed:
@@ -734,6 +1467,7 @@ class OCIProcessManager:
             self._terminate_client(process)
         except BaseException as exc:
             failures.append(exc)
+        client._finish_stderr_capture()
         for stream in (process.stdin, process.stdout, process.stderr):
             if stream is None or stream.closed:
                 continue
@@ -741,6 +1475,7 @@ class OCIProcessManager:
                 stream.close()
             except BaseException as exc:
                 failures.append(exc)
+        client._finish_stderr_capture()
         # A foreground Docker client can create the named container after the first
         # absence proof.  Only this proof after process-group death closes that race.
         try:
@@ -751,15 +1486,22 @@ class OCIProcessManager:
             raise OCIProcessError(
                 "attached OCI cleanup could not prove both client and container removal"
             ) from failures[0]
+        if not retain_stderr_artifact:
+            try:
+                client._stderr_capture.discard_artifact()
+            except (OSError, OCIProcessError) as exc:
+                raise OCIProcessError(
+                    f"could not discard successful OCI stderr artifact: {exc}"
+                ) from None
         client._closed = True
 
     def finalize_attached(self, client: OCIAttachedClient) -> None:
         """Normal host teardown after the caller consumed its final exact response."""
-        self._close_attached(client)
+        self._close_attached(client, retain_stderr_artifact=False)
 
     def abort_attached(self, client: OCIAttachedClient) -> None:
         """Exceptional host teardown; cleanup authority is identical to finalize."""
-        self._close_attached(client)
+        self._close_attached(client, retain_stderr_artifact=True)
 
     def run(
         self,
@@ -786,37 +1528,97 @@ class OCIProcessManager:
             raise OCIProcessError(f"OCI clock failed: {exc}") from None
         if not math.isfinite(started):
             raise OCIProcessError("OCI clock returned a non-finite value")
+        stderr_read_fd: int | None = None
+        stderr_write_fd: int | None = None
+        stderr_stream: BinaryIO | None = None
+        stderr_capture: _AttachedStderrCapture | None = None
         try:
+            stderr_read_fd, stderr_write_fd = os.pipe()
+            stderr_stream = os.fdopen(stderr_read_fd, "rb", buffering=0)
+            stderr_read_fd = None
             process = subprocess.Popen(
                 list(argv),
                 stdin=subprocess.PIPE,
                 stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                # Keep Docker stderr off ``communicate`` so the dedicated drain
+                # can hash every byte while retaining only a bounded memory tail
+                # and bounded private disk prefix.
+                stderr=stderr_write_fd,
                 close_fds=True,
                 start_new_session=True,
                 shell=False,
             )
         except OSError as exc:
+            for fd in (stderr_read_fd, stderr_write_fd):
+                if fd is not None:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+            if stderr_stream is not None:
+                stderr_stream.close()
             self.force_remove_container(lease)
             raise OCIProcessError(f"could not start OCI client: {exc}") from None
+        finally:
+            if stderr_write_fd is not None:
+                try:
+                    os.close(stderr_write_fd)
+                except OSError:
+                    pass
+        stderr_capture = self._stderr_capture(stderr_stream, lease)
+        timed_out = False
         try:
             process.communicate(input=stdin_bytes, timeout=float(timeout_s))
         except subprocess.TimeoutExpired:
             self._reap_failed_process(lease, process)
-            raise OCIProcessTimeout(
-                f"OCI process exceeded its {float(timeout_s):g}s deadline"
-            ) from None
+            timed_out = True
         except BaseException:
             self._reap_failed_process(lease, process)
             raise
+        finally:
+            stderr_capture.finish()
+            if stderr_stream is not None:
+                stderr_stream.close()
+            stderr_capture.finish()
+        if timed_out:
+            snapshot = stderr_capture.snapshot()
+            diagnostic = OCIAttachedDiagnostic(
+                snapshot.stderr_tail,
+                snapshot.stderr_truncated,
+                snapshot.capture_complete,
+                snapshot.capture_error,
+                process.returncode,
+                snapshot.stream_bytes,
+                snapshot.stream_sha256,
+                snapshot.artifact,
+            )
+            raise OCIProcessTimeout(
+                f"OCI process exceeded its {float(timeout_s):g}s deadline",
+                diagnostic,
+            ) from None
         self.force_remove_container(lease)
+        if int(process.returncode) == 0:
+            stderr_capture.discard_artifact()
+        diagnostic = stderr_capture.snapshot()
+        diagnostic = OCIAttachedDiagnostic(
+            diagnostic.stderr_tail,
+            diagnostic.stderr_truncated,
+            diagnostic.capture_complete,
+            diagnostic.capture_error,
+            int(process.returncode),
+            diagnostic.stream_bytes,
+            diagnostic.stream_sha256,
+            diagnostic.artifact,
+        )
         try:
             finished = float(self.clock())
         except Exception as exc:
             raise OCIProcessError(f"OCI clock failed: {exc}") from None
         if not math.isfinite(finished) or finished < started:
             raise OCIProcessError("OCI clock moved backwards or became non-finite")
-        return OCIProcessResult(int(process.returncode), finished - started)
+        return OCIProcessResult(
+            int(process.returncode), finished - started, diagnostic
+        )
 
     def run_capture(
         self,
@@ -881,7 +1683,7 @@ class OCIProcessManager:
             row = json.loads(raw)
         except (OSError, UnicodeError, json.JSONDecodeError) as exc:
             raise OCIProcessError(f"invalid OCI lease record: {exc}") from None
-        fields = {
+        required_fields = {
             "schema",
             "executor_id",
             "lease_id",
@@ -889,7 +1691,14 @@ class OCIProcessManager:
             "mount_relpaths",
             "stage_relpaths",
         }
-        if not isinstance(row, dict) or set(row) != fields or row["schema"] != LEASE_SCHEMA:
+        if (
+            not isinstance(row, dict)
+            or set(row) not in (
+                required_fields,
+                required_fields | {"gpu_reservation_id"},
+            )
+            or row["schema"] != LEASE_SCHEMA
+        ):
             raise OCIProcessError("OCI lease record schema mismatch")
         if (
             not stat.S_ISREG(info.st_mode)
@@ -901,6 +1710,11 @@ class OCIProcessManager:
         executor_id = _simple_id(row["executor_id"], field="executor_id")
         lease_id = _simple_id(row["lease_id"], field="lease_id")
         container_name = _simple_id(row["container_name"], field="container_name")
+        gpu_reservation_id = (
+            None
+            if "gpu_reservation_id" not in row
+            else _gpu_reservation_id(row["gpu_reservation_id"])
+        )
         if record_path.name != f"{lease_id}.json":
             raise OCIProcessError("OCI lease filename and identity differ")
         if executor_id != self.executor_id:
@@ -935,6 +1749,7 @@ class OCIProcessManager:
             resource_root / "container.cid",
             mount_paths,
             stage_paths,
+            gpu_reservation_id,
         )
 
     def release(self, lease: OCILease) -> None:

@@ -58,6 +58,7 @@ CONTAINER_ARTIFACT_BASE = "/optima/native-artifacts"
 CONTAINER_CACHE_PATH = "/optima/runtime-cache"
 DISCOVERY_OVERLAY_RELPATH = Path("dep_overlays/discovery")
 NVIDIA_SMI = "/usr/bin/nvidia-smi"
+WORKER_STDERR_DIAGNOSTIC_MAX_BYTES = 8 << 10
 
 _DIGEST_ENV = {
     "runtime_digest": "OPTIMA_RUNTIME_DIGEST",
@@ -113,17 +114,56 @@ def _write_all(fd: int, payload: bytes) -> None:
 
 
 def _reserve_protocol_fd() -> int:
-    """Keep original stdout as CLOEXEC protocol and silence the engine tree."""
+    """Keep stdout as CLOEXEC protocol and isolate engine stdout from it.
+
+    Stderr remains the container's stderr.  The trusted host continuously drains
+    that separate pipe, retains a fixed-size tail, and discards older bytes, so a
+    scheduler traceback survives without letting candidate output contaminate the
+    framed protocol or grow host memory without bound.
+    """
 
     protocol = os.dup(1)
     os.set_inheritable(protocol, False)
     devnull = os.open(os.devnull, os.O_WRONLY)
     try:
         os.dup2(devnull, 1)
-        os.dup2(devnull, 2)
     finally:
         os.close(devnull)
     return protocol
+
+
+def _write_stderr_diagnostic(stage: str, exc: BaseException) -> None:
+    """Best-effort last-line diagnostic when the framed error cannot be sent."""
+
+    try:
+        error_type = f"{type(exc).__module__}.{type(exc).__qualname__}"
+        first_arg = exc.args[0] if exc.args else None
+        if type(first_arg) is str:
+            detail = first_arg[:4096]
+        elif type(first_arg) in {int, float, bool, type(None)}:
+            detail = str(first_arg)
+        else:
+            # Do not invoke a candidate-defined __str__/__repr__ while handling
+            # the failure path. The framed error policy remains authoritative
+            # whenever it can be emitted.
+            detail = "<non-primitive exception detail omitted>"
+        raw = (
+            f"[optima-session-worker] stage={stage[:64]!r} "
+            f"error_type={error_type[:256]!r} detail={detail!r}\n"
+        ).encode("utf-8", errors="backslashreplace")
+        payload = raw[:WORKER_STDERR_DIAGNOSTIC_MAX_BYTES]
+        view = memoryview(payload)
+        offset = 0
+        while offset < len(view):
+            try:
+                written = os.write(2, view[offset:])
+            except InterruptedError:
+                continue
+            if written <= 0:
+                break
+            offset += written
+    except BaseException:
+        pass
 
 
 def _reserve_control_fd(input_fd: int) -> int:
@@ -967,6 +1007,7 @@ def run_session(*, input_fd: int = 0, output_fd: int | None = None) -> int:
                 expected_index += 1
                 request = None
     except BaseException as exc:  # noqa: BLE001 - bounded untrusted diagnostic
+        reported = False
         if session_id is not None and launch_digest is not None:
             try:
                 _write_all(
@@ -982,8 +1023,11 @@ def run_session(*, input_fd: int = 0, output_fd: int | None = None) -> int:
                         max_bytes=MAX_CONTROL_BYTES,
                     ),
                 )
+                reported = True
             except BaseException:
                 pass
+        if not reported:
+            _write_stderr_diagnostic(stage, exc)
         return 1
     finally:
         os.close(control_fd)

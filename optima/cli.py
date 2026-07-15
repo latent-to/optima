@@ -141,6 +141,7 @@ def cmd_set_weights(args: argparse.Namespace) -> int:
     from optima.chain.weights import (
         reconcile_weight_publication,
         release_weight_publication_hold,
+        resume_weight_projection,
     )
     from optima.economics import (
         EmissionsPolicyManifest,
@@ -193,6 +194,9 @@ def cmd_set_weights(args: argparse.Namespace) -> int:
                 "run set-weights again to refresh and reconcile"
             )
             return 0
+        if not args.dry_run:
+            projection = resume_weight_projection(projection, journal)
+            journal = SQLiteWeightPublicationJournal(store, projection)
         result = reconcile_weight_publication(
             subtensor,
             None if args.dry_run else wallet,
@@ -547,7 +551,8 @@ def cmd_verify(args: argparse.Namespace) -> int:
                                        bundle_path=str(args.bundle),
                                        graph_safe=bool(graph_safe),
                                        eligibility=eligibility_by_row[row_index],
-                                       tp_size=getattr(args, "tp_size", None))
+                                       tp_size=getattr(args, "tp_size", None),
+                                       variant_name=op.variant)
             print(f"  [variant {op.variant!r}]")
             print(format_verify(result))
             if result.context_inapplicable:
@@ -576,6 +581,8 @@ def cmd_verify(args: argparse.Namespace) -> int:
             manifest_architectures=op.architectures,
             tp_size=getattr(args, "tp_size", None),
             world_size=getattr(args, "world_size", None),
+            bundle_path=str(args.bundle),
+            variant_name=op.variant,
         )
         print(f"  [variant {op.variant!r}]")
         print(format_verify(result))

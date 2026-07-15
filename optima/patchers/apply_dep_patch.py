@@ -16,6 +16,7 @@ import json
 import os
 import shutil
 import stat
+import subprocess
 import sys
 import tempfile
 from fnmatch import fnmatch
@@ -170,9 +171,6 @@ def _required_target_architecture(policy) -> str:
     architectures = {module.target_architecture for module in policy.prebuilt_modules}
     if not architectures:
         return ""
-    if len(architectures) != 1:
-        raise RuntimeError("one dependency policy cannot prebuild multiple target architectures")
-    expected = next(iter(architectures))
     actual = os.environ.get("OPTIMA_TARGET_GPU_ARCH", "").strip().lower()
     if not actual and os.environ.get("OPTIMA_REBUILD_PHASE", "all") == "all":
         import torch
@@ -185,11 +183,14 @@ def _required_target_architecture(policy) -> str:
         major, minor = torch.cuda.get_device_capability(torch.cuda.current_device())
         actual = f"sm{major}{minor}"
         os.environ["OPTIMA_TARGET_GPU_ARCH"] = actual
-    if actual != expected:
+    # Every declared architecture compiles into the artifact; the build device
+    # must be one of them so the produced publication is usable where it runs.
+    if actual not in architectures:
         raise RuntimeError(
-            f"dependency prebuild requires target architecture {expected!r}, got {actual!r}"
+            f"dependency prebuild covers target architectures "
+            f"{sorted(architectures)!r}, got {actual!r}"
         )
-    return expected
+    return actual
 
 
 def _copy_built_module(source: Path, destination: Path) -> tuple[str, int]:
@@ -208,6 +209,40 @@ def _copy_built_module(source: Path, destination: Path) -> tuple[str, int]:
         os.fsync(writer.fileno())
     destination.chmod(0o444)
     return hashlib.sha256(destination.read_bytes()).hexdigest(), info.st_size
+
+
+# FlashInfer captures FLASHINFER_CUDA_ARCH_LIST in import-time singletons
+# (flashinfer.compilation_context.current_compilation_context), so each declared
+# architecture compiles in its own hermetic child interpreter whose environment
+# is fixed before any flashinfer import. The parent never imports flashinfer.
+_PREBUILD_CHILD_DRIVER = """\
+import importlib
+import json
+import pathlib
+import sys
+
+overlay_subtree, generator_module_name, generator_attr, expected_name = sys.argv[1:5]
+if any(name == "flashinfer" or name.startswith("flashinfer.") for name in sys.modules):
+    raise SystemExit("flashinfer was preloaded in the hermetic prebuild child")
+jit_environment = importlib.import_module("flashinfer.jit.env")
+jit_environment.FLASHINFER_CSRC_DIR = pathlib.Path(overlay_subtree)
+generator_module = importlib.import_module(generator_module_name)
+generator = getattr(generator_module, generator_attr, None)
+if not callable(generator):
+    raise SystemExit(
+        "dependency generator is missing: %s.%s"
+        % (generator_module_name, generator_attr)
+    )
+spec = generator(False)
+if getattr(spec, "name", None) != expected_name:
+    raise SystemExit(
+        "dependency generator returned unexpected spec name: %r"
+        % (getattr(spec, "name", None),)
+    )
+# Deliberately compile only. build_and_load()/tvm_ffi must never run here.
+spec.build(verbose=False)
+print(json.dumps({"built": str(spec.jit_library_path)}))
+"""
 
 
 def _build_prebuilt_modules(
@@ -230,12 +265,9 @@ def _build_prebuilt_modules(
             "flashinfer was imported before the hermetic dependency prebuild environment"
         )
 
-    cuda_arch_lists = {module.cuda_arch_list for module in policy.prebuilt_modules}
-    if len(cuda_arch_lists) != 1:
-        raise RuntimeError("one dependency policy cannot use multiple CUDA arch lists")
-    cuda_arch_list = next(iter(cuda_arch_lists))
+    policy_arch_lists = {module.cuda_arch_list for module in policy.prebuilt_modules}
     existing_arch = os.environ.get("FLASHINFER_CUDA_ARCH_LIST")
-    if existing_arch not in {None, cuda_arch_list}:
+    if existing_arch is not None and existing_arch not in policy_arch_lists:
         raise RuntimeError(
             "FLASHINFER_CUDA_ARCH_LIST conflicts with the validator prebuild policy"
         )
@@ -248,60 +280,59 @@ def _build_prebuilt_modules(
         prefix=".flashinfer-build-", dir=artifact_root
     ) as scratch_raw:
         scratch = Path(scratch_raw)
-        old_workspace = os.environ.get("FLASHINFER_WORKSPACE_BASE")
-        os.environ["FLASHINFER_WORKSPACE_BASE"] = str(scratch)
-        os.environ["FLASHINFER_CUDA_ARCH_LIST"] = cuda_arch_list
-        try:
-            jit_environment = importlib.import_module("flashinfer.jit.env")
-            jit_environment.FLASHINFER_CSRC_DIR = overlay_subtree
-            for module in policy.prebuilt_modules:
-                generator_module = importlib.import_module(module.generator_module)
-                generator = getattr(generator_module, module.generator_attr, None)
-                if not callable(generator):
-                    raise RuntimeError(
-                        f"dependency generator is missing: "
-                        f"{module.generator_module}.{module.generator_attr}"
-                    )
-                spec = generator(False)
-                if getattr(spec, "name", None) != module.name:
-                    raise RuntimeError(
-                        f"dependency generator returned unexpected spec name: "
-                        f"{getattr(spec, 'name', None)!r}"
-                    )
-                # Deliberately compile only.  build_and_load()/tvm_ffi must never run
-                # in the prebuild worker.
-                spec.build(verbose=False)
-                built = Path(spec.jit_library_path)
-                try:
-                    built.resolve().relative_to(scratch.resolve())
-                except (OSError, ValueError):
-                    raise RuntimeError(
-                        f"dependency generator wrote outside its private scratch: {built}"
-                    ) from None
-                relative = prebuilt_module_relative_path(target, module)
-                destination = artifact_root / relative
-                if destination.exists() or destination.is_symlink():
-                    raise RuntimeError(
-                        f"refusing to replace dependency module build output: {destination}"
-                    )
-                digest, size = _copy_built_module(built, destination)
-                rows.append(
-                    {
-                        **asdict(module),
-                        "path": relative,
-                        "sha256": digest,
-                        "size": size,
-                    }
+        for module in policy.prebuilt_modules:
+            child_env = dict(os.environ)
+            child_env["FLASHINFER_WORKSPACE_BASE"] = str(scratch)
+            child_env["FLASHINFER_CUDA_ARCH_LIST"] = module.cuda_arch_list
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    _PREBUILD_CHILD_DRIVER,
+                    str(overlay_subtree),
+                    module.generator_module,
+                    module.generator_attr,
+                    module.name,
+                ],
+                env=child_env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            if completed.returncode != 0:
+                raise RuntimeError(
+                    f"dependency prebuild child for {module.name!r} failed: "
+                    f"{completed.stderr[-2000:]}"
                 )
-        finally:
-            if old_workspace is None:
-                os.environ.pop("FLASHINFER_WORKSPACE_BASE", None)
-            else:
-                os.environ["FLASHINFER_WORKSPACE_BASE"] = old_workspace
-            if existing_arch is None:
-                os.environ.pop("FLASHINFER_CUDA_ARCH_LIST", None)
-            else:
-                os.environ["FLASHINFER_CUDA_ARCH_LIST"] = existing_arch
+            reports = [line for line in completed.stdout.splitlines() if line.strip()]
+            try:
+                built = Path(json.loads(reports[-1])["built"])
+            except (IndexError, KeyError, TypeError, ValueError):
+                raise RuntimeError(
+                    f"dependency prebuild child for {module.name!r} returned no "
+                    f"build report"
+                ) from None
+            try:
+                built.resolve().relative_to(scratch.resolve())
+            except (OSError, ValueError):
+                raise RuntimeError(
+                    f"dependency generator wrote outside its private scratch: {built}"
+                ) from None
+            relative = prebuilt_module_relative_path(target, module)
+            destination = artifact_root / relative
+            if destination.exists() or destination.is_symlink():
+                raise RuntimeError(
+                    f"refusing to replace dependency module build output: {destination}"
+                )
+            digest, size = _copy_built_module(built, destination)
+            rows.append(
+                {
+                    **asdict(module),
+                    "path": relative,
+                    "sha256": digest,
+                    "size": size,
+                }
+            )
     return rows
 
 def _development_workspace(build_spec_digest: str) -> Path:

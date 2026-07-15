@@ -25,6 +25,10 @@ from optima.engine_tree import (
     MaterializedEngineTree,
     reopen_materialized_engine_tree,
 )
+from optima.eval.native_compile_profile import (
+    NativeCompileProfileError,
+    NativeCuTeCompileProfile,
+)
 from optima.stack_identity import (
     canonical_digest,
     canonical_json_bytes,
@@ -33,7 +37,13 @@ from optima.stack_identity import (
 
 
 ENGINE_LAUNCH_SCHEMA_VERSION = 1
-NATIVE_BUILD_SCHEMA_VERSION = 1
+# Schema 1 is retained byte-for-byte for native builds that do not consume a
+# hardware compile profile.  A CuTe AOT build automatically uses schema 2 and
+# binds that profile.  ``NATIVE_BUILD_SCHEMA_VERSION`` names the latest schema;
+# callers should normally omit ``schema_version`` and let ``NativeBuildSpec``
+# select the only valid version for its fields.
+NATIVE_BUILD_SCHEMA_VERSION = 2
+LEGACY_NATIVE_BUILD_SCHEMA_VERSION = 1
 LOGICAL_HARDWARE_SCHEMA_VERSION = 1
 
 _ARCHITECTURE_RE = re.compile(r"sm[0-9]{2,3}[a-z]?\Z")
@@ -123,22 +133,28 @@ def native_compiler_policy_digest(
     worker_distribution_digest: str,
     dependency_policy_digest: str,
     target_architecture: str,
+    compile_profile_digest: str | None = None,
 ) -> str:
     """Identity of compiler argv policy and image-owned dependency generators."""
+    payload = {
+        "dependency_policy_digest": _digest(
+            dependency_policy_digest, field="dependency_policy_digest"
+        ),
+        "image_digest": _digest(image_digest, field="image_digest"),
+        "target_architecture": _architecture(
+            target_architecture, field="native target_architecture"
+        ),
+        "worker_distribution_digest": _digest(
+            worker_distribution_digest, field="worker_distribution_digest"
+        ),
+    }
+    if compile_profile_digest is not None:
+        payload["compile_profile_digest"] = _digest(
+            compile_profile_digest, field="compile_profile_digest"
+        )
     return canonical_digest(
         "optima.eval.native-compiler-policy",
-        {
-            "dependency_policy_digest": _digest(
-                dependency_policy_digest, field="dependency_policy_digest"
-            ),
-            "image_digest": _digest(image_digest, field="image_digest"),
-            "target_architecture": _architecture(
-                target_architecture, field="native target_architecture"
-            ),
-            "worker_distribution_digest": _digest(
-                worker_distribution_digest, field="worker_distribution_digest"
-            ),
-        },
+        payload,
     )
 
 
@@ -160,7 +176,10 @@ class NativeBuildSpec:
     compiler_flags_digest: str
     target_architecture: str
     dependency_policy_digest: str
-    schema_version: int = NATIVE_BUILD_SCHEMA_VERSION
+    # Keep schema_version in its historical positional slot.  The profile field
+    # is appended so schema-1 positional callers retain their prior meaning.
+    schema_version: int | None = None
+    compile_profile_digest: str | None = None
 
     def __post_init__(self) -> None:
         for field in (
@@ -183,11 +202,28 @@ class NativeBuildSpec:
                 self.target_architecture, field="native target_architecture"
             ),
         )
-        _version(
-            self.schema_version,
-            expected=NATIVE_BUILD_SCHEMA_VERSION,
-            field="native build schema_version",
+        if self.compile_profile_digest is not None:
+            object.__setattr__(
+                self,
+                "compile_profile_digest",
+                _digest(
+                    self.compile_profile_digest, field="compile_profile_digest"
+                ),
+            )
+        expected_schema = (
+            NATIVE_BUILD_SCHEMA_VERSION
+            if self.compile_profile_digest is not None
+            else LEGACY_NATIVE_BUILD_SCHEMA_VERSION
         )
+        supplied_schema = self.schema_version
+        if supplied_schema is None:
+            object.__setattr__(self, "schema_version", expected_schema)
+        else:
+            _version(
+                supplied_schema,
+                expected=expected_schema,
+                field="native build schema_version",
+            )
         expected = {
             "toolchain_digest": native_toolchain_digest(
                 image_digest=self.image_digest,
@@ -201,6 +237,7 @@ class NativeBuildSpec:
                 worker_distribution_digest=self.worker_distribution_digest,
                 dependency_policy_digest=self.dependency_policy_digest,
                 target_architecture=self.target_architecture,
+                compile_profile_digest=self.compile_profile_digest,
             ),
         }
         for field, value in expected.items():
@@ -218,7 +255,7 @@ class NativeBuildSpec:
         return canonical_json_bytes(self.to_dict())
 
     def to_dict(self) -> dict[str, object]:
-        return {
+        result: dict[str, object] = {
             "compiler_flags_digest": self.compiler_flags_digest,
             "dependency_policy_digest": self.dependency_policy_digest,
             "image_digest": self.image_digest,
@@ -231,28 +268,35 @@ class NativeBuildSpec:
             "type": "native_build",
             "worker_distribution_digest": self.worker_distribution_digest,
         }
+        if self.compile_profile_digest is not None:
+            result["compile_profile_digest"] = self.compile_profile_digest
+        return result
 
     @classmethod
     def from_dict(cls, value: object) -> "NativeBuildSpec":
-        row = _strict_object(
-            value,
-            fields=frozenset(
-                {
-                    "compiler_flags_digest",
-                    "dependency_policy_digest",
-                    "image_digest",
-                    "patcher_digest",
-                    "platform_digest",
-                    "schema_version",
-                    "target_architecture",
-                    "toolchain_digest",
-                    "tree_digest",
-                    "type",
-                    "worker_distribution_digest",
-                }
-            ),
-            name="native build",
-        )
+        common = {
+            "compiler_flags_digest",
+            "dependency_policy_digest",
+            "image_digest",
+            "patcher_digest",
+            "platform_digest",
+            "schema_version",
+            "target_architecture",
+            "toolchain_digest",
+            "tree_digest",
+            "type",
+            "worker_distribution_digest",
+        }
+        if not isinstance(value, Mapping):
+            raise EngineLaunchError("native build schema mismatch")
+        schema = value.get("schema_version")
+        if schema == LEGACY_NATIVE_BUILD_SCHEMA_VERSION:
+            fields = frozenset(common)
+        elif schema == NATIVE_BUILD_SCHEMA_VERSION:
+            fields = frozenset(common | {"compile_profile_digest"})
+        else:
+            raise EngineLaunchError("native build schema_version is unsupported")
+        row = _strict_object(value, fields=fields, name="native build")
         if row["type"] != "native_build":
             raise EngineLaunchError("native build type must be 'native_build'")
         return cls(
@@ -265,6 +309,7 @@ class NativeBuildSpec:
             compiler_flags_digest=row["compiler_flags_digest"],  # type: ignore[arg-type]
             target_architecture=row["target_architecture"],  # type: ignore[arg-type]
             dependency_policy_digest=row["dependency_policy_digest"],  # type: ignore[arg-type]
+            compile_profile_digest=row.get("compile_profile_digest"),  # type: ignore[arg-type]
             schema_version=row["schema_version"],  # type: ignore[arg-type]
         )
 
@@ -626,6 +671,7 @@ class TrustedLaunchBinding:
     native_build_spec: NativeBuildSpec
     runtime_preflight_receipt: object
     physical_hardware: PhysicalHardwareBinding
+    native_compile_profile: NativeCuTeCompileProfile | None = None
 
     def __post_init__(self) -> None:
         if isinstance(self.materialized_tree_root, bytes):
@@ -651,6 +697,23 @@ class TrustedLaunchBinding:
             raise EngineLaunchError(
                 "physical_hardware must be a PhysicalHardwareBinding"
             )
+        if self.native_build_spec.compile_profile_digest is None:
+            if self.native_compile_profile is not None:
+                raise EngineLaunchError(
+                    "legacy native build must not carry a native compile profile"
+                )
+        else:
+            if type(self.native_compile_profile) is not NativeCuTeCompileProfile:
+                raise EngineLaunchError(
+                    "profiled native build requires an exact NativeCuTeCompileProfile"
+                )
+            if (
+                self.native_compile_profile.digest
+                != self.native_build_spec.compile_profile_digest
+            ):
+                raise EngineLaunchError(
+                    "native compile profile digest differs from native build"
+                )
 
 
 @dataclass(frozen=True)
@@ -662,6 +725,7 @@ class ResolvedEngineLaunch:
     native_build_spec: NativeBuildSpec
     physical_hardware: PhysicalHardwareBinding
     runtime_preflight_identity: tuple[tuple[str, str], ...]
+    native_compile_profile: NativeCuTeCompileProfile | None = None
 
     @property
     def materialized_tree_root(self) -> Path:
@@ -781,6 +845,26 @@ def resolve_engine_launch(
         launch, binding.runtime_preflight_receipt
     )
     binding.physical_hardware.validate_against(launch.hardware)
+    if binding.native_compile_profile is not None:
+        profile = binding.native_compile_profile
+        try:
+            profile.validate_launch(
+                image_digest=launch.image_digest,
+                platform_digest=launch.platform_digest,
+                worker_distribution_digest=launch.worker_distribution_digest,
+                logical_hardware_digest=launch.hardware.digest,
+                logical_architecture=launch.hardware.architecture,
+                device_policy_digest=launch.hardware.device_policy_digest,
+                topology_digest=launch.hardware.topology_digest,
+                visible_gpu_count=launch.hardware.visible_gpu_count,
+                tp_size=launch.hardware.tp_size,
+                ep_size=launch.hardware.ep_size,
+                dp_size=launch.hardware.dp_size,
+            )
+        except NativeCompileProfileError as exc:
+            raise EngineLaunchError(
+                f"native compile profile differs from launch authority: {exc}"
+            ) from None
     tree = reopen_launch_tree(launch, binding.materialized_tree_root)
     return ResolvedEngineLaunch(
         spec=launch,
@@ -788,6 +872,7 @@ def resolve_engine_launch(
         native_build_spec=binding.native_build_spec,
         physical_hardware=binding.physical_hardware,
         runtime_preflight_identity=tuple(sorted(preflight.items())),
+        native_compile_profile=binding.native_compile_profile,
     )
 
 
@@ -796,6 +881,7 @@ __all__ = [
     "EngineLaunchError",
     "EngineLaunchSpec",
     "LOGICAL_HARDWARE_SCHEMA_VERSION",
+    "LEGACY_NATIVE_BUILD_SCHEMA_VERSION",
     "LogicalHardwareSpec",
     "NATIVE_BUILD_SCHEMA_VERSION",
     "NativeBuildSpec",

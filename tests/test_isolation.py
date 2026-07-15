@@ -150,6 +150,60 @@ def test_engine_kwargs_preserve_candidate_overrides_and_legacy_alias():
     assert candidate["page_size"] == 64
 
 
+def test_direct_native_target_architecture_covers_exact_visible_tp(
+    monkeypatch, tmp_path
+):
+    (tmp_path / "rebuild.json").write_text('{"steps": []}')
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "4,5,6,7")
+    monkeypatch.delenv("OPTIMA_TARGET_GPU_ARCH", raising=False)
+    monkeypatch.delenv("OPTIMA_ENGINE_WORKER", raising=False)
+    monkeypatch.delenv("OPTIMA_PREBUILT_ARTIFACTS", raising=False)
+    observed = []
+
+    def run(command, **kwargs):
+        observed.append((command, kwargs))
+        return SimpleNamespace(stdout="10.3\n10.3\n10.3\n10.3\n")
+
+    monkeypatch.setattr(_launch.subprocess, "run", run)
+    cfg = SimpleNamespace(tp_size=4)
+    assert _launch._direct_native_target_architecture(
+        cfg, bundle_path=str(tmp_path), active=True
+    ) == "sm103"
+    assert observed[0][0][-2:] == ["-i", "4,5,6,7"]
+    assert observed[0][1]["check"] is True
+
+
+def test_direct_native_target_architecture_rejects_mixed_or_stale_claim(
+    monkeypatch, tmp_path
+):
+    (tmp_path / "rebuild.json").write_text('{"steps": []}')
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0,1")
+    monkeypatch.delenv("OPTIMA_ENGINE_WORKER", raising=False)
+    monkeypatch.delenv("OPTIMA_PREBUILT_ARTIFACTS", raising=False)
+    cfg = SimpleNamespace(tp_size=2)
+
+    monkeypatch.setattr(
+        _launch.subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(stdout="10.3\n10.0\n"),
+    )
+    with pytest.raises(_launch.IsolationError, match="homogeneous"):
+        _launch._direct_native_target_architecture(
+            cfg, bundle_path=str(tmp_path), active=True
+        )
+
+    monkeypatch.setenv("OPTIMA_TARGET_GPU_ARCH", "sm120")
+    monkeypatch.setattr(
+        _launch.subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(stdout="10.3\n10.3\n"),
+    )
+    with pytest.raises(_launch.IsolationError, match="differs from live"):
+        _launch._direct_native_target_architecture(
+            cfg, bundle_path=str(tmp_path), active=True
+        )
+
+
 def test_prepare_and_entry_share_one_module_instance(tmp_path):
     # A (prepare, forward) op's callables must come from ONE module execution: the
     # seam/verify loaders pull both off a single load_module. Two load_entry calls

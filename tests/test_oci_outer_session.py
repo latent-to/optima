@@ -25,6 +25,11 @@ from optima.eval.oci_outer_session import (
     SessionExecutionPlan,
     run_outer_session,
 )
+from optima.eval.oci_process import (
+    STDERR_ARTIFACT_SCHEMA,
+    OCIAttachedDiagnostic,
+    OCIStderrArtifactReceipt,
+)
 from optima.eval.oci_session_protocol import (
     CONTROL_MAGIC,
     EVIDENCE_MAGIC,
@@ -528,6 +533,15 @@ class _PipeClient:
                 pass
 
 
+class _DiagnosticPipeClient(_PipeClient):
+    def __init__(self, diagnostic: OCIAttachedDiagnostic) -> None:
+        super().__init__()
+        self._diagnostic = diagnostic
+
+    def stderr_diagnostic(self) -> OCIAttachedDiagnostic:
+        return self._diagnostic
+
+
 class _PipeManager:
     def __init__(self, client: _PipeClient) -> None:
         self.client = client
@@ -538,8 +552,14 @@ class _PipeManager:
         return self.client
 
 
-def _attached() -> tuple[AttachedSessionTransport, _PipeClient]:
-    client = _PipeClient()
+def _attached(
+    diagnostic: OCIAttachedDiagnostic | None = None,
+) -> tuple[AttachedSessionTransport, _PipeClient]:
+    client = (
+        _PipeClient()
+        if diagnostic is None
+        else _DiagnosticPipeClient(diagnostic)
+    )
     transport = AttachedSessionTransport(
         _PipeManager(client), object(), ("/usr/bin/docker", "run")  # type: ignore[arg-type]
     )
@@ -624,6 +644,91 @@ def test_attached_transport_rejects_partial_wrong_magic_oversized_and_timeout() 
             transport.read_control(
                 max_bytes=MAX_CONTROL_BYTES, deadline=time.monotonic() + 0.01
             )
+    finally:
+        transport.abort()
+        client.close_fds()
+
+
+def test_process_error_preserves_only_a_bounded_terminal_safe_stderr_tail() -> None:
+    diagnostic = OCIAttachedDiagnostic(
+        b"old-noise\x1b[31m scheduler traceback\nTRACEBACK-TAIL",
+        True,
+        True,
+    )
+    transport, client = _attached(diagnostic)
+    try:
+        os.close(client.response_write)
+        client.response_write = -1
+        with pytest.raises(OuterSessionProcessError) as raised:
+            transport.read_control(
+                max_bytes=MAX_CONTROL_BYTES,
+                deadline=time.monotonic() + 1,
+            )
+        error = raised.value
+        assert error.diagnostic == diagnostic
+        rendered = str(error)
+        assert diagnostic.stderr_sha256 in rendered
+        assert "TRACEBACK-TAIL" in rendered
+        assert "\\x1b" in rendered
+        assert "\x1b" not in rendered
+        assert "truncated=true" in rendered
+        assert "complete=true" in rendered
+    finally:
+        transport.abort()
+        client.close_fds()
+
+
+def test_worker_error_attaches_private_artifact_receipt_path_and_digest(
+    tmp_path,
+) -> None:
+    raw = b"INITIATING-TP-RANK-ERROR\nlate teardown noise\n"
+    artifact_path = tmp_path / ("lease-1." + "a" * 32 + ".stderr")
+    receipt = OCIStderrArtifactReceipt(
+        STDERR_ARTIFACT_SCHEMA,
+        "validator-a",
+        "lease-1",
+        artifact_path,
+        artifact_path.with_name(artifact_path.name + ".json"),
+        hashlib.sha256(raw).hexdigest(),
+        hashlib.sha256(raw).hexdigest(),
+        len(raw),
+        len(raw),
+        False,
+        os.geteuid(),
+        os.getegid(),
+        0o600,
+    )
+    diagnostic = OCIAttachedDiagnostic(
+        raw,
+        False,
+        True,
+        client_returncode=1,
+        stream_bytes=len(raw),
+        stream_sha256=hashlib.sha256(raw).hexdigest(),
+        artifact=receipt,
+    )
+    current = _request(1, request_id="4" * 32)
+    transport, client = _attached(diagnostic)
+    try:
+        error = error_message(
+            session_id=current.session_id,
+            launch_digest=current.launch_digest,
+            stage="batch-1",
+            error=RuntimeError("engine failed"),
+            request=current,
+        )
+        os.write(
+            client.response_write,
+            frame_message(error, max_bytes=MAX_CONTROL_BYTES),
+        )
+        with pytest.raises(OuterSessionWorkerError) as raised:
+            transport.read_evidence(current, deadline=time.monotonic() + 1)
+        assert raised.value.diagnostic == diagnostic
+        rendered = str(raised.value)
+        assert repr(str(receipt.artifact_path)) in rendered
+        assert receipt.artifact_sha256 in rendered
+        assert repr(str(receipt.receipt_path)) in rendered
+        assert receipt.receipt_sha256 in rendered
     finally:
         transport.abort()
         client.close_fds()

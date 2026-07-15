@@ -26,7 +26,7 @@ import stat
 import tempfile
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from optima.capabilities import (
     CONTEXT_FIELDS,
@@ -43,6 +43,7 @@ from optima.verify import (
     _compare_outputs,
     _clone_tensor_inputs,
     _CudaGraphBackend,
+    _direct_aot_prepare_boundary,
     _device_architecture,
     _graph_case_inputs,
     _input_bindings,
@@ -262,11 +263,24 @@ def _terminate_processes(processes, *, grace_s: float = 5.0) -> None:
             process.join(max(0.0, deadline - time.monotonic()))
 
 
+def _direct_aot_collective_callables(
+    slot: SlotSpec,
+    entry: Callable[..., None],
+    *,
+    prepare_name: str | None,
+) -> tuple[Callable[..., None], Callable | None]:
+    """Bind a sealed direct entry to the ordinary collective lifecycle."""
+
+    return entry, _direct_aot_prepare_boundary(
+        slot, entry, prepare_name=prepare_name
+    )
+
+
 def _rank_worker(rank, world_size, backend, init_method, slot_name, source_path, entry_name,
                  shape, dtype_name, device, seed, result_dir, prepare_name=None, model_key=None,
                  bundle_path=None, graph_safe=False,
                  graph_replays=_DEFAULT_GRAPH_REPLAYS, verdict_identities=(),
-                 run_mode="single"):
+                 run_mode="single", variant_name=None):
     """One rank: init the group, run the miner collective into a validator-owned buffer,
     compare to the trusted fp32 cross-rank reduce. Writes its verdict to ``result_dir``.
 
@@ -322,14 +336,29 @@ def _rank_worker(rank, world_size, backend, init_method, slot_name, source_path,
         # spawned ranks included, or the shim silently falls back to its reference path
         # and the "verify" validates nothing (phantom parity). Rank 0 builds (compile is
         # not concurrency-safe on the shared cache), the rest barrier then load from cache.
+        direct_entry = None
         if bundle_path:
             from optima.rebuild import apply_rebuild_plan
 
+            rebuild_phase = (
+                "load"
+                if os.environ.get("OPTIMA_PREBUILT_ARTIFACTS") == "1"
+                else "all"
+            )
             if rank == 0:
-                apply_rebuild_plan(bundle_path)
+                apply_rebuild_plan(bundle_path, phase=rebuild_phase)
             dist.barrier()
             if rank != 0:
-                apply_rebuild_plan(bundle_path)
+                apply_rebuild_plan(bundle_path, phase=rebuild_phase)
+            from optima.artifact_runtime import resolve_direct_artifact_entry
+            from optima.manifest import load_manifest
+
+            direct_op = load_manifest(bundle_path).op_for(slot_name, variant_name)
+            if direct_op is None:
+                raise ValueError(
+                    f"bundle has no manifest row for {(slot_name, variant_name)!r}"
+                )
+            direct_entry = resolve_direct_artifact_entry(direct_op)
 
         slot = slot_for_model(slot_name, model_key)
         dtype = getattr(torch, dtype_name)
@@ -338,9 +367,14 @@ def _rank_worker(rank, world_size, backend, init_method, slot_name, source_path,
         # ONE module instance for prepare+entry AND across every sequence step (separate
         # loads would re-execute the body and split namespaces; and the whole point of a
         # temporal sequence is that the kernel's cross-call state PERSISTS step to step).
-        module = load_module(source_path)
-        entry = callable_from(module, entry_name)
-        prepare_fn = callable_from(module, prepare_name) if prepare_name else None
+        if direct_entry is not None:
+            entry, prepare_fn = _direct_aot_collective_callables(
+                slot, direct_entry, prepare_name=prepare_name
+            )
+        else:
+            module = load_module(source_path)
+            entry = callable_from(module, entry_name)
+            prepare_fn = callable_from(module, prepare_name) if prepare_name else None
         invoke = slot.invoke_collective or (lambda e, i, o, g, p: e(i["x"], o, g))
 
         steps = list(shape) if isinstance(shape, (list, tuple)) else [shape]
@@ -661,6 +695,7 @@ def verify_collective(
     model_key: str | None = None,
     jitter_seed: int | None = None,
     bundle_path: str | None = None,
+    variant_name: str | None = None,
     graph_safe: bool = False,
     graph_replays: int = _DEFAULT_GRAPH_REPLAYS,
     timeout_s: float | None = None,
@@ -756,7 +791,8 @@ def verify_collective(
                 verdict_identities.append(_regular_identity(path))
             args = (world_size, backend, init_method, slot.name, source_path, entry_name,
                     shape_or_seq, dtype_name, device, run_seed, rd, prepare_name, model_key,
-                    bundle_path, graph_safe, graph_replays, verdict_identities, run_mode)
+                    bundle_path, graph_safe, graph_replays, verdict_identities, run_mode,
+                    variant_name)
             spawn_err: str | None = None
             processes = []
             try:

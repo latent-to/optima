@@ -665,7 +665,7 @@ def test_reference_worker_rejects_any_contribution_manifest_before_engine(monkey
         os.close(output_read)
 
 
-def test_protocol_fd_is_cloexec_and_engine_stdout_is_silenced(tmp_path):
+def test_protocol_fd_is_cloexec_stdout_is_silenced_and_stderr_is_separate(tmp_path):
     script = tmp_path / "fd_probe.py"
     script.write_text(
         "import os\n"
@@ -673,6 +673,7 @@ def test_protocol_fd_is_cloexec_and_engine_stdout_is_silenced(tmp_path):
         "fd = _reserve_protocol_fd()\n"
         "assert not os.get_inheritable(fd)\n"
         "print('engine-noise', flush=True)\n"
+        "print('scheduler-traceback', file=__import__('sys').stderr, flush=True)\n"
         "os.write(fd, b'protocol-only')\n"
     )
     root = Path(__file__).resolve().parents[1]
@@ -686,7 +687,28 @@ def test_protocol_fd_is_cloexec_and_engine_stdout_is_silenced(tmp_path):
     )
     assert result.returncode == 0
     assert result.stdout == b"protocol-only"
-    assert result.stderr == b""
+    assert result.stderr == b"scheduler-traceback\n"
+
+
+def test_worker_fallback_stderr_diagnostic_has_a_hard_byte_cap(tmp_path):
+    script = tmp_path / "stderr_probe.py"
+    script.write_text(
+        "from optima.eval.oci_session_worker import _write_stderr_diagnostic\n"
+        "_write_stderr_diagnostic('batch', RuntimeError('x' * 100000))\n"
+    )
+    root = Path(__file__).resolve().parents[1]
+    result = subprocess.run(
+        [sys.executable, str(script)],
+        cwd=root,
+        env={**os.environ, "PYTHONPATH": str(root)},
+        capture_output=True,
+        timeout=30,
+        check=False,
+    )
+    assert result.returncode == 0
+    assert result.stdout == b""
+    assert result.stderr.startswith(b"[optima-session-worker]")
+    assert 0 < len(result.stderr) <= worker.WORKER_STDERR_DIAGNOSTIC_MAX_BYTES
 
 
 def test_descendant_pythonpath_contains_only_installed_site_bootstrap(

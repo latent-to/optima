@@ -45,7 +45,16 @@ logger = logging.getLogger("optima.receipts")
 
 _SAFE_RE = re.compile(r"[^0-9A-Za-z._\-]+")
 _IDENTITY_KINDS = frozenset(
-    {"active", "load_failed", "fired", "completed", "fallback", "audit"}
+    {
+        "active",
+        "load_failed",
+        "fired",
+        "completed",
+        "fallback",
+        "audit",
+        "aot_loaded",
+        "aot_invoked",
+    }
 )
 # Include the receipt directory so one long-lived process can participate in
 # independent launches without an earlier launch suppressing the later receipt.

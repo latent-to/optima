@@ -18,6 +18,7 @@ from optima.eval.evidence_store import EvidenceArtifactRef
 from optima.stack_identity import canonical_digest, require_sha256_hex
 from optima.stack_manifest import EvaluationStackManifest
 from optima.stack_plan import StackArmIdentity
+from optima.target_catalog import TargetCatalog, TargetResolutionError
 
 
 _ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,255}\Z")
@@ -915,5 +916,6 @@ def plan_settlement(
 __all__ = [
     "SettlementCandidate", "SettlementError", "SettlementEvidence", "SettlementEvent",
     "SettlementEventType", "SettlementPlan", "SettlementQualification",
-    "SettlementReproductionIdentity", "StackTransitionOutput", "plan_settlement",
+    "SettlementReproductionIdentity", "StackTransitionOutput",
+    "plan_settlement",
 ]

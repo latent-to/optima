@@ -21,6 +21,26 @@ logger = logging.getLogger("optima.flashinfer_overlay")
 _installed = False
 
 
+def _flashinfer_import_in_progress() -> bool:
+    """Keep overlay installation out of FlashInfer's partial-import window.
+
+    The bootstrap runs after every watched module import.  A different watched
+    module can finish while ``flashinfer.jit.cubin_loader`` is still importing;
+    importing the overlay's generator at that point re-enters FlashInfer and
+    creates a circular import.  Returning here is safe because seam activation
+    is repeated, including once at the positively identified scheduler entry.
+    No overlay state may be mutated before this check.
+    """
+
+    for name, module in tuple(sys.modules.items()):
+        if name != "flashinfer" and not name.startswith("flashinfer."):
+            continue
+        spec = getattr(module, "__spec__", None)
+        if spec is not None and bool(getattr(spec, "_initializing", False)):
+            return True
+    return False
+
+
 @dataclass(frozen=True)
 class _LoadOnlyJITSpec:
     """The only runtime operation is loading one already-validated shared object."""
@@ -95,6 +115,11 @@ def install(registry) -> None:  # registry unused; signature shared by integrati
     overlays = _active_overlays()
     if not overlays:
         return
+    # This is a deferral, not a best-effort fallback: the scheduler-entry
+    # activation retries installation after the framework import graph settles.
+    # Check before env/module/cache mutation so every attempt is atomic.
+    if _flashinfer_import_in_progress():
+        return
 
     from optima import receipts
 
@@ -108,12 +133,19 @@ def install(registry) -> None:  # registry unused; signature shared by integrati
             setattr(environment, attribute, overlay.subtree)
             logger.info("optima: %s.%s -> %s", module_name, attribute, overlay.subtree)
         target_architecture = os.environ.get("OPTIMA_TARGET_GPU_ARCH", "").strip().lower()
-        for module in overlay.modules:
-            if target_architecture != module.policy.target_architecture:
-                raise RuntimeError(
-                    f"prebuilt dependency module {module.policy.name!r} requires "
-                    f"{module.policy.target_architecture!r}, got {target_architecture!r}"
-                )
+        # The artifact carries one module per fleet architecture; install only
+        # the device's module and refuse devices the policy does not cover.
+        selected = tuple(
+            module
+            for module in overlay.modules
+            if module.policy.target_architecture == target_architecture
+        )
+        if overlay.modules and not selected:
+            raise RuntimeError(
+                f"dependency overlay {overlay.target!r} has no prebuilt module for "
+                f"device architecture {target_architecture!r}"
+            )
+        for module in selected:
             replacement = _load_only_generator(module)
             generator_module = importlib.import_module(module.policy.generator_module)
             setattr(generator_module, module.policy.generator_attr, replacement)

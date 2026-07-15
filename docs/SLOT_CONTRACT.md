@@ -114,6 +114,14 @@ per-step `max_len` host-sync); its graph-safe form is a paged-direct contract (t
   (`SiluAndMul.forward`, `RadixAttention.forward`, `FusedMoE.forward`, …) is a *lower-bell*
   adapter, re-validated on every `PINNED_SGLANG` bump via `optima compat`. Proliferate them
   freely; they never touch the four invariants.
+- **Native implementations keep the same static-slot waist.** An existing slot may
+  declare a `cutlass.cute.cubin.v1` prebuild export with a bounded validator-parsed
+  resource/launch plan. Candidate Python runs only in the GPU-hidden, no-egress
+  compiler child; the retained artifact is exact-architecture device CUBIN. Engine
+  ranks admit and launch it only through validator-owned CUDA Driver calls. Candidate
+  host objects, shared libraries, callbacks, runtime PTX/JIT, and per-submission
+  executable adapters are not an artifact-provider surface. The slot still owns the
+  inputs, output allocation, reference, verification, graph and fidelity gates.
 - **The first extraction trigger has fired, narrowly.** Output allocation is now the
   declarative `OutputSpec`/`TensorSpec` boundary shared by offline verification and live
   bindings; legacy slots bridge from `out_shapes` unchanged. Inputs, invocation, references,

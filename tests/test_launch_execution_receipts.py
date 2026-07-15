@@ -81,7 +81,13 @@ def test_fired_without_completed_fails_execution_gate(tmp_path):
         {"slot": "a", "pid": 10, "rank": 0, "world_size": 1},
         0,
     )
-    with pytest.raises(RuntimeError, match="failed execution coverage"):
+    _write(
+        tmp_path,
+        "aot_loaded",
+        {"slot": "a", "pid": 10, "rank": 0, "world_size": 1},
+        0,
+    )
+    with pytest.raises(RuntimeError, match="aot_loaded:1,aot_invoked:0"):
         _launch._require_execution_completion(
             str(tmp_path),
             active_receipts=active,
@@ -117,6 +123,71 @@ def test_any_selected_path_fallback_disqualifies(tmp_path):
     _write(tmp_path, "completed", complete, 0)
     _write(tmp_path, "fallback", {**complete, "error_type": "RuntimeError"}, 0)
     with pytest.raises(RuntimeError, match="selected-path fallbacks"):
+        _launch._require_execution_completion(
+            str(tmp_path),
+            active_receipts=active,
+            expected_slots=["a"],
+            expected_member_count=1,
+        )
+
+
+def test_sealed_aot_requires_load_and_use_on_every_active_member(tmp_path):
+    active = [_active(10, 0, slots=("a",)), _active(11, 1, slots=("a",))]
+    for index, (rank, pid) in enumerate(((0, 10), (1, 11))):
+        identity = {"slot": "a", "pid": pid, "rank": rank, "world_size": 2}
+        _write(tmp_path, "completed", identity, index)
+        _write(tmp_path, "aot_loaded", identity, index)
+    _write(
+        tmp_path,
+        "aot_invoked",
+        {"slot": "a", "pid": 10, "rank": 0, "world_size": 2},
+        0,
+    )
+
+    with pytest.raises(RuntimeError, match="failed sealed CuTe AOT use coverage"):
+        _launch._require_execution_completion(
+            str(tmp_path),
+            active_receipts=active,
+            expected_slots=["a"],
+            expected_member_count=2,
+        )
+
+    _write(
+        tmp_path,
+        "aot_invoked",
+        {"slot": "a", "pid": 11, "rank": 1, "world_size": 2},
+        1,
+    )
+    detail = _launch._require_execution_completion(
+        str(tmp_path),
+        active_receipts=active,
+        expected_slots=["a"],
+        expected_member_count=2,
+    )
+    assert "sealed CuTe AOT" in detail
+
+
+def test_sealed_aot_rejects_use_without_load_or_inactive_slot(tmp_path):
+    active = [_active(10, 0, slots=("a",), world_size=1)]
+    complete = {"slot": "a", "pid": 10, "rank": 0, "world_size": 1}
+    _write(tmp_path, "completed", complete, 0)
+    _write(tmp_path, "aot_invoked", complete, 0)
+    with pytest.raises(RuntimeError, match="without matching load evidence"):
+        _launch._require_execution_completion(
+            str(tmp_path),
+            active_receipts=active,
+            expected_slots=["a"],
+            expected_member_count=1,
+        )
+
+    (tmp_path / "aot_invoked.0.json").unlink()
+    _write(
+        tmp_path,
+        "aot_loaded",
+        {"slot": "other", "pid": 10, "rank": 0, "world_size": 1},
+        0,
+    )
+    with pytest.raises(RuntimeError, match="inactive slot"):
         _launch._require_execution_completion(
             str(tmp_path),
             active_receipts=active,

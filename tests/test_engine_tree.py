@@ -15,6 +15,7 @@ import pytest
 
 import optima.engine_tree as engine_tree
 from optima.bundle_hash import content_hash
+from optima.chain.publication import publish_worker_bundle
 from optima.discovery import (
     DEFAULT_DISCOVERY_POLICY,
     DISCOVERY_ABI_VERSION,
@@ -244,6 +245,38 @@ def test_singleton_materialization_projects_metadata_and_reopens(tmp_path: Path)
     assert "notes" not in metadata
     assert "regime" not in metadata
     assert all(path.stat().st_mode & 0o777 == 0o444 for path in result.root.rglob("*") if path.is_file())
+
+
+def test_materialization_accepts_exact_typed_worker_bundle_carrier(tmp_path: Path) -> None:
+    source = tmp_path / "private-source"
+    shutil.copytree(MSA, source)
+    for path in source.rglob("*"):
+        path.chmod(0o700 if path.is_dir() else 0o600)
+    source.chmod(0o700)
+
+    catalog = default_target_catalog()
+    context = _evaluation_context(catalog)
+    ref = _proposal_ref(source, catalog)
+    publication = publish_worker_bundle(
+        source,
+        tmp_path / "publications",
+        ref.artifact_digest,
+    )
+    assert content_hash(publication.root) != ref.artifact_digest
+
+    stack = _evaluation_stack(catalog, context, ref)
+    result = materialize_engine_tree(
+        stack,
+        context=context,
+        catalog=catalog,
+        resolver=_sources((ref, publication.root)),
+        destination=tmp_path / "engine",
+    )
+
+    assert result.stack_digest == stack.digest
+    assert reopen_materialized_engine_tree(
+        result.root, expected_tree_digest=result.tree_digest
+    ) == result
 
 
 def test_multiple_variants_share_selected_source_without_order_authority(
@@ -1054,6 +1087,97 @@ def test_dynamic_imports_fail_closed(tmp_path: Path, source_text: str) -> None:
     source = tmp_path / "source"
     shutil.copytree(MSA, source)
     (source / "kernels" / "blockscore.py").write_text(source_text)
+    with pytest.raises(EngineTreeError, match="dynamic import"):
+        inspect_contribution(source, catalog=default_target_catalog())
+
+
+@pytest.mark.parametrize(
+    "source_text",
+    [
+        # The CuTe DSL compile idiom: a single import-alias binding of
+        # cutlass.cute + a compile call on that module alias.
+        "import cutlass.cute as cute\n\n"
+        "def blockscore(q, k, out):\n"
+        "    kernel = cute.compile(blockscore, q, k, out)\n"
+        "    out.copy_(q @ k.transpose(-1, -2))\n",
+        "from cutlass import cute\n\n"
+        "def blockscore(q, k, out):\n"
+        "    kernel = cute.compile(blockscore)\n"
+        "    out.copy_(q @ k.transpose(-1, -2))\n",
+    ],
+)
+def test_cute_dsl_compile_alias_is_admitted(tmp_path: Path, source_text: str) -> None:
+    source = tmp_path / "source"
+    shutil.copytree(MSA, source)
+    (source / "kernels" / "blockscore.py").write_text(source_text)
+    inspected = inspect_contribution(source, catalog=default_target_catalog())
+    assert "kernels/blockscore.py" in inspected.python_files
+
+
+def test_runtime_toml_omits_only_inline_table_null_fields() -> None:
+    from optima.engine_tree import _toml_value
+
+    assert _toml_value({"active": 7, "inactive": None}) == '{ "active" = 7 }'
+    with pytest.raises(EngineTreeError, match="unsupported TOML value"):
+        _toml_value([None])
+
+
+@pytest.mark.parametrize(
+    "source_text",
+    [
+        # rebinding the alias anywhere withdraws the admission
+        "import cutlass.cute as cute\n"
+        "cute = cute\n\n"
+        "def blockscore(q, k, out):\n"
+        "    return cute.compile(blockscore)\n",
+        # so does shadowing it via a parameter in any scope
+        "import cutlass.cute as cute\n\n"
+        "def blockscore(q, k, out, cute=None):\n"
+        "    return cute.compile(blockscore)\n",
+        # a second import binding the same name
+        "import cutlass.cute as cute\n"
+        "import types as cute\n\n"
+        "def blockscore(q, k, out):\n"
+        "    return cute.compile(blockscore)\n",
+        # a non-allowlisted module behind the alias
+        "import types as cute\n\n"
+        "def blockscore(q, k, out):\n"
+        "    return cute.compile(blockscore)\n",
+        # .compile on anything that is not the allowlisted module alias
+        "def blockscore(q, k, out):\n"
+        "    gemm = object()\n"
+        "    return gemm.compile(q)\n",
+        # builtins reached as a module: builtins.compile is a plain attribute
+        "import builtins\n\n"
+        "def blockscore(q, k, out):\n"
+        "    f = builtins.compile\n"
+        "    return f\n",
+    ],
+)
+def test_cute_dsl_compile_admission_fails_closed(
+    tmp_path: Path, source_text: str
+) -> None:
+    source = tmp_path / "source"
+    shutil.copytree(MSA, source)
+    (source / "kernels" / "blockscore.py").write_text(source_text)
+    with pytest.raises(EngineTreeError, match="dynamic import"):
+        inspect_contribution(source, catalog=default_target_catalog())
+
+
+def test_cute_dsl_compile_vendored_local_module_fails_closed(tmp_path: Path) -> None:
+    # A bundle-local ``cutlass/`` package must withdraw the carve-out: the
+    # admitted receiver has to be the EXTERNAL pinned DSL, never bundle code.
+    source = tmp_path / "source"
+    shutil.copytree(MSA, source)
+    vendored = source / "cutlass"
+    vendored.mkdir()
+    (vendored / "__init__.py").write_text("VALUE = 1\n")
+    (vendored / "cute.py").write_text("VALUE = 2\n")
+    (source / "kernels" / "blockscore.py").write_text(
+        "import cutlass.cute as cute\n\n"
+        "def blockscore(q, k, out):\n"
+        "    return cute.compile(blockscore)\n"
+    )
     with pytest.raises(EngineTreeError, match="dynamic import"):
         inspect_contribution(source, catalog=default_target_catalog())
 

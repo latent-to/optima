@@ -80,7 +80,20 @@ PATCHABLE_DEPS: dict[str, DepPolicy] = {
         overlay_subtree="flashinfer/data/csrc",
         allowed_globs=("flashinfer/data/csrc/fused_moe/*",),
         env_rebind=("flashinfer.jit.env", "FLASHINFER_CSRC_DIR"),
+        # One sealed artifact carries every fleet architecture; the runtime
+        # installer selects the device's module and refuses devices no row
+        # covers. B200 (sm100) and B300 (sm103) are both admissible validator
+        # hardware, so both compile into the same publication.
         prebuilt_modules=(
+            PrebuiltJITModule(
+                name="fused_moe_100",
+                target_architecture="sm100",
+                cuda_arch_list="10.0",
+                generator_module="flashinfer.jit.fused_moe",
+                generator_attr="gen_cutlass_fused_moe_sm100_module",
+                consumer_module="flashinfer.fused_moe.core",
+                consumer_attr="gen_cutlass_fused_moe_sm100_module",
+            ),
             PrebuiltJITModule(
                 name="fused_moe_103",
                 target_architecture="sm103",

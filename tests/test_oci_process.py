@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import select
 import subprocess
 import sys
 import time
@@ -11,7 +13,12 @@ import pytest
 
 import optima.eval.oci_process as process_mod
 from optima.eval.oci_process import (
+    ATTACHED_STDERR_MAX_BYTES,
     CommandResult,
+    GPU_RESERVATION_ENV,
+    GPU_RESERVATION_LABEL,
+    OCIAttachedDiagnostic,
+    OCIStderrArtifactReceipt,
     OCIQuiescenceReceipt,
     OCIProcessError,
     OCIProcessManager,
@@ -22,11 +29,17 @@ from optima.eval.oci_process import (
 CONTAINER_ID = "d" * 64
 
 
+@pytest.fixture(autouse=True)
+def _clear_gpu_reservation_env(monkeypatch) -> None:
+    monkeypatch.delenv(GPU_RESERVATION_ENV, raising=False)
+
+
 class Commands:
     def __init__(self) -> None:
         self.rows: list[tuple[str, ...]] = []
         self.present: set[str] = set()
         self.labels: dict[str, tuple[str, str]] = {}
+        self.gpu_labels: dict[str, str] = {}
 
     def __call__(self, argv, *, timeout_s, max_output_bytes):
         row = tuple(argv)
@@ -38,13 +51,16 @@ class Commands:
         if row[1:3] == ("container", "inspect"):
             name = next(iter(self.present))
             executor, lease = self.labels.get(name, ("validator-a", "lease-1"))
+            labels = {
+                "optima.executor_id": executor,
+                "optima.lease_id": lease,
+            }
+            if name in self.gpu_labels:
+                labels[GPU_RESERVATION_LABEL] = self.gpu_labels[name]
             payload = {
                 "Id": CONTAINER_ID,
                 "Name": f"/{name}",
-                "Labels": {
-                    "optima.executor_id": executor,
-                    "optima.lease_id": lease,
-                },
+                "Labels": labels,
             }
             return CommandResult(0, json.dumps(payload).encode(), b"")
         if row[1:3] == ("rm", "--force"):
@@ -140,6 +156,57 @@ def test_register_writes_exact_lease_and_run_prefix(tmp_path: Path) -> None:
     assert lease.record_path.stat().st_mode & 0o777 == 0o600
 
 
+def test_register_propagates_gpu_reservation_label(
+    tmp_path: Path, monkeypatch
+) -> None:
+    reservation_id = "a1b2c3d4e5f6"
+    monkeypatch.setenv(GPU_RESERVATION_ENV, reservation_id)
+    manager = _manager(tmp_path)
+    lease = manager.register(lease_id="lease-1", container_name="container-1")
+
+    assert lease.gpu_reservation_id == reservation_id
+    assert json.loads(lease.record_path.read_text())["gpu_reservation_id"] == reservation_id
+    assert lease.run_prefix(manager.docker_binary) == (
+        "/usr/bin/docker",
+        "run",
+        "--name=container-1",
+        f"--cidfile={lease.cid_path}",
+        "--label=optima.executor_id=validator-a",
+        "--label=optima.lease_id=lease-1",
+        f"--label={GPU_RESERVATION_LABEL}={reservation_id}",
+    )
+    monkeypatch.delenv(GPU_RESERVATION_ENV)
+    restored = manager._lease_from_record(lease.record_path)
+    assert restored.gpu_reservation_id == reservation_id
+    assert restored.run_prefix(manager.docker_binary) == lease.run_prefix(
+        manager.docker_binary
+    )
+
+
+def test_register_rejects_malformed_gpu_reservation_identity(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setenv(GPU_RESERVATION_ENV, "not-a-reservation")
+    manager = _manager(tmp_path)
+    with pytest.raises(OCIProcessError, match=GPU_RESERVATION_ENV):
+        manager.register(lease_id="lease-1", container_name="container-1")
+
+
+def test_cleanup_requires_matching_gpu_reservation_label(
+    tmp_path: Path, monkeypatch
+) -> None:
+    reservation_id = "a1b2c3d4e5f6"
+    monkeypatch.setenv(GPU_RESERVATION_ENV, reservation_id)
+    commands = Commands()
+    manager = _manager(tmp_path, commands)
+    lease = manager.register(lease_id="lease-1", container_name="container-1")
+    commands.present.add("container-1")
+    commands.gpu_labels["container-1"] = "000000000000"
+
+    with pytest.raises(OCIProcessError, match="exact lease labels"):
+        manager.force_remove_container(lease)
+
+
 def test_quiescence_receipt_requires_empty_executor_namespace(tmp_path: Path) -> None:
     commands = Commands()
     times = iter((10.0, 11.0))
@@ -163,6 +230,23 @@ def test_quiescence_receipt_requires_empty_executor_namespace(tmp_path: Path) ->
     commands.present.add("container-1")
     with pytest.raises(OCIProcessError, match="not quiescent"):
         manager.prove_quiescent()
+
+
+def test_legacy_quiescence_digest_is_byte_stable() -> None:
+    receipt = OCIQuiescenceReceipt(
+        schema="optima.oci-quiescence.v1",
+        executor_id="validator-a",
+        manager_instance_id="1" * 32,
+        namespace_digest="2" * 64,
+        sequence=1,
+        observed_monotonic_s=10.0,
+        lease_records=(),
+        resource_entries=(),
+        container_ids=(),
+    )
+    assert receipt.digest == (
+        "3a1f289b3087b41503bf160267cb7c14b6ef7d626fdb20e0838db097a7770d06"
+    )
 
 
 def test_transaction_lock_reenters_for_one_controller_thread(tmp_path: Path) -> None:
@@ -233,6 +317,157 @@ def test_run_uses_no_shell_new_session_and_proves_absence(tmp_path: Path, monkey
     assert created[0].kwargs["start_new_session"] is True
     assert any(row[1:3] == ("container", "ls") for row in commands.rows)
     assert lease.record_path.exists(), "caller retains staged state until publication"
+
+
+def test_run_continuously_drains_and_retains_only_bounded_stderr_tail(
+    tmp_path: Path, monkeypatch
+) -> None:
+    manager = _manager(tmp_path)
+    lease = manager.register(lease_id="lease-1", container_name="container-1")
+    real_popen = subprocess.Popen
+    marker = b"PREBUILD-TRACEBACK-TAIL"
+    script = (
+        "import sys; "
+        f"sys.stderr.buffer.write(b'A' * {ATTACHED_STDERR_MAX_BYTES * 4}); "
+        f"sys.stderr.buffer.write({marker!r}); sys.stderr.buffer.flush(); "
+        "raise SystemExit(7)"
+    )
+
+    def spawn(_argv, **kwargs):
+        return real_popen([sys.executable, "-c", script], **kwargs)
+
+    monkeypatch.setattr(process_mod.subprocess, "Popen", spawn)
+    result = manager.run(
+        lease,
+        (*lease.run_prefix(manager.docker_binary), "image@sha256:x"),
+        timeout_s=5.0,
+    )
+    diagnostic = result.stderr_diagnostic
+    assert result.returncode == 7 and diagnostic is not None
+    assert len(diagnostic.stderr_tail) == ATTACHED_STDERR_MAX_BYTES
+    assert diagnostic.stderr_truncated and diagnostic.capture_complete
+    assert diagnostic.client_returncode == 7
+    assert diagnostic.stderr_tail.endswith(marker)
+    artifact = diagnostic.artifact
+    assert type(artifact) is OCIStderrArtifactReceipt
+    expected = b"A" * (ATTACHED_STDERR_MAX_BYTES * 4) + marker
+    assert diagnostic.stream_bytes == len(expected)
+    assert diagnostic.stream_sha256 == hashlib.sha256(expected).hexdigest()
+    assert artifact.stream_bytes == len(expected)
+    assert artifact.stream_sha256 == hashlib.sha256(expected).hexdigest()
+    assert artifact.artifact_bytes == len(expected)
+    assert not artifact.truncated
+    assert manager.reopen_stderr_artifact(artifact) == artifact.artifact_path
+    assert artifact.artifact_path.read_bytes() == expected
+    assert artifact.receipt_path.read_bytes() == artifact.receipt_bytes
+    assert artifact.artifact_path.stat().st_mode & 0o777 == 0o600
+    assert artifact.receipt_path.stat().st_mode & 0o777 == 0o600
+    assert (artifact.owner_uid, artifact.owner_gid) == (os.geteuid(), os.getegid())
+
+
+def test_failure_artifact_retains_earliest_rank_error_and_caps_disk_bytes(
+    tmp_path: Path, monkeypatch
+) -> None:
+    cap = 4096
+    monkeypatch.setattr(process_mod, "ATTACHED_STDERR_ARTIFACT_MAX_BYTES", cap)
+    manager = _manager(tmp_path)
+    lease = manager.register(lease_id="lease-1", container_name="container-1")
+    real_popen = subprocess.Popen
+    first = b"INITIATING-TP-RANK-ERROR rank=2\n"
+    last = b"FINAL-TEARDOWN-NOISE\n"
+    payload = first + b"x" * (cap * 3) + last
+    script = (
+        "import sys; "
+        f"sys.stderr.buffer.write({payload!r}); sys.stderr.buffer.flush(); "
+        "raise SystemExit(9)"
+    )
+
+    def spawn(_argv, **kwargs):
+        return real_popen([sys.executable, "-c", script], **kwargs)
+
+    monkeypatch.setattr(process_mod.subprocess, "Popen", spawn)
+    result = manager.run(
+        lease,
+        (*lease.run_prefix(manager.docker_binary), "image@sha256:x"),
+        timeout_s=5.0,
+    )
+    diagnostic = result.stderr_diagnostic
+    assert diagnostic is not None and diagnostic.artifact is not None
+    artifact = diagnostic.artifact
+    retained = artifact.artifact_path.read_bytes()
+    assert len(retained) == cap == artifact.artifact_bytes
+    assert retained == payload[:cap]
+    assert retained.startswith(first)
+    assert last not in retained
+    assert diagnostic.stderr_tail.endswith(last)
+    assert artifact.truncated
+    assert artifact.stream_bytes == len(payload)
+    assert artifact.stream_sha256 == hashlib.sha256(payload).hexdigest()
+    assert artifact.artifact_sha256 == hashlib.sha256(payload[:cap]).hexdigest()
+    assert manager.reopen_stderr_artifact(artifact) == artifact.artifact_path
+
+    replacement = tmp_path / "attacker-controlled"
+    replacement.write_bytes(payload[:cap])
+    artifact.artifact_path.unlink()
+    artifact.artifact_path.symlink_to(replacement)
+    with pytest.raises(OCIProcessError, match="securely reopen"):
+        manager.reopen_stderr_artifact(artifact)
+
+
+def test_successful_attached_finalize_discards_streamed_stderr_artifact(
+    tmp_path: Path, monkeypatch
+) -> None:
+    manager = _manager(tmp_path)
+    lease = manager.register(lease_id="lease-1", container_name="container-1")
+    real_popen = subprocess.Popen
+    script = (
+        "import sys,time; "
+        "sys.stderr.buffer.write(b'benign startup log'); sys.stderr.buffer.flush(); "
+        "sys.stdout.buffer.write(b'R'); sys.stdout.buffer.flush(); time.sleep(60)"
+    )
+
+    def spawn(_argv, **kwargs):
+        return real_popen([sys.executable, "-c", script], **kwargs)
+
+    monkeypatch.setattr(process_mod.subprocess, "Popen", spawn)
+    client = manager.spawn_attached(
+        lease, (*lease.run_prefix(manager.docker_binary), "image@sha256:x")
+    )
+    readable, _, _ = select.select([client.stdout], [], [], 5.0)
+    assert readable and client.stdout.read(1) == b"R"
+    client.finalize()
+    assert not tuple(manager.diagnostics_root.iterdir())
+
+
+def test_stderr_receipt_publication_never_unlinks_a_preexisting_path(
+    tmp_path: Path,
+) -> None:
+    manager = _manager(tmp_path)
+    artifact_path = manager.diagnostics_root / (
+        "lease-1." + "c" * 32 + ".stderr"
+    )
+    receipt_path = artifact_path.with_name(artifact_path.name + ".json")
+    receipt_path.write_bytes(b"preexisting")
+    receipt_path.chmod(0o600)
+    empty = hashlib.sha256(b"").hexdigest()
+    receipt = OCIStderrArtifactReceipt(
+        process_mod.STDERR_ARTIFACT_SCHEMA,
+        manager.executor_id,
+        "lease-1",
+        artifact_path,
+        receipt_path,
+        empty,
+        empty,
+        0,
+        0,
+        False,
+        os.geteuid(),
+        os.getegid(),
+        0o600,
+    )
+    with pytest.raises(FileExistsError):
+        manager._publish_stderr_receipt(receipt)
+    assert receipt_path.read_bytes() == b"preexisting"
 
 
 def test_run_rejects_argv_without_exact_lease_prefix(tmp_path: Path) -> None:
@@ -306,13 +541,74 @@ def test_attached_spawn_uses_pipes_no_shell_and_new_process_group(
     assert created[0].kwargs == {
         "stdin": subprocess.PIPE,
         "stdout": subprocess.PIPE,
-        "stderr": subprocess.DEVNULL,
+        "stderr": subprocess.PIPE,
         "bufsize": 0,
         "close_fds": True,
         "start_new_session": True,
         "shell": False,
     }
     client.abort()
+
+
+def test_attached_stderr_is_continuously_drained_and_tail_bounded(
+    tmp_path: Path, monkeypatch
+) -> None:
+    manager = _manager(tmp_path)
+    lease = manager.register(lease_id="lease-1", container_name="container-1")
+    real_popen = subprocess.Popen
+    marker = b"TRACEBACK-TAIL"
+    script = (
+        "import sys,time; "
+        f"sys.stderr.buffer.write(b'A' * {ATTACHED_STDERR_MAX_BYTES * 4}); "
+        f"sys.stderr.buffer.write({marker!r}); sys.stderr.buffer.flush(); "
+        "sys.stdout.buffer.write(b'R'); sys.stdout.buffer.flush(); time.sleep(60)"
+    )
+
+    def spawn(_argv, **kwargs):
+        return real_popen([sys.executable, "-c", script], **kwargs)
+
+    monkeypatch.setattr(process_mod.subprocess, "Popen", spawn)
+    client = manager.spawn_attached(
+        lease, (*lease.run_prefix(manager.docker_binary), "image@sha256:x")
+    )
+    try:
+        readable, _, _ = select.select([client.stdout], [], [], 5.0)
+        assert readable, "stderr backpressure prevented the child readiness marker"
+        assert client.stdout.read(1) == b"R"
+        for _ in range(200):
+            diagnostic = client.stderr_diagnostic()
+            if diagnostic.stderr_tail.endswith(marker):
+                break
+            time.sleep(0.01)
+        else:
+            pytest.fail("bounded stderr drain did not preserve the emitted tail")
+        assert len(diagnostic.stderr_tail) == ATTACHED_STDERR_MAX_BYTES
+        assert diagnostic.stderr_truncated
+        assert diagnostic.stderr_tail.endswith(marker)
+        assert not diagnostic.capture_complete
+    finally:
+        client.abort()
+
+    final = client.stderr_diagnostic()
+    assert final.capture_complete
+    assert final.client_returncode is not None
+    assert final.stderr_tail == diagnostic.stderr_tail
+    assert final.stderr_sha256 == diagnostic.stderr_sha256
+
+
+def test_attached_diagnostic_rejects_overflow_and_renders_a_bounded_safe_excerpt() -> None:
+    with pytest.raises(OCIProcessError, match="diagnostic"):
+        OCIAttachedDiagnostic(
+            b"x" * (ATTACHED_STDERR_MAX_BYTES + 1), True, True
+        )
+
+    diagnostic = OCIAttachedDiagnostic(
+        b"\x1b\x00" * (ATTACHED_STDERR_MAX_BYTES // 2), True, True
+    )
+    rendered = diagnostic.summary
+    assert len(rendered.encode("utf-8")) <= 10 << 10
+    assert "\x1b" not in rendered and "\x00" not in rendered
+    assert "\\x1b" in rendered and "\\x00" in rendered
 
 
 def test_attached_abort_rechecks_container_after_client_death(
@@ -472,13 +768,18 @@ def test_timeout_force_removes_container_and_terminates_client(tmp_path: Path, m
     monkeypatch.setattr(process_mod.subprocess, "Popen", lambda *args, **kwargs: proc)
     monkeypatch.setattr(process_mod.os, "killpg", lambda *_args: (_ for _ in ()).throw(OSError()))
 
-    with pytest.raises(OCIProcessTimeout):
+    with pytest.raises(OCIProcessTimeout) as raised:
         manager.run(
             lease,
             (*lease.run_prefix(manager.docker_binary), "image@sha256:x"),
             timeout_s=0.1,
         )
     assert proc.terminated
+    assert raised.value.diagnostic is not None
+    assert raised.value.diagnostic.artifact is not None
+    assert manager.reopen_stderr_artifact(
+        raised.value.diagnostic.artifact
+    ) == raised.value.diagnostic.artifact.artifact_path
     assert any(row[1:3] == ("rm", "--force") for row in commands.rows)
 
 

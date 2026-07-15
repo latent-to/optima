@@ -48,6 +48,7 @@ from optima.eval.marginal_runtime import (
     prepare_marginal_runtime,
     run_marginal_lifecycle,
 )
+from optima.eval.native_compile_profile import NativeCuTeCompileProfile
 from optima.eval.oci_backend import (
     EngineExecutionEvidence,
     TrustedArenaModelMountReceipt,
@@ -201,6 +202,51 @@ def _native(tree_digest: str, preflight: RuntimePreflightReceipt) -> NativeBuild
         target_architecture="sm120",
         dependency_policy_digest=dependency,
     )
+
+
+def _profiled_candidate_binding(case: Case) -> MaterializedArmBinding:
+    hardware = case.launch.hardware
+    profile = NativeCuTeCompileProfile(
+        logical_architecture=hardware.architecture,
+        compiler_architecture="sm_120a",
+        image_digest=case.preflight.image_digest,
+        platform_digest=case.preflight.platform_digest,
+        worker_distribution_digest=case.preflight.worker_distribution_digest,
+        logical_hardware_digest=hardware.digest,
+        device_policy_digest=hardware.device_policy_digest,
+        topology_digest=hardware.topology_digest,
+        visible_gpu_count=hardware.visible_gpu_count,
+        tp_size=hardware.tp_size,
+        ep_size=hardware.ep_size,
+        dp_size=hardware.dp_size,
+        constants={"max_active_clusters.cluster_size_1": 1},
+        measurement_digest=_digest("trusted compile-profile measurement"),
+    )
+    legacy = case.candidate_binding.launch_binding.native_build_spec
+    native = NativeBuildSpec(
+        tree_digest=case.candidate_tree.tree_digest,
+        image_digest=legacy.image_digest,
+        platform_digest=legacy.platform_digest,
+        worker_distribution_digest=legacy.worker_distribution_digest,
+        toolchain_digest=legacy.toolchain_digest,
+        patcher_digest=legacy.patcher_digest,
+        compiler_flags_digest=native_compiler_policy_digest(
+            image_digest=legacy.image_digest,
+            worker_distribution_digest=legacy.worker_distribution_digest,
+            dependency_policy_digest=legacy.dependency_policy_digest,
+            target_architecture=legacy.target_architecture,
+            compile_profile_digest=profile.digest,
+        ),
+        target_architecture=legacy.target_architecture,
+        dependency_policy_digest=legacy.dependency_policy_digest,
+        compile_profile_digest=profile.digest,
+    )
+    trusted = replace(
+        case.candidate_binding.launch_binding,
+        native_build_spec=native,
+        native_compile_profile=profile,
+    )
+    return MaterializedArmBinding(case.candidate_tree, trusted)
 
 
 def _local_binding(
@@ -851,6 +897,7 @@ def test_prepare_rejects_swaps_environment_context_and_workload(tmp_path: Path) 
             candidate_binding=other.candidate_binding,
             baseline_session_plan=case.session,
         )
+
     wrong_native = replace(
         case.candidate_binding.launch_binding.native_build_spec,
         dependency_policy_digest=_digest("other dependency"),
@@ -911,6 +958,30 @@ def test_prepare_rejects_swaps_environment_context_and_workload(tmp_path: Path) 
                 ),
             )
         )
+
+
+def test_prepare_allows_profiled_aot_candidate_on_legacy_baseline(
+    tmp_path: Path,
+) -> None:
+    case = _case(tmp_path)
+    profiled = _profiled_candidate_binding(case)
+
+    prepared = prepare_marginal_runtime(
+        case.arm,
+        catalog=case.catalog,
+        expected_context=case.context,
+        incumbent_launch=case.launch,
+        incumbent_binding=case.baseline_binding,
+        candidate_binding=profiled,
+        baseline_session_plan=case.session,
+    )
+
+    candidate = prepared.candidates[0]
+    assert candidate.binding == profiled
+    assert candidate.launch.native_build_spec_digest == (
+        profiled.launch_binding.native_build_spec.digest
+    )
+    assert profiled.launch_binding.native_compile_profile is not None
 
 
 def test_forged_empty_tree_claiming_candidate_stack_rejects_before_executor(

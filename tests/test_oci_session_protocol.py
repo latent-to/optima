@@ -737,6 +737,20 @@ def test_error_frame_is_bounded_and_exactly_bound_without_authority() -> None:
             request=request,
         )
 
+    class HostileError(RuntimeError):
+        def __str__(self) -> str:
+            raise AssertionError("candidate exception rendering executed")
+
+    hostile = error_message(
+        session_id=SESSION,
+        launch_digest=LAUNCH,
+        stage="batch-0",
+        error=HostileError(object()),
+        request=request,
+    )
+    assert hostile["error_type"] == "HostileError"
+    assert hostile["message"] == "<non-primitive exception detail omitted>"
+
 
 def test_protocol_module_has_no_evaluator_runtime_quality_or_chain_import() -> None:
     path = Path(protocol.__file__)

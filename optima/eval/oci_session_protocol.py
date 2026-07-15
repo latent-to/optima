@@ -942,11 +942,22 @@ def error_message(
         request.session_id != session_id or request.launch_digest != launch_digest
     ):
         raise SessionProtocolError("worker error request binding mismatch")
+    first_arg = error.args[0] if error.args else None
+    if not error.args:
+        bounded_message = ""
+    elif type(first_arg) is str:
+        bounded_message = first_arg[:MAX_ERROR_CHARS]
+    elif type(first_arg) in {int, float, bool, type(None)}:
+        bounded_message = str(first_arg)[:MAX_ERROR_CHARS]
+    else:
+        # Candidate-defined exception rendering is executable code and can return
+        # an unbounded value. Preserve the type/stage binding without invoking it.
+        bounded_message = "<non-primitive exception detail omitted>"
     return {
         "batch_index": None if request is None else request.batch_index,
         "error_type": type(error).__name__[:128],
         "launch_digest": _digest(launch_digest, field_name="launch_digest"),
-        "message": str(error)[:MAX_ERROR_CHARS],
+        "message": bounded_message,
         "nonce": None if request is None else request.nonce,
         "request_id": None if request is None else request.request_id,
         "schema": SESSION_SCHEMA,

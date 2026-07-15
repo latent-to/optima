@@ -43,6 +43,9 @@ _BANNED_IMPORT_ROOTS = frozenset(
         "socket", "ssl", "asyncio", "selectors",
         "subprocess", "multiprocessing", "concurrent",
         "ctypes", "cffi", "_ctypes",
+        # ``import builtins`` reaches ``builtins.compile``/``builtins.eval`` as
+        # plain attribute loads — the alias path around the bare-builtin ban.
+        "builtins",
         "requests", "urllib", "urllib2", "urllib3", "http", "httplib",
         "ftplib", "smtplib", "telnetlib", "poplib", "imaplib", "xmlrpc",
         "pickle", "dill", "marshal", "shelve", "cloudpickle",

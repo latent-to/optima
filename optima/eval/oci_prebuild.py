@@ -21,6 +21,22 @@ import stat
 from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
 
+from optima.artifact_provider import (
+    ARTIFACT_PROVIDERS,
+    ArtifactKind,
+    ArtifactProviderDescriptor,
+    ArtifactProviderPolicyError,
+)
+from optima.cute_aot import (
+    CUTE_COMPILE_PROFILE_DIGEST_ENV,
+    CUTE_COMPILE_PROFILE_ENV,
+    CuteAOTError,
+    load_compile_profile,
+)
+from optima.cute_cubin import (
+    CuteCubinError,
+    reopen_cute_cubin_index,
+)
 from optima.eval.engine_launch import (
     EngineLaunchSpec,
     ResolvedEngineLaunch,
@@ -34,6 +50,7 @@ from optima.eval.native_artifact import (
     publish_native_artifact,
     reopen_native_artifact,
 )
+from optima.eval.oci_cpuset import validate_cpuset_pair
 from optima.eval.oci_process import OCILease, OCIProcessManager
 from optima.eval.runtime_preflight import RuntimePreflightReceipt
 from optima.stack_identity import canonical_digest, canonical_json_bytes, require_sha256_hex
@@ -41,6 +58,7 @@ from optima.stack_identity import canonical_digest, canonical_json_bytes, requir
 
 CONTAINER_TREE = "/optima/engine-tree"
 CONTAINER_STAGE = "/optima/native-stage"
+CONTAINER_CUTE_COMPILE_PROFILE = "/optima/cute-compile-profile.json"
 PREBUILD_RECEIPT = "prebuild.json"
 PREBUILD_SCHEMA = "optima.oci-native-prebuild.v1"
 _PUBLICATION_MANIFEST = ".optima-native-artifact.json"
@@ -48,15 +66,120 @@ _SAFE_ID = re.compile(r"[a-z0-9][a-z0-9_.-]{0,127}\Z")
 _ARCH = re.compile(r"sm[0-9]{2,3}[a-z]?\Z")
 _IMAGE_ID = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _SIZE = re.compile(r"[1-9][0-9]{0,15}\Z")
-_ALLOWED_STAGE_TOP_LEVEL = frozenset(
-    {"cuda", "dep_modules", "dep_overlays", PREBUILD_RECEIPT}
+_ARTIFACT_PUBLICATION_DIRECTORIES = frozenset(
+    descriptor.publication_directory
+    for descriptor in ARTIFACT_PROVIDERS.descriptors()
 )
+_ALLOWED_STAGE_TOP_LEVEL = frozenset(
+    {
+        "cuda",
+        "dep_modules",
+        "dep_overlays",
+        PREBUILD_RECEIPT,
+    }
+) | _ARTIFACT_PUBLICATION_DIRECTORIES
 _DISCOVERY_ENGINE_METADATA = "metadata/optima_discovery.json"
 _DISCOVERY_RECEIPT_FIELD = "discovery_overlay_identity_digest"
+_CUTE_AOT_RECEIPT_FIELD = "cute_aot_compile_profile_digest"
 
 
 class OCIPrebuildError(RuntimeError):
     """Trusted prebuild configuration, execution, or evidence is invalid."""
+
+
+def _artifact_provider_descriptors(
+    manifest: object, rebuild_plan: object
+) -> tuple[ArtifactProviderDescriptor, ...]:
+    """Resolve manifest provider IDs to the closed prebuild policy table.
+
+    This function deliberately returns descriptors, not compiler/loader callbacks.
+    The reviewed rebuild plan remains the only authority that can execute a build.
+    """
+
+    ops = getattr(manifest, "ops", None)
+    if not isinstance(ops, tuple):
+        raise OCIPrebuildError("artifact provider resolution requires a typed manifest")
+    provider_ids = tuple(
+        sorted(
+            {
+                export.provider
+                for op in ops
+                for export in getattr(op, "aot_exports", ())
+            }
+        )
+    )
+    try:
+        descriptors = tuple(
+            ARTIFACT_PROVIDERS.require(provider_id)
+            for provider_id in provider_ids
+        )
+    except ArtifactProviderPolicyError as exc:
+        raise OCIPrebuildError(
+            f"engine tree selected an unregistered artifact provider: {exc}"
+        ) from None
+    steps = () if rebuild_plan is None else getattr(rebuild_plan, "steps", None)
+    if not isinstance(steps, tuple):
+        raise OCIPrebuildError("artifact provider resolution requires a typed rebuild plan")
+    patcher_ids = {getattr(step, "patcher_id", None) for step in steps}
+    missing_provider_patchers = tuple(
+        descriptor.build_patcher_id
+        for descriptor in descriptors
+        if descriptor.build_patcher_id not in patcher_ids
+    )
+    if missing_provider_patchers:
+        raise OCIPrebuildError(
+            "artifact providers lack their reviewed build patchers "
+            f"{missing_provider_patchers!r}"
+        )
+    return descriptors
+
+
+def _compile_profile_provider(
+    descriptors: tuple[ArtifactProviderDescriptor, ...],
+) -> ArtifactProviderDescriptor | None:
+    selected = tuple(
+        descriptor
+        for descriptor in descriptors
+        if descriptor.requires_compile_profile
+    )
+    if not selected:
+        return None
+    provider_ids = {descriptor.provider_id for descriptor in selected}
+    if len(provider_ids) != 1:
+        raise OCIPrebuildError(
+            "one engine tree cannot mix artifact compile-profile providers"
+        )
+    return selected[0]
+
+
+def _reopen_provider_publication(
+    descriptor: ArtifactProviderDescriptor,
+    root: Path,
+    *,
+    build_spec_digest: str,
+    tree_digest: str,
+    logical_architecture: str,
+    compile_profile_digest: str,
+    verify_distributions: bool,
+):
+    common = {
+        "expected_build_spec_digest": build_spec_digest,
+        "expected_tree_digest": tree_digest,
+        "expected_logical_architecture": logical_architecture,
+        "expected_compile_profile_digest": compile_profile_digest,
+        "verify_distributions": verify_distributions,
+    }
+    if descriptor.artifact_kind is ArtifactKind.CUDA_CUBIN:
+        try:
+            return reopen_cute_cubin_index(root, **common)
+        except CuteCubinError as exc:
+            raise OCIPrebuildError(
+                f"CuTe CUBIN publication cannot reopen: {exc}"
+            ) from None
+    raise OCIPrebuildError(
+        "registered artifact kind has no sealed prebuild validator: "
+        f"{descriptor.artifact_kind.value!r}"
+    )
 
 
 def _digest(value: object, *, field: str) -> str:
@@ -102,6 +225,8 @@ class OCIPrebuildPolicy:
     build_tmpdir: str
     pinned_build_roots: tuple[str, ...]
     runtime_policy_digest: str
+    cpuset_cpus: str | None = None
+    cpuset_mems: str | None = None
 
     def __post_init__(self) -> None:
         for field in ("uid", "gid"):
@@ -160,9 +285,19 @@ class OCIPrebuildPolicy:
             "runtime_policy_digest",
             _digest(self.runtime_policy_digest, field="runtime_policy_digest"),
         )
+        try:
+            cpus, mems = validate_cpuset_pair(
+                self.cpuset_cpus,
+                self.cpuset_mems,
+                cpu_millis=self.cpu_millis,
+            )
+        except ValueError as exc:
+            raise OCIPrebuildError(str(exc)) from None
+        object.__setattr__(self, "cpuset_cpus", cpus)
+        object.__setattr__(self, "cpuset_mems", mems)
 
     def resource_payload(self) -> dict[str, object]:
-        return {
+        payload: dict[str, object] = {
             "cpu_millis": self.cpu_millis,
             "container_python": self.container_python,
             "gid": self.gid,
@@ -175,6 +310,10 @@ class OCIPrebuildPolicy:
             "tmpfs_bytes": self.tmpfs_bytes,
             "uid": self.uid,
         }
+        if self.cpuset_cpus is not None:
+            payload["cpuset_cpus"] = self.cpuset_cpus
+            payload["cpuset_mems"] = self.cpuset_mems
+        return payload
 
     @property
     def resource_policy_digest(self) -> str:
@@ -299,6 +438,49 @@ def _copy_seccomp(source: Path, destination: Path, *, expected_digest: str) -> N
         raise OCIPrebuildError("lease seccomp copy failed its digest check")
 
 
+def _write_compile_profile(profile: object, destination: Path) -> None:
+    """Write one already validated profile into the private lease staging area."""
+
+    from optima.eval.native_compile_profile import NativeCuTeCompileProfile
+
+    if type(profile) is not NativeCuTeCompileProfile:
+        raise OCIPrebuildError("lease compile profile has the wrong type")
+    raw = profile.canonical_bytes
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(destination, flags, 0o444)
+    except OSError as exc:
+        raise OCIPrebuildError(f"cannot create lease compile profile: {exc}") from None
+    try:
+        view = memoryview(raw)
+        while view:
+            written = os.write(fd, view)
+            if written <= 0:
+                raise OCIPrebuildError("lease compile profile write stalled")
+            view = view[written:]
+        # Creation mode is filtered through the controller's umask.  The worker
+        # runs as an unprivileged UID, so override that mask explicitly before
+        # bind-mounting this validator-owned data file read-only.
+        os.fchmod(fd, 0o444)
+        os.fsync(fd)
+    except OSError as exc:
+        raise OCIPrebuildError(f"cannot seal lease compile profile: {exc}") from None
+    finally:
+        os.close(fd)
+    try:
+        observed = destination.read_bytes()
+    except OSError as exc:
+        raise OCIPrebuildError(f"cannot reopen lease compile profile: {exc}") from None
+    if observed != raw:
+        raise OCIPrebuildError("lease compile profile changed while staging")
+    try:
+        reopened = load_compile_profile(destination, expected_digest=profile.digest)
+    except CuteAOTError as exc:
+        raise OCIPrebuildError(f"lease compile profile cannot reopen: {exc}") from None
+    if reopened != profile:
+        raise OCIPrebuildError("lease compile profile round trip changed its value")
+
+
 def _validate_binding(
     launch: EngineLaunchSpec,
     binding: TrustedLaunchBinding,
@@ -407,6 +589,7 @@ def build_prebuild_argv(
     config: OCIPrebuildConfig,
     stage_path: Path,
     seccomp_path: Path,
+    compile_profile_path: Path | None = None,
 ) -> tuple[str, ...]:
     """Construct the closed, candidate-independent Docker argv."""
     policy = config.policy
@@ -429,6 +612,15 @@ def build_prebuild_argv(
         "PYTHONHASHSEED": "0",
         "TMPDIR": "/tmp",
     }
+    compile_profile = resolved.native_compile_profile
+    if (compile_profile is None) != (compile_profile_path is None):
+        raise OCIPrebuildError("prebuild compile profile mount does not match launch authority")
+    if compile_profile is not None:
+        assert compile_profile_path is not None
+        if not compile_profile_path.is_absolute():
+            raise OCIPrebuildError("prebuild compile profile host path must be absolute")
+        env[CUTE_COMPILE_PROFILE_ENV] = CONTAINER_CUTE_COMPILE_PROFILE
+        env[CUTE_COMPILE_PROFILE_DIGEST_ENV] = compile_profile.digest
     argv = [
         *lease.run_prefix(config.docker_binary),
         "--rm",
@@ -443,6 +635,14 @@ def build_prebuild_argv(
         f"--security-opt=seccomp={seccomp_path}",
         f"--user={policy.uid}:{policy.gid}",
         f"--cpus={policy.cpu_millis / 1000:g}",
+        *(
+            (
+                f"--cpuset-cpus={policy.cpuset_cpus}",
+                f"--cpuset-mems={policy.cpuset_mems}",
+            )
+            if policy.cpuset_cpus is not None
+            else ()
+        ),
         f"--memory={policy.memory_bytes}",
         f"--memory-swap={policy.memory_bytes}",
         f"--pids-limit={policy.pids_limit}",
@@ -454,6 +654,11 @@ def build_prebuild_argv(
         f"--mount=type=bind,src={resolved.materialized_tree_root},dst={CONTAINER_TREE},readonly,bind-propagation=rprivate",
         f"--mount=type=bind,src={stage_path},dst={CONTAINER_STAGE},bind-propagation=rprivate",
     ]
+    if compile_profile_path is not None:
+        argv.append(
+            f"--mount=type=bind,src={compile_profile_path},"
+            f"dst={CONTAINER_CUTE_COMPILE_PROFILE},readonly,bind-propagation=rprivate"
+        )
     argv.extend(f"--env={key}={env[key]}" for key in sorted(env))
     argv.extend(
         (
@@ -512,6 +717,10 @@ def _read_prebuild_receipt(
         row = json.loads(raw.decode("utf-8"))
     except (OSError, UnicodeError, ValueError) as exc:
         raise OCIPrebuildError(f"native prebuild receipt is unreadable: {exc}") from None
+    observed = {child.name for child in root.iterdir()}
+    observed.discard(_PUBLICATION_MANIFEST)
+    artifact_entries = observed & _ARTIFACT_PUBLICATION_DIRECTORIES
+    has_artifact_publication = bool(artifact_entries)
     keys = {
         "schema",
         "build_spec_digest",
@@ -523,6 +732,8 @@ def _read_prebuild_receipt(
     discovery = _discovery_binding(resolved)
     if discovery is not None:
         keys.add(_DISCOVERY_RECEIPT_FIELD)
+    if has_artifact_publication:
+        keys.add(_CUTE_AOT_RECEIPT_FIELD)
     if not isinstance(row, dict) or set(row) != keys or row.get("schema") != PREBUILD_SCHEMA:
         raise OCIPrebuildError("native prebuild receipt schema mismatch")
     if raw != canonical_json_bytes(row) + b"\n":
@@ -540,8 +751,6 @@ def _read_prebuild_receipt(
         raise OCIPrebuildError("native prebuild receipt stage inventory is invalid")
     if any(not isinstance(value, str) or value not in _ALLOWED_STAGE_TOP_LEVEL for value in entries):
         raise OCIPrebuildError("native prebuild receipt contains an unexpected stage entry")
-    observed = {child.name for child in root.iterdir()}
-    observed.discard(_PUBLICATION_MANIFEST)
     if observed != set(entries):
         raise OCIPrebuildError("native prebuild stage differs from its receipt")
     if type(row.get("rebuild_applied")) is not bool:
@@ -551,6 +760,48 @@ def _read_prebuild_receipt(
             row.get(_DISCOVERY_RECEIPT_FIELD),
             field="discovery overlay identity digest",
         )
+    compile_profile = resolved.native_compile_profile
+    if (compile_profile is None) == has_artifact_publication:
+        raise OCIPrebuildError(
+            "artifact publication does not match launch compile-profile authority"
+        )
+    if compile_profile is not None:
+        receipt_profile_digest = _digest(
+            row.get(_CUTE_AOT_RECEIPT_FIELD),
+            field="CuTe AOT receipt compile profile digest",
+        )
+        if receipt_profile_digest != compile_profile.digest:
+            raise OCIPrebuildError("CuTe AOT receipt compile profile digest mismatch")
+        try:
+            descriptor = ARTIFACT_PROVIDERS.require(compile_profile.provider)
+        except ArtifactProviderPolicyError as exc:
+            raise OCIPrebuildError(str(exc)) from None
+        if artifact_entries != {descriptor.publication_directory}:
+            raise OCIPrebuildError(
+                "artifact publication directory differs from compile-profile provider"
+            )
+        index = _reopen_provider_publication(
+            descriptor,
+            root,
+            build_spec_digest=resolved.native_build_spec.digest,
+            tree_digest=resolved.spec.tree_digest,
+            logical_architecture=resolved.native_build_spec.target_architecture,
+            compile_profile_digest=compile_profile.digest,
+            verify_distributions=False,
+        )
+        if index.compile_profile_digest != receipt_profile_digest:
+            raise OCIPrebuildError("CuTe AOT index differs from prebuild receipt")
+        if index.compiler_architecture != compile_profile.compiler_architecture:
+            raise OCIPrebuildError("CuTe AOT compiler architecture differs from profile")
+        for export in index.exports:
+            expected_profile = {
+                key: compile_profile.require_int(key)
+                for key in export.profile_inputs
+            }
+            if dict(export.resolved_profile) != expected_profile:
+                raise OCIPrebuildError(
+                    "CuTe AOT export values differ from validator compile profile"
+                )
     return row, discovery
 
 
@@ -673,11 +924,24 @@ def run_oci_prebuild(
         lease_id=lease_id,
         container_name="optima-" + lease_id,
         mount_relpaths=("native-stage",),
-        stage_relpaths=("seccomp.json", "publication-work"),
+        stage_relpaths=(
+            "seccomp.json",
+            "publication-work",
+            *(
+                ("cute-compile-profile.json",)
+                if resolved.native_compile_profile is not None
+                else ()
+            ),
+        ),
     )
     stage_path = lease.mount_paths[0]
     seccomp_copy = lease.stage_paths[0]
     publication_work = lease.stage_paths[1]
+    compile_profile_copy = (
+        lease.stage_paths[2]
+        if resolved.native_compile_profile is not None
+        else None
+    )
     try:
         _remaining_deadline(manager, deadline, stage="seccomp staging")
         _copy_seccomp(
@@ -685,6 +949,13 @@ def run_oci_prebuild(
             seccomp_copy,
             expected_digest=launch.seccomp_policy_digest,
         )
+        if resolved.native_compile_profile is not None:
+            assert compile_profile_copy is not None
+            _remaining_deadline(manager, deadline, stage="compile-profile staging")
+            _write_compile_profile(
+                resolved.native_compile_profile,
+                compile_profile_copy,
+            )
         _remaining_deadline(manager, deadline, stage="native-stage mount")
         manager.mount_tmpfs(
             lease,
@@ -706,6 +977,7 @@ def run_oci_prebuild(
             config=config,
             stage_path=stage_path,
             seccomp_path=seccomp_copy,
+            compile_profile_path=compile_profile_copy,
         )
         remaining = _remaining_deadline(
             manager, deadline, stage="native prebuild container"
@@ -718,8 +990,10 @@ def run_oci_prebuild(
         )
         _remaining_deadline(manager, deadline, stage="container completion")
         if execution.returncode != 0:
+            diagnostic = execution.stderr_diagnostic
+            detail = "" if diagnostic is None else f"; {diagnostic.summary}"
             raise OCIPrebuildError(
-                f"native prebuild container exited {execution.returncode}"
+                f"native prebuild container exited {execution.returncode}{detail}"
             )
         reopen_launch_tree(launch, resolved.materialized_tree_root)
         stage_receipt, stage_discovery = _read_prebuild_receipt(
@@ -858,6 +1132,14 @@ def container_build() -> Path:
     compile_timeout = _container_value(
         "OPTIMA_NATIVE_COMPILE_TIMEOUT_S", pattern=_SIZE
     )
+    compile_profile_raw = os.environ.get(CUTE_COMPILE_PROFILE_ENV, "").strip()
+    compile_profile_digest_raw = os.environ.get(
+        CUTE_COMPILE_PROFILE_DIGEST_ENV, ""
+    ).strip()
+    if bool(compile_profile_raw) != bool(compile_profile_digest_raw):
+        raise OCIPrebuildError("container CuTe compile-profile binding is incomplete")
+    if compile_profile_raw and compile_profile_raw != CONTAINER_CUTE_COMPILE_PROFILE:
+        raise OCIPrebuildError("container CuTe compile-profile path differs from policy")
     if os.environ.get("OPTIMA_REBUILD_CONTAINER") != "1":
         raise OCIPrebuildError("container build is not armed")
     if stage_raw != CONTAINER_STAGE:
@@ -895,6 +1177,9 @@ def container_build() -> Path:
         "PYTHONHASHSEED": "0",
         "TMPDIR": "/tmp",
     }
+    if compile_profile_raw:
+        preserved[CUTE_COMPILE_PROFILE_ENV] = compile_profile_raw
+        preserved[CUTE_COMPILE_PROFILE_DIGEST_ENV] = compile_profile_digest_raw
     os.environ.clear()
     os.environ.update(preserved)
     from optima.engine_tree import reopen_materialized_engine_tree
@@ -927,17 +1212,58 @@ def container_build() -> Path:
         raise OCIPrebuildError("container native stage is not empty")
 
     from optima.manifest import all_declared_cuda_sources, load_manifest
-    from optima.rebuild import apply_rebuild_plan
+    from optima.rebuild import apply_rebuild_plan, parse_rebuild_plan
 
+    manifest = None
     requires_rebuild = False
+    artifact_descriptors = ()
     if reopened.runtime_manifest is not None:
         manifest = load_manifest(CONTAINER_TREE)
+        plan = parse_rebuild_plan(CONTAINER_TREE)
+        artifact_descriptors = _artifact_provider_descriptors(manifest, plan)
         requires_rebuild = bool(
-            manifest.dep_patches or all_declared_cuda_sources(CONTAINER_TREE, manifest)
+            manifest.dep_patches
+            or all_declared_cuda_sources(CONTAINER_TREE, manifest)
+            or artifact_descriptors
         )
+    compile_profile_provider = _compile_profile_provider(artifact_descriptors)
+    requires_compile_profile = compile_profile_provider is not None
+    if requires_compile_profile != bool(compile_profile_raw):
+        raise OCIPrebuildError(
+            "artifact provider declaration does not match launch compile-profile authority"
+        )
+    compile_profile = None
+    if requires_compile_profile:
+        try:
+            compile_profile = load_compile_profile(
+                compile_profile_raw,
+                expected_digest=compile_profile_digest_raw,
+            )
+        except CuteAOTError as exc:
+            raise OCIPrebuildError(f"container CuTe compile profile is invalid: {exc}") from None
+        if compile_profile.logical_architecture != architecture:
+            raise OCIPrebuildError(
+                "container CuTe compile profile differs from target architecture"
+            )
+        assert compile_profile_provider is not None
+        if compile_profile.provider != compile_profile_provider.provider_id:
+            raise OCIPrebuildError(
+                "container CuTe compile profile names a different artifact provider"
+            )
     rebuilt = apply_rebuild_plan(CONTAINER_TREE, phase="build")
     if requires_rebuild and not rebuilt:
         raise OCIPrebuildError("declared native inputs lack a reviewed rebuild plan")
+    for descriptor in artifact_descriptors:
+        assert compile_profile is not None
+        _reopen_provider_publication(
+            descriptor,
+            stage,
+            build_spec_digest=build_digest,
+            tree_digest=tree_digest,
+            logical_architecture=architecture,
+            compile_profile_digest=compile_profile.digest,
+            verify_distributions=True,
+        )
     discovery_overlay_identity_digest = None
     if resolved_discovery is not None:
         from optima.discovery import DiscoveryError, build_discovery_overlay_stage
@@ -972,6 +1298,8 @@ def container_build() -> Path:
     }
     if discovery_overlay_identity_digest is not None:
         receipt[_DISCOVERY_RECEIPT_FIELD] = discovery_overlay_identity_digest
+    if compile_profile is not None:
+        receipt[_CUTE_AOT_RECEIPT_FIELD] = compile_profile.digest
     destination = stage / PREBUILD_RECEIPT
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
     fd = os.open(destination, flags, 0o444)
@@ -1004,6 +1332,7 @@ if __name__ == "__main__":
 
 
 __all__ = [
+    "CONTAINER_CUTE_COMPILE_PROFILE",
     "CONTAINER_STAGE",
     "CONTAINER_TREE",
     "OCIPrebuildConfig",

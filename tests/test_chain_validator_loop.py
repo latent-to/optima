@@ -214,7 +214,7 @@ def test_live_loop_calls_batch_qualification_and_retains_fail_outcome(
         ),
     )
 
-    def plan(_self, candidates, _receipts):
+    def plan(_self, candidates, _receipts, state=None):
         reservations = tuple(row.reservation for row in candidates)
         authority = QualificationAuthorityManifest(
             "registered", "a" * 64, "b" * 64, "c" * 64, "d" * 64,
@@ -288,3 +288,47 @@ def test_once_mode_propagates_validator_fault(monkeypatch, tmp_path):
             publication_root=tmp_path / "worker",
             once=True,
         )
+
+
+def test_settlement_refreshes_stale_pass_height_before_leasing():
+    class Store:
+        lease_blocks = []
+
+        def has_pending_settlement(self):
+            return True
+
+        def lease_settlement_cohort(self, *, current_block):
+            self.lease_blocks.append(current_block)
+            return None
+
+    store = Store()
+    assert loop._settle_pending(
+        store,
+        current_block=BLOCK,
+        finalized_block_provider=lambda: BLOCK + 100,
+    ) == {}
+    assert store.lease_blocks == [BLOCK + 100]
+
+
+def test_settlement_head_refresh_failure_cannot_create_a_lease():
+    class Store:
+        lease_calls = 0
+
+        def has_pending_settlement(self):
+            return True
+
+        def lease_settlement_cohort(self, *, current_block):
+            self.lease_calls += 1
+            return None
+
+    def unavailable_head():
+        raise RuntimeError("finalized head unavailable")
+
+    store = Store()
+    with pytest.raises(RuntimeError, match="finalized head unavailable"):
+        loop._settle_pending(
+            store,
+            current_block=BLOCK,
+            finalized_block_provider=unavailable_head,
+        )
+    assert store.lease_calls == 0

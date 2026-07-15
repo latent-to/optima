@@ -22,6 +22,7 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Callable, Iterator, Protocol
 
+from optima.cute_aot import CUTE_COMPILE_PROFILE_DIGEST_ENV
 from optima.eval.device_state import (
     CommandRunner as DeviceCommandRunner,
     DeviceStateActiveReceipt,
@@ -44,8 +45,10 @@ from optima.eval.native_artifact import (
     NativeArtifactPublication,
     reopen_native_artifact,
 )
+from optima.eval.oci_cpuset import validate_cpuset_pair
 from optima.eval.oci_outer_session import (
     AttachedSessionTransport,
+    OuterSessionError,
     SessionExecutionEvidence,
     SessionExecutionPlan,
     run_outer_session,
@@ -56,7 +59,12 @@ from optima.eval.oci_prebuild import (
     PREBUILD_RECEIPT,
     run_oci_prebuild,
 )
-from optima.eval.oci_process import OCILease, OCIProcessManager, OCIQuiescenceReceipt
+from optima.eval.oci_process import (
+    OCIAttachedDiagnostic,
+    OCILease,
+    OCIProcessManager,
+    OCIQuiescenceReceipt,
+)
 from optima.eval.oci_reference_session import (
     AttachedReferenceTransport,
     ReferenceSessionEvidence,
@@ -88,6 +96,24 @@ _OPAQUE_ID = re.compile(r"runtime-[0-9a-f]{32}\Z")
 
 class OCIBackendError(RuntimeError):
     """A trusted identity, resource, launch, or cleanup fact is invalid."""
+
+
+class OCIBackendRuntimeError(OCIBackendError):
+    """Runtime cleanup failure with a typed, bounded host diagnostic receipt."""
+
+    def __init__(
+        self, message: str, diagnostic: OCIAttachedDiagnostic | None = None
+    ) -> None:
+        super().__init__(message)
+        self._message = message
+        self.diagnostic = (
+            diagnostic if type(diagnostic) is OCIAttachedDiagnostic else None
+        )
+
+    def __str__(self) -> str:
+        if self.diagnostic is None:
+            return self._message
+        return f"{self._message}; {self.diagnostic.summary}"
 
 
 def _reference_publication_is_control_only(
@@ -344,6 +370,8 @@ class OCIRuntimeResourcePolicy:
     init_timeout_seconds: float
     batch_timeout_seconds: float
     container_python: str
+    cpuset_cpus: str | None = None
+    cpuset_mems: str | None = None
 
     def __post_init__(self) -> None:
         bounds = {
@@ -375,31 +403,45 @@ class OCIRuntimeResourcePolicy:
             "container_python",
             _absolute_path(self.container_python, field="container_python"),
         )
+        try:
+            cpus, mems = validate_cpuset_pair(
+                self.cpuset_cpus,
+                self.cpuset_mems,
+                cpu_millis=self.cpu_millis,
+            )
+        except ValueError as exc:
+            raise OCIBackendError(f"runtime resource {exc}") from None
+        object.__setattr__(self, "cpuset_cpus", cpus)
+        object.__setattr__(self, "cpuset_mems", mems)
 
     @property
     def digest(self) -> str:
-        return canonical_digest(
-            "optima.eval.oci-runtime-resource-policy",
-            {
-                "batch_timeout_milliseconds": int(
-                    round(float(self.batch_timeout_seconds) * 1000)
-                ),
-                "cache_bytes": self.cache_bytes,
-                "cache_inodes": self.cache_inodes,
-                "container_python": self.container_python,
-                "cpu_millis": self.cpu_millis,
-                "gid": self.gid,
-                "init_timeout_milliseconds": int(
-                    round(float(self.init_timeout_seconds) * 1000)
-                ),
-                "memory_bytes": self.memory_bytes,
-                "nofile_limit": self.nofile_limit,
-                "pids_limit": self.pids_limit,
-                "shm_bytes": self.shm_bytes,
-                "tmpfs_bytes": self.tmpfs_bytes,
-                "uid": self.uid,
-            },
-        )
+        payload: dict[str, object] = {
+            "batch_timeout_milliseconds": int(
+                round(float(self.batch_timeout_seconds) * 1000)
+            ),
+            "cache_bytes": self.cache_bytes,
+            "cache_inodes": self.cache_inodes,
+            "container_python": self.container_python,
+            "cpu_millis": self.cpu_millis,
+            "gid": self.gid,
+            "init_timeout_milliseconds": int(
+                round(float(self.init_timeout_seconds) * 1000)
+            ),
+            "memory_bytes": self.memory_bytes,
+            "nofile_limit": self.nofile_limit,
+            "pids_limit": self.pids_limit,
+            "shm_bytes": self.shm_bytes,
+            "tmpfs_bytes": self.tmpfs_bytes,
+            "uid": self.uid,
+        }
+        # Preserve the historical no-affinity policy identity byte-for-byte.
+        # Cpuset placement is an optional authority extension, not an identity
+        # epoch for every existing runtime policy.
+        if self.cpuset_cpus is not None:
+            payload["cpuset_cpus"] = self.cpuset_cpus
+            payload["cpuset_mems"] = self.cpuset_mems
+        return canonical_digest("optima.eval.oci-runtime-resource-policy", payload)
 
 
 @dataclass(frozen=True)
@@ -556,6 +598,10 @@ def build_runtime_argv(
         "TRITON_CACHE_DIR": f"{CONTAINER_CACHE}/triton",
         "XDG_CACHE_HOME": f"{CONTAINER_CACHE}/xdg",
     }
+    if resolved.native_compile_profile is not None:
+        environment[CUTE_COMPILE_PROFILE_DIGEST_ENV] = (
+            resolved.native_compile_profile.digest
+        )
     discovery_rows = tuple(
         row
         for row in publication.files
@@ -606,6 +652,14 @@ def build_runtime_argv(
         f"--security-opt=seccomp={seccomp_path}",
         f"--user={runtime.uid}:{runtime.gid}",
         f"--cpus={runtime.cpu_millis / 1000:g}",
+        *(
+            (
+                f"--cpuset-cpus={runtime.cpuset_cpus}",
+                f"--cpuset-mems={runtime.cpuset_mems}",
+            )
+            if runtime.cpuset_cpus is not None
+            else ()
+        ),
         f"--memory={runtime.memory_bytes}",
         f"--memory-swap={runtime.memory_bytes}",
         f"--pids-limit={runtime.pids_limit}",
@@ -827,6 +881,7 @@ class OCIEngineExecutor:
         )
         self.session_runner = session_runner
         self.reference_session_runner = reference_session_runner
+        # One executor owns one manager, so its transaction lock serializes every lifecycle.
         self._lock = self.manager.transaction_lock
         self._recovered: tuple[str, ...] | None = None
 
@@ -1159,11 +1214,23 @@ class OCIEngineExecutor:
                 )
             except BaseException as exc:
                 cleanup_failures.append(exc)
+        diagnostic: OCIAttachedDiagnostic | None = None
+        if transport is not None:
+            try:
+                observed = transport.stderr_diagnostic()
+            except BaseException:
+                pass
+            else:
+                if type(observed) is OCIAttachedDiagnostic:
+                    diagnostic = observed
+        if isinstance(primary, OuterSessionError) and diagnostic is not None:
+            primary.attach_diagnostic(lambda diagnostic=diagnostic: diagnostic)
         if cleanup_failures:
             cause = primary or cleanup_failures[0]
-            raise OCIBackendError(
+            raise OCIBackendRuntimeError(
                 "runtime cleanup or mandatory post-drain could not be proven: "
-                + "; ".join(str(item)[:256] for item in cleanup_failures)
+                + "; ".join(str(item)[:256] for item in cleanup_failures),
+                diagnostic,
             ) from cause
         if primary is not None:
             raise primary
@@ -1431,6 +1498,7 @@ __all__ = [
     "OCIBackendConfig",
     "OCIBackendDeadlineError",
     "OCIBackendError",
+    "OCIBackendRuntimeError",
     "OCIEngineExecutor",
     "OCIRuntimeResourcePolicy",
     "PristineReferenceExecutionEvidence",

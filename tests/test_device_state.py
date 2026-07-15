@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+import subprocess
 
 import pytest
 
@@ -374,6 +375,92 @@ def test_absolute_deadline_is_forwarded_as_decreasing_subprocess_timeouts():
     for (_, timeout, started) in runner.calls:
         assert started is not None
         assert timeout <= deadline - started + 1e-9
+
+
+def test_telemetry_command_window_is_independent_of_poll_interval():
+    policy = _policy(
+        poll_interval_s=60.0,
+        drain_timeout_s=180.0,
+    )
+    clock = FakeClock(10.0)
+    runner = ScriptedRunner(
+        [_gpu_output(policy)],
+        [_idle_process_output(policy)],
+        clock=clock,
+    )
+
+    _guard(policy, runner=runner, clock=clock).before_launch(
+        "launch-command-cap", deadline=400.0
+    )
+
+    assert runner.calls
+    assert all(timeout <= 10.0 for _, timeout, _ in runner.calls)
+
+
+def test_transient_telemetry_timeout_retries_inside_the_drain_deadline():
+    policy = _policy(
+        required_consecutive_idle_samples=2,
+        poll_interval_s=0.1,
+        drain_timeout_s=25.0,
+    )
+    clock = FakeClock(50.0)
+    delegate = ScriptedRunner(
+        [_gpu_output(policy)],
+        [_idle_process_output(policy)],
+        clock=clock,
+    )
+    calls = 0
+
+    def transient(argv, *, timeout_s):
+        nonlocal calls
+        calls += 1
+        # Let one complete idle sample land, then lose the next GPU query. The
+        # timeout must break consecutive-idle coverage rather than bridge it.
+        if calls == 3:
+            clock.value += timeout_s
+            raise subprocess.TimeoutExpired(argv, timeout_s)
+        return delegate(argv, timeout_s=timeout_s)
+
+    receipt = DeviceStateGuard(
+        policy,
+        runner=transient,
+        clock=clock,
+        sleep=clock.sleep,
+    ).before_launch("launch-transient", deadline=80.0)
+
+    assert calls == 7
+    assert len(receipt.samples) == 3
+    assert all(sample.idle for sample in receipt.samples)
+    assert receipt.completed_monotonic_s <= 80.0
+
+
+def test_repeated_telemetry_timeouts_exhaust_one_absolute_drain_deadline():
+    policy = _policy(
+        required_consecutive_idle_samples=2,
+        poll_interval_s=0.1,
+        drain_timeout_s=25.0,
+        maximum_samples=16,
+    )
+    clock = FakeClock(100.0)
+    calls = 0
+
+    def wedged(argv, *, timeout_s):
+        nonlocal calls
+        calls += 1
+        clock.value += timeout_s
+        raise subprocess.TimeoutExpired(argv, timeout_s)
+
+    guard = DeviceStateGuard(
+        policy,
+        runner=wedged,
+        clock=clock,
+        sleep=clock.sleep,
+    )
+    with pytest.raises(DeviceStateTimeoutError, match="idle envelope"):
+        guard.before_launch("launch-wedged", deadline=125.0)
+
+    assert calls == 3
+    assert clock.value == pytest.approx(125.0)
 
 
 def test_active_conditioning_requires_consecutive_pinned_envelope_samples():

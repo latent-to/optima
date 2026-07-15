@@ -33,6 +33,9 @@ NVIDIA_SMI = "/usr/bin/nvidia-smi"
 _MAX_STDOUT_BYTES = 4 * 1024 * 1024
 _MAX_STDERR_BYTES = 64 * 1024
 _MAX_PROCESS_NAME_CHARS = 256
+# Keep one host telemetry attempt short relative to a model bracket, but long
+# enough for nvidia-smi to cross transient driver teardown on large GPU nodes.
+_TELEMETRY_COMMAND_TIMEOUT_S = 10.0
 _LABEL = re.compile(r"[A-Za-z0-9_.-]{1,128}\Z")
 _UUID = re.compile(r"GPU-[0-9A-Fa-f-]{16,64}\Z")
 _PCI_BUS_ID = re.compile(
@@ -937,7 +940,7 @@ class DeviceStateGuard:
         # A wedged nvidia-smi must not make cancellation wait for the whole
         # multi-hour bracket deadline. Each live query receives a small bounded
         # command window while the outer polling loop retains the arena deadline.
-        command_window = max(2.0, 4.0 * float(self.policy.poll_interval_s))
+        command_window = _TELEMETRY_COMMAND_TIMEOUT_S
         query_deadline = min(deadline, self._now() + command_window)
         observed = parse_gpu_query(
             self._command(query_argv, deadline=query_deadline), policy=self.policy
@@ -1092,7 +1095,22 @@ class DeviceStateGuard:
         consecutive = 0
         last_reason = "no telemetry sample completed"
         for _ in range(self.policy.maximum_samples):
-            telemetry, processes = self._query(deadline=local_deadline)
+            try:
+                telemetry, processes = self._query(deadline=local_deadline)
+            except DeviceStateTimeoutError as exc:
+                # A live nvidia-smi query has its own short command window so a
+                # wedged driver cannot consume an entire multi-hour bracket.  A
+                # transient command timeout is not evidence that the selected
+                # devices are dirty, and the drain already owns a separate hard
+                # deadline. Retry without manufacturing an idle sample; a truly
+                # wedged query still exhausts the bounded drain and fails closed.
+                last_reason = str(exc)
+                consecutive = 0
+                remaining = local_deadline - self._now()
+                if remaining <= 0:
+                    break
+                self._sleep(min(float(self.policy.poll_interval_s), remaining))
+                continue
             sampled_at = self._now()
             if sampled_at > local_deadline:
                 raise DeviceStateTimeoutError("device sample completed after its deadline")

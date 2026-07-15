@@ -13,6 +13,14 @@ import types
 from optima.chain_canary import Check, format_checks, run_checks
 
 
+_FULL_METHODS = (
+    "set_weights", "metagraph", "get_all_commitments", "set_commitment",
+    "set_reveal_commitment", "query_map", "is_hotkey_registered",
+    "burned_register", "get_current_block", "get_block_hash", "commit",
+    "reveal_commitment",
+)
+
+
 def test_format_checks_green():
     out = format_checks([Check("a", True), Check("b", True, "detail")])
     assert "CHAIN SDK API PRESENT" in out
@@ -32,9 +40,11 @@ def test_missing_bittensor_is_graceful(monkeypatch):
     assert checks[0].ok is False
 
 
-def _fake_bittensor(methods: tuple[str, ...]) -> types.ModuleType:
+def _fake_bittensor(
+    methods: tuple[str, ...], *, version: str = "10.3.2"
+) -> types.ModuleType:
     mod = types.ModuleType("bittensor")
-    mod.__version__ = "9.9.9-fake"
+    mod.__version__ = version
     wcls = type("Wallet", (), {})
     mod.Wallet = wcls
     mod.wallet = wcls
@@ -46,12 +56,7 @@ def _fake_bittensor(methods: tuple[str, ...]) -> types.ModuleType:
 
 
 def test_full_fake_sdk_passes(monkeypatch):
-    fake = _fake_bittensor((
-        "set_weights", "metagraph", "get_all_commitments", "set_commitment",
-        "set_reveal_commitment", "get_all_revealed_commitments",
-        "is_hotkey_registered", "burned_register", "get_current_block", "get_block_hash",
-        "commit", "reveal_commitment",
-    ))
+    fake = _fake_bittensor(_FULL_METHODS)
     monkeypatch.setitem(sys.modules, "bittensor", fake)
     by_name = {c.name: c for c in run_checks()}
     assert by_name["bittensor installed"].ok
@@ -60,6 +65,17 @@ def test_full_fake_sdk_passes(monkeypatch):
     assert by_name["commitment/reveal API present"].ok   # found commit + reveal_commitment
     assert by_name["weights API present"].ok             # found set_weights
     assert all(c.ok for c in by_name.values())
+
+
+def test_full_wrong_version_fails_reveal_storage_abi(monkeypatch):
+    monkeypatch.setitem(
+        sys.modules, "bittensor", _fake_bittensor(_FULL_METHODS, version="9.9.9")
+    )
+    by_name = {c.name: c for c in run_checks()}
+    assert by_name["raw reveal-storage ABI"].ok is False
+    assert all(
+        check.ok for name, check in by_name.items() if name != "raw reveal-storage ABI"
+    )
 
 
 def test_missing_method_is_flagged(monkeypatch):

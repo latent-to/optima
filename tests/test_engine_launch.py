@@ -15,7 +15,9 @@ from optima.engine_tree import materialize_engine_tree
 from optima.eval.engine_launch import (
     EngineLaunchError,
     EngineLaunchSpec,
+    LEGACY_NATIVE_BUILD_SCHEMA_VERSION,
     LogicalHardwareSpec,
+    NATIVE_BUILD_SCHEMA_VERSION,
     NativeBuildSpec,
     PhysicalHardwareBinding,
     TrustedLaunchBinding,
@@ -27,6 +29,8 @@ from optima.eval.engine_launch import (
     validate_native_build_spec,
     validate_runtime_preflight_receipt,
 )
+from optima.eval.native_compile_profile import NativeCuTeCompileProfile
+from optima.stack_identity import canonical_digest, canonical_json_bytes
 from optima.stack_manifest import EvaluationStackContext, EvaluationStackManifest
 from optima.target_catalog import default_target_catalog
 
@@ -72,6 +76,7 @@ def _native(tree_digest: str, **changes: object) -> NativeBuildSpec:
         worker_distribution_digest=values["worker_distribution_digest"],  # type: ignore[arg-type]
         dependency_policy_digest=values["dependency_policy_digest"],  # type: ignore[arg-type]
         target_architecture=values["target_architecture"],  # type: ignore[arg-type]
+        compile_profile_digest=values.get("compile_profile_digest"),  # type: ignore[arg-type]
     ))
     return NativeBuildSpec(**values)  # type: ignore[arg-type]
 
@@ -156,6 +161,31 @@ def _physical(**changes: object) -> PhysicalHardwareBinding:
     return PhysicalHardwareBinding(**values)  # type: ignore[arg-type]
 
 
+def _compile_profile(
+    hardware: LogicalHardwareSpec | None = None,
+    **changes: object,
+) -> NativeCuTeCompileProfile:
+    logical = hardware or _hardware()
+    values: dict[str, object] = {
+        "logical_architecture": logical.architecture,
+        "compiler_architecture": f"sm_{logical.architecture.removeprefix('sm')}",
+        "image_digest": _digest("image"),
+        "platform_digest": _digest("platform"),
+        "worker_distribution_digest": _digest("worker-dist"),
+        "logical_hardware_digest": logical.digest,
+        "device_policy_digest": logical.device_policy_digest,
+        "topology_digest": logical.topology_digest,
+        "visible_gpu_count": logical.visible_gpu_count,
+        "tp_size": logical.tp_size,
+        "ep_size": logical.ep_size,
+        "dp_size": logical.dp_size,
+        "constants": {"max_active_clusters.cluster_size_1": 8},
+        "measurement_digest": _digest("compile-profile-measurement"),
+    }
+    values.update(changes)
+    return NativeCuTeCompileProfile(**values)  # type: ignore[arg-type]
+
+
 @dataclass(frozen=True)
 class _Receipt:
     launch_identity: object
@@ -198,6 +228,105 @@ def test_strict_canonical_round_trip_is_path_and_role_free() -> None:
         assert forbidden not in encoded
 
 
+def test_legacy_native_build_schema1_payload_bytes_and_digest_are_unchanged() -> None:
+    native = _native(_digest("tree"))
+    expected_policy_payload = {
+        "dependency_policy_digest": native.dependency_policy_digest,
+        "image_digest": native.image_digest,
+        "target_architecture": native.target_architecture,
+        "worker_distribution_digest": native.worker_distribution_digest,
+    }
+    assert native.compiler_flags_digest == canonical_digest(
+        "optima.eval.native-compiler-policy", expected_policy_payload
+    )
+
+    expected_build_payload = {
+        "compiler_flags_digest": native.compiler_flags_digest,
+        "dependency_policy_digest": native.dependency_policy_digest,
+        "image_digest": native.image_digest,
+        "patcher_digest": native.patcher_digest,
+        "platform_digest": native.platform_digest,
+        "schema_version": LEGACY_NATIVE_BUILD_SCHEMA_VERSION,
+        "target_architecture": native.target_architecture,
+        "toolchain_digest": native.toolchain_digest,
+        "tree_digest": native.tree_digest,
+        "type": "native_build",
+        "worker_distribution_digest": native.worker_distribution_digest,
+    }
+    assert native.schema_version == LEGACY_NATIVE_BUILD_SCHEMA_VERSION
+    assert native.compile_profile_digest is None
+    assert native.to_dict() == expected_build_payload
+    assert native.canonical_bytes == canonical_json_bytes(expected_build_payload)
+    assert native.digest == canonical_digest(
+        "optima.eval.native-build", expected_build_payload
+    )
+
+    # schema_version was historically the tenth positional argument.  Adding
+    # the optional profile must not reinterpret existing positional callers.
+    positional = NativeBuildSpec(
+        native.tree_digest,
+        native.image_digest,
+        native.platform_digest,
+        native.worker_distribution_digest,
+        native.toolchain_digest,
+        native.patcher_digest,
+        native.compiler_flags_digest,
+        native.target_architecture,
+        native.dependency_policy_digest,
+        LEGACY_NATIVE_BUILD_SCHEMA_VERSION,
+    )
+    assert positional == native
+
+
+def test_profiled_native_build_uses_closed_schema2_and_binds_policy() -> None:
+    profile_digest = _digest("compile-profile")
+    legacy = _native(_digest("tree"))
+    profiled = _native(
+        legacy.tree_digest,
+        compile_profile_digest=profile_digest,
+    )
+
+    expected_policy_payload = {
+        "compile_profile_digest": profile_digest,
+        "dependency_policy_digest": profiled.dependency_policy_digest,
+        "image_digest": profiled.image_digest,
+        "target_architecture": profiled.target_architecture,
+        "worker_distribution_digest": profiled.worker_distribution_digest,
+    }
+    assert profiled.schema_version == NATIVE_BUILD_SCHEMA_VERSION
+    assert profiled.compiler_flags_digest == canonical_digest(
+        "optima.eval.native-compiler-policy", expected_policy_payload
+    )
+    assert profiled.to_dict()["compile_profile_digest"] == profile_digest
+    assert NativeBuildSpec.from_dict(profiled.to_dict()) == profiled
+    assert profiled.digest != legacy.digest
+    assert profiled.compiler_flags_digest != legacy.compiler_flags_digest
+
+    with pytest.raises(EngineLaunchError, match="compiler_flags_digest"):
+        replace(profiled, compiler_flags_digest=legacy.compiler_flags_digest)
+    with pytest.raises(EngineLaunchError, match="schema_version must be 2"):
+        _native(
+            profiled.tree_digest,
+            compile_profile_digest=profile_digest,
+            schema_version=LEGACY_NATIVE_BUILD_SCHEMA_VERSION,
+        )
+    with pytest.raises(EngineLaunchError, match="schema_version must be 1"):
+        _native(
+            legacy.tree_digest,
+            schema_version=NATIVE_BUILD_SCHEMA_VERSION,
+        )
+
+    legacy_with_profile = legacy.to_dict()
+    legacy_with_profile["compile_profile_digest"] = profile_digest
+    with pytest.raises(EngineLaunchError, match="native build schema mismatch"):
+        NativeBuildSpec.from_dict(legacy_with_profile)
+
+    profiled_without_profile = profiled.to_dict()
+    del profiled_without_profile["compile_profile_digest"]
+    with pytest.raises(EngineLaunchError, match="native build schema mismatch"):
+        NativeBuildSpec.from_dict(profiled_without_profile)
+
+
 @pytest.mark.parametrize(
     "forbidden",
     (
@@ -237,13 +366,13 @@ def test_nested_schemas_are_closed_and_versions_and_digests_are_strict() -> None
     with pytest.raises(EngineLaunchError, match="native build schema mismatch"):
         NativeBuildSpec.from_dict(native_row)
 
-    for row, loader in (
-        (launch.to_dict(), EngineLaunchSpec.from_dict),
-        (native.to_dict(), NativeBuildSpec.from_dict),
-        (launch.hardware.to_dict(), LogicalHardwareSpec.from_dict),
+    for row, loader, unsupported_version in (
+        (launch.to_dict(), EngineLaunchSpec.from_dict, 2),
+        (native.to_dict(), NativeBuildSpec.from_dict, 3),
+        (launch.hardware.to_dict(), LogicalHardwareSpec.from_dict, 2),
     ):
         changed = dict(row)
-        changed["schema_version"] = 2
+        changed["schema_version"] = unsupported_version
         with pytest.raises(EngineLaunchError, match="schema_version"):
             loader(changed)
 
@@ -368,6 +497,78 @@ def test_resolution_reopens_tree_and_validates_all_local_bindings(
     )
     assert "GPU-0" not in launch.canonical_bytes.decode()
     assert str(tree.root) not in launch.canonical_bytes.decode()
+
+
+def test_profiled_resolution_requires_exact_profile_and_launch_authority(
+    tmp_path: Path,
+) -> None:
+    tree = _materialized_tree(tmp_path)
+    hardware = _hardware()
+    profile = _compile_profile(hardware)
+    native = _native(
+        tree.tree_digest,
+        compile_profile_digest=profile.digest,
+    )
+    launch = _launch(
+        stack_digest=tree.stack_digest,
+        tree_digest=tree.tree_digest,
+        native=native,
+        hardware=hardware,
+    )
+    binding = TrustedLaunchBinding(
+        materialized_tree_root=tree.root,
+        controller_distribution_digest=launch.controller_distribution_digest,
+        native_build_spec=native,
+        runtime_preflight_receipt=_receipt(launch),
+        physical_hardware=_physical(),
+        native_compile_profile=profile,
+    )
+
+    resolved = resolve_engine_launch(launch, binding)
+    assert resolved.native_compile_profile is profile
+
+    with pytest.raises(EngineLaunchError, match="requires an exact"):
+        replace(binding, native_compile_profile=None)
+    with pytest.raises(EngineLaunchError, match="profile digest differs"):
+        replace(
+            binding,
+            native_compile_profile=replace(
+                profile,
+                measurement_digest=_digest("different measurement"),
+            ),
+        )
+    with pytest.raises(EngineLaunchError, match="legacy native build"):
+        replace(
+            binding,
+            native_build_spec=_native(tree.tree_digest),
+        )
+
+    mismatched_profile = replace(
+        profile,
+        topology_digest=_digest("different profile topology"),
+    )
+    mismatched_native = _native(
+        tree.tree_digest,
+        compile_profile_digest=mismatched_profile.digest,
+    )
+    mismatched_launch = _launch(
+        stack_digest=tree.stack_digest,
+        tree_digest=tree.tree_digest,
+        native=mismatched_native,
+        hardware=hardware,
+    )
+    mismatched_binding = TrustedLaunchBinding(
+        materialized_tree_root=tree.root,
+        controller_distribution_digest=(
+            mismatched_launch.controller_distribution_digest
+        ),
+        native_build_spec=mismatched_native,
+        runtime_preflight_receipt=_receipt(mismatched_launch),
+        physical_hardware=_physical(),
+        native_compile_profile=mismatched_profile,
+    )
+    with pytest.raises(EngineLaunchError, match="topology_digest"):
+        resolve_engine_launch(mismatched_launch, mismatched_binding)
 
 
 def test_reopen_rejects_tree_digest_and_embedded_stack_split_brains(

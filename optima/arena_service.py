@@ -546,7 +546,7 @@ class ArenaServiceProvider(Protocol):
     ) -> ScreenStageResult: ...
 
     def build_qualification(
-        self, request: ArenaQualificationRequest
+        self, request: ArenaQualificationRequest, state: object | None = None
     ) -> ArenaQualificationWork: ...
 
 
@@ -656,6 +656,8 @@ class ArenaService:
         self,
         candidates: tuple[ArenaCandidateBinding, ...],
         screen_receipts: tuple[ArenaScreenReceipt, ...],
+        *,
+        state: object | None = None,
     ) -> ArenaQualificationWork:
         if len(candidates) > self.manifest.capacity.max_cohort_size:
             raise ArenaServiceError("qualification cohort exceeds arena capacity")
@@ -665,7 +667,7 @@ class ArenaService:
             tuple(candidates),
             tuple(screen_receipts),
         )
-        work = self._provider.build_qualification(request)
+        work = self._provider.build_qualification(request, state)
         if type(work) is not ArenaQualificationWork:
             raise ArenaServiceError("provider returned untyped qualification work")
         if work.qualification_policy_digest != request.qualification_policy_digest:

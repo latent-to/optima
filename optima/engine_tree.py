@@ -23,8 +23,13 @@ from contextlib import contextmanager
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
-from typing import Any, Iterator, Protocol
+from typing import TYPE_CHECKING, Any, Iterator, Protocol
 
+from optima import dsl_jit_policy
+from optima.artifact_provider import (
+    ARTIFACT_PROVIDERS,
+    ArtifactProviderPolicyError,
+)
 from optima.bundle_hash import content_hash
 from optima.deppatch import parse_patch_text
 from optima.manifest import ABI_VERSION, Manifest, OpEntry, load_manifest
@@ -36,8 +41,7 @@ from optima.stack_identity import (
     sha256_hex,
 )
 
-
-_MATERIALIZER_VERSION = 1
+_MATERIALIZER_VERSION = 2
 _FILE_MODE = 0o444
 _DIR_MODE = 0o755
 _INTERNAL_BUNDLE_ID = "optima-materialized-v1"
@@ -45,6 +49,7 @@ _DISCOVERY_METADATA = "metadata/optima_discovery.json"
 _REBUILD_ORDER = {
     "optima/patchers/apply_dep_patch.py": 0,
     "optima/patchers/build_cuda_ext.py": 1,
+    "optima/patchers/build_cute_cubin.py": 2,
 }
 _SKIP_DIRS = frozenset({".git", "__pycache__"})
 _SKIP_SUFFIXES = frozenset({".pyc", ".pyo"})
@@ -449,6 +454,14 @@ def _validate_cuda_closure(root: Path, cuda_files: tuple[str, ...]) -> None:
                 )
 
 
+def _dsl_module_resolves_locally(root: Path, parts: tuple[str, ...]) -> bool:
+    """Return whether a trusted DSL module prefix is bundle-controlled."""
+
+    if not parts:
+        return False
+    return _existing_module(root, parts) is not None or _local_namespace(root, parts)
+
+
 def _parse_python(root: Path, relative: str) -> tuple[bytes, ast.Module]:
     raw = _stable_read(root, relative)
     try:
@@ -459,6 +472,10 @@ def _parse_python(root: Path, relative: str) -> tuple[bytes, ast.Module]:
         tree = ast.parse(text, filename=relative, type_comments=True)
     except SyntaxError as exc:
         raise EngineTreeError(f"python source {relative!r} does not parse: {exc}") from exc
+    dsl_receivers = dsl_jit_policy.admitted_receivers(
+        tree,
+        module_resolves_locally=lambda parts: _dsl_module_resolves_locally(root, parts),
+    )
     for node in ast.walk(tree):
         if isinstance(node, ast.Name) and node.id in {
             "__import__",
@@ -467,7 +484,13 @@ def _parse_python(root: Path, relative: str) -> tuple[bytes, ast.Module]:
             "exec",
         }:
             raise EngineTreeError(f"dynamic import is unsupported in {relative!r}")
-        if isinstance(node, ast.alias) and node.name in {"__import__", "import_module"}:
+        if isinstance(node, ast.alias) and node.name in {
+            "__import__",
+            "import_module",
+            # ``import builtins`` (or aliasing it) reaches ``builtins.compile``/
+            # ``builtins.eval`` as plain attributes, bypassing the bare-name bans.
+            "builtins",
+        }:
             raise EngineTreeError(f"dynamic import is unsupported in {relative!r}")
         if isinstance(node, ast.Constant) and node.value in {"__import__", "import_module"}:
             raise EngineTreeError(f"dynamic import is unsupported in {relative!r}")
@@ -490,6 +513,10 @@ def _parse_python(root: Path, relative: str) -> tuple[bytes, ast.Module]:
                 "exec_module",
                 "spec_from_file_location",
             }:
+                if node.func.attr in dsl_jit_policy.ADMITTED_ATTRS and (
+                    dsl_jit_policy.is_admitted_call(node, dsl_receivers)
+                ):
+                    continue
                 raise EngineTreeError(f"dynamic import is unsupported in {relative!r}")
     return raw, tree
 
@@ -784,7 +811,12 @@ def _rebuild_features(plan: RebuildPlan | None) -> tuple[str, ...]:
 
     features: list[str] = []
     for step in () if plan is None else plan.steps:
-        if step.patcher_id == "optima.apply-dep-patch.v1":
+        artifact_feature = ARTIFACT_PROVIDERS.build_feature_for_patcher(
+            step.patcher_id
+        )
+        if artifact_feature is not None:
+            features.append(artifact_feature)
+        elif step.patcher_id == "optima.apply-dep-patch.v1":
             features.append(FEATURE_REBUILD_APPLY_DEP_PATCH)
         elif step.patcher_id == "optima.build-cuda-ext.v1":
             features.append(FEATURE_REBUILD_BUILD_CUDA_EXT)
@@ -795,22 +827,52 @@ def _rebuild_features(plan: RebuildPlan | None) -> tuple[str, ...]:
     return tuple(features)
 
 
-def _op_identity(op: OpEntry) -> dict[str, object]:
+def _manifest_artifact_provider_ids(manifest: Manifest) -> tuple[str, ...]:
+    return tuple(
+        sorted(
+            {
+                export.provider
+                for op in manifest.ops
+                for export in op.aot_exports
+            }
+        )
+    )
+
+
+def _require_crownable_artifact_providers(
+    manifest: Manifest, *, context: str
+) -> None:
+    """Reject bring-up providers before an evaluation/release tree is emitted."""
+
+    provider_ids = _manifest_artifact_provider_ids(manifest)
+    if not provider_ids:
+        return
+    try:
+        ARTIFACT_PROVIDERS.require_crownable(provider_ids, context=context)
+    except ArtifactProviderPolicyError as exc:
+        raise EngineTreeError(str(exc)) from None
+
+
+def _op_identity(manifest: Manifest, op: OpEntry) -> dict[str, object]:
     from optima.capabilities import canonical_value
+    from optima.artifact_identity import DIRECT_ARTIFACT_ENTRY
 
     if op.extra:
         raise EngineTreeError(
             f"target-selected op {op.slot!r} contains unregistered fields "
             f"{tuple(sorted(op.extra))!r}"
         )
-    return {
+    identity: dict[str, object] = {
         "architectures": sorted(
             {str(canonical_value("architecture", value)) for value in op.architectures}
         ),
         "base_kernel": op.base_kernel,
         "cuda_sources": sorted(set(op.cuda_sources)),
         "dtypes": sorted({str(canonical_value("dtype", value)) for value in op.dtypes}),
-        "entry": op.entry,
+        # Direct artifacts never execute ``ops.entry``.  Canonicalize the legacy
+        # required manifest field so changing a dead Python symbol cannot rotate
+        # selected-delta, engine-tree, or settlement identity.
+        "entry": DIRECT_ARTIFACT_ENTRY if op.aot_exports else op.entry,
         "metadata": op.metadata,
         "override_point": op.override_point,
         "prepare": op.prepare,
@@ -819,6 +881,44 @@ def _op_identity(op: OpEntry) -> dict[str, object]:
         "source": op.source,
         "variant": op.variant,
     }
+    # Preserve every legacy selected-payload identity byte-for-byte.  This field
+    # exists only for the new direct-AOT lane; an unconditional empty list would
+    # rotate all canonical non-AOT contributions.
+    if op.aot_exports:
+        from optima.artifact_identity import (
+            ArtifactIdentityError,
+            direct_artifact_execution_identity,
+        )
+
+        try:
+            artifact_identity = direct_artifact_execution_identity(manifest, op)
+        except ArtifactIdentityError as exc:
+            raise EngineTreeError(
+                f"op {op.slot!r} artifact resources are not canonical: {exc}"
+            ) from None
+        identity["artifact_identity_schema"] = artifact_identity["schema"]
+        identity["artifact_resource_plan"] = artifact_identity[
+            "artifact_resource_plan"
+        ]
+        identity["artifact_resource_plan_sha256"] = artifact_identity[
+            "artifact_resource_plan_sha256"
+        ]
+        identity["aot_exports"] = artifact_identity["exports"]
+    return identity
+
+
+def _runtime_op_identity(manifest: Manifest, op: OpEntry) -> dict[str, object]:
+    """Return one emitted runtime row with exact artifact declarations."""
+
+    row = _op_identity(manifest, op)
+    if op.aot_exports:
+        # Selected identity encodes finite floats as exact tagged strings because
+        # stack JSON forbids native floats.  Runtime TOML must retain the original
+        # scalar types consumed by specialization and prelaunch validation.
+        from optima.artifact_identity import direct_artifact_runtime_exports
+
+        row["aot_exports"] = direct_artifact_runtime_exports(manifest, op)
+    return row
 
 
 def _validate_variant_domains(root: Path, manifest: Manifest) -> None:
@@ -865,7 +965,7 @@ def _inspect_contribution(
     *,
     catalog: object,
 ) -> InspectedContribution:
-    """Inspect one registered source without importing it or mutating its tree."""
+    """Inspect one registered contribution source without executing it."""
 
     from optima.registry import eligibility_from_metadata
     from optima.target_catalog import TargetCatalog
@@ -875,8 +975,9 @@ def _inspect_contribution(
     before = _tree_snapshot(root)
     manifest = load_manifest(root)
     plan = parse_rebuild_plan(root)
+    observed_features = _rebuild_features(plan)
     resolved = catalog.resolve_intake(
-        manifest, observed_features=_rebuild_features(plan)
+        manifest, observed_features=observed_features
     )
     assert resolved.target_id is not None
 
@@ -946,7 +1047,7 @@ def _inspect_contribution(
         "materializer_policy_version": _MATERIALIZER_VERSION,
         "metadata": sorted(metadata_identity, key=lambda row: str(row["path"])),
         "ops": [
-            _op_identity(op)
+            _op_identity(manifest, op)
             for op in sorted(manifest.ops, key=lambda item: (item.slot, item.variant))
         ],
         "patches": patch_declarations,
@@ -987,7 +1088,7 @@ def inspect_contribution(
     *,
     catalog: object,
 ) -> InspectedContribution:
-    """Freeze and inspect one registered source without executing submission code."""
+    """Freeze and inspect one registered static-slot contribution."""
 
     source = _source_directory(source_root, field="contribution source")
     with _staged_source_tree(source) as staged:
@@ -1348,7 +1449,12 @@ def _contribution_files(
     for op in inspection.manifest.ops:
         required = required_entry_names.setdefault(op.source, set())
         optional = optional_entry_names.setdefault(op.source, set())
-        if op.is_override:
+        if op.aot_exports:
+            # A direct-AOT row is never imported in an engine worker.  Its source
+            # contributes only prebuild factories; runtime execution is constructed
+            # from the sealed declarative slot-resource projection.
+            pass
+        elif op.is_override:
             required.add(op.entry + "_ref")
             optional.add(op.entry)
         else:
@@ -1357,6 +1463,7 @@ def _contribution_files(
             required.add(op.prepare)
         if op.setup is not None:
             required.add(op.setup)
+        required.update(export.factory for export in op.aot_exports)
     entry_paths: dict[str, str] = {}
     for relative, required in sorted(required_entry_names.items()):
         output = f"entries/{_generated_name(prefix, relative, suffix='.py')}"
@@ -1410,7 +1517,7 @@ def _contribution_files(
 
     op_rows: list[dict[str, object]] = []
     for op in sorted(inspection.manifest.ops, key=lambda row: (row.slot, row.variant)):
-        row = _op_identity(op)
+        row = _runtime_op_identity(inspection.manifest, op)
         row["source"] = entry_paths[op.source]
         row["metadata"] = metadata_paths.get(op.metadata) if op.metadata else None
         row["cuda_sources"] = [native_paths[path] for path in row["cuda_sources"]]
@@ -1426,8 +1533,33 @@ def _toml_array(values: list[str]) -> str:
     return "[" + ", ".join(_toml_string(value) for value in values) + "]"
 
 
+def _toml_value(value: object) -> str:
+    """Serialize the bounded JSON-shaped artifact-plan subset as TOML."""
+
+    if isinstance(value, str):
+        return _toml_string(value)
+    if type(value) is bool:
+        return "true" if value else "false"
+    if type(value) in {int, float}:
+        return repr(value)
+    if isinstance(value, list):
+        return "[" + ", ".join(_toml_value(item) for item in value) + "]"
+    if isinstance(value, dict):
+        # TOML has no null. Canonical artifact plans use ``None`` only for
+        # inactive/default fields in their tagged unions; omit those fields on
+        # the wire and let the typed manifest decoder reconstruct and validate
+        # the canonical defaults. A top-level/list null remains unsupported.
+        return "{ " + ", ".join(
+            f"{_toml_string(str(key))} = {_toml_value(item)}"
+            for key, item in sorted(value.items(), key=lambda row: str(row[0]))
+            if item is not None
+        ) + " }"
+    raise EngineTreeError(f"runtime manifest contains an unsupported TOML value: {value!r}")
+
+
 def _runtime_manifest(
-    ops: list[dict[str, object]], patches: list[dict[str, str]]
+    ops: list[dict[str, object]],
+    patches: list[dict[str, str]],
 ) -> bytes:
     lines = [
         f"bundle_id = {_toml_string(_INTERNAL_BUNDLE_ID)}",
@@ -1459,6 +1591,201 @@ def _runtime_manifest(
             assert isinstance(values, list) and all(isinstance(value, str) for value in values)
             if values:
                 lines.append(f"{key} = {_toml_array(values)}")
+        aot_exports = op.get("aot_exports", [])
+        assert isinstance(aot_exports, list)
+        if aot_exports:
+            from optima.cute_aot import (
+                CuteAOTError,
+                reopen_artifact_resource_plan_identity,
+            )
+            from optima.manifest import (
+                reopen_artifact_target_authority,
+                static_artifact_target_authority,
+            )
+
+            try:
+                dispatch_slot = op["slot"]
+                assert isinstance(dispatch_slot, str)
+                authority_data = op.get("artifact_target_authority")
+                authority_digest = op.get("artifact_target_authority_sha256")
+                if authority_data is None:
+                    if authority_digest is not None:
+                        raise ValueError(
+                            "artifact target authority digest lacks its snapshot"
+                        )
+                    target_authority = static_artifact_target_authority(dispatch_slot)
+                else:
+                    target_authority = reopen_artifact_target_authority(
+                        authority_data,
+                        expected_dispatch_slot=dispatch_slot,
+                    )
+                    if authority_digest != target_authority.digest:
+                        raise ValueError("artifact target authority digest mismatch")
+                _resource_plan, resource_plan_data, _resource_plan_sha256 = (
+                    reopen_artifact_resource_plan_identity(
+                        op.get("artifact_resource_plan"),
+                        expected_slot=dispatch_slot,
+                        authority=target_authority,
+                        expected_sha256=op.get("artifact_resource_plan_sha256"),
+                    )
+                )
+            except (CuteAOTError, ValueError) as exc:
+                raise EngineTreeError(
+                    f"runtime artifact resource plan is invalid: {exc}"
+                ) from None
+            resources = resource_plan_data["resources"]
+            assert isinstance(resources, list)
+            for resource in resources:
+                assert isinstance(resource, dict)
+                expected_resource_fields = {
+                    "alignment",
+                    "dtype",
+                    "lifetime",
+                    "name",
+                    "shape",
+                }
+                resource_fields = set(resource)
+                if resource_fields not in (
+                    expected_resource_fields,
+                    expected_resource_fields | {"scope"},
+                ):
+                    raise EngineTreeError(
+                        "runtime artifact resource fields differ from the "
+                        "canonical resource-plan schema"
+                    )
+                resource_lines = [
+                    "[[ops.artifact_resources]]",
+                    f"name = {_toml_value(resource['name'])}",
+                    f"dtype = {_toml_value(resource['dtype'])}",
+                    f"alignment = {_toml_value(resource['alignment'])}",
+                    f"lifetime = {_toml_value(resource['lifetime'])}",
+                    f"shape = {_toml_value(resource['shape'])}",
+                ]
+                if "scope" in resource:
+                    resource_lines.append(
+                        f"scope = {_toml_value(resource['scope'])}"
+                    )
+                lines.extend(resource_lines)
+        for export in aot_exports:
+            assert isinstance(export, dict)
+            provider = export["provider"]
+            name = export["name"]
+            factory = export["factory"]
+            profile_inputs = export["profile_inputs"]
+            bindings = export["bindings"]
+            device_plan = export.get("device_plan")
+            plan = export["plan"]
+            prelaunch = export["prelaunch"]
+            provider_capability_requirements = export[
+                "provider_capability_requirements"
+            ]
+            role = export["role"]
+            specialization_capability_requirements = export[
+                "specialization_capability_requirements"
+            ]
+            specializes = export["specializes"]
+            step = export["step"]
+            assert isinstance(provider, str)
+            assert isinstance(name, str)
+            assert isinstance(factory, str)
+            assert isinstance(plan, str)
+            assert isinstance(role, str)
+            assert type(step) is int
+            assert isinstance(bindings, list)
+            assert isinstance(prelaunch, list)
+            assert isinstance(provider_capability_requirements, list)
+            assert isinstance(specialization_capability_requirements, list)
+            assert isinstance(specializes, dict)
+            assert isinstance(profile_inputs, list) and all(
+                isinstance(value, str) for value in profile_inputs
+            )
+            from optima.artifact_abi import (
+                ArtifactABIError,
+                parse_artifact_bindings,
+                parse_artifact_prelaunch,
+            )
+            from optima.artifact_device_launch import (
+                DeviceLaunchError,
+                DeviceLaunchPlan,
+            )
+
+            try:
+                typed_bindings = parse_artifact_bindings(
+                    bindings, field="runtime artifact bindings"
+                )
+                typed_prelaunch = parse_artifact_prelaunch(
+                    prelaunch, field="runtime artifact prelaunch"
+                )
+                typed_specializes = target_authority.call_abi.validate_plan(
+                    role=role,
+                    bindings=typed_bindings,
+                    specializes=specializes,
+                    prelaunch=typed_prelaunch,
+                    require_outputs=False,
+                    artifact_resources=_resource_plan,
+                )
+                if device_plan is not None:
+                    typed_device_plan = DeviceLaunchPlan.from_dict(device_plan)
+                    typed_device_plan.validate_bindings(
+                        typed_bindings,
+                        provider_capabilities=(
+                            ARTIFACT_PROVIDERS.require(provider).provider_capabilities
+                        ),
+                    )
+                expected_provider_requirements = [
+                    requirement.to_dict()
+                    for requirement in target_authority.call_abi.provider_capability_requirements(
+                        typed_bindings,
+                        artifact_resources=_resource_plan,
+                    )
+                ]
+                expected_specialization_requirements = [
+                    requirement.to_dict()
+                    for requirement in target_authority.call_abi.specialization_capability_requirements(
+                        typed_specializes,
+                        artifact_resources=_resource_plan,
+                    )
+                ]
+            except (
+                ArtifactABIError,
+                ArtifactProviderPolicyError,
+                DeviceLaunchError,
+                ValueError,
+            ) as exc:
+                raise EngineTreeError(
+                    f"runtime artifact launch plan is invalid: {exc}"
+                ) from None
+            if (
+                provider_capability_requirements
+                != expected_provider_requirements
+                or specialization_capability_requirements
+                != expected_specialization_requirements
+            ):
+                raise EngineTreeError(
+                    "runtime artifact capability requirements differ from "
+                    "validator reconstruction"
+                )
+            lines.extend(
+                [
+                    "[[ops.aot_exports]]",
+                    f"provider = {_toml_string(provider)}",
+                    f"name = {_toml_string(name)}",
+                    f"factory = {_toml_string(factory)}",
+                    f"profile_inputs = {_toml_array(profile_inputs)}",
+                    f"role = {_toml_string(role)}",
+                    f"plan = {_toml_string(plan)}",
+                    f"step = {step}",
+                    f"specializes = {_toml_value(specializes)}",
+                    f"prelaunch = {_toml_value(prelaunch)}",
+                    f"bindings = {_toml_value(bindings)}",
+                    "provider_capability_requirements = "
+                    f"{_toml_value(provider_capability_requirements)}",
+                    "specialization_capability_requirements = "
+                    f"{_toml_value(specialization_capability_requirements)}",
+                ]
+            )
+            if device_plan is not None:
+                lines.append(f"device_plan = {_toml_value(device_plan)}")
         lines.append("")
     return ("\n".join(lines).rstrip() + "\n").encode("utf-8")
 
@@ -1543,31 +1870,19 @@ def _validate_contribution_rows(rows: object) -> list[dict[str, object]]:
     return rows
 
 
-def _write_materialized_tree(
+def _publish_engine_tree_files(
     destination: Path,
     *,
-    stack_digest: str,
     files: dict[str, bytes],
-    runtime_manifest: str | None,
-    contributions: list[dict[str, object]],
-) -> MaterializedEngineTree:
+) -> tuple[tuple[EmittedFile, ...], str]:
     if destination.exists() or destination.is_symlink():
         raise EngineTreeError(f"materialized destination already exists: {destination}")
-    pre_metadata = _emitted_rows(files)
-    metadata = {
-        "contributions": contributions,
-        "files": [row.identity_data() for row in pre_metadata],
-        "materializer_policy_version": _MATERIALIZER_VERSION,
-        "runtime_manifest": runtime_manifest,
-        "stack_digest": stack_digest,
-    }
-    _put_file(
-        files,
-        "metadata/optima_engine_tree.json",
-        json.dumps(metadata, ensure_ascii=False, indent=2, sort_keys=True).encode("utf-8") + b"\n",
-    )
     rows = _emitted_rows(files)
     tree_digest = _logical_tree_digest(rows)
+
+    def reopen_written_tree(root: Path) -> None:
+        reopen_materialized_engine_tree(root, expected_tree_digest=tree_digest)
+
     destination.parent.mkdir(parents=True, exist_ok=True)
     temp = Path(tempfile.mkdtemp(prefix=f".{destination.name}.", dir=destination.parent))
     try:
@@ -1587,7 +1902,7 @@ def _write_materialized_tree(
             os.utime(path, (0, 0), follow_symlinks=False)
         os.chmod(temp, _DIR_MODE)
         os.utime(temp, (0, 0), follow_symlinks=False)
-        reopen_materialized_engine_tree(temp, expected_tree_digest=tree_digest)
+        reopen_written_tree(temp)
         os.replace(temp, destination)
     except BaseException:
         for path in sorted(temp.rglob("*"), reverse=True):
@@ -1602,15 +1917,8 @@ def _write_materialized_tree(
             pass
         shutil.rmtree(temp, ignore_errors=True)
         raise
-    result = MaterializedEngineTree(
-        root=destination,
-        stack_digest=stack_digest,
-        tree_digest=tree_digest,
-        files=rows,
-        runtime_manifest=runtime_manifest,
-    )
     try:
-        reopen_materialized_engine_tree(destination, expected_tree_digest=tree_digest)
+        reopen_written_tree(destination)
     except BaseException:
         try:
             os.chmod(destination, 0o755)
@@ -1618,15 +1926,50 @@ def _write_materialized_tree(
             pass
         shutil.rmtree(destination, ignore_errors=True)
         raise
+    return rows, tree_digest
+
+
+def _write_materialized_tree(
+    destination: Path,
+    *,
+    stack_digest: str,
+    files: dict[str, bytes],
+    runtime_manifest: str | None,
+    contributions: list[dict[str, object]],
+) -> MaterializedEngineTree:
+    pre_metadata = _emitted_rows(files)
+    metadata = {
+        "contributions": contributions,
+        "files": [row.identity_data() for row in pre_metadata],
+        "materializer_policy_version": _MATERIALIZER_VERSION,
+        "runtime_manifest": runtime_manifest,
+        "stack_digest": stack_digest,
+    }
+    _put_file(
+        files,
+        "metadata/optima_engine_tree.json",
+        json.dumps(metadata, ensure_ascii=False, indent=2, sort_keys=True).encode("utf-8") + b"\n",
+    )
+    rows, tree_digest = _publish_engine_tree_files(
+        destination,
+        files=files,
+    )
+    result = MaterializedEngineTree(
+        root=destination,
+        stack_digest=stack_digest,
+        tree_digest=tree_digest,
+        files=rows,
+        runtime_manifest=runtime_manifest,
+    )
     return result
 
 
-def reopen_materialized_engine_tree(
+def _reopen_engine_tree(
     root: str | Path,
     *,
     expected_tree_digest: str | None = None,
 ) -> MaterializedEngineTree:
-    """Reopen and independently verify a previously materialized logical tree."""
+    """Structurally reopen one static evaluation/release stack tree."""
 
     path = _source_directory(root, field="materialized tree")
     if stat.S_IMODE(path.stat().st_mode) != _DIR_MODE:
@@ -1666,14 +2009,17 @@ def reopen_materialized_engine_tree(
         metadata = json.loads(_stable_read(path, metadata_path).decode("utf-8"))
     except (UnicodeDecodeError, ValueError) as exc:
         raise EngineTreeError(f"materialized tree metadata is invalid: {exc}") from exc
-    if not isinstance(metadata, dict) or set(metadata) != {
+    static_metadata_fields = {
         "contributions",
         "files",
         "materializer_policy_version",
         "runtime_manifest",
         "stack_digest",
-    }:
+    }
+    metadata_fields = frozenset(metadata) if isinstance(metadata, dict) else None
+    if metadata_fields != frozenset(static_metadata_fields):
         raise EngineTreeError("materialized tree metadata schema mismatch")
+    assert isinstance(metadata, dict)
     if metadata["materializer_policy_version"] != _MATERIALIZER_VERSION:
         raise EngineTreeError("materialized tree policy version mismatch")
     contributions = _validate_contribution_rows(metadata["contributions"])
@@ -1683,7 +2029,9 @@ def reopen_materialized_engine_tree(
     except ValueError as exc:
         raise EngineTreeError("materialized contribution inventory is invalid") from exc
     stack_digest = metadata["stack_digest"]
-    if not isinstance(stack_digest, str) or not re.fullmatch(r"[0-9a-f]{64}", stack_digest):
+    if not isinstance(stack_digest, str) or not re.fullmatch(
+        r"[0-9a-f]{64}", stack_digest
+    ):
         raise EngineTreeError("materialized tree stack digest is malformed")
     runtime_manifest = metadata["runtime_manifest"]
     if runtime_manifest is not None and runtime_manifest != "manifest.toml":
@@ -1713,6 +2061,25 @@ def reopen_materialized_engine_tree(
         files=row_tuple,
         runtime_manifest=runtime_manifest,
     )
+
+
+def reopen_materialized_engine_tree(
+    root: str | Path,
+    *,
+    expected_tree_digest: str | None = None,
+) -> MaterializedEngineTree:
+    """Reopen an exact evaluation/release stack tree.
+
+    A live launch authority must supply ``expected_tree_digest``. Without it this
+    is structural validation only.
+    """
+
+    reopened = _reopen_engine_tree(
+        root,
+        expected_tree_digest=expected_tree_digest,
+    )
+    assert isinstance(reopened, MaterializedEngineTree)
+    return reopened
 
 
 def materialize_discovery_engine_tree(
@@ -1851,6 +2218,11 @@ def materialize_engine_tree(
         raise TypeError("catalog must be a TargetCatalog")
     if not isinstance(stack, (EvaluationStackManifest, EngineReleaseManifest)):
         raise TypeError("stack must be an EvaluationStackManifest or EngineReleaseManifest")
+    artifact_admission_context = (
+        "release stack admission"
+        if isinstance(stack, EngineReleaseManifest)
+        else "evaluation stack admission"
+    )
     stack.validate_against(context)
     if isinstance(stack, EngineReleaseManifest):
         if integration_records is None:
@@ -1890,9 +2262,22 @@ def materialize_engine_tree(
                 source_kind = "proposal_artifact"
                 source_digest = ref.artifact_digest
                 if content_hash(staged) != source_digest:
-                    raise EngineTreeError(
-                        f"proposal artifact digest mismatch for {target_id!r}"
+                    # Published worker bundles carry one validator-owned native-
+                    # artifact receipt beside the exact miner files.  That carrier
+                    # byte is deliberately outside the miner's committed content
+                    # hash, so admit the mismatch only when the original source
+                    # independently reopens as that exact typed publication.
+                    from optima.chain.publication import (
+                        WorkerBundlePublicationError,
+                        reopen_worker_bundle,
                     )
+
+                    try:
+                        reopen_worker_bundle(source, source_digest)
+                    except (WorkerBundlePublicationError, OSError, TypeError, ValueError):
+                        raise EngineTreeError(
+                            f"proposal artifact digest mismatch for {target_id!r}"
+                        ) from None
             elif isinstance(ref, IntegratedContributionRef):
                 source_kind = "integrated_source"
                 source_digest = ref.integrated_source_tree_digest
@@ -1904,6 +2289,10 @@ def materialize_engine_tree(
                 raise EngineTreeError(f"unsupported contribution ref for {target_id!r}")
 
             inspection = _inspect_contribution(staged, catalog=catalog)
+            _require_crownable_artifact_providers(
+                inspection.manifest,
+                context=artifact_admission_context,
+            )
             if inspection.target_id != target_id or ref.target_id != target_id:
                 raise EngineTreeError(f"resolved target mismatch for {target_id!r}")
             if inspection.target_spec_digest != ref.target_spec_digest:

@@ -202,6 +202,8 @@ def _require_execution_completion(
 
     completed = receipts.collect(receipt_dir, "completed")
     fallbacks = receipts.collect(receipt_dir, "fallback")
+    aot_loaded = receipts.collect(receipt_dir, "aot_loaded")
+    aot_invoked = receipts.collect(receipt_dir, "aot_invoked")
     passed, detail = receipts.completed_gate(
         completed,
         expected_slots=expected_slots,
@@ -210,7 +212,60 @@ def _require_execution_completion(
         fallback_receipts=fallbacks,
     )
     if not passed:
-        raise RuntimeError("candidate engine run failed execution coverage: " + detail)
+        observed = (
+            f"observed_receipts=completed:{len(completed)},fallback:{len(fallbacks)},"
+            f"aot_loaded:{len(aot_loaded)},aot_invoked:{len(aot_invoked)}"
+        )
+        raise RuntimeError(
+            "candidate engine run failed execution coverage: "
+            + detail
+            + "; "
+            + observed
+        )
+    if aot_invoked and not aot_loaded:
+        raise RuntimeError(
+            "candidate engine run has sealed CuTe AOT use evidence without "
+            "matching load evidence"
+        )
+    if aot_loaded:
+        aot_slots = sorted(
+            {
+                row.get("slot")
+                for row in aot_loaded
+                if isinstance(row.get("slot"), str) and row.get("slot")
+            }
+        )
+        if not aot_slots:
+            raise RuntimeError(
+                "candidate engine run has malformed CuTe AOT load evidence"
+            )
+        if not set(aot_slots).issubset(expected_slots):
+            raise RuntimeError(
+                "candidate engine run loaded sealed CuTe AOT for an inactive slot"
+            )
+        loaded_passed, loaded_detail = receipts.completed_gate(
+            aot_loaded,
+            expected_slots=aot_slots,
+            member_receipts=active_receipts,
+            expected_member_count=expected_member_count,
+        )
+        if not loaded_passed:
+            raise RuntimeError(
+                "candidate engine run failed sealed CuTe AOT load coverage: "
+                + loaded_detail
+            )
+        aot_passed, aot_detail = receipts.completed_gate(
+            aot_invoked,
+            expected_slots=aot_slots,
+            member_receipts=active_receipts,
+            expected_member_count=expected_member_count,
+        )
+        if not aot_passed:
+            raise RuntimeError(
+                "candidate engine run failed sealed CuTe AOT use coverage: "
+                + aot_detail
+            )
+        detail += "; sealed CuTe AOT " + loaded_detail + "; " + aot_detail
     return detail
 
 

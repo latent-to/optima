@@ -841,21 +841,28 @@ def set_weights(subtensor, wallet, netuid: int, weights_by_hotkey: dict[str, flo
         version_key=version_key, wait_for_inclusion=wait_for_inclusion,
         wait_for_finalization=wait_for_finalization,
     )
-    # An included extrinsic can still FAIL chain-side (rate limit, permit, CR
-    # window) — report that honestly or the caller records weights that never
-    # applied. Measured on 307 (2026-07-10): a second commit 24 blocks after the
-    # first was accepted by the SDK but never revealed (weights_rate_limit=100
-    # applies to CR commits too); the old unconditional submitted=True wrote the
-    # state file and suppressed every retry.
-    if isinstance(result, tuple):  # older SDKs: (success, message)
-        ok, message = bool(result[0]), str(result[1] if len(result) > 1 else "")
-    else:
-        ok = bool(getattr(result, "success", result))
-        message = str(getattr(result, "message", ""))
+    # Report chain-side failure honestly or the caller records weights that
+    # never applied (weights_rate_limit=100 applies to CR commits too; the old
+    # unconditional submitted=True wrote the state file and suppressed retries).
+    ok, message = _extrinsic_outcome(result)
     if not ok:
         logger.warning("set_weights failed on-chain: %s", message or result)
     return {"submitted": ok, "result": result, "message": message,
             "uids": uids, "weights": weights}
+
+
+def _extrinsic_outcome(result) -> tuple[bool, str]:
+    """Fail-closed interpretation of an SDK extrinsic submission result.
+
+    An extrinsic the SDK accepted without raising can still FAIL chain-side
+    (rate limit, permit, CR window, undeserializable wallet). Measured on 307
+    twice: a failed ``ExtrinsicResponse`` reported as a phantom submission
+    (2026-07-14), and a second CR commit accepted but never revealed
+    (2026-07-10). ``success`` is the SDK's field; ``is_success`` is not.
+    """
+    if isinstance(result, tuple):  # older SDKs: (success, message)
+        return bool(result[0]), str(result[1] if len(result) > 1 else "")
+    return bool(getattr(result, "success", result)), str(getattr(result, "message", ""))
 
 
 def post_commitment(subtensor, wallet, netuid: int, data: str, *, dry_run: bool = False) -> dict:
@@ -864,7 +871,10 @@ def post_commitment(subtensor, wallet, netuid: int, data: str, *, dry_run: bool 
         logger.info("DRY RUN set_commitment netuid=%s data=%s", netuid, data)
         return {"submitted": False, "dry_run": True, "data": data}
     result = subtensor.set_commitment(wallet=wallet, netuid=netuid, data=data)
-    return {"submitted": True, "result": result}
+    ok, message = _extrinsic_outcome(result)
+    if not ok:
+        logger.warning("set_commitment failed on-chain: %s", message or result)
+    return {"submitted": ok, "result": result, "message": message}
 
 
 def post_reveal_commitment(subtensor, wallet, netuid: int, data: str, *,
@@ -883,7 +893,10 @@ def post_reveal_commitment(subtensor, wallet, netuid: int, data: str, *,
     result = subtensor.set_reveal_commitment(
         wallet=wallet, netuid=netuid, data=data, blocks_until_reveal=blocks_until_reveal,
     )
-    return {"submitted": True, "result": result}
+    ok, message = _extrinsic_outcome(result)
+    if not ok:
+        logger.warning("set_reveal_commitment failed on-chain: %s", message or result)
+    return {"submitted": ok, "result": result, "message": message}
 
 
 def preflight(subtensor, wallet, netuid: int) -> list:

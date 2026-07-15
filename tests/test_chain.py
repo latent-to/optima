@@ -258,6 +258,33 @@ def test_post_commitment_dry_run_and_submit():
     assert st.set_commitment_calls == ["thehash"]
 
 
+def test_commitment_wrappers_report_failed_extrinsics_honestly():
+    class _FailedResponse:
+        success = False
+        message = "wallet could not be deserialized"
+
+    class _SucceededResponse:
+        success = True
+        message = ""
+
+    for failed in (_FailedResponse(), (False, "rate limited"), None, False):
+        st = _MockSubtensor(hotkeys=["a"])
+        st.set_commitment = lambda *, wallet, netuid, data, _r=failed: _r
+        st.set_reveal_commitment = (
+            lambda *, wallet, netuid, data, blocks_until_reveal, _r=failed: _r
+        )
+        assert chain.post_commitment(st, object(), 1, "h")["submitted"] is False
+        assert chain.post_reveal_commitment(st, object(), 1, "p")["submitted"] is False
+
+    st = _MockSubtensor(hotkeys=["a"])
+    st.set_commitment = lambda *, wallet, netuid, data: _SucceededResponse()
+    st.set_reveal_commitment = (
+        lambda *, wallet, netuid, data, blocks_until_reveal: (True, "")
+    )
+    assert chain.post_commitment(st, object(), 1, "h")["submitted"] is True
+    assert chain.post_reveal_commitment(st, object(), 1, "p")["submitted"] is True
+
+
 def test_read_revealed_commitments_takes_latest_per_hotkey():
     st = _MockSubtensor(hotkeys=["a", "b"], revealed={
         "a": ((5, "old"), (9, "new")),

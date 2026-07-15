@@ -214,7 +214,7 @@ def test_live_loop_calls_batch_qualification_and_retains_fail_outcome(
         ),
     )
 
-    def plan(_self, candidates, _receipts):
+    def plan(_self, candidates, _receipts, state=None):
         reservations = tuple(row.reservation for row in candidates)
         authority = QualificationAuthorityManifest(
             "registered", "a" * 64, "b" * 64, "c" * 64, "d" * 64,

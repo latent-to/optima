@@ -29,11 +29,8 @@ from optima.eval.native_compile_profile import (
     NativeCompileProfileError,
     NativeCuTeCompileProfile,
 )
-from optima.stack_identity import (
-    canonical_digest,
-    canonical_json_bytes,
-    require_sha256_hex,
-)
+from optima.stack_identity import canonical_digest, canonical_json_bytes
+from optima._strict import require_digest, require_exact_fields
 
 
 ENGINE_LAUNCH_SCHEMA_VERSION = 1
@@ -61,9 +58,7 @@ class EngineLaunchError(ValueError):
 def _strict_object(
     value: object, *, fields: frozenset[str], name: str
 ) -> Mapping[str, object]:
-    if not isinstance(value, Mapping) or set(value) != fields:
-        raise EngineLaunchError(f"{name} schema mismatch")
-    return value
+    return require_exact_fields(value, fields=fields, label=name, error=EngineLaunchError)
 
 
 def _version(value: object, *, expected: int, field: str) -> int:
@@ -73,13 +68,7 @@ def _version(value: object, *, expected: int, field: str) -> int:
 
 
 def _digest(value: object, *, field: str) -> str:
-    try:
-        checked = require_sha256_hex(value, field=field)
-    except ValueError as exc:
-        raise EngineLaunchError(str(exc)) from exc
-    if checked == "0" * 64:
-        raise EngineLaunchError(f"{field} must not be the all-zero digest")
-    return checked
+    return require_digest(value, field=field, error=EngineLaunchError)
 
 
 def _architecture(value: object, *, field: str) -> str:

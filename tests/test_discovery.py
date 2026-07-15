@@ -176,8 +176,8 @@ def test_discovery_abi_is_separate_from_component_manifest(tmp_path):
     "manifest_text,match",
     [
         (_manifest(abi="optima-op-abi-v0"), "unsupported abi_version"),
-        (_manifest(extra='command = "bash evil.sh"\n'), "schema mismatch"),
-        (_manifest(extra='environment = { HOME = "/tmp" }\n'), "schema mismatch"),
+        (_manifest(extra='command = "bash evil.sh"\n'), "fields mismatch"),
+        (_manifest(extra='environment = { HOME = "/tmp" }\n'), "fields mismatch"),
         (_manifest(patches=()), "patches must be a nonempty"),
         (_manifest(patches=("../escape.patch",)), "canonical relative path"),
         (_manifest(patches=("patches/change.txt",)), "must use .patch"),

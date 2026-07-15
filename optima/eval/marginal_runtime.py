@@ -38,7 +38,6 @@ from optima.eval.oci_outer_session import SessionExecutionPlan
 from optima.eval.runtime_preflight import RuntimePreflightReceipt
 from optima.discovery import DiscoveryArmPlan, reopen_discovery_engine_binding
 from optima.discovery_overlay import DiscoveryActivationReceipt
-from optima.stack_identity import require_sha256_hex
 from optima.stack_manifest import (
     EvaluationStackContext,
     EvaluationStackManifest,
@@ -47,6 +46,7 @@ from optima.stack_manifest import (
 )
 from optima.stack_plan import CohortPlan, MarginalArmPlan, StackPlanError
 from optima.target_catalog import TargetCatalog
+from optima._strict import require_digest
 
 
 _TREE_METADATA = "metadata/optima_engine_tree.json"
@@ -75,11 +75,7 @@ class EngineExecutor(Protocol):
 
 
 def _digest(value: object, *, field: str) -> str:
-    try:
-        result = require_sha256_hex(value, field=field)
-    except ValueError as exc:
-        raise MarginalRuntimeError(str(exc)) from exc
-    return result
+    return require_digest(value, field=field, error=MarginalRuntimeError)
 
 
 def _native_environment(binding: TrustedLaunchBinding) -> dict[str, object]:

@@ -77,7 +77,8 @@ from optima.eval.runtime_preflight import (
     RuntimePreflightReceipt,
     WORKER_DISTRIBUTION,
 )
-from optima.stack_identity import canonical_digest, require_sha256_hex
+from optima.stack_identity import canonical_digest
+from optima._strict import require_digest
 
 
 CONTAINER_TREE = "/optima/engine-tree"
@@ -132,13 +133,7 @@ class OCIBackendDeadlineError(OCIBackendError):
 
 
 def _digest(value: object, *, field: str) -> str:
-    try:
-        result = require_sha256_hex(value, field=field)
-    except ValueError as exc:
-        raise OCIBackendError(str(exc)) from None
-    if result == "0" * 64:
-        raise OCIBackendError(f"{field} must not be the all-zero digest")
-    return result
+    return require_digest(value, field=field, error=OCIBackendError)
 
 
 def _absolute_path(value: object, *, field: str) -> str:

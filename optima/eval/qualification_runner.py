@@ -62,6 +62,7 @@ from optima.eval.scoring import (
 )
 from optima.stack_identity import canonical_digest, canonical_json_bytes, require_sha256_hex
 from optima.stack_manifest import EvaluationStackManifest
+from optima._strict import require_exact_fields
 
 class QualificationRunnerError(RuntimeError):
     """Infrastructure/authority failure; callers must treat it as NO_DECISION."""
@@ -75,9 +76,10 @@ DISCOVERY_ATTEMPT_DOMAIN = "qualification.discovery-attempt"
 DISCOVERY_ATTEMPT_SCHEMA = "optima.qualification.discovery-attempt.v1"
 
 def _strict(value: object, fields: set[str], label: str) -> dict[str, object]:
-    if type(value) is not dict or set(value) != fields:
-        raise QualificationRunnerError(f"{label} fields do not match the schema")
-    return value
+    return require_exact_fields(
+        value, fields=frozenset(fields), label=label, error=QualificationRunnerError,
+        exact_dict=True,
+    )
 
 def _encode_record(value: object) -> object:
     if isinstance(value, Enum):

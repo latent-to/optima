@@ -183,7 +183,7 @@ def test_strict_parser_rejects_unknown_or_tampered_fields() -> None:
     manifest = _manifest()
     raw = manifest.to_dict()
     raw["untrusted_threshold"] = "0"
-    with pytest.raises(CalibrationError, match="fields do not match"):
+    with pytest.raises(CalibrationError, match="fields mismatch"):
         CalibrationManifest.from_dict(raw)
 
     raw = manifest.to_dict()

@@ -19,12 +19,8 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, Iterable, Mapping
 
-from optima.stack_identity import (
-    StackIdentityError,
-    canonical_digest,
-    canonical_json_bytes,
-    require_sha256_hex,
-)
+from optima.stack_identity import canonical_digest, canonical_json_bytes
+from optima._strict import require_digest, require_exact_fields
 
 
 MODEL_PROVISION_SCHEMA_VERSION = 1
@@ -50,24 +46,13 @@ class ModelProvisionError(RuntimeError):
 
 
 def _digest(value: object, *, field: str) -> str:
-    try:
-        return require_sha256_hex(value, field=field)
-    except StackIdentityError as exc:
-        raise ModelProvisionError(str(exc)) from exc
+    return require_digest(value, field=field, error=ModelProvisionError)
 
 
 def _strict_object(
     value: object, *, fields: frozenset[str], label: str
 ) -> Mapping[str, object]:
-    if not isinstance(value, Mapping) or not all(isinstance(key, str) for key in value):
-        raise ModelProvisionError(f"{label} must be an object with string keys")
-    actual = frozenset(value)
-    if actual != fields:
-        raise ModelProvisionError(
-            f"{label} fields mismatch: missing={sorted(fields - actual)!r}, "
-            f"extra={sorted(actual - fields)!r}"
-        )
-    return value
+    return require_exact_fields(value, fields=fields, label=label, error=ModelProvisionError)
 
 
 def _logical_path(value: object) -> str:

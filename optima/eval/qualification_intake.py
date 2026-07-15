@@ -13,6 +13,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable
+from optima._strict import require_digest, require_identifier, require_int
 
 if TYPE_CHECKING:
     from optima.settlement import SettlementQualification
@@ -48,11 +49,7 @@ from optima.eval.qualification_runner import (
 from optima.eval.oci_backend import OCIBackendError
 from optima.eval.oci_outer_session import OuterSessionProcessError
 from optima.eval.scoring import RawSpeedEvidenceError
-from optima.stack_identity import (
-    canonical_digest,
-    canonical_json_bytes,
-    require_sha256_hex,
-)
+from optima.stack_identity import canonical_digest, canonical_json_bytes
 
 
 AUTHORITY_SCHEMA_VERSION = 1
@@ -66,25 +63,17 @@ class QualificationIntakeError(ValueError):
 
 
 def _digest(value: object, field: str) -> str:
-    try:
-        result = require_sha256_hex(value, field=field)
-    except ValueError as exc:
-        raise QualificationIntakeError(str(exc)) from None
-    if result == "0" * 64:
-        raise QualificationIntakeError(f"{field} must not be the all-zero digest")
-    return result
+    return require_digest(value, field=field, error=QualificationIntakeError)
 
 
 def _identifier(value: object, field: str) -> str:
-    if not isinstance(value, str) or _IDENTIFIER.fullmatch(value) is None:
-        raise QualificationIntakeError(f"{field} is not a canonical identifier")
-    return value
+    return require_identifier(
+        value, field=field, error=QualificationIntakeError, pattern=_IDENTIFIER
+    )
 
 
 def _integer(value: object, field: str) -> int:
-    if type(value) is not int or value < 0:
-        raise QualificationIntakeError(f"{field} must be a nonnegative integer")
-    return value
+    return require_int(value, field=field, error=QualificationIntakeError, minimum=0)
 
 
 @dataclass(frozen=True)

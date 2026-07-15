@@ -27,6 +27,7 @@ import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Mapping, MutableMapping, Sequence
+from optima._strict import truthy_flag
 
 
 ARMED = "OPTIMA_DISCOVERY_OVERLAY_ARMED"
@@ -377,8 +378,7 @@ class _DriverActivationState:
 _DRIVER_ACTIVATION: _DriverActivationState | None = None
 
 
-def _truthy(value: str | None) -> bool:
-    return (value or "").strip().lower() in {"1", "true", "yes", "on"}
+_truthy = truthy_flag
 
 
 def _required(environment: Mapping[str, str], key: str) -> str:

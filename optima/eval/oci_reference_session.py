@@ -52,8 +52,9 @@ from optima.eval.reference_protocol import (
     expected_evidence_payload_bytes,
     request_sha256,
 )
-from optima.stack_identity import canonical_digest, require_sha256_hex, sha256_hex
+from optima.stack_identity import canonical_digest, sha256_hex
 from optima.stack_manifest import EvaluationStackManifest
+from optima._strict import require_digest
 
 
 class ReferenceSessionError(RuntimeError):
@@ -73,13 +74,7 @@ class ReferenceTransport(Protocol):
 
 
 def _digest(value: object, *, field: str) -> str:
-    try:
-        result = require_sha256_hex(value, field=field)
-    except ValueError as exc:
-        raise ReferenceSessionError(str(exc)) from None
-    if result == "0" * 64:
-        raise ReferenceSessionError(f"{field} must not be the all-zero digest")
-    return result
+    return require_digest(value, field=field, error=ReferenceSessionError)
 
 
 def _now(clock: Callable[[], float], *, previous: float | None = None) -> float:

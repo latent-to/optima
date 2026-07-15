@@ -15,10 +15,11 @@ from enum import Enum
 from typing import Iterable
 
 from optima.eval.evidence_store import EvidenceArtifactRef
-from optima.stack_identity import canonical_digest, require_sha256_hex
+from optima.stack_identity import canonical_digest
 from optima.stack_manifest import EvaluationStackManifest
 from optima.stack_plan import StackArmIdentity
 from optima.target_catalog import TargetCatalog, TargetResolutionError
+from optima._strict import require_digest, require_identifier, require_int
 
 
 _ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,255}\Z")
@@ -30,24 +31,15 @@ class SettlementError(ValueError):
 
 
 def _digest(value: object, field: str, *, optional: bool = False) -> str:
-    if optional and value == "":
-        return ""
-    try:
-        return require_sha256_hex(value, field=field)
-    except ValueError as exc:
-        raise SettlementError(str(exc)) from None
+    return require_digest(value, field=field, error=SettlementError, optional=optional)
 
 
 def _identifier(value: object, field: str) -> str:
-    if not isinstance(value, str) or _ID.fullmatch(value) is None:
-        raise SettlementError(f"{field} is not a canonical identifier")
-    return value
+    return require_identifier(value, field=field, error=SettlementError, pattern=_ID)
 
 
 def _integer(value: object, field: str) -> int:
-    if type(value) is not int or value < 0:
-        raise SettlementError(f"{field} must be a nonnegative integer")
-    return value
+    return require_int(value, field=field, error=SettlementError, minimum=0)
 
 
 def _speedup(value: object) -> str:

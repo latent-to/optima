@@ -17,14 +17,14 @@ without importing CUDA Python.
 from __future__ import annotations
 
 import hashlib
-import operator
 import re
 import threading
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Any, Mapping
 
-from optima.stack_identity import canonical_digest, require_sha256_hex
+from optima.stack_identity import canonical_digest
+from optima._strict import require_digest, require_driver_integer
 
 
 CUDA_CUBIN_ABI_SCHEMA = "optima.cuda-cubin-abi.v1"
@@ -110,17 +110,7 @@ def _require_elf_cubin(raw: bytes) -> None:
 
 
 def _digest(value: object, *, field: str) -> str:
-    if type(value) is not str:
-        raise CudaCubinError(
-            f"{field} must be a lowercase 64-hex SHA-256 digest"
-        )
-    try:
-        digest = require_sha256_hex(value, field=field)
-    except ValueError as exc:
-        raise CudaCubinError(str(exc)) from None
-    if digest == "0" * 64:
-        raise CudaCubinError(f"{field} must not be the all-zero digest")
-    return digest
+    return require_digest(value, field=field, error=CudaCubinError)
 
 
 def _kernel_name(value: object, *, field: str) -> str:
@@ -432,21 +422,7 @@ class CudaCubinABI:
 
 
 def _driver_integer(value: object, *, field: str) -> int:
-    """Accept integer-protocol CUDA values without lossy ``int()`` coercion."""
-
-    if isinstance(value, bool):
-        raise CudaCubinError(f"CUDA driver returned a malformed {field}")
-    try:
-        return operator.index(value)
-    except (TypeError, ValueError, OverflowError):
-        enum_value = getattr(value, "value", None)
-        if isinstance(enum_value, bool):
-            raise CudaCubinError(f"CUDA driver returned a malformed {field}")
-        try:
-            return operator.index(enum_value)
-        except (TypeError, ValueError, OverflowError):
-            pass
-    raise CudaCubinError(f"CUDA driver returned a malformed {field}")
+    return require_driver_integer(value, field=field, error=CudaCubinError)
 
 
 def _result_code(value: object) -> int:

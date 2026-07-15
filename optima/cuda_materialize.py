@@ -9,7 +9,6 @@ by :func:`make_cuda_primitive_registry` inside the isolated engine worker.
 from __future__ import annotations
 
 import math
-import operator
 import struct
 from dataclasses import dataclass
 from types import MappingProxyType
@@ -22,6 +21,7 @@ from optima.cuda_launch import (
     CudaScalar,
     CudaScalarType,
 )
+from optima._strict import require_driver_integer, require_int
 
 
 CUDA_EXPRESSION_SCHEMA = "optima.cuda-expression-dag.v1"
@@ -971,20 +971,7 @@ _TMA_DRIVER_OOB = MappingProxyType(
 
 
 def _driver_integer(value: object, *, field: str) -> int:
-    if isinstance(value, bool):
-        raise CudaMaterializeError(f"CUDA driver returned malformed {field}")
-    try:
-        return operator.index(value)
-    except (TypeError, ValueError, OverflowError):
-        enum_value = getattr(value, "value", None)
-        if isinstance(enum_value, bool):
-            raise CudaMaterializeError(f"CUDA driver returned malformed {field}")
-        try:
-            return operator.index(enum_value)
-        except (TypeError, ValueError, OverflowError):
-            raise CudaMaterializeError(
-                f"CUDA driver returned malformed {field}"
-            ) from None
+    return require_driver_integer(value, field=field, error=CudaMaterializeError)
 
 
 def _driver_enum(driver: object, owner: str, member: str) -> object:
@@ -1198,9 +1185,9 @@ class _ExpressionContext:
 
 
 def _integer(value: object, *, field: str) -> int:
-    if type(value) is not int or not _INT64_MIN <= value <= _INT64_MAX:
-        raise CudaMaterializeError(f"{field} must resolve to a signed 64-bit integer")
-    return value
+    return require_int(
+        value, field=field, error=CudaMaterializeError, minimum=_INT64_MIN, maximum=_INT64_MAX
+    )
 
 
 def _eval_expression(

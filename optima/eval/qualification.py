@@ -20,8 +20,8 @@ from optima.stack_identity import (
     StackIdentityError,
     canonical_digest,
     canonical_json_bytes,
-    require_sha256_hex,
 )
+from optima._strict import require_digest, require_exact_fields, require_int
 
 if TYPE_CHECKING:
     from optima.discovery_overlay import DiscoveryActivationReceipt
@@ -49,13 +49,7 @@ class QualificationDecision(str, Enum):
 
 
 def _digest(value: object, field: str) -> str:
-    try:
-        result = require_sha256_hex(value, field=field)
-    except StackIdentityError as exc:
-        raise QualificationError(str(exc)) from exc
-    if result == "0" * 64:
-        raise QualificationError(f"{field} must not be the all-zero digest")
-    return result
+    return require_digest(value, field=field, error=QualificationError)
 
 
 def _id(value: object, field: str) -> str:
@@ -65,9 +59,7 @@ def _id(value: object, field: str) -> str:
 
 
 def _integer(value: object, field: str, minimum: int = 0) -> int:
-    if type(value) is not int or value < minimum:
-        raise QualificationError(f"{field} must be an integer >= {minimum}")
-    return value
+    return require_int(value, field=field, error=QualificationError, minimum=minimum)
 
 
 def _boolean(value: object, field: str) -> bool:
@@ -83,13 +75,7 @@ def _array(value: object, label: str) -> Sequence[object]:
 
 
 def _strict(value: object, expected: frozenset[str], label: str) -> Mapping[str, object]:
-    if (
-        not isinstance(value, Mapping)
-        or not all(isinstance(key, str) for key in value)
-        or frozenset(value) != expected
-    ):
-        raise QualificationError(f"{label} fields do not match the schema")
-    return value
+    return require_exact_fields(value, fields=expected, label=label, error=QualificationError)
 
 
 def _encode(value: object) -> object:

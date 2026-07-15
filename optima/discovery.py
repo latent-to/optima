@@ -22,19 +22,14 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any
+from optima._strict import require_digest, require_exact_fields, require_identifier
 
 if TYPE_CHECKING:
     from optima.engine_tree import MaterializedEngineTree
 
 from optima.deppatch import DepPatchError, FilePatch, apply_file_patch, parse_patch_text
 from optima.eval.native_artifact import NativeArtifactPublication
-from optima.stack_identity import (
-    StackIdentityError,
-    canonical_digest,
-    canonical_json_bytes,
-    require_sha256_hex,
-    sha256_hex,
-)
+from optima.stack_identity import canonical_digest, canonical_json_bytes, sha256_hex
 from optima.stack_manifest import EvaluationStackManifest
 from optima.stack_plan import StackArmIdentity
 
@@ -96,25 +91,15 @@ def _require(condition: bool, message: str) -> None:
 
 
 def _strict_object(value: object, fields: frozenset[str], *, name: str) -> Mapping[str, Any]:
-    if not isinstance(value, Mapping) or set(value) != fields:
-        raise DiscoveryError(f"{name} schema mismatch")
-    return value
+    return require_exact_fields(value, fields=fields, label=name, error=DiscoveryError)
 
 
 def _digest(value: object, *, field: str) -> str:
-    try:
-        digest = require_sha256_hex(value, field=field)
-    except StackIdentityError as exc:
-        raise DiscoveryError(str(exc)) from None
-    if digest == "0" * 64:
-        raise DiscoveryError(f"{field} must not be the all-zero digest")
-    return digest
+    return require_digest(value, field=field, error=DiscoveryError)
 
 
 def _identifier(value: object, *, field: str) -> str:
-    if not isinstance(value, str) or _ID_RE.fullmatch(value) is None:
-        raise DiscoveryError(f"{field} must match [a-z0-9][a-z0-9._-]*")
-    return value
+    return require_identifier(value, field=field, error=DiscoveryError, pattern=_ID_RE)
 
 
 def _selector(value: object, *, field: str) -> str:

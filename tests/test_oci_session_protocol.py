@@ -554,7 +554,7 @@ def test_batch_request_discloses_only_one_exact_bounded_batch() -> None:
         ({"session_id": "0" * 32}, "nonzero"),
         ({"request_id": SESSION}, "distinct"),
         ({"nonce": REQUEST}, "distinct"),
-        ({"launch_digest": "0" * 64}, "nonzero"),
+        ({"launch_digest": "0" * 64}, "all-zero"),
         ({"batch_index": -1}, "batch_index"),
         ({"prompts": ()}, "prompts count"),
         ({"prompts": (3,)}, "invalid"),

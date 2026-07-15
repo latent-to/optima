@@ -23,11 +23,8 @@ from optima.artifact_provider import (
     CUTE_CUBIN_PROVIDER_ID,
     ArtifactKind,
 )
-from optima.stack_identity import (
-    canonical_digest,
-    canonical_json_bytes,
-    require_sha256_hex,
-)
+from optima.stack_identity import canonical_digest, canonical_json_bytes
+from optima._strict import require_digest
 
 
 PROFILE_SCHEMA = "optima.native-cute-compile-profile.v1"
@@ -47,13 +44,7 @@ class NativeCompileProfileError(ValueError):
 
 
 def _digest(value: object, *, field: str) -> str:
-    try:
-        checked = require_sha256_hex(value, field=field)
-    except ValueError as exc:
-        raise NativeCompileProfileError(str(exc)) from None
-    if checked == "0" * 64:
-        raise NativeCompileProfileError(f"{field} must not be the all-zero digest")
-    return checked
+    return require_digest(value, field=field, error=NativeCompileProfileError)
 
 
 def _degree(value: object, *, field: str) -> int:

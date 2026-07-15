@@ -36,9 +36,11 @@ def _stub_flashinfer(monkeypatch):
     def stock_generator(use_fast_build=False):
         return ("stock", use_fast_build)
 
+    source.gen_cutlass_fused_moe_sm100_module = stock_generator
     source.gen_cutlass_fused_moe_sm103_module = stock_generator
 
     consumer = types.ModuleType("flashinfer.fused_moe.core")
+    consumer.gen_cutlass_fused_moe_sm100_module = stock_generator
     consumer.gen_cutlass_fused_moe_sm103_module = stock_generator
 
     @functools.cache
@@ -111,12 +113,21 @@ def _candidate(tmp_path, monkeypatch, *, materialize=True):
         source = subtree / "fused_moe/x.cu"
         source.write_text("new\n")
 
-        module = policy.prebuilt_modules[0]
-        module_relative = prebuilt_module_relative_path("flashinfer", module)
-        module_path = artifact / module_relative
-        module_path.parent.mkdir(parents=True)
-        module_bytes = b"synthetic-shared-object"
-        module_path.write_bytes(module_bytes)
+        module_rows = []
+        for module in policy.prebuilt_modules:
+            module_relative = prebuilt_module_relative_path("flashinfer", module)
+            module_path = artifact / module_relative
+            module_path.parent.mkdir(parents=True)
+            module_bytes = f"synthetic-shared-object-{module.name}".encode()
+            module_path.write_bytes(module_bytes)
+            module_rows.append(
+                {
+                    **asdict(module),
+                    "path": module_relative,
+                    "sha256": hashlib.sha256(module_bytes).hexdigest(),
+                    "size": len(module_bytes),
+                }
+            )
 
         tree_digest, files = tree_inventory(subtree)
         stamp = expected_overlay_stamp(
@@ -129,14 +140,7 @@ def _candidate(tmp_path, monkeypatch, *, materialize=True):
                 },
                 "tree_digest": tree_digest,
                 "tree_files": [row.to_dict() for row in files],
-                "prebuilt_modules": [
-                    {
-                        **asdict(module),
-                        "path": module_relative,
-                        "sha256": hashlib.sha256(module_bytes).hexdigest(),
-                        "size": len(module_bytes),
-                    }
-                ],
+                "prebuilt_modules": module_rows,
             }
         )
         (overlay / "overlay.json").write_text(
@@ -187,6 +191,9 @@ def test_installs_rebinds_load_only_generator_and_receipt(tmp_path, monkeypatch,
     assert consumer.get_cutlass_fused_moe_module.cache_info().currsize == 0
     with pytest.raises(RuntimeError, match="use_fast_build=False"):
         source.gen_cutlass_fused_moe_sm103_module(True)
+    # The other architecture's module ships in the artifact but must NOT be
+    # installed on this device.
+    assert source.gen_cutlass_fused_moe_sm100_module("x") == ("stock", "x")
 
     (receipt,) = receipts.collect(receipt_dir, "overlay")
     assert receipt == {
@@ -233,7 +240,7 @@ def test_writable_publication_and_off_domain_arch_are_terminal(tmp_path, monkeyp
 
     artifact.chmod(0o555)
     monkeypatch.setenv("OPTIMA_TARGET_GPU_ARCH", "sm120")
-    with pytest.raises(RuntimeError, match="requires 'sm103', got 'sm120'"):
+    with pytest.raises(RuntimeError, match="no prebuilt module for device architecture 'sm120'"):
         fov.install(registry=None)
 
 

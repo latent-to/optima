@@ -133,12 +133,19 @@ def install(registry) -> None:  # registry unused; signature shared by integrati
             setattr(environment, attribute, overlay.subtree)
             logger.info("optima: %s.%s -> %s", module_name, attribute, overlay.subtree)
         target_architecture = os.environ.get("OPTIMA_TARGET_GPU_ARCH", "").strip().lower()
-        for module in overlay.modules:
-            if target_architecture != module.policy.target_architecture:
-                raise RuntimeError(
-                    f"prebuilt dependency module {module.policy.name!r} requires "
-                    f"{module.policy.target_architecture!r}, got {target_architecture!r}"
-                )
+        # The artifact carries one module per fleet architecture; install only
+        # the device's module and refuse devices the policy does not cover.
+        selected = tuple(
+            module
+            for module in overlay.modules
+            if module.policy.target_architecture == target_architecture
+        )
+        if overlay.modules and not selected:
+            raise RuntimeError(
+                f"dependency overlay {overlay.target!r} has no prebuilt module for "
+                f"device architecture {target_architecture!r}"
+            )
+        for module in selected:
             replacement = _load_only_generator(module)
             generator_module = importlib.import_module(module.policy.generator_module)
             setattr(generator_module, module.policy.generator_attr, replacement)

@@ -1265,20 +1265,22 @@ def test_materialized_dep_cuda_tree_builds_publishes_and_reopens_load_only(
         assert (overlay_subtree / "fused_moe/fused_moe.cu").read_text() == (
             "export_prefinalize();\n"
         )
-        module = policy.prebuilt_modules[0]
-        relative = dep_policy.prebuilt_module_relative_path(target, module)
-        destination = artifact_root / relative
-        digest, size = apply_namespace["_copy_built_module"](
-            prebuilt_source, destination
-        )
-        return [
-            {
-                **asdict(module),
-                "path": relative,
-                "sha256": digest,
-                "size": size,
-            }
-        ]
+        rows = []
+        for module in policy.prebuilt_modules:
+            relative = dep_policy.prebuilt_module_relative_path(target, module)
+            destination = artifact_root / relative
+            digest, size = apply_namespace["_copy_built_module"](
+                prebuilt_source, destination
+            )
+            rows.append(
+                {
+                    **asdict(module),
+                    "path": relative,
+                    "sha256": digest,
+                    "size": size,
+                }
+            )
+        return rows
 
     apply_namespace["_build_prebuilt_modules"] = fake_prebuilt_modules
 

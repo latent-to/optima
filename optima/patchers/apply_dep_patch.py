@@ -170,9 +170,6 @@ def _required_target_architecture(policy) -> str:
     architectures = {module.target_architecture for module in policy.prebuilt_modules}
     if not architectures:
         return ""
-    if len(architectures) != 1:
-        raise RuntimeError("one dependency policy cannot prebuild multiple target architectures")
-    expected = next(iter(architectures))
     actual = os.environ.get("OPTIMA_TARGET_GPU_ARCH", "").strip().lower()
     if not actual and os.environ.get("OPTIMA_REBUILD_PHASE", "all") == "all":
         import torch
@@ -185,11 +182,14 @@ def _required_target_architecture(policy) -> str:
         major, minor = torch.cuda.get_device_capability(torch.cuda.current_device())
         actual = f"sm{major}{minor}"
         os.environ["OPTIMA_TARGET_GPU_ARCH"] = actual
-    if actual != expected:
+    # Every declared architecture compiles into the artifact; the build device
+    # must be one of them so the produced publication is usable where it runs.
+    if actual not in architectures:
         raise RuntimeError(
-            f"dependency prebuild requires target architecture {expected!r}, got {actual!r}"
+            f"dependency prebuild covers target architectures "
+            f"{sorted(architectures)!r}, got {actual!r}"
         )
-    return expected
+    return actual
 
 
 def _copy_built_module(source: Path, destination: Path) -> tuple[str, int]:
@@ -230,12 +230,9 @@ def _build_prebuilt_modules(
             "flashinfer was imported before the hermetic dependency prebuild environment"
         )
 
-    cuda_arch_lists = {module.cuda_arch_list for module in policy.prebuilt_modules}
-    if len(cuda_arch_lists) != 1:
-        raise RuntimeError("one dependency policy cannot use multiple CUDA arch lists")
-    cuda_arch_list = next(iter(cuda_arch_lists))
+    policy_arch_lists = {module.cuda_arch_list for module in policy.prebuilt_modules}
     existing_arch = os.environ.get("FLASHINFER_CUDA_ARCH_LIST")
-    if existing_arch not in {None, cuda_arch_list}:
+    if existing_arch is not None and existing_arch not in policy_arch_lists:
         raise RuntimeError(
             "FLASHINFER_CUDA_ARCH_LIST conflicts with the validator prebuild policy"
         )
@@ -250,11 +247,13 @@ def _build_prebuilt_modules(
         scratch = Path(scratch_raw)
         old_workspace = os.environ.get("FLASHINFER_WORKSPACE_BASE")
         os.environ["FLASHINFER_WORKSPACE_BASE"] = str(scratch)
-        os.environ["FLASHINFER_CUDA_ARCH_LIST"] = cuda_arch_list
         try:
             jit_environment = importlib.import_module("flashinfer.jit.env")
             jit_environment.FLASHINFER_CSRC_DIR = overlay_subtree
             for module in policy.prebuilt_modules:
+                # Each declared architecture cross-compiles from any build
+                # device; the spec reads the arch list at construction time.
+                os.environ["FLASHINFER_CUDA_ARCH_LIST"] = module.cuda_arch_list
                 generator_module = importlib.import_module(module.generator_module)
                 generator = getattr(generator_module, module.generator_attr, None)
                 if not callable(generator):

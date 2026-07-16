@@ -284,6 +284,45 @@ def test_a_real_loss_is_a_loss_not_no_decision():
     assert v.speedup < 1.0
 
 
+def test_multi_candidate_reads_score_on_the_mean():
+    # B C B' C' B'' shape: two candidate reads average before the ratio.
+    v = score_speedup([100.0, 101.0, 99.0], [113.0, 111.0], min_margin=0.02, k=2.0, max_noise=0.10)
+    assert v.n_candidates == 2
+    assert v.confident
+    assert v.passed_speedup
+    assert abs(v.speedup - (112.0 / 100.0)) < 1e-9
+
+
+def test_single_candidate_read_keeps_legacy_verdict():
+    # The historical B/C/B' shape must be bit-identical through the new path.
+    legacy = score_speedup([100.0, 108.0], 106.0, min_margin=0.02, k=2.0, max_noise=0.10)
+    wrapped = score_speedup([100.0, 108.0], [106.0], min_margin=0.02, k=2.0, max_noise=0.10)
+    assert legacy.n_candidates == wrapped.n_candidates == 1
+    assert (legacy.speedup, legacy.noise, legacy.required, legacy.passed_speedup,
+            legacy.confident, legacy.detail) == (
+        wrapped.speedup, wrapped.noise, wrapped.required, wrapped.passed_speedup,
+        wrapped.confident, wrapped.detail)
+
+
+def test_noisy_candidate_reads_are_no_decision():
+    # 2026-07-16 forensics: two honest candidate legs spread 7.2% on a boot draw.
+    # With tight baselines, that spread alone must block the crown at max_noise 5%.
+    v = score_speedup([100.0, 100.5], [107.2, 100.0], max_noise=0.05)
+    assert not v.confident
+    assert not v.passed_speedup
+    assert "candidate drift" in v.detail
+
+
+def test_candidate_spread_raises_the_required_bar():
+    # Within the noise ceiling, a spread candidate raises the bar exactly like a
+    # spread baseline: noise = max(baseline, candidate) feeds 1 + k*noise.
+    v = score_speedup([100.0, 100.0], [104.0, 100.0], min_margin=0.005, k=2.0, max_noise=0.10)
+    assert v.confident
+    assert abs(v.noise - (4.0 / 102.0)) < 1e-9
+    assert abs(v.required - (1.0 + 2.0 * 4.0 / 102.0)) < 1e-9
+    assert not v.passed_speedup  # mean 102 -> 1.020 < required ~1.078
+
+
 @pytest.mark.parametrize(
     ("baselines", "candidate"),
     (
@@ -295,6 +334,9 @@ def test_a_real_loss_is_a_loss_not_no_decision():
         ([100.0, 101.0], False),
         ([100.0, 101.0], 0.0),
         ([100.0, 101.0], float("inf")),
+        ([100.0, 101.0], [110.0, 0.0]),
+        ([100.0, 101.0], [110.0, float("nan")]),
+        ([100.0, 101.0], [110.0, True]),
     ),
 )
 def test_speed_samples_fail_closed_without_filtering(baselines, candidate):

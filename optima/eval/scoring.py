@@ -7,13 +7,14 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True)
 class SpeedupVerdict:
-    speedup: float  # robust paired estimate: candidate / mean(baseline reads)
-    noise: float  # measured relative spread of the baseline reads (the floor)
+    speedup: float  # robust paired estimate: mean(candidate reads) / mean(baseline reads)
+    noise: float  # measured relative spread floor: baselines, and candidates when >= 2 reads
     required: float  # the bar it had to clear: 1 + max(min_margin, k*noise)
     passed_speedup: bool  # cleared `required` AND the round was trustworthy
     confident: bool  # False -> box too noisy this round; treat as NO-DECISION, never crown
     n_baselines: int
     detail: str = ""
+    n_candidates: int = 1
 
 class RawSpeedEvidenceError(ValueError):
     pass
@@ -526,7 +527,7 @@ def relative_spread(samples: list[float]) -> float:
 
 def score_speedup(
     baseline_reads: list[float],
-    candidate_read: float,
+    candidate_read: float | list[float],
     *,
     min_margin: float = 0.005,
     k: float = 2.0,
@@ -541,28 +542,52 @@ def score_speedup(
         _positive_number(sample, field="baseline throughput")
         for sample in baseline_reads
     ]
-    candidate = _positive_number(candidate_read, field="candidate throughput")
-    if not reads:
+    raw_candidates = (
+        list(candidate_read) if isinstance(candidate_read, (list, tuple)) else [candidate_read]
+    )
+    candidate_reads = [
+        _positive_number(sample, field="candidate throughput")
+        for sample in raw_candidates
+    ]
+    if not reads or not candidate_reads:
         return SpeedupVerdict(0.0, float("inf"), 1.0 + min_margin, False, False,
-                              len(reads), "missing/zero throughput sample")
+                              len(reads), "missing/zero throughput sample",
+                              n_candidates=len(candidate_reads))
     base = statistics.fmean(reads)
-    noise = relative_spread(reads)
+    candidate = statistics.fmean(candidate_reads)
+    baseline_noise = relative_spread(reads)
+    # A single candidate read (the historical B/C/B' shape) leaves the candidate's own
+    # spread unmeasured and keeps the verdict identical to the legacy behavior. With
+    # repeated candidate reads (B C B' C' B''), the candidate draw is measured too and
+    # a noisy candidate is as disqualifying as a noisy baseline: 2026-07-16 forensics
+    # measured 7.2% spread between two honest candidate legs, so a single-C verdict at
+    # small margins crowns or kills on a per-boot draw.
+    candidate_noise = relative_spread(candidate_reads) if len(candidate_reads) >= 2 else 0.0
+    noise = max(baseline_noise, candidate_noise) if math.isfinite(baseline_noise) else baseline_noise
     speedup = candidate / base
     required = 1.0 + max(margin, multiplier * (noise if math.isfinite(noise) else 0.0))
     if not math.isfinite(speedup) or not math.isfinite(required):
         raise RawSpeedEvidenceError("derived speed verdict is non-finite")
     confident = len(reads) >= 2 and noise <= noise_ceiling
     passed = confident and speedup >= required
+    spread_note = (
+        f"noise {noise:.1%}"
+        if len(candidate_reads) < 2
+        else f"noise {noise:.1%} (baseline {baseline_noise:.1%}, candidate {candidate_noise:.1%})"
+    )
     if not confident:
         if len(reads) < 2:
             detail = "single baseline read -> noise unmeasured; cannot crown (bookend the baseline)"
+        elif candidate_noise > noise_ceiling >= baseline_noise:
+            detail = f"candidate drift {candidate_noise:.1%} > max_noise {noise_ceiling:.0%}; NO-DECISION (re-queue)"
         else:
-            detail = f"baseline drift {noise:.1%} > max_noise {noise_ceiling:.0%}; NO-DECISION (re-queue)"
+            detail = f"baseline drift {baseline_noise:.1%} > max_noise {noise_ceiling:.0%}; NO-DECISION (re-queue)"
     elif passed:
-        detail = f"speedup {speedup:.3f} >= required {required:.3f} (noise {noise:.1%})"
+        detail = f"speedup {speedup:.3f} >= required {required:.3f} ({spread_note})"
     else:
-        detail = f"speedup {speedup:.3f} < required {required:.3f} (noise {noise:.1%})"
+        detail = f"speedup {speedup:.3f} < required {required:.3f} ({spread_note})"
     return SpeedupVerdict(
         speedup=speedup, noise=noise, required=required,
         passed_speedup=passed, confident=confident, n_baselines=len(reads), detail=detail,
+        n_candidates=len(candidate_reads),
     )

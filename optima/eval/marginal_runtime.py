@@ -284,12 +284,22 @@ class CandidateLifecycleEvidence:
 
 @dataclass(frozen=True)
 class MarginalLifecycleEvidence:
-    """Complete raw lifecycle facts; deliberately has no score or canonical verdict."""
+    """Complete raw lifecycle facts; deliberately has no score or canonical verdict.
+
+    The default shape is the historical ``B, C1..Ck, B'``. With repeated candidate
+    reads (speed evidence policy, 2026-07-16: one C read cannot measure the
+    candidate's own boot draw — 7.2% spread was measured between two honest
+    candidate legs at fixed work), the run extends to ``B, C1..Ck, B', C1'..Ck',
+    B''`` and the extra legs land in ``candidates_repeat`` / ``baseline_third`` —
+    both present or both absent, so a repeat read is always bookended.
+    """
 
     prepared: PreparedMarginalRuntime
     baseline_before: EngineExecutionEvidence
     candidates: tuple[CandidateLifecycleEvidence, ...]
     baseline_after: EngineExecutionEvidence
+    candidates_repeat: tuple[CandidateLifecycleEvidence, ...] = ()
+    baseline_third: EngineExecutionEvidence | None = None
 
     def __post_init__(self) -> None:
         if type(self.prepared) is not PreparedMarginalRuntime:
@@ -299,6 +309,7 @@ class MarginalLifecycleEvidence:
         ) is not EngineExecutionEvidence:
             raise MarginalRuntimeError("baseline lifecycle evidence has the wrong type")
         object.__setattr__(self, "candidates", tuple(self.candidates))
+        object.__setattr__(self, "candidates_repeat", tuple(self.candidates_repeat))
         if not self.candidates or any(
             type(row) is not CandidateLifecycleEvidence for row in self.candidates
         ):
@@ -310,6 +321,27 @@ class MarginalLifecycleEvidence:
             != self.prepared.candidates
         ):
             raise MarginalRuntimeError("lifecycle evidence was relabeled or reordered")
+        if bool(self.candidates_repeat) != (self.baseline_third is not None):
+            raise MarginalRuntimeError(
+                "repeated candidate reads require the third baseline bookend (and vice versa)"
+            )
+        if self.candidates_repeat:
+            if any(
+                type(row) is not CandidateLifecycleEvidence
+                for row in self.candidates_repeat
+            ) or tuple(row.candidate for row in self.candidates_repeat) != self.prepared.candidates:
+                raise MarginalRuntimeError("repeat-read lifecycle rows were relabeled or reordered")
+            if (
+                type(self.baseline_third) is not EngineExecutionEvidence
+                or self.baseline_third.launch_digest != self.prepared.baseline_launch.digest
+            ):
+                raise MarginalRuntimeError("third baseline lifecycle evidence has the wrong type")
+
+    @property
+    def final_baseline(self) -> EngineExecutionEvidence:
+        """The last baseline executed — B'' when repeat reads ran, else B-prime.
+        Teardown/quiescence ordering must bind to THIS leg."""
+        return self.baseline_third if self.baseline_third is not None else self.baseline_after
 
     @property
     def source(self) -> RuntimeSource:
@@ -765,11 +797,22 @@ def run_marginal_lifecycle(
     executor: EngineExecutor,
     model_mount: TrustedArenaModelMountReceipt,
     deadline: float,
+    candidate_reads: int = 1,
 ) -> MarginalLifecycleEvidence:
-    """Execute exactly B,C1..Ck,B-prime or raise without a partial receipt."""
+    """Execute exactly B,C1..Ck,B-prime — or, with ``candidate_reads=2``, the
+    extended B,C1..Ck,B',C1'..Ck',B'' — or raise without a partial receipt.
+
+    ``candidate_reads`` is an evidence-GENERATION policy, not a grading threshold:
+    more reads let the scorer measure the candidate's own boot draw (score_speedup
+    gates on the worse of baseline/candidate spread when two reads exist). It
+    deliberately lives here, not in SpeedCalibration, so calibration digests are
+    untouched and the historical single-read shape stays the default.
+    """
 
     if type(prepared) is not PreparedMarginalRuntime:
         raise MarginalRuntimeError("prepared runtime has the wrong type")
+    if type(candidate_reads) is not int or candidate_reads not in (1, 2):
+        raise MarginalRuntimeError("candidate_reads must be exactly 1 or 2")
     _validate_prepared_runtime(prepared)
     if type(model_mount) is not TrustedArenaModelMountReceipt:
         raise MarginalRuntimeError("model_mount has the wrong type")
@@ -845,11 +888,33 @@ def run_marginal_lifecycle(
         prepared.incumbent_binding.launch_binding,
         prepared.baseline_session_plan,
     )
+    candidates_repeat: list[CandidateLifecycleEvidence] = []
+    baseline_third: EngineExecutionEvidence | None = None
+    if candidate_reads == 2:
+        for candidate in prepared.candidates:
+            execution = execute(
+                candidate.launch,
+                candidate.binding.launch_binding,
+                candidate.session_plan,
+            )
+            candidates_repeat.append(
+                CandidateLifecycleEvidence(
+                    candidate,
+                    execution,
+                )
+            )
+        baseline_third = execute(
+            prepared.baseline_launch,
+            prepared.incumbent_binding.launch_binding,
+            prepared.baseline_session_plan,
+        )
     return MarginalLifecycleEvidence(
         prepared,
         baseline_before,
         tuple(candidates),
         baseline_after,
+        tuple(candidates_repeat),
+        baseline_third,
     )
 
 

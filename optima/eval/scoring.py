@@ -43,6 +43,9 @@ class MarginalSpeedProjection:
     candidate: ChargedExecutionRate
     baseline_after: ChargedExecutionRate
     verdict: SpeedupVerdict
+    # Repeat-read legs (B,C,B',C',B'' lifecycle). None on the historical 3-leg shape.
+    candidate_repeat: ChargedExecutionRate | None = None
+    baseline_third: ChargedExecutionRate | None = None
 
 
 def _finite_time(value: object, *, field: str) -> float:
@@ -488,9 +491,33 @@ def project_marginal_speed(
     selected = lifecycle.candidates[selected_index]
     candidate_rate = candidate_rates[selected_delta_digest]
     after = rate(lifecycle.baseline_after, launch, prepared.incumbent_binding, baseline_plan)
+    # Repeat-read legs (B,C..,B',C'..,B''): validate every executed session in run
+    # order so the dedup state sees them all, and grade the SELECTED arm on both of
+    # its reads plus all three baselines. The 3-leg digest input is unchanged —
+    # legacy evidence recomputes byte-identically; 5 rates is a self-describing
+    # extension under the same digest label.
+    candidate_repeat_rate: ChargedExecutionRate | None = None
+    baseline_third_rate: ChargedExecutionRate | None = None
+    if lifecycle.candidates_repeat:
+        repeat_rates: dict[str, ChargedExecutionRate] = {}
+        for digest, row in zip(digests, lifecycle.candidates_repeat):
+            repeat_rates[digest] = rate(
+                row.execution, row.candidate.launch, row.candidate.binding, row.candidate.session_plan
+            )
+        candidate_repeat_rate = repeat_rates[selected_delta_digest]
+        baseline_third_rate = rate(
+            lifecycle.baseline_third, launch, prepared.incumbent_binding, baseline_plan
+        )
+    baseline_reads = [before.tokens_per_second, after.tokens_per_second]
+    candidate_reads = [candidate_rate.tokens_per_second]
+    digest_rates: tuple[ChargedExecutionRate, ...] = (before, candidate_rate, after)
+    if candidate_repeat_rate is not None and baseline_third_rate is not None:
+        baseline_reads.append(baseline_third_rate.tokens_per_second)
+        candidate_reads.append(candidate_repeat_rate.tokens_per_second)
+        digest_rates = (before, candidate_rate, after, candidate_repeat_rate, baseline_third_rate)
     verdict = score_speedup(
-        [before.tokens_per_second, after.tokens_per_second],
-        candidate_rate.tokens_per_second,
+        baseline_reads,
+        candidate_reads,
         min_margin=min_margin,
         k=k,
         max_noise=max_noise,
@@ -504,12 +531,14 @@ def project_marginal_speed(
         evidence_digest=_projection_digest(
             selected_delta_digest, selected.candidate.launch.digest, calibration.digest,
             expected_context.digest, workload, expected_runtime_resource_policy_digest,
-            (before, candidate_rate, after)
+            digest_rates
         ),
         baseline_before=before,
         candidate=candidate_rate,
         baseline_after=after,
         verdict=verdict,
+        candidate_repeat=candidate_repeat_rate,
+        baseline_third=baseline_third_rate,
     )
 
 

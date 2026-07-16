@@ -387,15 +387,19 @@ class SpeedWitness:
     workload_digest: str
     runtime_resource_policy_digest: str
     evidence_digest: str
-    rates: tuple[ChargedExecutionRate, ChargedExecutionRate, ChargedExecutionRate]
+    # 3 rates = the historical B/C/B-prime shape (digest-identical to all prior
+    # witnesses); 5 rates = repeat-read evidence in RUN ORDER B, C, B', C', B''.
+    rates: tuple[ChargedExecutionRate, ...]
 
     def __post_init__(self) -> None:
         for field in self.__dataclass_fields__:
             if field != "rates":
                 object.__setattr__(self, field, require_sha256_hex(getattr(self, field), field=field))
         rates = tuple(self.rates)
-        if len(rates) != 3:
-            raise QualificationRunnerError("speed witness must contain B/C/B-prime rates")
+        if len(rates) not in (3, 5):
+            raise QualificationRunnerError(
+                "speed witness must contain B/C/B-prime rates (or B/C/B'/C'/B'' repeat reads)"
+            )
         rates = tuple(_validated_rate(row) for row in rates)
         object.__setattr__(self, "rates", rates)
         if _projection_digest(
@@ -409,10 +413,17 @@ class SpeedWitness:
     def from_projection(cls, row: MarginalSpeedProjection, runtime_policy: str) -> "SpeedWitness":
         if type(row) is not MarginalSpeedProjection:
             raise QualificationRunnerError("speed projection is not typed")
+        if (row.candidate_repeat is None) != (row.baseline_third is None):
+            raise QualificationRunnerError("speed projection repeat-read evidence is unpaired")
+        rates: tuple[ChargedExecutionRate, ...] = (
+            row.baseline_before, row.candidate, row.baseline_after,
+        )
+        if row.candidate_repeat is not None and row.baseline_third is not None:
+            rates = rates + (row.candidate_repeat, row.baseline_third)
         return cls(
             row.selected_delta_digest, row.candidate_launch_digest, row.calibration_digest,
             row.calibration_context_digest, row.workload_digest, runtime_policy,
-            row.evidence_digest, (row.baseline_before, row.candidate, row.baseline_after),
+            row.evidence_digest, rates,
         )
 
     def to_dict(self) -> dict[str, object]:
@@ -431,9 +442,19 @@ class SpeedWitness:
             or not calibration.thresholds_frozen
         ):
             raise QualificationRunnerError("speed witness calibration authority differs")
-        before, candidate, after = self.rates
+        if len(self.rates) == 3:
+            before, candidate, after = self.rates
+            baseline_reads = [before.tokens_per_second, after.tokens_per_second]
+            candidate_reads = [candidate.tokens_per_second]
+        else:  # run order B, C, B', C', B''
+            before, candidate, after, candidate_repeat, baseline_third = self.rates
+            baseline_reads = [
+                before.tokens_per_second, after.tokens_per_second,
+                baseline_third.tokens_per_second,
+            ]
+            candidate_reads = [candidate.tokens_per_second, candidate_repeat.tokens_per_second]
         verdict = score_speedup(
-            [before.tokens_per_second, after.tokens_per_second], candidate.tokens_per_second,
+            baseline_reads, candidate_reads,
             min_margin=float(decimal_value(calibration.speed.min_margin)),
             k=float(decimal_value(calibration.speed.noise_multiplier)),
             max_noise=float(decimal_value(calibration.speed.max_noise)),
@@ -1616,8 +1637,14 @@ def run_causal_qualification(
     hidden_judge: HiddenJudge,
     deadline: float,
     id_factory: Callable[[], str] | None = None,
+    speed_candidate_reads: int = 1,
 ) -> EvidenceArtifactRef:
-    """Run one complete causal cohort or raise without a partial PASS."""
+    """Run one complete causal cohort or raise without a partial PASS.
+
+    ``speed_candidate_reads=2`` extends the speed lifecycle to B,C..,B',C'..,B''
+    so the verdict can measure the candidate's own boot draw (evidence-generation
+    policy; grading thresholds stay in the frozen calibration).
+    """
 
     if type(executor) is not OCIEngineExecutor or not callable(entropy_provider) or not callable(hidden_judge):
         raise QualificationRunnerError("runner authorities are not exact and callable")
@@ -1655,6 +1682,7 @@ def run_causal_qualification(
             executor=executor,
             model_mount=value.model_mount,
             deadline=float(deadline),
+            candidate_reads=speed_candidate_reads,
         )
         discovery_grades: dict[str, DiscoveryExecutionGrade] = {}
         for authority in value.candidates:
@@ -1665,9 +1693,11 @@ def run_causal_qualification(
                     )
                 )
         teardown_before = executor.prove_quiescent()
-        last_post = lifecycle.baseline_after.device_receipts[-1].completed_monotonic_s
+        # Bind quiescence to the FINAL executed baseline (B'' under repeat reads,
+        # B-prime otherwise) — baseline_after is mid-run in the 5-leg shape.
+        last_post = lifecycle.final_baseline.device_receipts[-1].completed_monotonic_s
         if teardown_before.observed_monotonic_s < last_post:
-            raise QualificationRunnerError("pre-T quiescence predates B-prime teardown")
+            raise QualificationRunnerError("pre-T quiescence predates the final baseline teardown")
         entropy = entropy_provider(value.commitment, teardown_before)
         if type(entropy) is not SelectionEntropyReceipt:
             raise QualificationRunnerError("entropy provider returned an untyped receipt")

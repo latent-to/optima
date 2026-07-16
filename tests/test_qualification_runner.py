@@ -173,14 +173,18 @@ class _Harness:
             )
             for index, authority in enumerate(authorities)
         )
+        final_baseline = SimpleNamespace(
+            device_receipts=(
+                SimpleNamespace(completed_monotonic_s=1.0),
+                SimpleNamespace(completed_monotonic_s=2.0),
+            )
+        )
         self.lifecycle = SimpleNamespace(
             candidates=lifecycle_candidates,
-            baseline_after=SimpleNamespace(
-                device_receipts=(
-                    SimpleNamespace(completed_monotonic_s=1.0),
-                    SimpleNamespace(completed_monotonic_s=2.0),
-                )
-            ),
+            baseline_after=final_baseline,
+            # mirrors MarginalLifecycleEvidence.final_baseline (== baseline_after on
+            # the historical 3-leg shape; B'' when repeat reads run)
+            final_baseline=final_baseline,
         )
         prepared = SimpleNamespace(
             source=SimpleNamespace(digest=_d("source")),

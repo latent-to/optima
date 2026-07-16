@@ -14,6 +14,9 @@ l.json
 # Private working log — candid history, live pod access, strategy. NOT for GitHub.
 WORKLOG.md
 
+# Local audit ledger — adversarial reports, reproductions, and compaction-proof handoffs.
+audits/
+
 # Local planning / design docs (proposals; local-only, like WORKLOG.md).
 plan.md
 plan_*.md

@@ -154,7 +154,7 @@ slot = "activation.silu_and_mul"
 source = "kernels/silu_and_mul.py"
 entry = "silu_and_mul"
 dtypes = ["bfloat16", "float16"]
-architectures = ["sm80", "sm86", "sm89", "sm90", "sm100"]
+architectures = ["sm80", "sm86", "sm89", "sm90", "sm100", "sm103"]
 metadata = "metadata/silu_and_mul.json"
 ```
 

@@ -23,6 +23,7 @@ import tarfile
 import tempfile
 import threading
 import time
+import zlib
 from pathlib import Path, PurePosixPath
 from urllib.parse import unquote, urljoin, urlparse
 
@@ -540,7 +541,7 @@ def _preflight_tar_stream(archive: Path, *, deadline: float) -> None:
                     )
     except FetchError:
         raise
-    except (gzip.BadGzipFile, tarfile.TarError, OSError, EOFError) as exc:
+    except (gzip.BadGzipFile, zlib.error, tarfile.TarError, OSError, EOFError) as exc:
         raise FetchError(f"corrupt archive: {exc}") from None
 
 
@@ -555,7 +556,9 @@ def _safe_extract(
     directories: set[PurePosixPath] = set()
     file_paths: set[PurePosixPath] = set()
     try:
-        with tarfile.open(archive, "r:*") as tar:
+        # Preflight accepts gzip only; keep the materializing pass on the same
+        # format instead of invoking tarfile's unrelated decompressor probes.
+        with tarfile.open(archive, "r:gz") as tar:
             for count, member in enumerate(tar, start=1):
                 _remaining(deadline)
                 if count > MAX_MEMBERS:
@@ -650,7 +653,7 @@ def _safe_extract(
             )
     except FetchError:
         raise
-    except (tarfile.TarError, OSError, EOFError) as exc:
+    except (zlib.error, tarfile.TarError, OSError, EOFError) as exc:
         raise FetchError(f"corrupt archive: {exc}") from None
 
 

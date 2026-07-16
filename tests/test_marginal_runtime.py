@@ -1147,6 +1147,51 @@ def test_candidate_worker_error_carries_exact_active_arm_identity(tmp_path: Path
     assert len(executor.calls) == 2
 
 
+def test_repeat_candidate_worker_error_carries_exact_active_arm_identity(
+    tmp_path: Path,
+) -> None:
+    case = _case(tmp_path)
+    prepared = _prepared(case)
+    candidate = prepared.candidates[0]
+    # B, C, B-prime succeed; C-prime fails at lifecycle index 3.
+    executor = _WorkerFailExecutor(3)
+
+    with pytest.raises(CandidateArmWorkerError) as raised:
+        run_marginal_lifecycle(
+            prepared,
+            executor=executor,
+            model_mount=case.mount,
+            deadline=100.0,
+            candidate_reads=2,
+        )
+
+    failure = raised.value
+    assert failure.candidate_index == 0
+    assert failure.selected_delta_digest == candidate.arm.selected_delta_digest
+    assert failure.arm_digest == candidate.arm.digest
+    assert failure.launch_digest == candidate.launch.digest
+    assert type(failure.worker_error) is OuterSessionWorkerError
+    assert len(executor.calls) == 4
+
+
+def test_b_double_prime_worker_error_remains_shared_infrastructure(
+    tmp_path: Path,
+) -> None:
+    case = _case(tmp_path)
+    # B, C, B-prime, C-prime succeed; B-double-prime fails at index 4.
+    executor = _WorkerFailExecutor(4)
+
+    with pytest.raises(OuterSessionWorkerError, match="lifecycle index 4"):
+        run_marginal_lifecycle(
+            _prepared(case),
+            executor=executor,
+            model_mount=case.mount,
+            deadline=100.0,
+            candidate_reads=2,
+        )
+    assert len(executor.calls) == 5
+
+
 @pytest.mark.parametrize("fail_at", (0, 2), ids=("baseline-before", "baseline-after"))
 def test_baseline_worker_error_is_never_relabelled_as_candidate(
     tmp_path: Path, fail_at: int

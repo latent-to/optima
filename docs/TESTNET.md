@@ -94,6 +94,50 @@ optima set-weights --intake-db chain_intake/intake.sqlite3 \
   --discovery-pool-ppm <PPM> --refresh-blocks <N> --dry-run
 ```
 
+**Commit-reveal timing:** `--refresh-blocks` is both the normal refresh cadence
+and the bounded deadline for authoritative readback of an in-flight publication.
+On a commit-reveal weights subnet it must exceed one full reveal tempo plus a
+finality/readback margin; the chain's `weights_rate_limit` is not a safe substitute.
+Netuid 307 has tempo 360, so use `--refresh-blocks 400`, not 100.
+
+If a real publication remains `pending`, reconcile it with the same policy arguments
+plus `--reconcile-only --validator-hotkey <VALIDATOR_SS58>`. This mode never constructs
+a wallet or accepts a signer: it reopens the retained projection and records
+`confirmed` only when the exact finalized sparse row and update chronology match. If
+that historical landing is already older than the refresh cadence, the command prints
+`refresh_due=True` and exits 3 after recording the valid confirmation. Run the ordinary
+wallet-backed command once afterward; it builds a fresh current projection and submits
+exactly one refresh. Other mismatch/submission-required cases fail without mutation.
+
+If an undersized or interrupted deadline already placed the journal in `held`, first
+verify the intended vector against finalized chain state, then run `set-weights` with
+`--release-hold "verified late commit-reveal readback" --validator-hotkey
+<VALIDATOR_SS58>`. Release reopens only the digest-chained retained head: it does not
+rebuild off-pod qualification evidence, construct a signer, read weights, or submit.
+Next use `--reconcile-only`. A refresh-due released row fails without mutation;
+after resolving that result, run the ordinary wallet-backed command exactly once
+to refresh. Otherwise do not emit a duplicate.
+
+### Archiving legacy schema-v3 holds
+
+An intake database migrated from schema v1/v2 may contain the exact fail-closed
+reason `schema3_reproduction_required`: that historical single-PASS evidence is
+never eligible to crown. After reviewing and backing up the retained row, remove
+only its permanent queue/priority veto with the signer-free command below:
+
+```bash
+optima chain-archive-schema3-hold \
+  --intake-db chain_intake/intake.sqlite3 \
+  --network <NETWORK> --netuid <NETUID> \
+  --reservation-id <RESERVATION_DIGEST> \
+  --reason "reviewed legacy evidence; retained for audit only"
+```
+
+The command requires the exact migration hold plus consistent non-settled
+candidate state at a finalized head. It terminalizes only the reservation;
+qualification/candidate bytes remain retained and held, and cannot be released,
+leased, or crowned. Ordinary holds and already-settled authority fail closed.
+
 ## Historical testnet receipts
 
 The following receipts established the chain SDK, timelock, fetch, copy, restart, and
@@ -112,7 +156,8 @@ joined production-arena run for the current implementation.
   stake (`SubtokenDisabled`), and validator permits are the gate for actually
   landing `set_weights` — check `chain-status` for your permit before expecting
   weights to apply. Hyperparams there: tempo 360, commit-reveal weights ENABLED,
-  weights_rate_limit 100 (skipped under commit-reveal).
+  weights_rate_limit 100 (skipped under commit-reveal). The control-plane
+  readback deadline must therefore use 400 blocks, as described above.
 
 ### Netuid 307, round 2 (2026-07-10) — real weights
 

@@ -35,11 +35,17 @@ _ACTIVE = (
 )
 _TERMINAL = ("failed", "expired", "qualified")
 _STATUSES = frozenset((*_ACTIVE, *_TERMINAL, "held", "no_decision"))
-_EXPIRABLE = (
+_EXPLICITLY_EXPIRABLE = (
+    "reserved", "transport_retry", "published", "promoted",
+    "reproduction_pending", "held", "no_decision",
+)
+_AUTOMATICALLY_EXPIRABLE = (
     "reserved", "transport_retry", "published", "promoted",
     "reproduction_pending", "held", "no_decision",
 )
 _AUTOMATIC_EXPIRY_REASON = "finalized_block_sla_expired"
+_SCHEMA3_MIGRATION_HOLD_REASON = "schema3_reproduction_required"
+_SCHEMA3_ARCHIVE_REASON_PREFIX = "schema3_archived@"
 
 
 class IntakeError(RuntimeError):
@@ -514,6 +520,7 @@ class FinalizedIntakeStore:
                 qualification_json TEXT NOT NULL,
                 attempt_ref_json TEXT NOT NULL,
                 evidence_root TEXT NOT NULL,
+                retained_block INTEGER NOT NULL DEFAULT 0 CHECK(retained_block>=0),
                 PRIMARY KEY(reservation_id, reproduction_index)
             ) STRICT;
             CREATE TABLE IF NOT EXISTS settlement_candidates (
@@ -592,6 +599,19 @@ class FinalizedIntakeStore:
                 self._db.execute(
                     f"ALTER TABLE reservations ADD COLUMN {name} {declaration}"
                 )
+        qualification_columns = {
+            row["name"] for row in self._db.execute(
+                "PRAGMA table_info(settlement_qualifications)"
+            )
+        }
+        if "retained_block" not in qualification_columns:
+            # Existing evidence predates a trustworthy progress timestamp.  Keep
+            # zero as an explicit unknown sentinel; automatic expiry must not
+            # invent a deadline for those rows.
+            self._db.execute(
+                "ALTER TABLE settlement_qualifications ADD COLUMN "
+                "retained_block INTEGER NOT NULL DEFAULT 0 CHECK(retained_block>=0)"
+            )
         settlement_columns = {
             row["name"] for row in self._db.execute(
                 "PRAGMA table_info(settlement_candidates)"
@@ -1347,6 +1367,7 @@ class FinalizedIntakeStore:
         self,
         batch,
         *,
+        current_finalized_block: int,
         evidence_root: str | Path | None = None,
     ) -> tuple[IntakeReservation, ...]:
         """Persist one typed cohort result and its retry groups atomically."""
@@ -1357,6 +1378,13 @@ class FinalizedIntakeStore:
 
         if type(batch) is not QualificationIntakeBatch:
             raise IntakeError("qualification batch is not exactly typed")
+        cursor = self._cursor()
+        if (
+            type(current_finalized_block) is not int
+            or current_finalized_block < 0
+            or (cursor is not None and current_finalized_block < cursor[0])
+        ):
+            raise IntakeError("qualification progress block is not finalized")
         if any(
             outcome.decision is QualificationDecision.PASS
             and type(outcome.settlement_qualification) is not SettlementQualification
@@ -1490,10 +1518,12 @@ class FinalizedIntakeStore:
                     self._db.execute(
                         "INSERT INTO settlement_qualifications(reservation_id,"
                         "reproduction_index,qualification_digest,qualification_json,"
-                        "attempt_ref_json,evidence_root) VALUES(?,?,?,?,?,?)",
+                        "attempt_ref_json,evidence_root,retained_block) "
+                        "VALUES(?,?,?,?,?,?,?)",
                         (
                             reservation_id, reproduction_index, qualification.digest,
                             qualification_json, attempt_json, str(root),
+                            current_finalized_block,
                         ),
                     )
                     if reproduction_index == 1:
@@ -2534,31 +2564,78 @@ class FinalizedIntakeStore:
         return self.get(reservation_id)
 
     def _expire_stale_rows(self, current_block: int) -> tuple[str, ...]:
-        """Expire SLA-old unresolved rows inside the caller's transaction."""
+        """Expire SLA-old unresolved work inside the caller's transaction.
+
+        The arrival-block SLA bounds admission, transport, and primary qualification
+        work.  A first retained PASS resets the same SLA from its durable finalized
+        progress block, so independent reproduction gets a full bounded window
+        without regaining a permanent priority veto.  Legacy retained evidence with
+        an unknown (zero) progress block remains fail-closed for explicit operator
+        disposition.  Schema-v3 migration holds require their dedicated migration
+        path instead.
+        """
 
         threshold = current_block - self.policy.expiry_blocks
         if threshold < 0:
             return ()
-        placeholders = ",".join("?" for _ in _EXPIRABLE)
+        malformed = self._db.execute(
+            "SELECT r.reservation_id FROM reservations AS r WHERE "
+            "r.status='reproduction_pending' AND "
+            "((SELECT COUNT(*) FROM settlement_qualifications AS q "
+            "WHERE q.reservation_id=r.reservation_id)!=1 OR "
+            "(SELECT COUNT(*) FROM settlement_qualifications AS q "
+            "WHERE q.reservation_id=r.reservation_id "
+            "AND q.reproduction_index=0)!=1) LIMIT 1"
+        ).fetchone()
+        if malformed is not None:
+            raise IntakeError("reproduction-pending authority is inconsistent")
+        malformed_block = self._db.execute(
+            "SELECT reservation_id FROM settlement_qualifications WHERE "
+            "retained_block<0 OR retained_block>? LIMIT 1",
+            (current_block,),
+        ).fetchone()
+        if malformed_block is not None:
+            raise IntakeError("retained qualification block is not finalized")
+        placeholders = ",".join("?" for _ in _AUTOMATICALLY_EXPIRABLE)
+        predicate = (
+            f"r.status IN ({placeholders}) AND r.reason!=? AND ("
+            "(r.block<=? AND NOT EXISTS ("
+            "SELECT 1 FROM settlement_qualifications AS q "
+            "WHERE q.reservation_id=r.reservation_id)) OR EXISTS ("
+            "SELECT 1 FROM settlement_qualifications AS q "
+            "WHERE q.reservation_id=r.reservation_id "
+            "AND q.reproduction_index=0 AND q.retained_block>0 "
+            "AND q.retained_block<=?))"
+        )
         rows = tuple(
             row["reservation_id"]
             for row in self._db.execute(
-                f"SELECT reservation_id FROM reservations WHERE block<=? "
-                f"AND status IN ({placeholders}) ORDER BY block,event_index,"
-                "event_subindex,hotkey,content_hash",
-                (threshold, *_EXPIRABLE),
+                f"SELECT r.reservation_id FROM reservations AS r WHERE {predicate} "
+                "ORDER BY r.block,r.event_index,r.event_subindex,r.hotkey,r.content_hash",
+                (
+                    *_AUTOMATICALLY_EXPIRABLE,
+                    _SCHEMA3_MIGRATION_HOLD_REASON,
+                    threshold,
+                    threshold,
+                ),
             )
         )
         if rows:
             self._db.execute(
-                f"UPDATE reservations SET status='expired',decision='NO_DECISION',"
-                f"reason=? WHERE block<=? AND status IN ({placeholders})",
-                (_AUTOMATIC_EXPIRY_REASON, threshold, *_EXPIRABLE),
+                f"UPDATE reservations AS r SET status='expired',decision='NO_DECISION',"
+                f"reason=? WHERE {predicate}",
+                (
+                    _AUTOMATIC_EXPIRY_REASON,
+                    *_AUTOMATICALLY_EXPIRABLE,
+                    _SCHEMA3_MIGRATION_HOLD_REASON,
+                    threshold,
+                    threshold,
+                ),
             )
         return rows
 
     def expire_stale(self, *, current_block: int) -> tuple[IntakeReservation, ...]:
-        """Apply the finalized-block arrival SLA to every unresolved row."""
+        """Apply finalized-block arrival/progress SLAs to eligible unresolved work."""
 
         if type(current_block) is not int or current_block < 0:
             raise IntakeError("automatic expiry block is malformed")
@@ -2568,15 +2645,113 @@ class FinalizedIntakeStore:
 
     def expire(self, reservation_id: str, *, current_block: int, reason: str) -> IntakeReservation:
         row = self.get(reservation_id)
+        if row.reason == _SCHEMA3_MIGRATION_HOLD_REASON:
+            raise IntakeError(
+                "legacy single-PASS settlement requires explicit archival migration"
+            )
+        if not isinstance(reason, str) or not reason:
+            raise IntakeError("explicit expiry requires an operator reason")
         if type(current_block) is not int or current_block - row.arrival.block < self.policy.expiry_blocks:
             raise IntakeError("reservation is not old enough for explicit expiry")
         return self._transition(
             reservation_id,
-            set(_EXPIRABLE),
+            set(_EXPLICITLY_EXPIRABLE),
             "expired",
             "NO_DECISION",
             reason,
         )
+
+    def archive_schema3_migration_hold(
+        self,
+        reservation_id: str,
+        *,
+        current_finalized_block: int,
+        reason: str,
+    ) -> IntakeReservation:
+        """Terminally archive one exact schema-v3 migration hold.
+
+        This is deliberately narrower than generic expiry/release.  It preserves
+        the retained candidate and qualification rows, cannot make them pending or
+        crownable, and only removes the reservation's permanent queue/priority veto
+        after an operator supplies a bounded audit reason at a finalized height.
+        """
+
+        if (
+            type(current_finalized_block) is not int
+            or current_finalized_block < 0
+            or not isinstance(reason, str)
+            or not reason
+            or reason.strip() != reason
+            or any(ord(char) < 32 or ord(char) == 127 for char in reason)
+        ):
+            raise IntakeError("schema3 archival authority is malformed")
+        archive_reason = (
+            f"{_SCHEMA3_ARCHIVE_REASON_PREFIX}{current_finalized_block}:{reason}"
+        )
+        if len(archive_reason) > 2_048:
+            raise IntakeError("schema3 archival reason is oversized")
+
+        with self._transaction():
+            row = self.get(reservation_id)
+            if (
+                row.status != "held"
+                or row.reason != _SCHEMA3_MIGRATION_HOLD_REASON
+                or current_finalized_block < row.arrival.block
+            ):
+                raise IntakeError(
+                    "only an exact schema3 reproduction migration hold may be archived"
+                )
+            candidate_row = self._db.execute(
+                "SELECT * FROM settlement_candidates WHERE reservation_id=?",
+                (reservation_id,),
+            ).fetchone()
+            if candidate_row is None:
+                raise IntakeError("schema3 migration hold lacks retained settlement authority")
+            # Legacy candidate bytes may predate the current two-PASS parser.
+            # Preserve them verbatim rather than pretending to regrade them; this
+            # transition only removes priority and can never make them crownable.
+            if (
+                not candidate_row["candidate_json"]
+                or require_sha256_hex(
+                    candidate_row["candidate_digest"], field="candidate_digest"
+                )
+                != candidate_row["candidate_digest"]
+                or candidate_row["status"] != "held"
+                or candidate_row["reason"] != _SCHEMA3_MIGRATION_HOLD_REASON
+                or candidate_row["lease_id"]
+                or candidate_row["lease_expires_block"] != 0
+                or candidate_row["settlement_evidence_digest"]
+                or self._db.execute(
+                    "SELECT 1 FROM settlement_events WHERE reservation_id=? LIMIT 1",
+                    (reservation_id,),
+                ).fetchone()
+                is not None
+            ):
+                raise IntakeError(
+                    "schema3 migration hold has settlement authority that cannot be archived"
+                )
+            reservation_update = self._db.execute(
+                "UPDATE reservations SET status='expired',decision='NO_DECISION',"
+                "reason=? WHERE reservation_id=? AND status='held' AND reason=?",
+                (
+                    archive_reason,
+                    reservation_id,
+                    _SCHEMA3_MIGRATION_HOLD_REASON,
+                ),
+            )
+            candidate_update = self._db.execute(
+                "UPDATE settlement_candidates SET reason=? WHERE reservation_id=? "
+                "AND status='held' AND reason=? AND lease_id='' "
+                "AND lease_expires_block=0 AND settlement_evidence_digest=''",
+                (
+                    archive_reason,
+                    reservation_id,
+                    _SCHEMA3_MIGRATION_HOLD_REASON,
+                ),
+            )
+            if reservation_update.rowcount != 1 or candidate_update.rowcount != 1:
+                raise IntakeError("schema3 migration hold changed during archival")
+        return self.get(reservation_id)
 
     def release_hold(self, reservation_id: str, *, reason: str) -> IntakeReservation:
         if not reason:
@@ -2585,7 +2760,7 @@ class FinalizedIntakeStore:
             row = self.get(reservation_id)
             if row.status not in {"held", "no_decision"}:
                 raise IntakeError("only held intake may be released")
-            if row.reason == "schema3_reproduction_required":
+            if row.reason == _SCHEMA3_MIGRATION_HOLD_REASON:
                 raise IntakeError(
                     "legacy single-PASS settlement requires explicit archival migration"
                 )
@@ -2622,8 +2797,11 @@ class SQLiteWeightPublicationJournal:
         self.store = store
         self.projection = projection
 
-    def _head(self) -> tuple[str, str] | None:
-        row = self.store._db.execute(
+    @staticmethod
+    def _read_head(
+        store: FinalizedIntakeStore,
+    ) -> tuple[str, str] | None:
+        row = store._db.execute(
             "SELECT value FROM metadata WHERE key='weight_publication_head'"
         ).fetchone()
         if row is None:
@@ -2639,6 +2817,52 @@ class SQLiteWeightPublicationJournal:
         require_sha256_hex(value["projection_digest"], field="projection_digest")
         require_sha256_hex(value["record_digest"], field="record_digest")
         return value["projection_digest"], value["record_digest"]
+
+    def _head(self) -> tuple[str, str] | None:
+        return self._read_head(self.store)
+
+    @classmethod
+    def reopen_from_head(
+        cls,
+        store: FinalizedIntakeStore,
+    ) -> "SQLiteWeightPublicationJournal":
+        """Reopen the exact retained projection bound to the verified journal head."""
+
+        from optima.chain.weights import WeightProjection, WeightPublicationError
+
+        if type(store) is not FinalizedIntakeStore:
+            raise IntakeError("weight publication journal store is not exactly typed")
+        head = cls._read_head(store)
+        if head is None:
+            raise IntakeError("weight publication journal has no retained head")
+        row = store._db.execute(
+            "SELECT projection_digest,projection_json FROM weight_publications "
+            "WHERE record_digest=?",
+            (head[1],),
+        ).fetchone()
+        if row is None or row["projection_digest"] != head[0]:
+            raise IntakeError("weight publication head has no retained projection")
+        try:
+            projection = WeightProjection.from_dict(
+                json.loads(row["projection_json"])
+            )
+        except (
+            TypeError,
+            ValueError,
+            json.JSONDecodeError,
+            WeightPublicationError,
+        ) as exc:
+            raise IntakeError(f"weight projection is corrupt: {exc}") from None
+        if projection.digest != head[0]:
+            raise IntakeError("retained weight projection differs from journal head")
+        journal = cls(store, projection)
+        try:
+            record = journal.load()
+        except WeightPublicationError as exc:
+            raise IntakeError(f"weight publication record is corrupt: {exc}") from None
+        if record is None or record.digest != head[1]:
+            raise IntakeError("weight publication head cannot be reopened")
+        return journal
 
     def load(self) -> WeightPublicationRecord | None:
         from optima.chain.weights import WeightPublicationRecord

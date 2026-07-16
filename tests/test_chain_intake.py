@@ -5,6 +5,8 @@ import json
 
 import pytest
 
+import optima.cli as cli
+from optima import chain
 from optima.arena_service import (
     SCREEN_STAGES, ArenaScreenReceipt, PromotionDecision, ScreenGrade,
     ScreenStageResult,
@@ -125,7 +127,12 @@ def _stack_context(catalog: TargetCatalog) -> EvaluationStackContext:
     )
 
 
-def _qualified_settlement_candidate(store: FinalizedIntakeStore) -> SettlementCandidate:
+def _qualified_settlement_candidate(
+    store: FinalizedIntakeStore,
+    *,
+    primary_only: bool = False,
+    retained_block: int = 10,
+) -> SettlementCandidate | str:
     catalog = default_target_catalog()
     target = "activation.silu_and_mul"
     incumbent = EvaluationStackManifest(
@@ -244,11 +251,16 @@ def _qualified_settlement_candidate(store: FinalizedIntakeStore) -> SettlementCa
         )
         store.apply_qualification_batch(
             QualificationIntakeBatch(authority, (outcome,), attempt),
+            current_finalized_block=retained_block,
             evidence_root=evidence_root,
         )
         if index == 0:
             assert store.get(row.reservation_id).status == "reproduction_pending"
-            assert store.lease_settlement_cohort(current_block=11) is None
+            assert store.lease_settlement_cohort(
+                current_block=max(11, retained_block)
+            ) is None
+            if primary_only:
+                return row.reservation_id
     return SettlementCandidate.from_reproductions(*qualifications)
 
 
@@ -394,6 +406,7 @@ def _qualified_discovery_candidate(
             QualificationIntakeBatch(
                 settled.qualification_authority_digest, (outcome,), attempt
             ),
+            current_finalized_block=10,
             evidence_root=evidence_root,
         )
     return SettlementCandidate.from_reproductions(*qualifications)
@@ -685,6 +698,269 @@ def test_finalized_sla_removes_old_blocker_but_preserves_settled_candidate(tmp_p
         ).candidate == candidate
 
 
+def test_finalized_sla_resets_on_retained_primary_and_survives_restart(tmp_path):
+    with _store(tmp_path, expiry_blocks=20) as store:
+        reservation_id = _qualified_settlement_candidate(
+            store, primary_only=True, retained_block=29
+        )
+        assert isinstance(reservation_id, str)
+
+        # Arrival block 10 would expire at 30.  The primary PASS retained at 29
+        # resets the same 20-block SLA, giving reproduction through block 48.
+        assert store.expire_stale(current_block=30) == ()
+        retained = store.get(reservation_id)
+        assert retained.status == "reproduction_pending"
+        progress = store._db.execute(
+            "SELECT retained_block FROM settlement_qualifications "
+            "WHERE reservation_id=? AND reproduction_index=0",
+            (reservation_id,),
+        ).fetchone()
+        assert progress["retained_block"] == 29
+
+    with _store(tmp_path, expiry_blocks=20) as reopened:
+        assert reopened.expire_stale(current_block=48) == ()
+        expired = reopened.expire_stale(current_block=49)
+        assert tuple(row.reservation_id for row in expired) == (reservation_id,)
+        assert (
+            expired[0].status,
+            expired[0].decision,
+            expired[0].reason,
+        ) == (
+            "expired", "NO_DECISION", "finalized_block_sla_expired"
+        )
+
+
+def test_legacy_retained_primary_unknown_block_stays_manual(tmp_path):
+    with _store(tmp_path, expiry_blocks=20) as store:
+        reservation_id = _qualified_settlement_candidate(
+            store, primary_only=True
+        )
+        assert isinstance(reservation_id, str)
+        # Simulate the exact additive migration input: an existing schema-3
+        # qualification table from before retained progress was recorded.
+        store._db.execute(
+            "ALTER TABLE settlement_qualifications DROP COLUMN retained_block"
+        )
+
+    with _store(tmp_path, expiry_blocks=20) as reopened:
+        progress = reopened._db.execute(
+            "SELECT retained_block FROM settlement_qualifications "
+            "WHERE reservation_id=? AND reproduction_index=0",
+            (reservation_id,),
+        ).fetchone()
+        assert progress["retained_block"] == 0
+        assert reopened.expire_stale(current_block=100) == ()
+        expired = reopened.expire(
+            reservation_id,
+            current_block=100,
+            reason="operator archived legacy retained PASS",
+        )
+        assert (expired.status, expired.reason) == (
+            "expired", "operator archived legacy retained PASS"
+        )
+
+
+def test_schema3_migration_hold_survives_all_generic_expiry_paths(tmp_path):
+    with _store(tmp_path, expiry_blocks=20) as store:
+        candidate = _qualified_settlement_candidate(store)
+        assert isinstance(candidate, SettlementCandidate)
+        # Reopen through the real v2 -> v3 migration path.
+        store._db.execute("UPDATE metadata SET value='2' WHERE key='schema'")
+
+    with _store(tmp_path, expiry_blocks=20) as reopened:
+        held = reopened.get(candidate.reservation_digest)
+        assert (held.status, held.decision, held.reason) == (
+            "held",
+            "NO_DECISION",
+            "schema3_reproduction_required",
+        )
+        assert reopened.expire_stale(current_block=100) == ()
+        assert reopened.get(candidate.reservation_digest) == held
+        with pytest.raises(IntakeError, match="archival migration"):
+            reopened.expire(
+                candidate.reservation_digest,
+                current_block=100,
+                reason="generic operator expiry",
+            )
+        with pytest.raises(IntakeError, match="archival migration"):
+            reopened.release_hold(
+                candidate.reservation_digest,
+                reason="generic operator release",
+            )
+
+
+def test_schema3_archival_is_terminal_preserves_evidence_and_releases_priority(
+    tmp_path,
+):
+    with _store(tmp_path, expiry_blocks=20) as store:
+        candidate = _qualified_settlement_candidate(store)
+        assert isinstance(candidate, SettlementCandidate)
+        store._db.execute("UPDATE metadata SET value='2' WHERE key='schema'")
+
+    with _store(tmp_path, expiry_blocks=20) as reopened:
+        legacy = reopened.get(candidate.reservation_digest)
+        candidate_before = dict(
+            reopened._db.execute(
+                "SELECT * FROM settlement_candidates WHERE reservation_id=?",
+                (candidate.reservation_digest,),
+            ).fetchone()
+        )
+        qualifications_before = tuple(
+            tuple(row)
+            for row in reopened._db.execute(
+                "SELECT * FROM settlement_qualifications WHERE reservation_id=? "
+                "ORDER BY reproduction_index",
+                (candidate.reservation_digest,),
+            )
+        )
+
+        later = reopened.reserve_finalized(
+            (_arrival(1, block=11),),
+            finalized_block=11,
+            finalized_block_hash="0x" + f"{11:064x}",
+        )[0]
+        reopened.mark_fetching(later.reservation_id)
+        reopened.mark_published(
+            later.reservation_id,
+            delta_fingerprint=_fingerprint(
+                candidate.target_id,
+                candidate.target_id,
+                "b",
+                selected_delta="6" * 64,
+            ),
+            publication_digest="e" * 64,
+            publication_root="/published/later",
+        )
+        assert reopened.settlement_blockers(later.reservation_id) == (legacy,)
+
+        archived = reopened.archive_schema3_migration_hold(
+            candidate.reservation_digest,
+            current_finalized_block=11,
+            reason="operator verified legacy evidence remains audit-only",
+        )
+        assert (archived.status, archived.decision) == ("expired", "NO_DECISION")
+        assert archived.reason.startswith("schema3_archived@11:")
+        assert reopened.settlement_blockers(later.reservation_id) == ()
+
+        candidate_after = dict(
+            reopened._db.execute(
+                "SELECT * FROM settlement_candidates WHERE reservation_id=?",
+                (candidate.reservation_digest,),
+            ).fetchone()
+        )
+        assert candidate_after["status"] == "held"
+        assert candidate_after["reason"] == archived.reason
+        assert candidate_after["candidate_json"] == candidate_before["candidate_json"]
+        assert candidate_after["candidate_digest"] == candidate_before["candidate_digest"]
+        assert candidate_after["evidence_root"] == candidate_before["evidence_root"]
+        assert candidate_after["reproduction_evidence_root"] == candidate_before[
+            "reproduction_evidence_root"
+        ]
+        assert tuple(
+            tuple(row)
+            for row in reopened._db.execute(
+                "SELECT * FROM settlement_qualifications WHERE reservation_id=? "
+                "ORDER BY reproduction_index",
+                (candidate.reservation_digest,),
+            )
+        ) == qualifications_before
+        assert reopened.has_pending_settlement() is False
+        assert reopened.lease_settlement_cohort(current_block=11) is None
+        with pytest.raises(IntakeError, match="only held intake"):
+            reopened.release_hold(
+                candidate.reservation_digest,
+                reason="must not restore crown eligibility",
+            )
+        with pytest.raises(IntakeError, match="active crown"):
+            reopened.reopen_active_crown(candidate.arena_digest, candidate.target_id)
+        with pytest.raises(IntakeError, match="exact schema3"):
+            reopened.archive_schema3_migration_hold(
+                candidate.reservation_digest,
+                current_finalized_block=12,
+                reason="must not archive twice",
+            )
+
+
+def test_schema3_archival_rejects_ordinary_or_inconsistent_holds(tmp_path):
+    with _store(tmp_path) as store:
+        ordinary = store.reserve_finalized(
+            (_arrival(0),),
+            finalized_block=10,
+            finalized_block_hash="0x" + f"{10:064x}",
+        )[0]
+        ordinary = store.mark_held(ordinary.reservation_id, "ordinary operator hold")
+        with pytest.raises(IntakeError, match="exact schema3"):
+            store.archive_schema3_migration_hold(
+                ordinary.reservation_id,
+                current_finalized_block=10,
+                reason="must not archive an ordinary hold",
+            )
+        assert store.get(ordinary.reservation_id) == ordinary
+
+    other_root = tmp_path / "inconsistent"
+    with _store(other_root) as store:
+        candidate = _qualified_settlement_candidate(store)
+        assert isinstance(candidate, SettlementCandidate)
+        store._db.execute("UPDATE metadata SET value='2' WHERE key='schema'")
+    with _store(other_root) as reopened:
+        reopened._db.execute(
+            "UPDATE settlement_candidates SET status='pending' WHERE reservation_id=?",
+            (candidate.reservation_digest,),
+        )
+        held = reopened.get(candidate.reservation_digest)
+        with pytest.raises(IntakeError, match="settlement authority"):
+            reopened.archive_schema3_migration_hold(
+                candidate.reservation_digest,
+                current_finalized_block=10,
+                reason="must fail closed on inconsistent authority",
+            )
+        assert reopened.get(candidate.reservation_digest) == held
+
+
+def test_schema3_archival_cli_uses_finalized_public_scope_without_a_wallet(
+    tmp_path, monkeypatch, capsys
+):
+    with _store(tmp_path) as store:
+        candidate = _qualified_settlement_candidate(store)
+        assert isinstance(candidate, SettlementCandidate)
+        store._db.execute("UPDATE metadata SET value='2' WHERE key='schema'")
+
+    class Subtensor:
+        def get_block_hash(self, block):
+            assert block == 0
+            return SCOPE.genesis_hash
+
+    monkeypatch.setattr(chain, "connect", lambda network: Subtensor())
+    monkeypatch.setattr(
+        chain,
+        "read_finalized_head",
+        lambda _subtensor: (12, "0x" + f"{12:064x}"),
+    )
+    args = cli.build_parser().parse_args(
+        [
+            "chain-archive-schema3-hold",
+            "--network",
+            "mock",
+            "--netuid",
+            str(SCOPE.netuid),
+            "--intake-db",
+            str(tmp_path / "private" / "intake.sqlite3"),
+            "--reservation-id",
+            candidate.reservation_digest,
+            "--reason",
+            "reviewed before testnet restart",
+        ]
+    )
+    assert args.func is cli.cmd_chain_archive_schema3_hold
+    result = args.func(args)
+    assert result == 0
+    assert "retained evidence remains non-crownable" in capsys.readouterr().out
+    with _store(tmp_path) as reopened:
+        archived = reopened.get(candidate.reservation_digest)
+        assert archived.status == "expired"
+        assert archived.reason.startswith("schema3_archived@12:")
+
+
 def test_qualification_no_decision_is_retained_before_bounded_requeue(tmp_path):
     with _store(tmp_path, max_qualification_retries=1) as store:
         row = store.reserve_finalized(
@@ -811,7 +1087,8 @@ def test_qualification_batch_persists_dispositions_and_groups_atomically(tmp_pat
             failure,
         )
         stored = store.apply_qualification_batch(
-            QualificationIntakeBatch("7" * 64, outcomes, retry_plan=retry)
+            QualificationIntakeBatch("7" * 64, outcomes, retry_plan=retry),
+            current_finalized_block=10,
         )
         assert [row.status for row in stored] == ["published", "published"]
         assert store.published() == (store.get(rows[0].reservation_id),)
@@ -864,7 +1141,8 @@ def test_worker_failure_retry_holds_offender_without_stranding_peer(tmp_path):
         store.apply_qualification_batch(
             QualificationIntakeBatch(
                 "7" * 64, first_outcomes, retry_plan=first_retry
-            )
+            ),
+            current_finalized_block=10,
         )
 
         # Finalized order selects the offender's isolated retry without pulling
@@ -895,7 +1173,8 @@ def test_worker_failure_retry_holds_offender_without_stranding_peer(tmp_path):
                     ((offender.reservation_id,),),
                     singleton_failure,
                 ),
-            )
+            ),
+            current_finalized_block=10,
         )
 
         held = store.get(offender.reservation_id)
@@ -926,7 +1205,8 @@ def test_worker_failure_retry_holds_offender_without_stranding_peer(tmp_path):
                     ),
                 ),
                 ATTEMPT,
-            )
+            ),
+            current_finalized_block=10,
         )
         completed = store.get(peer.reservation_id)
         assert completed.status == "failed"
@@ -1242,6 +1522,15 @@ def test_weight_projection_reopens_every_active_crown_and_holds_on_loss(tmp_path
         )
         assert projection.crown_count == 1
         assert projection.weights_ppm == (("miner", 1_000_000),)
+        pending = WeightPublicationRecord(
+            projection.digest,
+            "pending",
+            submit_block=projection.effective_block,
+            retry_after_block=projection.effective_block + 20,
+            reason="sdk_result_unconfirmed",
+        )
+        journal = SQLiteWeightPublicationJournal(store, projection)
+        journal.compare_and_swap(None, pending)
         standing = store.active_reward_claims()[0][0]
         orphan = StandingRewardClaim(
             _h("orphan-arena"),
@@ -1298,6 +1587,9 @@ def test_weight_projection_reopens_every_active_crown_and_holds_on_loss(tmp_path
                 catalogs={candidate.arena_digest: catalog},
                 netuid=SCOPE.netuid,
             )
+        retained = SQLiteWeightPublicationJournal.reopen_from_head(store)
+        assert retained.projection == projection
+        assert retained.load() == pending
 
 
 def test_uncrowned_arena_is_staging_and_cannot_halt_a_crowned_arena(tmp_path):
@@ -1438,7 +1730,8 @@ def test_pass_without_exact_settlement_projection_is_rejected_atomically(tmp_pat
         )
         with pytest.raises(IntakeError, match="settlement projection"):
             store.apply_qualification_batch(
-                QualificationIntakeBatch("7" * 64, (outcome,), ATTEMPT)
+                QualificationIntakeBatch("7" * 64, (outcome,), ATTEMPT),
+                current_finalized_block=10,
             )
         assert store.get(row.reservation_id).status == "qualifying"
         assert store.qualification_dispositions(row.reservation_id) == ()
@@ -1476,7 +1769,8 @@ def test_sqlite_weight_journal_is_cas_bound_and_restart_reopenable(tmp_path):
             journal.compare_and_swap(None, intent)
 
     with _store(tmp_path) as reopened:
-        journal = SQLiteWeightPublicationJournal(reopened, projection)
+        journal = SQLiteWeightPublicationJournal.reopen_from_head(reopened)
+        assert journal.projection == projection
         assert journal.load() == intent
         assert journal.retained_projection(projection.digest) == projection
         pending = WeightPublicationRecord(
@@ -1492,3 +1786,38 @@ def test_sqlite_weight_journal_is_cas_bound_and_restart_reopenable(tmp_path):
         assert reopened._db.execute(
             "SELECT COUNT(*) AS n FROM weight_publications"
         ).fetchone()["n"] == 2
+
+
+def test_sqlite_weight_journal_reopen_rejects_corrupt_head_projection(tmp_path):
+    projection = WeightProjection(
+        _h("scope"),
+        307,
+        "validator",
+        _h("policy"),
+        _h("settlement"),
+        _h("evaluation"),
+        _h("metagraph"),
+        (_h("arena-state"),),
+        1,
+        10,
+        1,
+        (_h("evidence"),),
+        (("miner", 1_000_000),),
+    )
+    pending = WeightPublicationRecord(
+        projection.digest,
+        "pending",
+        submit_block=10,
+        retry_after_block=20,
+        reason="sdk_result_unconfirmed",
+    )
+    with _store(tmp_path) as store:
+        journal = SQLiteWeightPublicationJournal(store, projection)
+        journal.compare_and_swap(None, pending)
+        store._db.execute(
+            "UPDATE weight_publications SET projection_json='{}' "
+            "WHERE record_digest=?",
+            (pending.digest,),
+        )
+        with pytest.raises(IntakeError, match="projection is corrupt"):
+            SQLiteWeightPublicationJournal.reopen_from_head(store)

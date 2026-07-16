@@ -57,6 +57,14 @@ the noise term is what guards an unstable box), and a round whose baselines disa
 tolerance is **NO-DECISION** (never crowns). `ignore_eos` is on for scoring so both sides emit
 identical token counts.
 
+The calibrated production default remains the historical, byte-compatible v1
+`B/C/B′` speed-evidence policy. A complete v2 repeat-read authority is available only
+as an explicit opt-in: it runs `B/C/B′/C′/B″`, binds that read shape and estimator into
+the causal authority and settlement evidence, teacher-grades both overlapping quality
+triplets, and requires primary and reproduction to use the same policy. V2 has not yet
+received a current-head GPU stock-null and honest-control calibration, so it is not the
+production default and no v2 performance result is claimed here.
+
 **The production referee authority is isolated and fail-closed.** Finalized submissions
 move from validator-private fetch storage into immutable, hash-complete worker
 publications. Candidate import, hermetic native compilation, engine construction, and
@@ -83,7 +91,14 @@ trusted `ArenaServiceRegistry` binds runtime/model/topology identity, decode and
 long-prefill workload regimes, capacity/retry policy, and the fixed non-crown
 static/build/ABI/graph/abbreviated-serving screen. A first passing qualification is retained
 as `reproduction_pending`; settlement requires a second independent passing authority for
-the same candidate identity and conservatively uses the lower speedup.
+the same candidate identity and conservatively uses the lower speedup. The retained PASS
+durably records a finalized head read after qualification completes and starts a fresh,
+bounded reproduction SLA;
+pre-PASS work remains bounded from arrival, while legacy retained rows without a known
+progress block and schema-v3 migration holds remain fail-closed for explicit operator
+disposition (the latter only through the terminal, evidence-preserving
+`chain-archive-schema3-hold` command). Hostile bundle intake also rejects malformed gzip/DEFLATE streams during
+bounded preflight or extraction before anything can be published into the cache.
 
 **First gate-passing submission (2026-07-07): a submitted kernel measured faster than
 stock sglang through the referee at equal fidelity.** The `miner_m3_fused_epilogue` bundle (fused AR+residual+RMSNorm collective, the
@@ -457,7 +472,7 @@ cross-validator consensus catches a rogue validator.
 | Throughput gain | **two crowned bundles on M3-NVFP4/4×B300: 1.044×/1.049× (shallow) and 1.074×/1.071× (deep), each double-proven** | keep beating the pinned baseline as it advances |
 | Model | gpt-oss-120b (1×H100); MiniMax-M3-NVFP4 (4×B300, TP4) | DSV4-scale (multi-GPU, TP/PD/EP) |
 | Quality gate | Current causal path: pristine-T distribution/task evidence; in-engine audit code and historical B300 receipts exist but are not transported or graded in production | wire host-regraded exact slot×rank audit evidence, then add full-vocab reference-seam checks + large-n (100–200) benchmarks |
-| Scoring noise | noise-derived margin + bookended A/B + no-decision (no clock-lock needed) | + interleaved per-iter A/B + locked clocks where available |
+| Scoring noise | noise-derived margin + calibrated v1 B/C/B′ + no-decision (no clock-lock needed); v2 B/C/B′/C′/B″ is explicit and uncalibrated | + calibrate v2 repeat reads; interleaved per-iter A/B + locked clocks where available |
 | Isolation | validator-owned no-egress OCI worker; trusted controller never loads candidate code | deploy the same policy on each validator's production runtime |
 | Champion | explicit singleton/atomic targets; two independent PASSes; transactional stack settlement | continued whole-stack regression and re-baseline on pin changes |
 | Chain | **native timelock commit-reveal + hash-verified finalized intake + SQLite authority + journaled weights**, with chain behavior run on testnet | own subnet, production permits/cadence, hosted bundle store |

@@ -102,8 +102,10 @@ class _Harness:
         swap_exchanges: bool = False,
         fail_pre_t_quiescence: bool = False,
         exercise_judge_cache: bool = False,
+        repeat: bool = False,
     ) -> None:
-        assert len(graph) == len(speed) == len(quality)
+        assert len(graph) == len(speed)
+        assert len(quality) == len(graph) * (2 if repeat else 1)
         # This runner harness predates the typed authority constructor and
         # intentionally replaces the fully validated input boundary with
         # lightweight records. Preserve exact production type checks while
@@ -236,6 +238,11 @@ class _Harness:
             expected_launch_resource_policy_digest=_d("launch-policy"),
             expected_runtime_resource_policy_digest=_d("runtime-policy"),
             expected_device_policy_digest=_d("device-policy"),
+            speed_evidence_policy=(
+                runner.SpeedEvidencePolicy.repeat()
+                if repeat
+                else runner.SpeedEvidencePolicy.legacy()
+            ),
             calibration_threshold_policy=SimpleNamespace(
                 digest=_d("calibration-threshold-policy")
             ),
@@ -377,14 +384,18 @@ class _Harness:
             request_id,
             nonce,
             index,
+            candidate_read=1,
         ):
             del request_id, nonce
+            request_label = f"request-{authority.selected_delta_digest}"
+            if candidate_read == 2:
+                request_label += "-repeat"
             return SimpleNamespace(
                 index=index,
                 delta=authority.selected_delta_digest,
                 session_id=session_id,
                 plan_digest=plan_digest,
-                sha256=_d(f"request-{authority.selected_delta_digest}"),
+                sha256=_d(request_label),
             )
 
         monkeypatch.setattr(runner, "_reference_request", make_request)
@@ -396,7 +407,7 @@ class _Harness:
         )
         raw_index = 0
 
-        def raw_artifact(_lifecycle, authority, *_args):
+        def raw_artifact(_lifecycle, authority, *_args, candidate_read=1):
             nonlocal raw_index
             self.calls.append(f"raw.{raw_index}")
             raw_index += 1
@@ -419,7 +430,10 @@ class _Harness:
                 "selected_trajectory_projection_digest": _d("trajectory-projection"),
                 "selected_prompt_digests": (_d("prompt"),),
                 "t_session_digest": _d("reference-session"),
-                "t_request_sha256": _d(f"request-{authority.selected_delta_digest}"),
+                "t_request_sha256": _d(
+                    f"request-{authority.selected_delta_digest}"
+                    + ("-repeat" if candidate_read == 2 else "")
+                ),
                 "support_policy_digest": _d("support-policy"),
                 "hidden_task_plan_digest": _d("hidden-task-plan"),
                 "nll_tail_threshold": "1",
@@ -496,6 +510,17 @@ class _Harness:
                 baseline_launch,
                 60 if decision is QualificationDecision.NO_DECISION else 30,
             )
+            candidate_repeat = (
+                rate(
+                    4,
+                    candidate_launch,
+                    36 if decision is QualificationDecision.PASS else 27
+                    if decision is QualificationDecision.FAIL else 30,
+                )
+                if repeat
+                else None
+            )
+            baseline_third = rate(5, baseline_launch, 30) if repeat else None
             context_digest = _d("calibration-context")
             workload_digest = _d("workload")
             evidence_digest = runner._projection_digest(
@@ -505,11 +530,30 @@ class _Harness:
                 context_digest,
                 workload_digest,
                 self.value.expected_runtime_resource_policy_digest,
-                (before, candidate, after),
+                (
+                    (before, candidate, after, candidate_repeat, baseline_third)
+                    if repeat
+                    else (before, candidate, after)
+                ),
             )
             verdict = runner.score_speedup(
-                [before.tokens_per_second, after.tokens_per_second],
-                candidate.tokens_per_second,
+                [
+                    before.tokens_per_second,
+                    after.tokens_per_second,
+                    *(
+                        [baseline_third.tokens_per_second]
+                        if baseline_third is not None
+                        else []
+                    ),
+                ],
+                [
+                    candidate.tokens_per_second,
+                    *(
+                        [candidate_repeat.tokens_per_second]
+                        if candidate_repeat is not None
+                        else []
+                    ),
+                ],
             )
             return runner.MarginalSpeedProjection(
                 _d(f"delta-{index}"),
@@ -522,6 +566,8 @@ class _Harness:
                 candidate,
                 after,
                 verdict,
+                candidate_repeat,
+                baseline_third,
             )
 
         monkeypatch.setattr(runner, "project_marginal_speed", project_speed)
@@ -536,7 +582,7 @@ class _Harness:
             _d("causal-attempt-artifact"),
             2,
             "application/json",
-            runner.ATTEMPT_SCHEMA,
+            runner.ATTEMPT_SCHEMA_V2 if repeat else runner.ATTEMPT_SCHEMA,
         )
         self.published_attempt = None
 
@@ -559,7 +605,15 @@ class _Harness:
         monkeypatch.setattr(runner, "reopen_causal_qualification", reopen_attempt)
 
     def run(self):
-        ids = iter(f"{index + 1:032x}" for index in range(1 + 2 * len(self.value.candidates)))
+        ids = iter(
+            f"{index + 1:032x}"
+            for index in range(
+                1
+                + 2
+                * len(self.value.candidates)
+                * self.value.speed_evidence_policy.candidate_reads
+            )
+        )
         reference = runner.run_causal_qualification(
             self.value,
             executor=self.executor,
@@ -725,6 +779,65 @@ def test_causal_order_uses_one_multi_candidate_t_lifetime(monkeypatch) -> None:
         QualificationDecision.PASS,
         QualificationDecision.PASS,
     ]
+
+
+def test_repeat_attempt_grades_c_and_c_prime_and_uses_v2_wire_schema(
+    monkeypatch, tmp_path: Path
+) -> None:
+    harness = _Harness(
+        monkeypatch,
+        graph=(QualificationDecision.PASS,),
+        speed=(QualificationDecision.PASS,),
+        # Primary C is faithful; C-prime regresses.  The conservative aggregate
+        # must fail even though the mean speed witness itself passes.
+        quality=(QualificationDecision.PASS, QualificationDecision.FAIL),
+        repeat=True,
+    )
+    attempt = harness.run()
+    report = attempt.reports[0]
+
+    assert harness.reference_request_counts == [2]
+    assert len(report.speed_witness.rates) == 5
+    assert report.speed_witness.policy == runner.SpeedEvidencePolicy.repeat()
+    assert report.repeat_quality is not None
+    assert report.repeat_quality.quality_decision is QualificationDecision.FAIL
+    assert report.quality_decision is QualificationDecision.FAIL
+    assert report.decision is QualificationDecision.FAIL
+    assert report.reason == "quality_repeat_regression"
+    assert "repeat_quality" in report.to_dict()
+
+    monkeypatch.setattr(runner, "publish_evidence", publish_evidence)
+    reference = _REAL_PUBLISH_CAUSAL(tmp_path / "repeat-attempt", attempt)
+    assert reference.schema == runner.ATTEMPT_SCHEMA_V2
+    payload = runner._canonical_payload(
+        reopen_evidence(tmp_path / "repeat-attempt", reference)
+    )
+    assert runner.CohortQualificationAttempt.from_dict(payload) == attempt
+
+
+def test_repeat_report_cannot_drop_c_prime_quality_or_regrade_as_legacy(
+    monkeypatch,
+) -> None:
+    harness = _Harness(
+        monkeypatch,
+        graph=(QualificationDecision.PASS,),
+        speed=(QualificationDecision.PASS,),
+        quality=(QualificationDecision.PASS, QualificationDecision.PASS),
+        repeat=True,
+    )
+    report = harness.run().reports[0]
+    payload = report.to_dict()
+    del payload["repeat_quality"]
+    with pytest.raises(
+        runner.QualificationRunnerError, match="repeat quality coverage"
+    ):
+        runner.CandidateQualificationReport.from_dict(payload)
+    with pytest.raises(runner.QualificationRunnerError, match="policy differs"):
+        report.speed_witness.regrade(
+            harness.calibration,
+            harness.value.calibration_context,
+            expected_policy=runner.SpeedEvidencePolicy.legacy(),
+        )
 
 
 def test_pristine_reference_worker_error_remains_unattributed(monkeypatch) -> None:

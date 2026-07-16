@@ -179,6 +179,9 @@ def _apply_qualification(
     reservations: tuple[IntakeReservation, ...],
     publications: tuple[WorkerBundlePublication, ...],
     service: ArenaService,
+    *,
+    minimum_finalized_block: int,
+    finalized_block_provider: Callable[[], int],
 ) -> QualificationIntakeBatch:
     authority_rows = _qualification_reservations(reservations, publications)
     candidates = tuple(
@@ -228,8 +231,19 @@ def _apply_qualification(
         != tuple(row.selected_delta_digest for row in authority_rows)
     ):
         raise IntakeControllerError("qualification outcomes changed cohort authority")
+    # Qualification can occupy the GPU for hours.  Timestamp retained PASS
+    # evidence from a finalized head read after the work completes, not from the
+    # pass-start reveal snapshot, or the reproduction SLA can be mostly (or
+    # entirely) consumed before the first PASS is durable.
+    retained_block = finalized_block_provider()
+    if (
+        type(retained_block) is not int
+        or retained_block < minimum_finalized_block
+    ):
+        raise IntakeControllerError("finalized qualification clock regressed")
     store.apply_qualification_batch(
         batch,
+        current_finalized_block=retained_block,
         evidence_root=None if prepared is None else prepared.evidence_root,
     )
     return batch
@@ -474,7 +488,14 @@ def run_pass(
                     for row in cohort
                 )
                 batch = _apply_qualification(
-                    store, cohort, publications, service
+                    store,
+                    cohort,
+                    publications,
+                    service,
+                    minimum_finalized_block=result.finalized_block,
+                    finalized_block_provider=lambda: chain.read_finalized_head(
+                        subtensor
+                    )[0],
                 )
                 result.decisions.update(
                     (row.reservation_digest, row.decision.value)

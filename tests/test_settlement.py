@@ -262,6 +262,19 @@ def test_conservative_speed_uses_slower_independent_reproduction() -> None:
     assert reproduced.speedup == "1.03"
 
 
+def test_reproduction_must_use_the_same_speed_evidence_policy() -> None:
+    catalog = default_target_catalog()
+    candidate = _candidate(
+        _stack(catalog), _ref(catalog, MSA, "a"), catalog, label="a"
+    )
+    mismatched = replace(
+        candidate.reproduction,
+        speed_evidence_policy_digest=_h("repeat-speed-policy"),
+    )
+    with pytest.raises(SettlementError, match="contribution identity"):
+        SettlementCandidate.from_reproductions(candidate.primary, mismatched)
+
+
 def test_settlement_evidence_binds_both_retained_attempts() -> None:
     catalog = default_target_catalog()
     candidate = _candidate(

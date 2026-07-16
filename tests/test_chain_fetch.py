@@ -233,6 +233,23 @@ def test_extract_rejects_pax_metadata_before_tarfile_materializes_it(
         )
 
 
+def test_extract_contains_corrupt_deflate_as_fetch_error(tmp_path):
+    # Valid gzip framing followed by an invalid DEFLATE block.  GzipFile.read()
+    # raises zlib.error for this payload rather than gzip.BadGzipFile.
+    path = tmp_path / "corrupt-deflate.tar.gz"
+    path.write_bytes(
+        bytes.fromhex("1f8b08000000000002ff06000000000000000000")
+    )
+    cache = tmp_path / "cache-corrupt-deflate"
+
+    with pytest.raises(FetchError, match="corrupt archive"):
+        fetch_bundle_from_local_file_for_testing(
+            path.as_uri(), "a" * 64, cache
+        )
+
+    assert not (cache / ("a" * 64)).exists()
+
+
 def test_extract_rejects_oversized_and_aggregate_inspectable_source(
     tmp_path, monkeypatch
 ):

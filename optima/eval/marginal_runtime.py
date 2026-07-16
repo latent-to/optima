@@ -933,12 +933,25 @@ def run_marginal_lifecycle(
     candidates_repeat: list[CandidateLifecycleEvidence] = []
     baseline_third: EngineExecutionEvidence | None = None
     if candidate_reads == 2:
-        for candidate in prepared.candidates:
-            execution = execute(
-                candidate.launch,
-                candidate.binding.launch_binding,
-                candidate.session_plan,
-            )
+        for candidate_index, candidate in enumerate(prepared.candidates):
+            try:
+                execution = execute(
+                    candidate.launch,
+                    candidate.binding.launch_binding,
+                    candidate.session_plan,
+                )
+            except OuterSessionWorkerError as exc:
+                # C-prime is candidate-owned to exactly the same degree as C.  Do
+                # not let a repeat-read worker failure fall through as a shared
+                # B/B-prime/B-double-prime infrastructure failure and strand the
+                # rest of a cohort.
+                raise CandidateArmWorkerError(
+                    candidate_index=candidate_index,
+                    selected_delta_digest=candidate.arm.selected_delta_digest,
+                    arm_digest=candidate.arm.digest,
+                    launch_digest=candidate.launch.digest,
+                    worker_error=exc,
+                ) from exc
             candidates_repeat.append(
                 CandidateLifecycleEvidence(
                     candidate,

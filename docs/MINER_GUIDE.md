@@ -246,7 +246,7 @@ dtypes = ["bfloat16", "float16"]       # optional eligibility filter
 metadata = "metadata/my_kernel.json"   # optional
 # prepare = "prepare"                   # for (prepare, forward) slots like MoE
 # setup   = "setup"                     # engine-wide mutation; fenced framework lane only
-# architectures = ["sm90", "sm100"]     # optional GPU-arch gate (sm90=H100, sm100=B200)
+# architectures = ["sm90", "sm100", "sm103"] # optional gate (H100, B200, B300)
 ```
 
 All paths are relative and must stay inside the bundle. It may carry multiple

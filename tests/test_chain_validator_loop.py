@@ -61,11 +61,27 @@ class _NoWeightsSubtensor:
         return SCOPE.genesis_hash
 
 
-def _run(tmp_path, monkeypatch, snapshot, sources, **changes):
+def _run(
+    tmp_path,
+    monkeypatch,
+    snapshot,
+    sources,
+    *,
+    head_provider=None,
+    **changes,
+):
     monkeypatch.setattr(
         loop.chain,
         "read_finalized_reveal_history",
         lambda *_, **__: snapshot,
+    )
+    provider = head_provider or (
+        lambda: (snapshot.finalized_block, snapshot.finalized_block_hash)
+    )
+    monkeypatch.setattr(
+        loop.chain,
+        "read_finalized_head",
+        lambda *_: provider(),
     )
     calls = []
 
@@ -187,6 +203,8 @@ def test_live_loop_calls_batch_qualification_and_retains_fail_outcome(
     snapshot = _snapshot([("miner", encode_payload(digest, "https://example.com/a"))])
 
     calls = []
+    progress_events = []
+    retained_blocks = []
     service = object.__new__(ArenaService)
     service.manifest = type(
         "Manifest",
@@ -237,6 +255,7 @@ def test_live_loop_calls_batch_qualification_and_retains_fail_outcome(
     monkeypatch.setattr(loop, "QualificationAuthorityManifest", type("NotManifest", (), {}))
 
     def qualify(factory, **_kwargs):
+        progress_events.append("qualification_complete")
         calls.append(factory.manifest.digest)
         authority = factory.manifest.reservations[0]
         outcome = QualificationIntakeOutcome(
@@ -256,16 +275,36 @@ def test_live_loop_calls_batch_qualification_and_retains_fail_outcome(
         return QualificationIntakeBatch(factory.manifest.digest, (outcome,), ref)
 
     monkeypatch.setattr(loop, "run_qualification_intake", qualify)
+    original_apply = FinalizedIntakeStore.apply_qualification_batch
+
+    def apply_with_progress(self, batch, **kwargs):
+        progress_events.append("apply")
+        retained_blocks.append(kwargs["current_finalized_block"])
+        return original_apply(self, batch, **kwargs)
+
+    monkeypatch.setattr(
+        FinalizedIntakeStore,
+        "apply_qualification_batch",
+        apply_with_progress,
+    )
+
+    def refreshed_head():
+        progress_events.append("finalized_head")
+        return BLOCK + 100, "0x" + "a" * 64
+
     result, _fetches, options = _run(
         tmp_path,
         monkeypatch,
         snapshot,
         {digest: source},
+        head_provider=refreshed_head,
         intake_only=False,
         arena_registry=registry,
         arena_id="test-arena",
     )
     assert len(calls) == 1 and len(calls[0]) == 64
+    assert progress_events == ["qualification_complete", "finalized_head", "apply"]
+    assert retained_blocks == [BLOCK + 100]
     assert set(result.decisions.values()) == {"FAIL"}
     with FinalizedIntakeStore(options["intake_db"], scope=SCOPE) as store:
         row = store.all()[0]

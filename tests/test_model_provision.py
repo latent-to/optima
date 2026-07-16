@@ -66,6 +66,37 @@ def test_wrong_expected_digest_publishes_nothing(tmp_path: Path) -> None:
     assert list(receipts.iterdir()) == []
 
 
+def test_provision_rejects_transient_cache_tree(tmp_path: Path) -> None:
+    model = tmp_path / "model"
+    receipts = tmp_path / "receipts"
+    model.mkdir()
+    receipts.mkdir()
+    _tree(model)
+    metadata = model / ".cache" / "huggingface" / "download" / "config.json.metadata"
+    metadata.parent.mkdir(parents=True)
+    metadata.write_text("etag\ncommit\ntimestamp\n")
+
+    with pytest.raises(ModelProvisionError, match="transient cache path: \\.cache"):
+        provision_model(model, receipts, workers=1)
+
+    assert list(receipts.iterdir()) == []
+
+
+def test_reopen_rejects_transient_cache_added_after_provision(tmp_path: Path) -> None:
+    model = tmp_path / "model"
+    receipts = tmp_path / "receipts"
+    model.mkdir()
+    receipts.mkdir()
+    _tree(model)
+    published = provision_model(model, receipts, workers=1)
+    cache = model / ".cache"
+    cache.mkdir()
+    (cache / "metadata").write_text("mutable\n")
+
+    with pytest.raises(ModelProvisionError, match="transient cache path: \\.cache"):
+        reopen_model_provision(model, published.receipt_path, workers=1)
+
+
 @pytest.mark.parametrize("kind", ["root_symlink", "nested_symlink", "hardlink", "fifo"])
 def test_provision_rejects_nonconcrete_or_aliased_trees(
     tmp_path: Path, kind: str

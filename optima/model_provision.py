@@ -27,6 +27,7 @@ MODEL_PROVISION_SCHEMA_VERSION = 1
 MODEL_RECEIPT_PREFIX = "model-provision-sha256-"
 _MAX_RECEIPT_BYTES = 64 * 1024 * 1024
 _READ_SIZE = 16 * 1024 * 1024
+_TRANSIENT_MODEL_PATH_NAMES = frozenset({".cache"})
 _STAT_FIELDS = (
     "st_dev",
     "st_ino",
@@ -229,6 +230,10 @@ def _discover(
         snapshot.append((directory_name, _stat_values(directory_info)))
         for entry in entries:
             relative = _logical_path(PurePosixPath(*prefix, entry.name).as_posix())
+            if entry.name in _TRANSIENT_MODEL_PATH_NAMES:
+                raise ModelProvisionError(
+                    f"model tree contains a transient cache path: {relative}"
+                )
             previous = folded.get(relative.casefold())
             if previous is not None and previous != relative:
                 raise ModelProvisionError(

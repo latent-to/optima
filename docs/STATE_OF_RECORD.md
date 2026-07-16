@@ -109,8 +109,9 @@ plane reconciliation over the transactional global reward projection.
 
 **The serving release is separate from evaluation and chain state.** Approved
 `IntegrationReviewRecord`s authorize exact contributions in an
-`EngineReleaseManifest`; deterministic model provisioning seals every file in the model
-tree. The chain-independent release module emits signed descriptors, deterministic source
+`EngineReleaseManifest`; deterministic model provisioning seals every file in a clean model
+tree and rejects transient `.cache` paths rather than silently excluding mounted bytes. The
+chain-independent release module emits signed descriptors, deterministic source
 and wheel artifacts, SPDX SBOM, provenance, a pinned serve specification, and an OCI build
 context. The serving wheel excludes chain, wallet, settlement, and evaluation-control code.
 

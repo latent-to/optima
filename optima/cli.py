@@ -607,7 +607,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = sub.add_parser(
         "model-provision",
-        help="seal exact model bytes into a content-addressed external receipt",
+        help=(
+            "seal a clean exact model tree into a content-addressed external receipt "
+            "(transient cache paths are rejected)"
+        ),
     )
     sp.add_argument("model_root")
     sp.add_argument("publication_root")

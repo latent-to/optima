@@ -10,6 +10,7 @@ becoming executable, unhashed bytes beside the submitted delta.
 from __future__ import annotations
 
 import http.client
+import gzip
 import ipaddress
 import logging
 import os
@@ -37,11 +38,32 @@ logger = logging.getLogger("optima.chain.fetch")
 MAX_ARCHIVE_BYTES = 64 * 1024 * 1024
 MAX_EXTRACTED_BYTES = 256 * 1024 * 1024
 MAX_MEMBERS = 4096
+# Every accepted bundle is later parsed, normalized, and fingerprinted in trusted
+# intake.  Bound the shape before those readers can materialize one hostile file.
+MAX_FILE_BYTES = 16 * 1024 * 1024
+MAX_INSPECTABLE_FILE_BYTES = 8 * 1024 * 1024
+MAX_INSPECTABLE_BYTES = 32 * 1024 * 1024
+# PAX/GNU extension payloads are consumed by tarfile before it yields the logical
+# member.  Preflight the raw decompressed tar stream and cap these bytes first.
+MAX_EXTENSION_HEADER_BYTES = 64 * 1024
+MAX_EXTENSION_BYTES = 1024 * 1024
 FETCH_TIMEOUT_S = 60.0
 MAX_REDIRECTS = 5
 _REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
 _TRANSFER_CHUNK_BYTES = 1024 * 1024
 _HASH_RE = re.compile(r"[0-9a-f]{64}\Z")
+_GZIP_MAGIC = b"\x1f\x8b"
+_TAR_BLOCK_BYTES = 512
+_ZERO_TAR_BLOCK = b"\0" * _TAR_BLOCK_BYTES
+_EXTENSION_TYPES = frozenset(
+    {
+        tarfile.XHDTYPE,
+        tarfile.XGLTYPE,
+        tarfile.GNUTYPE_LONGNAME,
+        tarfile.GNUTYPE_LONGLINK,
+    }
+)
+_INSPECTABLE_SUFFIXES = frozenset({".py", ".cu", ".cuh", ".patch", ".diff", ".toml", ".json"})
 
 
 class FetchError(RuntimeError):
@@ -391,14 +413,151 @@ def _member_path(raw: str) -> PurePosixPath:
     return path
 
 
-def _safe_extract(archive: Path, destination: Path) -> None:
+def _tar_stream_limit() -> int:
+    # One header and at most 511 padding bytes per logical member, extension
+    # payloads, two end markers, and one record of harmless zero padding.
+    return (
+        MAX_EXTRACTED_BYTES
+        + MAX_MEMBERS * 1024
+        + MAX_EXTENSION_BYTES
+        + 12 * 1024
+    )
+
+
+def _read_tar_bytes(
+    stream: gzip.GzipFile,
+    size: int,
+    *,
+    deadline: float,
+    consumed: list[int],
+    allow_clean_eof: bool = False,
+) -> bytes:
+    if size < 0 or consumed[0] + size > _tar_stream_limit():
+        raise FetchError("decompressed archive stream exceeds its bounded budget")
+    chunks: list[bytes] = []
+    remaining = size
+    while remaining:
+        _remaining(deadline)
+        chunk = stream.read(min(_TRANSFER_CHUNK_BYTES, remaining))
+        if not chunk:
+            if allow_clean_eof and remaining == size:
+                return b""
+            raise FetchError("decompressed archive stream is truncated")
+        chunks.append(chunk)
+        consumed[0] += len(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
+def _discard_tar_bytes(
+    stream: gzip.GzipFile,
+    size: int,
+    *,
+    deadline: float,
+    consumed: list[int],
+) -> None:
+    if size < 0 or consumed[0] + size > _tar_stream_limit():
+        raise FetchError("decompressed archive stream exceeds its bounded budget")
+    remaining = size
+    while remaining:
+        _remaining(deadline)
+        chunk = stream.read(min(_TRANSFER_CHUNK_BYTES, remaining))
+        if not chunk:
+            raise FetchError("decompressed archive stream is truncated")
+        consumed[0] += len(chunk)
+        remaining -= len(chunk)
+
+
+def _preflight_tar_stream(archive: Path, *, deadline: float) -> None:
+    """Bound raw gzip/tar work before ``tarfile`` materializes PAX metadata."""
+
+    consumed = [0]
+    extension_bytes = 0
+    raw_headers = 0
+    try:
+        with archive.open("rb") as compressed:
+            if compressed.read(2) != _GZIP_MAGIC:
+                raise FetchError("bundle archive must be gzip-compressed tar")
+            compressed.seek(0)
+            with gzip.GzipFile(fileobj=compressed, mode="rb") as stream:
+                zero_blocks = 0
+                while True:
+                    block = _read_tar_bytes(
+                        stream,
+                        _TAR_BLOCK_BYTES,
+                        deadline=deadline,
+                        consumed=consumed,
+                        allow_clean_eof=True,
+                    )
+                    if not block:
+                        if zero_blocks < 2:
+                            raise FetchError("archive omitted the two tar end markers")
+                        break
+                    if block == _ZERO_TAR_BLOCK:
+                        zero_blocks += 1
+                        if zero_blocks < 2:
+                            continue
+                        # A gzip stream may retain record-alignment zeros.  Drain and
+                        # count them so a trailing zero bomb cannot bypass the cap.
+                        while True:
+                            _remaining(deadline)
+                            chunk = stream.read(_TRANSFER_CHUNK_BYTES)
+                            if not chunk:
+                                return
+                            consumed[0] += len(chunk)
+                            if consumed[0] > _tar_stream_limit():
+                                raise FetchError(
+                                    "decompressed archive stream exceeds its bounded budget"
+                                )
+                            if any(chunk):
+                                raise FetchError("archive has nonzero bytes after its end markers")
+                    if zero_blocks:
+                        raise FetchError("archive has data after a tar end marker")
+                    raw_headers += 1
+                    if raw_headers > MAX_MEMBERS * 2:
+                        raise FetchError("archive has too many raw tar headers")
+                    try:
+                        member = tarfile.TarInfo.frombuf(
+                            block, encoding="utf-8", errors="surrogateescape"
+                        )
+                    except (tarfile.TarError, ValueError) as exc:
+                        raise FetchError(f"corrupt tar header: {exc}") from None
+                    if type(member.size) is not int or member.size < 0:
+                        raise FetchError("archive header has an invalid size")
+                    if member.type in _EXTENSION_TYPES:
+                        if member.size > MAX_EXTENSION_HEADER_BYTES:
+                            raise FetchError(
+                                "archive extension header exceeds its per-header budget"
+                            )
+                        extension_bytes += member.size
+                        if extension_bytes > MAX_EXTENSION_BYTES:
+                            raise FetchError(
+                                "archive extension headers exceed their aggregate budget"
+                            )
+                    padded = ((member.size + _TAR_BLOCK_BYTES - 1) // _TAR_BLOCK_BYTES) * _TAR_BLOCK_BYTES
+                    _discard_tar_bytes(
+                        stream, padded, deadline=deadline, consumed=consumed
+                    )
+    except FetchError:
+        raise
+    except (gzip.BadGzipFile, tarfile.TarError, OSError, EOFError) as exc:
+        raise FetchError(f"corrupt archive: {exc}") from None
+
+
+def _safe_extract(
+    archive: Path, destination: Path, *, deadline: float | None = None
+) -> None:
+    deadline = time.monotonic() + FETCH_TIMEOUT_S if deadline is None else deadline
+    _preflight_tar_stream(archive, deadline=deadline)
     budget = MAX_EXTRACTED_BYTES
+    inspectable_budget = MAX_INSPECTABLE_BYTES
     seen: dict[PurePosixPath, str] = {}
     directories: set[PurePosixPath] = set()
     file_paths: set[PurePosixPath] = set()
     try:
         with tarfile.open(archive, "r:*") as tar:
             for count, member in enumerate(tar, start=1):
+                _remaining(deadline)
                 if count > MAX_MEMBERS:
                     raise FetchError(f"archive has more than {MAX_MEMBERS} members")
                 name = _member_path(member.name)
@@ -424,6 +583,22 @@ def _safe_extract(archive: Path, destination: Path) -> None:
                     )
                 if type(member.size) is not int or member.size < 0:
                     raise FetchError(f"archive member has an invalid size: {member.name!r}")
+                if member.size > MAX_FILE_BYTES:
+                    raise FetchError(
+                        f"archive member exceeds the {MAX_FILE_BYTES}-byte per-file budget: "
+                        f"{member.name!r}"
+                    )
+                if name.suffix in _INSPECTABLE_SUFFIXES:
+                    if member.size > MAX_INSPECTABLE_FILE_BYTES:
+                        raise FetchError(
+                            "inspectable archive member exceeds its per-file budget: "
+                            f"{member.name!r}"
+                        )
+                    inspectable_budget -= member.size
+                    if inspectable_budget < 0:
+                        raise FetchError(
+                            "inspectable archive members exceed their aggregate budget"
+                        )
                 budget -= member.size
                 if budget < 0:
                     raise FetchError(f"extracted size exceeds {MAX_EXTRACTED_BYTES} bytes")
@@ -440,6 +615,7 @@ def _safe_extract(archive: Path, destination: Path) -> None:
                 try:
                     remaining = member.size
                     while remaining:
+                        _remaining(deadline)
                         chunk = source.read(min(_TRANSFER_CHUNK_BYTES, remaining))
                         if not chunk:
                             raise FetchError(f"archive member was truncated: {member.name!r}")
@@ -450,6 +626,7 @@ def _safe_extract(archive: Path, destination: Path) -> None:
                                 raise FetchError("archive extraction write made no progress")
                             view = view[written:]
                         remaining -= len(chunk)
+                    _remaining(deadline)
                     if source.read(1):
                         raise FetchError(
                             f"archive member exceeded its declared size: {member.name!r}"
@@ -592,7 +769,7 @@ def _fetch_bundle(
             _download_https(url, archive, MAX_ARCHIVE_BYTES, deadline=deadline)
         extract_dir = temporary_path / "extract"
         extract_dir.mkdir(mode=0o700)
-        _safe_extract(archive, extract_dir)
+        _safe_extract(archive, extract_dir, deadline=deadline)
         proposal = _bundle_root(extract_dir)
         # ``mkdir(parents=True)`` may create the archive's single wrapper
         # directory with the process umask rather than the leaf's explicit

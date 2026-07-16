@@ -42,7 +42,7 @@ def cmd_compat(_: argparse.Namespace) -> int:
     from optima.compat import format_checks, run_checks
 
     checks = run_checks()
-    print("sglang compatibility canary (run after any sglang bump):")
+    print("sglang pin + compatibility canary (run after any sglang bump):")
     print(format_checks(checks))
     return 0 if all(c.ok for c in checks) else 2
 
@@ -119,6 +119,7 @@ def cmd_set_weights(args: argparse.Namespace) -> int:
         SQLiteWeightPublicationJournal,
     )
     from optima.chain.weights import (
+        WeightPublicationError,
         reconcile_weight_publication,
         release_weight_publication_hold,
         resume_weight_projection,
@@ -128,44 +129,81 @@ def cmd_set_weights(args: argparse.Namespace) -> int:
         GlobalRewardProjectionContext,
         MetagraphMember,
     )
-    from optima.target_catalog import default_target_catalog
 
+    if args.reconcile_only and args.dry_run:
+        raise SystemExit("--reconcile-only cannot be combined with --dry-run")
+    if args.reconcile_only and args.release_hold:
+        raise SystemExit("--reconcile-only cannot be combined with --release-hold")
+    if args.release_hold and args.dry_run:
+        raise SystemExit("--release-hold cannot be combined with --dry-run")
+    head_only = args.reconcile_only or bool(args.release_hold)
+    if head_only and args.validator_hotkey:
+        validator_hotkey = args.validator_hotkey
+        wallet = None
+    elif args.reconcile_only:
+        raise SystemExit("--reconcile-only requires --validator-hotkey")
+    else:
+        import bittensor as bt
+
+        public_wallet = bt.Wallet(name=args.wallet, hotkey=args.hotkey)
+        validator_hotkey = public_wallet.hotkey.ss58_address
+        # A hold release needs only the local journal plus public authority
+        # identity.  Do not retain a signer-capable object on that path.
+        wallet = None if args.release_hold else public_wallet
     subtensor = chain.connect(args.network)
-    import bittensor as bt
-
-    wallet = bt.Wallet(name=args.wallet, hotkey=args.hotkey)
-    validator_hotkey = wallet.hotkey.ss58_address
     scope = IntakeScope(str(subtensor.get_block_hash(0)).lower(), args.netuid)
-    metagraph = chain.fetch_metagraph(subtensor, args.netuid)
-    context = GlobalRewardProjectionContext(
-        scope.digest,
-        validator_hotkey,
-        metagraph.block,
-        metagraph.block_hash.lower(),
-        tuple(
-            MetagraphMember(uid, hotkey)
-            for uid, hotkey in zip(metagraph.uids, metagraph.hotkeys, strict=True)
-        ),
-    )
     policy = EmissionsPolicyManifest(
         args.half_life_blocks,
         args.discovery_lifetime_blocks,
         args.discovery_pool_ppm,
     )
-    catalog = default_target_catalog()
     with FinalizedIntakeStore(args.intake_db, scope=scope) as store:
-        states = store.evaluation_stacks()
-        catalogs = {state.arena_digest: catalog for state in states}
-        projection = store.build_weight_projection(
-            policy=policy,
-            context=context,
-            catalogs=catalogs,
-            netuid=args.netuid,
-        )
-        journal = SQLiteWeightPublicationJournal(store, projection)
+        if head_only:
+            journal = SQLiteWeightPublicationJournal.reopen_from_head(store)
+            projection = journal.projection
+            if projection.chain_scope_digest != scope.digest:
+                raise WeightPublicationError(
+                    "retained projection differs from the requested chain scope"
+                )
+            if projection.netuid != args.netuid:
+                raise WeightPublicationError(
+                    "retained projection differs from the requested netuid"
+                )
+            if projection.validator_hotkey != validator_hotkey:
+                raise WeightPublicationError(
+                    "retained projection differs from the public validator hotkey"
+                )
+            if projection.policy_digest != policy.digest:
+                raise WeightPublicationError(
+                    "retained projection differs from the supplied emissions policy"
+                )
+        else:
+            from optima.target_catalog import default_target_catalog
+
+            catalog = default_target_catalog()
+            metagraph = chain.fetch_metagraph(subtensor, args.netuid)
+            context = GlobalRewardProjectionContext(
+                scope.digest,
+                validator_hotkey,
+                metagraph.block,
+                metagraph.block_hash.lower(),
+                tuple(
+                    MetagraphMember(uid, hotkey)
+                    for uid, hotkey in zip(
+                        metagraph.uids, metagraph.hotkeys, strict=True
+                    )
+                ),
+            )
+            states = store.evaluation_stacks()
+            catalogs = {state.arena_digest: catalog for state in states}
+            projection = store.build_weight_projection(
+                policy=policy,
+                context=context,
+                catalogs=catalogs,
+                netuid=args.netuid,
+            )
+            journal = SQLiteWeightPublicationJournal(store, projection)
         if args.release_hold:
-            if args.dry_run:
-                raise SystemExit("--release-hold cannot be combined with --dry-run")
             released = release_weight_publication_hold(
                 journal, reason=args.release_hold
             )
@@ -174,7 +212,7 @@ def cmd_set_weights(args: argparse.Namespace) -> int:
                 "run set-weights again to refresh and reconcile"
             )
             return 0
-        if not args.dry_run:
+        if not args.dry_run and not args.reconcile_only:
             projection = resume_weight_projection(projection, journal)
             journal = SQLiteWeightPublicationJournal(store, projection)
         result = reconcile_weight_publication(
@@ -184,11 +222,15 @@ def cmd_set_weights(args: argparse.Namespace) -> int:
             journal,
             refresh_blocks=args.refresh_blocks,
             dry_run=args.dry_run,
+            reconcile_only=args.reconcile_only,
         )
     print(
         f"weight projection={projection.digest} status={result.status} "
-        f"chain_matches={result.chain_matches} submitted={result.submitted}"
+        f"chain_matches={result.chain_matches} submitted={result.submitted} "
+        f"refresh_due={result.refresh_due}"
     )
+    if result.refresh_due:
+        return 3
     return 0 if result.status in {"dry_run", "confirmed", "pending"} else 2
 
 
@@ -327,6 +369,28 @@ def cmd_chain_validate(
             print(f"  rejected {reservation[:16]}… {why}")
         if args.intake_only:
             print("qualification/settlement: disabled by --intake-only")
+    return 0
+
+
+def cmd_chain_archive_schema3_hold(args: argparse.Namespace) -> int:
+    """Archive one legacy schema-v3 hold without loading any signer authority."""
+
+    from optima import chain
+    from optima.chain.intake import FinalizedIntakeStore, IntakeScope
+
+    subtensor = chain.connect(args.network)
+    scope = IntakeScope(str(subtensor.get_block_hash(0)).lower(), args.netuid)
+    finalized_block, _finalized_hash = chain.read_finalized_head(subtensor)
+    with FinalizedIntakeStore(args.intake_db, scope=scope) as store:
+        archived = store.archive_schema3_migration_hold(
+            args.reservation_id,
+            current_finalized_block=finalized_block,
+            reason=args.reason,
+        )
+    print(
+        f"archived schema3 migration hold {archived.reservation_id} "
+        f"at finalized block {finalized_block}; retained evidence remains non-crownable"
+    )
     return 0
 
 
@@ -607,7 +671,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = sub.add_parser(
         "model-provision",
-        help="seal exact model bytes into a content-addressed external receipt",
+        help=(
+            "seal a clean exact model tree into a content-addressed external receipt "
+            "(transient cache paths are rejected)"
+        ),
     )
     sp.add_argument("model_root")
     sp.add_argument("publication_root")
@@ -648,6 +715,23 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--discovery-lifetime-blocks", type=int, required=True)
     sp.add_argument("--discovery-pool-ppm", type=int, required=True)
     sp.add_argument("--refresh-blocks", type=int, required=True)
+    sp.add_argument(
+        "--reconcile-only",
+        action="store_true",
+        help=(
+            "confirm only from exact authoritative readback; never construct or invoke "
+            "a signer; a stale historical pending confirmation exits 3 with "
+            "refresh_due=True, while other submission/refresh cases fail"
+        ),
+    )
+    sp.add_argument(
+        "--validator-hotkey",
+        default="",
+        help=(
+            "public validator hotkey required by --reconcile-only and usable for a "
+            "signer-free --release-hold"
+        ),
+    )
     sp.add_argument(
         "--release-hold",
         default="",
@@ -705,6 +789,20 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--interval", type=float, default=60.0, help="seconds between passes")
     sp.add_argument("--once", action="store_true", help="single pass, then exit")
     sp.set_defaults(func=cmd_chain_validate)
+
+    sp = sub.add_parser(
+        "chain-archive-schema3-hold",
+        help=(
+            "terminally archive one exact legacy schema-v3 reproduction hold; "
+            "preserves evidence and never signs, releases, or crowns"
+        ),
+    )
+    sp.add_argument("--netuid", type=int, required=True)
+    sp.add_argument("--network", required=True)
+    sp.add_argument("--intake-db", default="chain_intake/intake.sqlite3")
+    sp.add_argument("--reservation-id", required=True)
+    sp.add_argument("--reason", required=True, help="bounded operator audit reason")
+    sp.set_defaults(func=cmd_chain_archive_schema3_hold)
 
     sp = sub.add_parser("chain-register",
                         help="register this hotkey on a subnet (burned_register; needs "

@@ -18,15 +18,20 @@ plan and audit make the ongoing implementation reviewable and resumable.
 ## What is and isn't done
 
 **Done & validated on real GPUs (H100 up to gpt-oss-120b; 4×B300 MiniMax-M3-NVFP4;
-CUDA 13; the scored sglang version is `PINNED_SGLANG` in `optima/compat.py`, which
-also records that pin's validation state):**
-the whole *mechanism* — typed op-slots, fused-*block* slots, **and cross-GPU *collective*
+CUDA 13):** the stable/default SGLang pin is `PINNED_SGLANG` in `optima/compat.py`;
+the crowned MiniMax-M3 campaign instead used source build
+`0.0.0.dev1+g56e290315` at revision `56e290315b8fdb4c8c10f8e31360d9bc3d878633`.
+Those are distinct runtime identities and their evidence must not be mixed; making the
+source revision/image identity a mandatory authenticated arena pin remains open. The historical
+GPU results validate the whole *mechanism* — typed op-slots, fused-*block* slots,
+**and cross-GPU *collective*
 slots** (a slot can be one op, a region behind one typed tensor boundary, or a collective
 handed the process group), the seam that swaps an untrusted kernel into a spawned model
-process, op-correctness, bookended throughput measurement, the fidelity gates (in-engine
-audit + pristine-reference distribution/task checks), chain-native commit-reveal
-intake with cumulative copy disposition, and tamper-resistant timing. **Ten slots:** `activation.silu_and_mul`,
-`norm.rmsnorm` (ops); `attention.sdpa` / `attention.decode` / `attention.msa_block_score`,
+process, op-correctness, bookended throughput measurement, the historical evaluator's
+in-engine audit plus pristine-reference distribution/task checks, chain-native commit-reveal
+intake with cumulative copy disposition, and tamper-resistant timing. **Eleven slots:**
+`activation.silu_and_mul`, `norm.rmsnorm` (ops); `attention.sdpa` / `attention.decode` /
+`attention.msa_block_score` / `attention.msa_prefill_block_score`,
 `moe.fused_experts` (blocks); `collective.all_reduce`, `moe.fused_experts_reduce`,
 `collective.ar_residual_rmsnorm`, and `collective.moe_finalize_ar_rmsnorm` (collectives,
 verified distributed). `moe.fused_experts_reduce` is the **block that owns its trailing TP
@@ -52,6 +57,14 @@ the noise term is what guards an unstable box), and a round whose baselines disa
 tolerance is **NO-DECISION** (never crowns). `ignore_eos` is on for scoring so both sides emit
 identical token counts.
 
+The calibrated production default remains the historical, byte-compatible v1
+`B/C/B′` speed-evidence policy. A complete v2 repeat-read authority is available only
+as an explicit opt-in: it runs `B/C/B′/C′/B″`, binds that read shape and estimator into
+the causal authority and settlement evidence, teacher-grades both overlapping quality
+triplets, and requires primary and reproduction to use the same policy. V2 has not yet
+received a current-head GPU stock-null and honest-control calibration, so it is not the
+production default and no v2 performance result is claimed here.
+
 **The production referee authority is isolated and fail-closed.** Finalized submissions
 move from validator-private fetch storage into immutable, hash-complete worker
 publications. Candidate import, hermetic native compilation, engine construction, and
@@ -62,6 +75,15 @@ schema; it does not load miner Python or native extensions. Qualification is B/C
 separate pristine teacher-forced T authority, including graph-capture/replay and raw quality
 evidence.
 
+**Current production fidelity gap (2026-07-16):** that causal qualification path does
+**not** currently run or grade the in-engine audit described by the historical results.
+`optima/eval/engine_worker.py` clears `OPTIMA_SLOT_AUDIT` and
+`OPTIMA_SLOT_AUDIT_SEED`; the session protocol and aggregate report carry no audit facts;
+settlement has no audit-compatibility field. Current production qualification therefore
+grades graph execution, calibrated speed, and pristine-T distribution/task evidence only.
+The audit must be wired as a separate untimed candidate role with host-regraded, exact
+slot×rank evidence before meaningful-emission launch; see [FIDELITY.md](FIDELITY.md).
+
 **The production intake and arena path uses SQLite and explicit target/stack identity.**
 `FinalizedIntakeStore` persists finalized ordering, copy disposition, screen receipts,
 qualification attempts, stack transitions, settlement, and weight-publication state. A
@@ -69,7 +91,14 @@ trusted `ArenaServiceRegistry` binds runtime/model/topology identity, decode and
 long-prefill workload regimes, capacity/retry policy, and the fixed non-crown
 static/build/ABI/graph/abbreviated-serving screen. A first passing qualification is retained
 as `reproduction_pending`; settlement requires a second independent passing authority for
-the same candidate identity and conservatively uses the lower speedup.
+the same candidate identity and conservatively uses the lower speedup. The retained PASS
+durably records a finalized head read after qualification completes and starts a fresh,
+bounded reproduction SLA;
+pre-PASS work remains bounded from arrival, while legacy retained rows without a known
+progress block and schema-v3 migration holds remain fail-closed for explicit operator
+disposition (the latter only through the terminal, evidence-preserving
+`chain-archive-schema3-hold` command). Hostile bundle intake also rejects malformed gzip/DEFLATE streams during
+bounded preflight or extraction before anything can be published into the cache.
 
 **First gate-passing submission (2026-07-07): a submitted kernel measured faster than
 stock sglang through the referee at equal fidelity.** The `miner_m3_fused_epilogue` bundle (fused AR+residual+RMSNorm collective, the
@@ -109,8 +138,9 @@ plane reconciliation over the transactional global reward projection.
 
 **The serving release is separate from evaluation and chain state.** Approved
 `IntegrationReviewRecord`s authorize exact contributions in an
-`EngineReleaseManifest`; deterministic model provisioning seals every file in the model
-tree. The chain-independent release module emits signed descriptors, deterministic source
+`EngineReleaseManifest`; deterministic model provisioning seals every file in a clean model
+tree and rejects transient `.cache` paths rather than silently excluding mounted bytes. The
+chain-independent release module emits signed descriptors, deterministic source
 and wheel artifacts, SPDX SBOM, provenance, a pinned serve specification, and an OCI build
 context. The serving wheel excludes chain, wallet, settlement, and evaluation-control code.
 
@@ -118,7 +148,8 @@ context. The serving wheel excludes chain, wallet, settlement, and evaluation-co
 bundle storage); broader optimization targets (MLA / weight-absorbed attention, GEMM,
 comms-overlap blocks); and B300-only proof for SM103/CuTe, NVLink/custom collectives,
 topology-specific calibration, TP4 role swaps, and the existing MiniMax-M3 campaign
-kernels. The earlier measured calibration findings remain below.
+kernels. Production audit wiring and the global-versus-per-arena SGLang pin policy are
+also open. The earlier measured calibration findings remain below.
 
 ## Status: validated end-to-end
 
@@ -214,7 +245,7 @@ optima/
   verify.py                 # op/block correctness vs HP reference (allclose|matched_ratio|cosine)
   verify_collective.py      # DISTRIBUTED verify for collective slots (mp-spawn N ranks; count-dim jitter)
   rebuild.py                # fenced escape hatch: validator-shipped repo patchers only (no bundle code)
-  compat.py                 # PINNED_SGLANG (0.5.13.post1) + the seam canary (`optima compat`)
+  compat.py                 # default PINNED_SGLANG (0.5.13.post1) + strict version/seam canary
   seam.py / bootstrap.py    # install the seam in every venv interpreter via a .pth
   integrations/
     sglang_silu.py / sglang_norm.py        # ops: SiluAndMul, RMSNorm
@@ -263,8 +294,8 @@ moment its module loads — including in the spawned scheduler. The chokepoints 
 `RadixAttention.forward` / `FusedMoE.forward` (blocks), `GroupCoordinator.all_reduce`
 (collective), the fused AR+residual+RMSNorm epilogue behind
 `--enable-flashinfer-allreduce-fusion` (arfusion), and the deep-seam pair
-(`LayerCommunicator` defer-gate + the fused-moe export wrap). The pinned sglang (0.5.13.post1, see
-`optima/compat.py`) **does** ship a hook/plugin framework (`srt/plugins/hook_registry.py`,
+(`LayerCommunicator` defer-gate + the fused-moe export wrap). The default stable SGLang
+pin (0.5.13.post1, see `optima/compat.py`) **does** ship a hook/plugin framework (`srt/plugins/hook_registry.py`,
 added by PR #21388 — present at the pin), so migrating the seam to a sanctioned
 `sglang.srt.plugins` entry-point hook is a tracked option (`integrations/sglang_plugin.py`
 is the shim); the `.pth` path is kept primary today because it is version-independent and
@@ -331,7 +362,7 @@ that legitimately differ (attention/fp8/absorbed), or `cosine` (vs the HP refere
 low-bit kernels where element-wise tolerance is meaningless (FP4/FP8). A kernel that
 targets a block/collective slot also declares `graph_safe` in its metadata to be run
 (and scored) under CUDA graphs; undeclared kernels stay eager-only and fall back in-graph.
-**Ten slots today:**
+**Eleven slots today:**
 
 - `activation.silu_and_mul` — `entry(x, out)` — Qwen/Llama-class MLP (op).
 - `norm.rmsnorm` — `entry(x, weight, out, eps)` — universal; fires on gpt-oss (op).
@@ -342,6 +373,9 @@ targets a block/collective slot also declares `graph_safe` in its metadata to be
   it (block; eager-only gather MVP — a paged-direct, CUDA-graph-safe contract is next).
 - `attention.msa_block_score` — the MiniMax sparse-attention block-score stage
   (block; `matched_ratio` vs high-precision ground truth — see the M3 arena work).
+- `attention.msa_prefill_block_score` — the prefill indexer's causal block-score
+  sheet; the validator retains stock top-k selection/attention and verifies per-row
+  `topk_overlap` on a long-chunk causality-sensitive shape.
 - `moe.fused_experts` — `(prepare, forward)` pair — SwiGLU fused experts; `prepare` owns
   the weight layout once at load, `forward(x, topk_ids, topk_weights, prepared, out)` runs
   per step (block; a quantized kernel carries its FP4/FP8 weight layout in `prepare`).
@@ -398,7 +432,8 @@ local JSON-ledger round simulator (`optima commit/reveal/ledger/legacy-settle`,
   not winner-take-all.
 
 Robust scoring (see `optima/eval/scoring.py`), built for a validator that **can't lock GPU
-clocks**: each launch does median-of-K timed passes; the candidate is **bracketed by a
+clocks**: each arm recomputes one charged rate from the pooled conditioning and timed
+batch token/interval evidence; the candidate is **bracketed by a
 baseline before and after** (B,C,B'); the speedup is paired against the baseline mean; the
 bar is **derived from the measured baseline noise** (`1 + max(margin, k·noise)`) not a
 hand-picked constant; a round whose bracketing baselines disagree past a tolerance is
@@ -411,7 +446,7 @@ whose visible head matches (top-k KL is blind to it), the argmax-rate catches sp
 can't hard-code the verify shapes), `ignore_eos` so both sides emit identical token counts
 and the throughput numerator is a driver-known fixed budget (not a scheduler-reported
 count), a `max_running_requests` knob to score at a serving-realistic batch, and a
-**stale-champion** flag at settle when the `PINNED_SGLANG` differs (re-baseline on a bump).
+**stale-champion** flag at settle when the stack/runtime identity differs (re-baseline on a bump).
 
 ## Security model
 
@@ -433,11 +468,11 @@ cross-validator consensus catches a rogue validator.
 
 | Concern | Now | Production |
 |---|---|---|
-| Slots | 10: silu/rmsnorm, attention ×3, MoE ×2, all-reduce, AR+norm epilogues ×2 (deep via dep_patches) | + MLA, FP8/FP4 GEMM, graph-safe paged attention |
+| Slots | 11: silu/rmsnorm, attention ×4, MoE ×2, all-reduce, AR+norm epilogues ×2 (deep via dep_patches) | + MLA, FP8/FP4 GEMM, graph-safe paged attention |
 | Throughput gain | **two crowned bundles on M3-NVFP4/4×B300: 1.044×/1.049× (shallow) and 1.074×/1.071× (deep), each double-proven** | keep beating the pinned baseline as it advances |
 | Model | gpt-oss-120b (1×H100); MiniMax-M3-NVFP4 (4×B300, TP4) | DSV4-scale (multi-GPU, TP/PD/EP) |
-| Quality gate | in-engine audit (nondet arenas) / calibrated KL (det arenas) + coverage/argmax/per-slot-threshold + GSM8K/MMLU | full-vocab KL at a reference seam + large-n (100–200) benchmarks |
-| Scoring noise | noise-derived margin + bookended A/B + no-decision (no clock-lock needed) | + interleaved per-iter A/B + locked clocks where available |
+| Quality gate | Current causal path: pristine-T distribution/task evidence; in-engine audit code and historical B300 receipts exist but are not transported or graded in production | wire host-regraded exact slot×rank audit evidence, then add full-vocab reference-seam checks + large-n (100–200) benchmarks |
+| Scoring noise | noise-derived margin + calibrated v1 B/C/B′ + no-decision (no clock-lock needed); v2 B/C/B′/C′/B″ is explicit and uncalibrated | + calibrate v2 repeat reads; interleaved per-iter A/B + locked clocks where available |
 | Isolation | validator-owned no-egress OCI worker; trusted controller never loads candidate code | deploy the same policy on each validator's production runtime |
 | Champion | explicit singleton/atomic targets; two independent PASSes; transactional stack settlement | continued whole-stack regression and re-baseline on pin changes |
 | Chain | **native timelock commit-reveal + hash-verified finalized intake + SQLite authority + journaled weights**, with chain behavior run on testnet | own subnet, production permits/cadence, hosted bundle store |

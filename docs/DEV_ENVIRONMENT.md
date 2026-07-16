@@ -76,11 +76,10 @@ lium rsync <pod> ~/Downloads/github/optima/examples
 # on the pod (lium ssh, or wrap each in `lium exec <pod> "..."`):
 curl -LsSf https://astral.sh/uv/install.sh | sh
 cd /root/optima && uv venv --python 3.12 .venv && source .venv/bin/activate
-# Latest stable sglang on CUDA 13. --prerelease is needed (0.5.12 depends on the
-# flash-attn-4 beta, a pure-python wheel); --torch-backend routes the torch family to
-# the cu130 index. Then PIN kernels<0.13 — transformers 5.6 breaks against kernels
-# 0.15 ("Either a revision or a version must be specified").
-uv pip install --prerelease=allow --torch-backend=cu130 "sglang==0.5.12.post1"
+# Install the committed default stable/discovery pin; never copy a stale version
+# literal from this runbook. --torch-backend routes the torch family to cu130.
+SGLANG_PIN=$(.venv/bin/python -c 'from optima.compat import PINNED_SGLANG; print(PINNED_SGLANG)')
+uv pip install --prerelease=allow --torch-backend=cu130 "sglang==$SGLANG_PIN"
 uv pip install "kernels>=0.12,<0.13" datasets pytest -e .
 SP=$(python -c 'import site;print(site.getsitepackages()[0])')
 echo 'import optima.bootstrap' > "$SP/optima.pth"     # install the seam everywhere
@@ -90,6 +89,11 @@ export PATH=/usr/local/cuda/bin:$PWD/.venv/bin:$PATH   # sglang JIT needs nvcc +
 export TORCH_CUDA_ARCH_LIST=9.0                        # set per GPU: 9.0 = H100, 10.0 = B200
 .venv/bin/python -m optima.cli verify   examples/miner_silu_triton --device cuda
 ```
+
+This generic recipe targets the default `PINNED_SGLANG`. The MiniMax-M3 campaign
+used the source build `0.0.0.dev1+g56e290315` and reviewed validator overlays; do
+not substitute that build merely to make `optima compat` green. Its exact
+source/image consensus policy remains a separate production decision.
 
 ## Clean-signal eval settings
 

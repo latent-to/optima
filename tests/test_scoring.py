@@ -23,6 +23,7 @@ from optima.eval.device_state import (
 from optima.eval.marginal_runtime import (
     CandidateLifecycleEvidence,
     MarginalLifecycleEvidence,
+    MarginalRuntimeError,
     run_marginal_lifecycle,
 )
 from optima.eval.native_artifact import publish_native_artifact
@@ -30,8 +31,10 @@ from optima.eval.oci_backend import EngineExecutionEvidence, runtime_identity_fr
 from optima.eval.oci_prebuild import OCIPrebuildResult
 from optima.eval.oci_outer_session import (
     BatchExecutionEvidence,
+    OuterSessionInfrastructureError,
     SessionExecutionEvidence,
     SessionExecutionPlan,
+    require_decode_dominant_plan,
 )
 from optima.eval.oci_session_protocol import (
     BatchEvidence,
@@ -284,6 +287,45 @@ def test_a_real_loss_is_a_loss_not_no_decision():
     assert v.speedup < 1.0
 
 
+def test_multi_candidate_reads_score_on_the_mean():
+    # B C B' C' B'' shape: two candidate reads average before the ratio.
+    v = score_speedup([100.0, 101.0, 99.0], [113.0, 111.0], min_margin=0.02, k=2.0, max_noise=0.10)
+    assert v.n_candidates == 2
+    assert v.confident
+    assert v.passed_speedup
+    assert abs(v.speedup - (112.0 / 100.0)) < 1e-9
+
+
+def test_single_candidate_read_keeps_legacy_verdict():
+    # The historical B/C/B' shape must be bit-identical through the new path.
+    legacy = score_speedup([100.0, 108.0], 106.0, min_margin=0.02, k=2.0, max_noise=0.10)
+    wrapped = score_speedup([100.0, 108.0], [106.0], min_margin=0.02, k=2.0, max_noise=0.10)
+    assert legacy.n_candidates == wrapped.n_candidates == 1
+    assert (legacy.speedup, legacy.noise, legacy.required, legacy.passed_speedup,
+            legacy.confident, legacy.detail) == (
+        wrapped.speedup, wrapped.noise, wrapped.required, wrapped.passed_speedup,
+        wrapped.confident, wrapped.detail)
+
+
+def test_noisy_candidate_reads_are_no_decision():
+    # 2026-07-16 forensics: two honest candidate legs spread 7.2% on a boot draw.
+    # With tight baselines, that spread alone must block the crown at max_noise 5%.
+    v = score_speedup([100.0, 100.5], [107.2, 100.0], max_noise=0.05)
+    assert not v.confident
+    assert not v.passed_speedup
+    assert "candidate drift" in v.detail
+
+
+def test_candidate_spread_raises_the_required_bar():
+    # Within the noise ceiling, a spread candidate raises the bar exactly like a
+    # spread baseline: noise = max(baseline, candidate) feeds 1 + k*noise.
+    v = score_speedup([100.0, 100.0], [104.0, 100.0], min_margin=0.005, k=2.0, max_noise=0.10)
+    assert v.confident
+    assert abs(v.noise - (4.0 / 102.0)) < 1e-9
+    assert abs(v.required - (1.0 + 2.0 * 4.0 / 102.0)) < 1e-9
+    assert not v.passed_speedup  # mean 102 -> 1.020 < required ~1.078
+
+
 @pytest.mark.parametrize(
     ("baselines", "candidate"),
     (
@@ -295,6 +337,9 @@ def test_a_real_loss_is_a_loss_not_no_decision():
         ([100.0, 101.0], False),
         ([100.0, 101.0], 0.0),
         ([100.0, 101.0], float("inf")),
+        ([100.0, 101.0], [110.0, 0.0]),
+        ([100.0, 101.0], [110.0, float("nan")]),
+        ([100.0, 101.0], [110.0, True]),
     ),
 )
 def test_speed_samples_fail_closed_without_filtering(baselines, candidate):
@@ -626,3 +671,159 @@ def test_projection_accepts_ready_miss_before_authoritative_passing_tail(tmp_pat
     )
     with pytest.raises(RawSpeedEvidenceError, match="sample facts"):
         _project(with_failed_tail, delta, case, calibration, runtime_policy)
+
+
+def _lifecycle_repeat(tmp_path: Path):
+    # B, C, B', C', B'' — scales make both candidate reads ~1.32x the baselines
+    # with tiny within-arm spread, so the repeat-read verdict is a confident PASS.
+    case = runtime_case(tmp_path)
+    case.session = replace(
+        case.session,
+        prompt_batches=(("warmup",), ("timed-1",), ("timed-2",)),
+        max_new_tokens=10,
+        top_logprobs_num=1,
+    )
+    prepared = prepared_runtime(case)
+    runtime_policy = _digest("runtime-resource-policy")
+    lifecycle = run_marginal_lifecycle(
+        prepared,
+        executor=_TypedExecutor(
+            tmp_path / "executor", (1.0, 0.75, 1.002, 0.76, 0.998), runtime_policy
+        ),
+        model_mount=case.mount,
+        deadline=10_000.0,
+        candidate_reads=2,
+    )
+    context = CalibrationContext(
+        _digest("reference-manifest"),
+        case.launch.arena_digest,
+        case.launch.runtime_digest,
+        case.launch.base_engine_digest,
+        case.launch.model_revision_digest,
+        case.launch.model_manifest_digest,
+        case.launch.model_content_digest,
+        case.launch.hardware.digest,
+        marginal_workload_digest(prepared.baseline_session_plan),
+        _digest("verification-policy"),
+        case.launch.controller_distribution_digest,
+    )
+    calibration = replace(
+        calibration_manifest(), context=context, speed=SpeedCalibration("0.02", "2", "0.1")
+    )
+    return lifecycle, case.arm.selected_delta_digest, case, calibration, runtime_policy
+
+
+def test_repeat_read_lifecycle_projects_and_regrades_five_rates(tmp_path):
+    from optima.eval.qualification_runner import SpeedWitness
+
+    lifecycle, delta, case, calibration, runtime_policy = _lifecycle_repeat(tmp_path)
+    assert len(lifecycle.candidates_repeat) == 1
+    assert lifecycle.baseline_third is not None
+    assert lifecycle.final_baseline is lifecycle.baseline_third
+
+    projection = _project(lifecycle, delta, case, calibration, runtime_policy)
+    assert projection.candidate_repeat is not None
+    assert projection.baseline_third is not None
+    assert projection.verdict.n_baselines == 3
+    assert projection.verdict.n_candidates == 2
+    assert projection.verdict.confident
+    assert projection.verdict.passed_speedup
+    assert projection.verdict.speedup > 1.25
+
+    witness = SpeedWitness.from_projection(projection, runtime_policy)
+    assert len(witness.rates) == 5
+    # run order: B, C, B', C', B''
+    assert witness.rates[0] == projection.baseline_before
+    assert witness.rates[1] == projection.candidate
+    assert witness.rates[2] == projection.baseline_after
+    assert witness.rates[3] == projection.candidate_repeat
+    assert witness.rates[4] == projection.baseline_third
+    round_tripped = SpeedWitness.from_dict(witness.to_dict())
+    assert round_tripped == witness
+    grade, speedup = round_tripped.regrade(calibration, calibration.context)
+    assert grade.name == "PASS"
+    assert speedup == format(projection.verdict.speedup, ".17g")
+
+
+def test_repeat_reads_require_the_third_baseline_bookend(tmp_path):
+    lifecycle, *_ = _lifecycle_repeat(tmp_path)
+    with pytest.raises(MarginalRuntimeError, match="third baseline bookend"):
+        MarginalLifecycleEvidence(
+            lifecycle.prepared,
+            lifecycle.baseline_before,
+            lifecycle.candidates,
+            lifecycle.baseline_after,
+            lifecycle.candidates_repeat,
+            None,
+        )
+    with pytest.raises(MarginalRuntimeError, match="third baseline bookend"):
+        MarginalLifecycleEvidence(
+            lifecycle.prepared,
+            lifecycle.baseline_before,
+            lifecycle.candidates,
+            lifecycle.baseline_after,
+            (),
+            lifecycle.baseline_third,
+        )
+
+
+def test_candidate_reads_policy_is_exact(tmp_path):
+    case = runtime_case(tmp_path)
+    case.session = replace(
+        case.session,
+        prompt_batches=(("warmup",), ("timed-1",), ("timed-2",)),
+        max_new_tokens=10,
+        top_logprobs_num=1,
+    )
+    prepared = prepared_runtime(case)
+    executor = _TypedExecutor(tmp_path / "executor", (1.0,), _digest("runtime-resource-policy"))
+    for reads in (0, 3, True, 2.0):
+        with pytest.raises(MarginalRuntimeError, match="candidate_reads"):
+            run_marginal_lifecycle(
+                prepared,
+                executor=executor,
+                model_mount=case.mount,
+                deadline=10_000.0,
+                candidate_reads=reads,
+            )
+
+
+def test_legacy_three_leg_witness_shape_is_unchanged(tmp_path):
+    from optima.eval.qualification_runner import SpeedWitness
+
+    lifecycle, delta, case, calibration, runtime_policy = _lifecycle(tmp_path)
+    projection = _project(lifecycle, delta, case, calibration, runtime_policy)
+    assert projection.candidate_repeat is None
+    assert projection.baseline_third is None
+    assert projection.verdict.n_candidates == 1
+    witness = SpeedWitness.from_projection(projection, runtime_policy)
+    assert len(witness.rates) == 3
+    assert SpeedWitness.from_dict(witness.to_dict()) == witness
+
+
+def test_decode_dominant_plan_gate(tmp_path):
+    case = runtime_case(tmp_path)
+    case.session = replace(
+        case.session,
+        prompt_batches=(("warmup",), ("t1",), ("t2",)),
+        max_new_tokens=10,
+        top_logprobs_num=1,
+    )
+    plan = prepared_runtime(case).baseline_session_plan
+    count_tokens = len  # chars-as-tokens keeps the gate arithmetic transparent
+    charged = plan.prompt_batches[plan.warmup_count - plan.conditioning_count :]
+    prompt_tokens = sum(len(prompt) for batch in charged for prompt in batch)
+    decode_tokens = sum(len(batch) * plan.max_new_tokens for batch in charged)
+    expected = decode_tokens / (decode_tokens + prompt_tokens)
+    share = require_decode_dominant_plan(
+        plan, count_tokens=count_tokens, min_decode_share=expected * 0.9
+    )
+    assert abs(share - expected) < 1e-12
+    with pytest.raises(OuterSessionInfrastructureError, match="prefill-heavy"):
+        require_decode_dominant_plan(plan, count_tokens=count_tokens, min_decode_share=0.99)
+    with pytest.raises(OuterSessionInfrastructureError, match="min_decode_share"):
+        require_decode_dominant_plan(plan, count_tokens=count_tokens, min_decode_share=1.0)
+    with pytest.raises(OuterSessionInfrastructureError, match="positive ints"):
+        require_decode_dominant_plan(
+            plan, count_tokens=lambda prompt: 0, min_decode_share=0.5
+        )

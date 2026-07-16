@@ -276,6 +276,43 @@ def _direct_aot_collective_callables(
     )
 
 
+def _init_rank_process_group(
+    torch_module: Any,
+    dist_module: Any,
+    *,
+    backend: str,
+    init_method: str,
+    rank: int,
+    world_size: int,
+    device: str,
+) -> None:
+    """Initialize one rank with an explicit NCCL device binding.
+
+    ``set_device`` alone does not give NCCL's process-group/barrier machinery a
+    deterministic device mapping. Supplying ``device_id`` also initializes NCCL
+    against the rank's known local CUDA device instead of letting it guess from the
+    global rank. The CPU/Gloo call deliberately keeps its original arguments.
+    """
+    kwargs = {
+        "backend": backend,
+        "init_method": init_method,
+        "rank": rank,
+        "world_size": world_size,
+    }
+    if device == "cuda":
+        torch_module.cuda.set_device(rank)
+        kwargs["device_id"] = torch_module.device(f"cuda:{rank}")
+    dist_module.init_process_group(**kwargs)
+
+
+def _rank_barrier(dist_module: Any, *, rank: int, device: str) -> None:
+    """Enter a process-group barrier without asking NCCL to infer its device."""
+    if device == "cuda":
+        dist_module.barrier(device_ids=[rank])
+    else:
+        dist_module.barrier()
+
+
 def _rank_worker(rank, world_size, backend, init_method, slot_name, source_path, entry_name,
                  shape, dtype_name, device, seed, result_dir, prepare_name=None, model_key=None,
                  bundle_path=None, graph_safe=False,
@@ -326,9 +363,15 @@ def _rank_worker(rank, world_size, backend, init_method, slot_name, source_path,
         from optima.sandbox import callable_from, load_module
         from optima.slots import slot_for_model
 
-        if device == "cuda":
-            torch.cuda.set_device(rank)
-        dist.init_process_group(backend=backend, init_method=init_method, rank=rank, world_size=world_size)
+        _init_rank_process_group(
+            torch,
+            dist,
+            backend=backend,
+            init_method=init_method,
+            rank=rank,
+            world_size=world_size,
+            device=device,
+        )
         initialized = True
 
         # A bundle with a rebuild plan (e.g. declared cuda_sources compiled by a reviewed
@@ -347,7 +390,7 @@ def _rank_worker(rank, world_size, backend, init_method, slot_name, source_path,
             )
             if rank == 0:
                 apply_rebuild_plan(bundle_path, phase=rebuild_phase)
-            dist.barrier()
+            _rank_barrier(dist, rank=rank, device=device)
             if rank != 0:
                 apply_rebuild_plan(bundle_path, phase=rebuild_phase)
             from optima.artifact_runtime import resolve_direct_artifact_entry

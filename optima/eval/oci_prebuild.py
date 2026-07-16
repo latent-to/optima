@@ -53,7 +53,8 @@ from optima.eval.native_artifact import (
 from optima.eval.oci_cpuset import validate_cpuset_pair
 from optima.eval.oci_process import OCILease, OCIProcessManager
 from optima.eval.runtime_preflight import RuntimePreflightReceipt
-from optima.stack_identity import canonical_digest, canonical_json_bytes, require_sha256_hex
+from optima.stack_identity import canonical_digest, canonical_json_bytes
+from optima._strict import require_digest
 
 
 CONTAINER_TREE = "/optima/engine-tree"
@@ -183,13 +184,7 @@ def _reopen_provider_publication(
 
 
 def _digest(value: object, *, field: str) -> str:
-    try:
-        result = require_sha256_hex(value, field=field)
-    except ValueError as exc:
-        raise OCIPrebuildError(str(exc)) from None
-    if result == "0" * 64:
-        raise OCIPrebuildError(f"{field} must not be all zeroes")
-    return result
+    return require_digest(value, field=field, error=OCIPrebuildError)
 
 
 def _absolute_container_path(value: object, *, field: str) -> str:

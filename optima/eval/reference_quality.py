@@ -33,8 +33,8 @@ from optima.stack_identity import (
     StackIdentityError,
     canonical_digest,
     canonical_json_bytes,
-    require_sha256_hex,
 )
+from optima._strict import require_digest, require_exact_fields, require_int
 
 QUALITY_SCHEMA_VERSION = 1
 QUALITY_POLICY_VERSION = "pristine-reference-quality.v1"
@@ -56,17 +56,11 @@ _MAX_NLL = Decimal("1000000")
 class ReferenceQualityError(ValueError):
     """Raw or projected pristine-reference evidence is invalid."""
 def _digest(value: object, field: str) -> str:
-    try:
-        result = require_sha256_hex(value, field=field)
-    except StackIdentityError as exc:
-        raise ReferenceQualityError(str(exc)) from exc
-    if result == "0" * 64:
-        raise ReferenceQualityError(f"{field} must not be the all-zero digest")
-    return result
+    return require_digest(value, field=field, error=ReferenceQualityError)
 def _integer(value: object, field: str, minimum: int = 0, maximum: int = _MAX_TOKEN_ID) -> int:
-    if type(value) is not int or not minimum <= value <= maximum:
-        raise ReferenceQualityError(f"{field} must be an integer in [{minimum}, {maximum}]")
-    return value
+    return require_int(
+        value, field=field, error=ReferenceQualityError, minimum=minimum, maximum=maximum
+    )
 def _decimal(value: object, field: str, maximum: Decimal = _MAX_DECIMAL) -> str:
     if not isinstance(value, str) or len(value) > 96:
         raise ReferenceQualityError(f"{field} must be a bounded canonical decimal string")
@@ -83,13 +77,7 @@ def _probability(value: object, field: str) -> str:
         raise ReferenceQualityError(f"{field} must be positive")
     return text
 def _strict(value: object, expected: frozenset[str], label: str) -> Mapping[str, object]:
-    if (
-        not isinstance(value, Mapping)
-        or not all(isinstance(key, str) for key in value)
-        or frozenset(value) != expected
-    ):
-        raise ReferenceQualityError(f"{label} fields do not match the schema")
-    return value
+    return require_exact_fields(value, fields=expected, label=label, error=ReferenceQualityError)
 def _array(value: object, label: str) -> Sequence[object]:
     if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
         raise ReferenceQualityError(f"{label} must be an array")

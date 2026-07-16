@@ -20,8 +20,8 @@ from optima.stack_identity import (
     StackIdentityError,
     canonical_digest,
     canonical_json_bytes,
-    require_sha256_hex,
 )
+from optima._strict import require_digest, require_exact_fields, require_int
 
 if TYPE_CHECKING:
     from optima.discovery_overlay import DiscoveryActivationReceipt
@@ -49,13 +49,7 @@ class QualificationDecision(str, Enum):
 
 
 def _digest(value: object, field: str) -> str:
-    try:
-        result = require_sha256_hex(value, field=field)
-    except StackIdentityError as exc:
-        raise QualificationError(str(exc)) from exc
-    if result == "0" * 64:
-        raise QualificationError(f"{field} must not be the all-zero digest")
-    return result
+    return require_digest(value, field=field, error=QualificationError)
 
 
 def _id(value: object, field: str) -> str:
@@ -65,9 +59,7 @@ def _id(value: object, field: str) -> str:
 
 
 def _integer(value: object, field: str, minimum: int = 0) -> int:
-    if type(value) is not int or value < minimum:
-        raise QualificationError(f"{field} must be an integer >= {minimum}")
-    return value
+    return require_int(value, field=field, error=QualificationError, minimum=minimum)
 
 
 def _boolean(value: object, field: str) -> bool:
@@ -83,13 +75,7 @@ def _array(value: object, label: str) -> Sequence[object]:
 
 
 def _strict(value: object, expected: frozenset[str], label: str) -> Mapping[str, object]:
-    if (
-        not isinstance(value, Mapping)
-        or not all(isinstance(key, str) for key in value)
-        or frozenset(value) != expected
-    ):
-        raise QualificationError(f"{label} fields do not match the schema")
-    return value
+    return require_exact_fields(value, fields=expected, label=label, error=QualificationError)
 
 
 def _encode(value: object) -> object:
@@ -1506,6 +1492,37 @@ def _trajectory_rows(lifecycle: object):
     return workload, tuple(rows)
 
 
+def _quality_leg_lifecycle(lifecycle: object, candidate_read: int):
+    """Return the exact three-role lifecycle for one candidate read.
+
+    The raw pristine-T protocol deliberately stays baseline/candidate/control.
+    A repeat referee therefore produces two independently gradeable triplets:
+    B/C/B-prime and B-prime/C-prime/B-double-prime.
+    """
+
+    from optima.eval.marginal_runtime import MarginalLifecycleEvidence
+
+    if type(lifecycle) is not MarginalLifecycleEvidence:
+        raise QualificationError("quality lifecycle is not typed")
+    if type(candidate_read) is not int or candidate_read not in (1, 2):
+        raise QualificationError("candidate read must be exactly 1 or 2")
+    if candidate_read == 1:
+        return MarginalLifecycleEvidence(
+            lifecycle.prepared,
+            lifecycle.baseline_before,
+            lifecycle.candidates,
+            lifecycle.baseline_after,
+        )
+    if not lifecycle.candidates_repeat or lifecycle.baseline_third is None:
+        raise QualificationError("repeat quality requested without repeat lifecycle evidence")
+    return MarginalLifecycleEvidence(
+        lifecycle.prepared,
+        lifecycle.baseline_after,
+        lifecycle.candidates_repeat,
+        lifecycle.baseline_third,
+    )
+
+
 def lifecycle_prompt_digests(lifecycle: object) -> tuple[str, ...]:
     """Canonical prompt-occurrence pool fixed before any quality selection."""
 
@@ -1513,9 +1530,25 @@ def lifecycle_prompt_digests(lifecycle: object) -> tuple[str, ...]:
 
 
 def cohort_trajectory_digest(lifecycle: object) -> str:
-    """Bind every B/C/B-prime retained token and top-k frame in execution order."""
+    """Bind every retained token/top-k frame in complete execution order."""
 
     workload, rows = _trajectory_rows(lifecycle)
+    if lifecycle.candidates_repeat:
+        repeat_workload, repeat_rows = _trajectory_rows(
+            _quality_leg_lifecycle(lifecycle, 2)
+        )
+        if repeat_workload != workload or tuple(row[0] for row in repeat_rows) != tuple(
+            row[0] for row in rows
+        ):
+            raise QualificationError("repeat trajectory workload differs")
+        return canonical_digest(
+            "optima.qualification.cohort-trajectories.v2",
+            {
+                "workload_digest": workload,
+                "primary": [[key, frames] for key, frames in rows],
+                "repeat": [[key, frames] for key, frames in repeat_rows],
+            },
+        )
     return canonical_digest(
         "optima.qualification.cohort-trajectories",
         {"workload_digest": workload, "prompts": [[key, frames] for key, frames in rows]},
@@ -1544,6 +1577,15 @@ def candidate_lifecycle_digest(
         candidate.execution,
         lifecycle.baseline_after,
     )
+    if lifecycle.candidates_repeat:
+        repeats = tuple(
+            row
+            for row in lifecycle.candidates_repeat
+            if row.arm.selected_delta_digest == selected_delta_digest
+        )
+        if len(repeats) != 1 or lifecycle.baseline_third is None:
+            raise QualificationError("repeat candidate lifecycle is absent or ambiguous")
+        executions += (repeats[0].execution, lifecycle.baseline_third)
 
     def execution_row(execution):
         session = execution.session
@@ -1638,8 +1680,11 @@ def selected_trajectory_digest(
     *,
     selected_delta_digest: str,
     selected_prompt_digests: tuple[str, ...],
+    candidate_read: int = 1,
 ) -> str:
     """Bind selected B/C/B-prime frames for one exact candidate arm."""
+
+    lifecycle = _quality_leg_lifecycle(lifecycle, candidate_read)
 
     candidates = tuple(row.arm.selected_delta_digest for row in lifecycle.candidates)
     if candidates.count(selected_delta_digest) != 1:
@@ -1668,8 +1713,11 @@ def selected_trajectory_projection_digest(
     *,
     selected_delta_digest: str,
     selected_prompt_digests: tuple[str, ...],
+    candidate_read: int = 1,
 ) -> str:
     """Bind raw-quality-checkable token, support, and true-argmax facts."""
+
+    lifecycle = _quality_leg_lifecycle(lifecycle, candidate_read)
 
     candidates = tuple(row.arm.selected_delta_digest for row in lifecycle.candidates)
     if candidates.count(selected_delta_digest) != 1:
@@ -1846,6 +1894,7 @@ def validate_quality_binding(
     graph_requirement: GraphVerificationRequirement | DiscoveryExecutionRequirement,
     reference_execution: object,
     reference_request_sha256: str,
+    candidate_read: int = 1,
 ):
     """Project frozen workload/trajectory coverage onto one raw T binding."""
 
@@ -1874,9 +1923,10 @@ def validate_quality_binding(
     binding = raw_artifact.binding
     t_session = reference_execution.session
     selection.reopen(commitment, entropy)
+    quality_lifecycle = _quality_leg_lifecycle(lifecycle, candidate_read)
     plan = lifecycle.prepared.baseline_session_plan
     candidates = tuple(
-        row for row in lifecycle.candidates
+        row for row in quality_lifecycle.candidates
         if row.arm.selected_delta_digest == selected_delta_digest
     )
     if len(candidates) != 1:
@@ -2002,12 +2052,14 @@ def validate_quality_binding(
             lifecycle,
             selected_delta_digest=selected_delta_digest,
             selected_prompt_digests=selection.selected_prompt_digests,
+            candidate_read=candidate_read,
         )
         or binding.selected_trajectory_projection_digest
         != selected_trajectory_projection_digest(
             lifecycle,
             selected_delta_digest=selected_delta_digest,
             selected_prompt_digests=selection.selected_prompt_digests,
+            candidate_read=candidate_read,
         )
         or binding.selected_prompt_digests != selection.selected_prompt_digests
         or binding.hidden_task_plan_digest

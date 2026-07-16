@@ -222,22 +222,13 @@ def read_validator_weight_snapshot(
         raise ChainWeightStateError("netuid must be a non-negative integer")
     if not isinstance(validator_hotkey, str) or not validator_hotkey:
         raise ChainWeightStateError("validator hotkey must be non-empty")
-    if metagraph_view is not None:
-        if type(metagraph_view) is not MetagraphView or metagraph_view.netuid != netuid:
-            raise ChainWeightStateError("supplied metagraph view is not authoritative")
-        hotkeys = list(metagraph_view.hotkeys)
-        raw_uids = list(metagraph_view.uids)
-        raw_last_updates = list(metagraph_view.last_update)
+    if metagraph_view is None:
+        metagraph_view = fetch_metagraph(subtensor, netuid)
     else:
-        try:
-            metagraph = subtensor.metagraph(netuid=netuid)
-            hotkeys = list(metagraph.hotkeys)
-            raw_uids = list(metagraph.uids)
-            raw_last_updates = list(metagraph.last_update)
-        except Exception as exc:
-            raise ChainWeightStateError(
-                f"cannot fetch metagraph for active-weight verification: {exc}"
-            ) from None
+        metagraph_view = _reopen_metagraph_view(subtensor, netuid, metagraph_view)
+    hotkeys = list(metagraph_view.hotkeys)
+    raw_uids = list(metagraph_view.uids)
+    raw_last_updates = list(metagraph_view.last_update)
     if len(raw_uids) != len(hotkeys) or len(raw_last_updates) != len(hotkeys):
         raise ChainWeightStateError("metagraph UID/hotkey/last-update widths differ")
     if any(not isinstance(hotkey, str) or not hotkey for hotkey in hotkeys):
@@ -257,10 +248,21 @@ def read_validator_weight_snapshot(
     except ValueError:
         return ValidatorWeightSnapshot({}, 0)
     try:
-        raw_rows = list(subtensor.weights(netuid=netuid))
+        raw_rows = list(
+            subtensor.weights(netuid=netuid, block=metagraph_view.block)
+        )
     except Exception as exc:
         raise ChainWeightStateError(
             f"cannot fetch validator on-chain weights: {exc}"
+        ) from None
+    try:
+        if _block_hash(subtensor, metagraph_view.block) != metagraph_view.block_hash:
+            raise ChainWeightStateError(
+                "finalized sparse weights height/hash changed while it was read"
+            )
+    except ChainRevealHistoryError as exc:
+        raise ChainWeightStateError(
+            f"cannot verify finalized sparse-weight provenance: {exc}"
         ) from None
     rows: dict[int, dict[int, int]] = {}
     for raw_row in raw_rows:
@@ -333,18 +335,119 @@ def connect(network: str = "finney", *, fallback_endpoints: Optional[list[str]] 
     return bt.Subtensor(network=network, **kwargs)
 
 
-def fetch_metagraph(subtensor, netuid: int) -> MetagraphView:
-    mg = subtensor.metagraph(netuid=netuid)
-    block = int(subtensor.get_current_block())
-    return MetagraphView(
-        netuid=netuid,
-        block=block,
-        block_hash=str(subtensor.get_block_hash(block)),  # chain-compat pins get_block_hash
-        uids=[int(u) for u in mg.uids],
-        hotkeys=list(mg.hotkeys),
-        validator_permit=[bool(p) for p in getattr(mg, "validator_permit", [])],
-        last_update=[int(value) for value in getattr(mg, "last_update", [])],
-    )
+def _weight_finalized_point(subtensor, block: int | None = None) -> tuple[int, str]:
+    """Resolve one historical point that is already below the finalized head."""
+
+    try:
+        finalized_block, finalized_hash = _finalized_head(subtensor)
+        if block is None:
+            return finalized_block, finalized_hash
+        requested = _weight_uint(block, "metagraph block")
+        if requested > finalized_block:
+            raise ChainWeightStateError(
+                "requested metagraph block is newer than the finalized head"
+            )
+        requested_hash = _block_hash(subtensor, requested)
+    except ChainWeightStateError:
+        raise
+    except ChainRevealHistoryError as exc:
+        raise ChainWeightStateError(
+            f"cannot resolve finalized weight authority: {exc}"
+        ) from None
+    return requested, requested_hash
+
+
+def fetch_metagraph(
+    subtensor, netuid: int, *, block: int | None = None
+) -> MetagraphView:
+    """Fetch membership from one exact finalized height/hash.
+
+    The SDK's unqualified metagraph call reads a moving best head. Weight authority
+    must instead use the same finalized height for the UID mapping, sparse row, and
+    projection label.
+    """
+
+    if type(netuid) is not int or netuid < 0:
+        raise ChainWeightStateError("netuid must be a non-negative integer")
+    resolved_block, block_hash = _weight_finalized_point(subtensor, block)
+    try:
+        mg = subtensor.metagraph(netuid=netuid, block=resolved_block)
+        reported_block = _weight_uint(
+            getattr(mg, "block", None), "returned metagraph block"
+        )
+        if reported_block != resolved_block:
+            raise ChainWeightStateError(
+                "metagraph response does not match the requested finalized block"
+            )
+        uids = [_weight_uint(value, "metagraph UID") for value in list(mg.uids)]
+        hotkeys = list(mg.hotkeys)
+        permits = [bool(value) for value in list(mg.validator_permit)]
+        last_update = [
+            _weight_uint(value, "metagraph last-update block")
+            for value in list(mg.last_update)
+        ]
+        if not (
+            len(uids) == len(hotkeys) == len(permits) == len(last_update)
+        ):
+            raise ChainWeightStateError(
+                "metagraph UID/hotkey/permit/last-update widths differ"
+            )
+        if (
+            len(set(uids)) != len(uids)
+            or len(set(hotkeys)) != len(hotkeys)
+            or any(not isinstance(hotkey, str) or not hotkey for hotkey in hotkeys)
+        ):
+            raise ChainWeightStateError(
+                "metagraph contains invalid or duplicate UID/hotkey membership"
+            )
+        view = MetagraphView(
+            netuid=netuid,
+            block=resolved_block,
+            block_hash=block_hash,
+            uids=uids,
+            hotkeys=hotkeys,
+            validator_permit=permits,
+            last_update=last_update,
+        )
+        if _block_hash(subtensor, resolved_block) != block_hash:
+            raise ChainWeightStateError(
+                "finalized metagraph height/hash changed while it was read"
+            )
+        return view
+    except ChainWeightStateError:
+        raise
+    except ChainRevealHistoryError as exc:
+        raise ChainWeightStateError(
+            f"cannot verify finalized metagraph provenance: {exc}"
+        ) from None
+    except Exception as exc:
+        raise ChainWeightStateError(
+            f"cannot fetch finalized metagraph: {exc}"
+        ) from None
+
+
+def _reopen_metagraph_view(
+    subtensor, netuid: int, supplied: MetagraphView
+) -> MetagraphView:
+    """Replace a caller-supplied view with its chain-reopened exact snapshot."""
+
+    if type(supplied) is not MetagraphView or supplied.netuid != netuid:
+        raise ChainWeightStateError("supplied metagraph view is not authoritative")
+    if (
+        not isinstance(supplied.block_hash, str)
+        or _BLOCK_HASH_RE.fullmatch(supplied.block_hash) is None
+    ):
+        raise ChainWeightStateError("supplied metagraph view has an invalid block hash")
+    reopened = fetch_metagraph(subtensor, netuid, block=supplied.block)
+    if (
+        reopened.block_hash != supplied.block_hash.lower()
+        or reopened.uids != supplied.uids
+        or reopened.hotkeys != supplied.hotkeys
+    ):
+        raise ChainWeightStateError(
+            "supplied metagraph view differs from finalized chain membership"
+        )
+    return reopened
 
 
 def read_commitments(subtensor, netuid: int) -> dict[str, Commitment]:
@@ -820,22 +923,33 @@ def read_revealed_commitments(subtensor, netuid: int) -> dict[str, RevealedCommi
 
 def set_weights(subtensor, wallet, netuid: int, weights_by_hotkey: dict[str, float], *,
                 version_key: int = WEIGHTS_VERSION_KEY, dry_run: bool = False,
-                wait_for_inclusion: bool = True, wait_for_finalization: bool = False) -> dict:
+                wait_for_inclusion: bool = True, wait_for_finalization: bool = True,
+                metagraph_view: MetagraphView | None = None) -> dict:
     """Submit one already-authorized global weight projection on-chain.
 
-    ``dry_run=True`` builds the ``(uids, weights)`` payload from the live metagraph and
-    logs it WITHOUT signing or submitting — so the payload can be eyeballed before going
-    live. The control-plane publication state machine owns intent and readback.
+    ``dry_run=True`` builds the ``(uids, weights)`` payload from one exact finalized
+    metagraph and logs it WITHOUT signing or submitting. The control-plane publication
+    state machine owns intent and finalized readback.
     """
-    mg = fetch_metagraph(subtensor, netuid)
+    if not dry_run and (wait_for_inclusion is not True or wait_for_finalization is not True):
+        raise ChainWeightStateError(
+            "real weight submission must wait for inclusion and finalization"
+        )
+    mg = (
+        fetch_metagraph(subtensor, netuid)
+        if metagraph_view is None
+        else _reopen_metagraph_view(subtensor, netuid, metagraph_view)
+    )
     uids, weights = weights_to_uid_vector(weights_by_hotkey, mg)
     if not uids:
         logger.warning("set_weights: no on-chain hotkeys to weight (champion deregistered?)")
-        return {"submitted": False, "reason": "no eligible uids", "uids": [], "weights": []}
+        return {"submitted": False, "reason": "no eligible uids", "uids": [], "weights": [],
+                "authority_block": mg.block, "authority_block_hash": mg.block_hash}
     if dry_run:
         logger.info("DRY RUN set_weights netuid=%s version_key=%s uids=%s weights=%s",
                     netuid, version_key, uids, weights)
-        return {"submitted": False, "dry_run": True, "uids": uids, "weights": weights}
+        return {"submitted": False, "dry_run": True, "uids": uids, "weights": weights,
+                "authority_block": mg.block, "authority_block_hash": mg.block_hash}
     result = subtensor.set_weights(
         wallet=wallet, netuid=netuid, uids=uids, weights=weights,
         version_key=version_key, wait_for_inclusion=wait_for_inclusion,
@@ -848,7 +962,8 @@ def set_weights(subtensor, wallet, netuid: int, weights_by_hotkey: dict[str, flo
     if not ok:
         logger.warning("set_weights failed on-chain: %s", message or result)
     return {"submitted": ok, "result": result, "message": message,
-            "uids": uids, "weights": weights}
+            "uids": uids, "weights": weights, "authority_block": mg.block,
+            "authority_block_hash": mg.block_hash}
 
 
 def _extrinsic_outcome(result) -> tuple[bool, str]:

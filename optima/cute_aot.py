@@ -36,7 +36,8 @@ from optima.artifact_resource_identity import (
     ArtifactResourceIdentityError,
     artifact_resource_plan_identity as _artifact_resource_plan_identity,
 )
-from optima.stack_identity import canonical_json_bytes, require_sha256_hex
+from optima.stack_identity import canonical_json_bytes
+from optima._strict import duplicate_key_pairs, require_digest
 
 if TYPE_CHECKING:
     from optima.artifact_abi import (
@@ -70,22 +71,11 @@ class CuteAOTError(RuntimeError):
 
 
 def _digest(value: object, *, field: str) -> str:
-    try:
-        result = require_sha256_hex(value, field=field)
-    except ValueError as exc:
-        raise CuteAOTError(str(exc)) from None
-    if result == "0" * 64:
-        raise CuteAOTError(f"{field} must not be the all-zero digest")
-    return result
+    return require_digest(value, field=field, error=CuteAOTError)
 
 
 def _strict_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
-    result: dict[str, Any] = {}
-    for key, value in pairs:
-        if key in result:
-            raise CuteAOTError(f"CuTe AOT JSON repeats key {key!r}")
-        result[key] = value
-    return result
+    return duplicate_key_pairs(pairs, label="CuTe AOT JSON", error=CuteAOTError)
 
 
 def _safe_relative(value: object, *, field: str) -> str:

@@ -20,8 +20,8 @@ from optima.stack_identity import (
     StackIdentityError,
     canonical_digest,
     canonical_json_bytes,
-    require_sha256_hex,
 )
+from optima._strict import require_digest, require_exact_fields
 
 
 CONTRIBUTION_REF_SCHEMA_VERSION = 1
@@ -51,10 +51,7 @@ def _target_id(value: object, *, field: str = "target_id") -> str:
 
 
 def _digest(value: object, *, field: str) -> str:
-    try:
-        return require_sha256_hex(value, field=field)
-    except StackIdentityError as exc:
-        raise StackManifestError(str(exc)) from exc
+    return require_digest(value, field=field, error=StackManifestError)
 
 
 def _current_version(value: object, *, field: str, expected: object) -> object:
@@ -66,18 +63,7 @@ def _current_version(value: object, *, field: str, expected: object) -> object:
 def _strict_object(
     value: object, *, fields: frozenset[str], name: str
 ) -> Mapping[str, object]:
-    if not isinstance(value, Mapping):
-        raise StackManifestError(f"{name} must be an object")
-    if not all(isinstance(key, str) for key in value):
-        raise StackManifestError(f"{name} keys must be strings")
-    actual = frozenset(value)
-    if actual != fields:
-        missing = tuple(sorted(fields - actual))
-        extra = tuple(sorted(actual - fields))
-        raise StackManifestError(
-            f"{name} fields mismatch: missing={missing!r}, extra={extra!r}"
-        )
-    return value
+    return require_exact_fields(value, fields=fields, label=name, error=StackManifestError)
 
 
 def _catalog_json(snapshot: object) -> bytes:

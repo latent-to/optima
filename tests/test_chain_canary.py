@@ -14,7 +14,7 @@ from optima.chain_canary import Check, format_checks, run_checks
 
 
 _FULL_METHODS = (
-    "set_weights", "metagraph", "get_all_commitments", "set_commitment",
+    "set_weights", "metagraph", "weights", "get_all_commitments", "set_commitment",
     "set_reveal_commitment", "query_map", "is_hotkey_registered",
     "burned_register", "get_current_block", "get_block_hash", "commit",
     "reveal_commitment",
@@ -85,3 +85,34 @@ def test_missing_method_is_flagged(monkeypatch):
     assert by_name["subtensor.set_weights"].ok is False
     assert "MISSING" in by_name["subtensor.set_weights"].detail
     assert not all(c.ok for c in by_name.values())
+
+
+def test_finalized_weight_signature_drift_is_flagged(monkeypatch):
+    fake = _fake_bittensor(_FULL_METHODS)
+
+    def latest_only_metagraph(self, netuid):
+        return None
+
+    fake.Subtensor.metagraph = latest_only_metagraph
+    monkeypatch.setitem(sys.modules, "bittensor", fake)
+    by_name = {c.name: c for c in run_checks()}
+    assert by_name["subtensor.metagraph"].ok is False
+    assert "block" in by_name["subtensor.metagraph"].detail
+
+
+def test_nonfinal_set_weights_default_is_flagged(monkeypatch):
+    fake = _fake_bittensor(_FULL_METHODS)
+
+    def nonfinal_set_weights(
+        self,
+        *,
+        wait_for_inclusion=True,
+        wait_for_finalization=False,
+    ):
+        return None
+
+    fake.Subtensor.set_weights = nonfinal_set_weights
+    monkeypatch.setitem(sys.modules, "bittensor", fake)
+    by_name = {c.name: c for c in run_checks()}
+    assert by_name["subtensor.set_weights"].ok is False
+    assert "default to True" in by_name["subtensor.set_weights"].detail

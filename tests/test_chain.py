@@ -28,11 +28,12 @@ def _scale_reveal_hex(data: str) -> str:
 # --- a minimal stand-in for bittensor's subtensor (records what was called) ---
 
 class _MockMetagraph:
-    def __init__(self, hotkeys, permits=None, last_updates=None):
+    def __init__(self, hotkeys, permits=None, last_updates=None, *, block=0):
         self.uids = list(range(len(hotkeys)))
         self.hotkeys = list(hotkeys)
         self.validator_permit = list(permits) if permits is not None else [True] * len(hotkeys)
         self.last_update = list(last_updates) if last_updates is not None else [0] * len(hotkeys)
+        self.block = block
 
 
 class _MockSubtensor:
@@ -52,13 +53,21 @@ class _MockSubtensor:
             get_block_number=lambda block_hash: int(block_hash[2:], 16),
         )
         self.set_weights_calls: list[dict] = []
+        self.metagraph_calls: list[int | None] = []
+        self.weight_calls: list[int | None] = []
         self.set_commitment_calls: list[str] = []
         self.set_reveal_commitment_calls: list[tuple] = []
 
-    def metagraph(self, netuid=None):
-        return _MockMetagraph(self._hotkeys, last_updates=self._last_updates)
+    def metagraph(self, netuid=None, block=None):
+        self.metagraph_calls.append(block)
+        return _MockMetagraph(
+            self._hotkeys,
+            last_updates=self._last_updates,
+            block=self._block if block is None else block,
+        )
 
-    def weights(self, netuid=None):
+    def weights(self, netuid=None, block=None):
+        self.weight_calls.append(block)
         return list(self._weight_rows)
 
     def get_current_block(self):
@@ -104,7 +113,13 @@ class _MockSubtensor:
 
     def set_weights(self, *, wallet, netuid, uids, weights, version_key,
                     wait_for_inclusion, wait_for_finalization):
-        self.set_weights_calls.append({"uids": uids, "weights": weights, "version_key": version_key})
+        self.set_weights_calls.append({
+            "uids": uids,
+            "weights": weights,
+            "version_key": version_key,
+            "wait_for_inclusion": wait_for_inclusion,
+            "wait_for_finalization": wait_for_finalization,
+        })
         return True
 
     def is_hotkey_registered(self, *, hotkey_ss58, netuid):
@@ -166,6 +181,62 @@ def test_fetch_metagraph():
     mg = chain.fetch_metagraph(st, netuid=1)
     assert mg.uids == [0, 1] and mg.hotkeys == ["a", "b"]
     assert mg.block == 42 and mg.block_hash == "0x" + f"{42:064x}"
+    assert st.metagraph_calls == [42]
+
+
+def test_fetch_metagraph_pins_finalized_height_and_rejects_false_provenance():
+    st = _MockSubtensor(hotkeys=["a", "b"], block=42)
+    st.get_current_block = lambda: 99
+    mg = chain.fetch_metagraph(st, netuid=1)
+    assert mg.block == 42
+    assert st.metagraph_calls == [42]
+
+    class Mislabelled(_MockSubtensor):
+        def metagraph(self, netuid=None, block=None):
+            result = super().metagraph(netuid=netuid, block=block)
+            result.block = int(block) + 1
+            return result
+
+    with pytest.raises(chain.ChainWeightStateError, match="requested finalized block"):
+        chain.fetch_metagraph(Mislabelled(hotkeys=["a"], block=42), netuid=1)
+
+
+def test_sparse_weight_row_and_uid_mapping_share_one_finalized_block():
+    calls: list[tuple[str, int | None]] = []
+
+    class ReassignedAtBestHead:
+        def get_finalized_block_number(self):
+            return 100
+
+        def get_current_block(self):
+            return 101
+
+        def get_block_hash(self, block):
+            return "0x" + f"{block:064x}"
+
+        def metagraph(self, *, netuid, block):
+            calls.append(("metagraph", block))
+            assert block == 100
+            return types.SimpleNamespace(
+                # UID 1 belongs to mallory at best head 101, but to alice at
+                # the exact finalized authority used for this sparse row.
+                uids=[0, 1],
+                hotkeys=["validator", "alice"],
+                last_update=[90, 0],
+                validator_permit=[True, True],
+                block=block,
+            )
+
+        def weights(self, *, netuid, block):
+            calls.append(("weights", block))
+            assert block == 100
+            return [(0, [(1, 65_535)])]
+
+    snapshot = chain.read_validator_weight_snapshot(
+        ReassignedAtBestHead(), 1, "validator"
+    )
+    assert snapshot.weights == {"alice": 1.0}
+    assert calls == [("metagraph", 100), ("weights", 100)]
 
 
 def test_read_commitments():
@@ -187,8 +258,27 @@ def test_set_weights_submits_with_version_key():
     res = chain.set_weights(st, wallet=object(), netuid=1, weights_by_hotkey={"b": 1.0})
     assert res["submitted"] is True
     assert st.set_weights_calls == [
-        {"uids": [1], "weights": [1.0], "version_key": chain.WEIGHTS_VERSION_KEY}
+        {
+            "uids": [1],
+            "weights": [1.0],
+            "version_key": chain.WEIGHTS_VERSION_KEY,
+            "wait_for_inclusion": True,
+            "wait_for_finalization": True,
+        }
     ]
+
+
+def test_set_weights_refuses_nonfinal_submission_mode_before_signing():
+    st = _MockSubtensor(hotkeys=["a", "b"])
+    with pytest.raises(chain.ChainWeightStateError, match="wait for inclusion and finalization"):
+        chain.set_weights(
+            st,
+            wallet=object(),
+            netuid=1,
+            weights_by_hotkey={"b": 1.0},
+            wait_for_finalization=False,
+        )
+    assert st.metagraph_calls == [] and st.set_weights_calls == []
 
 
 def test_set_weights_chain_side_failure_reported():
@@ -224,6 +314,8 @@ def test_read_validator_weights_uses_authoritative_sparse_sdk_row():
     snapshot = chain.read_validator_weight_snapshot(st, 1, "validator")
     assert snapshot.last_update_block == 91
     assert snapshot.weights == pytest.approx({"alice": 0.25, "bob": 0.75})
+    assert st.metagraph_calls == [100]
+    assert st.weight_calls == [100]
 
 
 def test_read_validator_weights_fails_closed_without_sparse_weight_api():

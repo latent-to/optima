@@ -28,8 +28,8 @@ from optima.stack_identity import (
     StackIdentityError,
     canonical_digest,
     canonical_json_bytes,
-    require_sha256_hex,
 )
+from optima._strict import require_digest, require_exact_fields
 
 
 CALIBRATION_SCHEMA_VERSION = 1
@@ -61,13 +61,7 @@ class CalibrationError(ValueError):
 
 
 def _digest(value: object, *, field: str) -> str:
-    try:
-        result = require_sha256_hex(value, field=field)
-    except StackIdentityError as exc:
-        raise CalibrationError(str(exc)) from exc
-    if result == "0" * 64:
-        raise CalibrationError(f"{field} must not be the all-zero digest")
-    return result
+    return require_digest(value, field=field, error=CalibrationError)
 
 
 def _name(value: object, *, field: str) -> str:
@@ -100,9 +94,7 @@ def decimal_value(value: str) -> Decimal:
 
 
 def _strict(value: object, fields: frozenset[str], *, label: str) -> Mapping[str, object]:
-    if not isinstance(value, Mapping) or frozenset(value) != fields:
-        raise CalibrationError(f"{label} fields do not match the schema")
-    return value
+    return require_exact_fields(value, fields=fields, label=label, error=CalibrationError)
 
 
 @dataclass(frozen=True)

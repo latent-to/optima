@@ -7,6 +7,16 @@
 > failed on all 3,120 audited calls (worst_frac 0.0029). Full record:
 > `experiments/minimax_m3/frontier_2026-07-07/02_FE_BUNDLE_INGEST_LEDGER.md`.
 
+> **Production wiring status (2026-07-16): NOT ENFORCED.** The numbers above are
+> valid historical evaluator evidence. In the current causal OCI qualification path,
+> `optima/eval/engine_worker.py` explicitly clears `OPTIMA_SLOT_AUDIT` and
+> `OPTIMA_SLOT_AUDIT_SEED`; the worker protocol transports no audit facts;
+> qualification reports and settlement do not grade audit evidence. The current path
+> grades graph execution, calibrated speed, and pristine-T distribution/task evidence.
+> Sections 3–6 below describe the intended gate and historically exercised mechanism,
+> not an active production invariant. Do not enable meaningful emissions on the
+> assumption that this audit is armed.
+
 ## 1. What the fidelity gate is actually for
 
 The referee pays for **speed at equal fidelity**. "Equal fidelity" has to be a
@@ -55,7 +65,7 @@ fails *every* candidate, honest or not, including stock itself. Worse, the
 divergence scales with any *timing* change, so the gate structurally punishes
 the one thing the subnet exists to buy: speed.
 
-## 3. The replacement stack
+## 3. The target replacement stack (historically exercised, not production-wired)
 
 ```
 scan  →  verify  →  IN-ENGINE AUDIT  →  benchmark no-regression  →  timed bracket
@@ -108,7 +118,11 @@ proxy. Properties:
   clones taken *before* the kernel executes, so a kernel that mutates its
   inputs cannot steer the expected value.
 
-## 4. The adversarial matrix — honest edition
+## 4. The adversarial matrix — target/historical audit path
+
+The statuses in this table assume the audit launch and receipt gate actually run.
+They are not claims about the current causal production path; without that wiring,
+every row whose only active control is the audit remains open.
 
 | # | Attack | Caught by | Status |
 |---|--------|-----------|--------|
@@ -139,10 +153,12 @@ re-evaluation today, but they are where a motivated adversary would dig.
 
 ## 5. Knobs & usage
 
-The audit is armed on the validator's untimed quality launch inside the
-qualification bracket (the legacy local `optima evaluate --fidelity-mode ...`
-diagnostic was deleted in the post-arc trim; audit statistics now flow into the
-pristine reference-quality record, `optima/eval/reference_quality.py`).
+The historical evaluator armed the audit on a separate untimed candidate launch.
+The current causal qualification bracket does not: it clears the audit environment
+and does not transport audit receipts. Restoring the gate requires a distinct untimed
+candidate role, exact slot×TP-rank coverage, bounded raw facts over the worker protocol,
+trusted host regrading, and report/settlement schema binding. The legacy local
+`optima evaluate --fidelity-mode ...` diagnostic was deleted in the post-arc trim.
 
 * `OPTIMA_SLOT_AUDIT` / `OPTIMA_SLOT_AUDIT_SEED` — set by the launcher
   for the quality launch only; never set them on a timed launch.
@@ -161,10 +177,11 @@ pristine reference-quality record, `optima/eval/reference_quality.py`).
 
 ## 6. Which fidelity mode for which arena
 
-Rollout-KL remains valid where its premise holds — the premise is now a
+As a target policy, rollout-KL remains valid where its premise holds — the premise is a
 *measured requirement*, not an assumption: **stock-vs-stock KL must be ~0 on
 that arena config** (deterministic-capable backend, pinned autotune, fixed
 batching). Record the control result in the arena row. Where the control
-fails (any nondeterministic stack — e.g. M3/fa4/NVFP4), `audit` is the only
-sound mode. The arena registry is the home for this choice, together with
-bench budgets, stop cues, and template policy.
+fails (any nondeterministic stack — e.g. M3/fa4/NVFP4), the in-engine audit is the
+intended primary control, but it is not presently production-wired. The arena registry
+is the intended home for this choice, together with bench budgets, stop cues, and
+template policy.

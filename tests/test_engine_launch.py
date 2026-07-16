@@ -318,12 +318,12 @@ def test_profiled_native_build_uses_closed_schema2_and_binds_policy() -> None:
 
     legacy_with_profile = legacy.to_dict()
     legacy_with_profile["compile_profile_digest"] = profile_digest
-    with pytest.raises(EngineLaunchError, match="native build schema mismatch"):
+    with pytest.raises(EngineLaunchError, match="native build fields mismatch"):
         NativeBuildSpec.from_dict(legacy_with_profile)
 
     profiled_without_profile = profiled.to_dict()
     del profiled_without_profile["compile_profile_digest"]
-    with pytest.raises(EngineLaunchError, match="native build schema mismatch"):
+    with pytest.raises(EngineLaunchError, match="native build fields mismatch"):
         NativeBuildSpec.from_dict(profiled_without_profile)
 
 
@@ -346,7 +346,7 @@ def test_launch_schema_rejects_path_physical_and_economic_fields(
     launch = _launch(stack_digest=_digest("stack"), tree_digest=_digest("tree"))
     row = launch.to_dict()
     row[forbidden] = "attacker-controlled"
-    with pytest.raises(EngineLaunchError, match="schema mismatch"):
+    with pytest.raises(EngineLaunchError, match="fields mismatch"):
         EngineLaunchSpec.from_dict(row)
 
 
@@ -358,12 +358,12 @@ def test_nested_schemas_are_closed_and_versions_and_digests_are_strict() -> None
 
     launch_row = copy.deepcopy(launch.to_dict())
     launch_row["hardware"]["gpu_path"] = "/dev/nvidia0"  # type: ignore[index]
-    with pytest.raises(EngineLaunchError, match="logical hardware schema mismatch"):
+    with pytest.raises(EngineLaunchError, match="logical hardware fields mismatch"):
         EngineLaunchSpec.from_dict(launch_row)
 
     native_row = native.to_dict()
     native_row["source_stem"] = "collision"
-    with pytest.raises(EngineLaunchError, match="native build schema mismatch"):
+    with pytest.raises(EngineLaunchError, match="native build fields mismatch"):
         NativeBuildSpec.from_dict(native_row)
 
     for row, loader, unsupported_version in (
@@ -629,7 +629,7 @@ def test_resolution_rejects_distribution_and_preflight_mismatches(
 
     extra = dict(launch.runtime_preflight_identity)
     extra["candidate_digest"] = _digest("candidate")
-    with pytest.raises(EngineLaunchError, match="schema mismatch"):
+    with pytest.raises(EngineLaunchError, match="fields mismatch"):
         validate_runtime_preflight_receipt(launch, _Receipt(extra))
 
 

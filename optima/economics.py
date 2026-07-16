@@ -12,9 +12,10 @@ import re
 from dataclasses import dataclass
 from typing import Iterable, Mapping
 
-from optima.stack_identity import canonical_digest, require_sha256_hex
+from optima.stack_identity import canonical_digest
 from optima.stack_manifest import EvaluationStackManifest
 from optima.target_catalog import TargetCatalog, TargetResolutionError
+from optima._strict import require_digest, require_exact_fields, require_int
 
 
 POLICY_SCHEMA_VERSION = 1
@@ -29,19 +30,11 @@ class EconomicsError(ValueError):
 
 
 def _digest(value: object, field: str) -> str:
-    try:
-        result = require_sha256_hex(value, field=field)
-    except ValueError as exc:
-        raise EconomicsError(str(exc)) from None
-    if result == "0" * 64:
-        raise EconomicsError(f"{field} must not be the all-zero digest")
-    return result
+    return require_digest(value, field=field, error=EconomicsError)
 
 
 def _integer(value: object, field: str, *, minimum: int = 0) -> int:
-    if type(value) is not int or value < minimum:
-        raise EconomicsError(f"{field} must be an integer >= {minimum}")
-    return value
+    return require_int(value, field=field, error=EconomicsError, minimum=minimum)
 
 
 def _hotkey(value: object, field: str = "hotkey") -> str:
@@ -51,9 +44,9 @@ def _hotkey(value: object, field: str = "hotkey") -> str:
 
 
 def _strict(value: object, fields: set[str], name: str) -> dict[str, object]:
-    if type(value) is not dict or set(value) != fields:
-        raise EconomicsError(f"{name} fields do not match the schema")
-    return value
+    return require_exact_fields(
+        value, fields=frozenset(fields), label=name, error=EconomicsError, exact_dict=True
+    )
 
 
 @dataclass(frozen=True)

@@ -8,7 +8,6 @@ signer supplies a wallet. An SDK return value is never confirmation authority.
 from __future__ import annotations
 
 import math
-import operator
 from dataclasses import dataclass, replace
 from typing import Protocol
 
@@ -276,13 +275,22 @@ class WeightPublicationResult:
     submitted: bool
     dry_run: bool
     observed_block: int
+    refresh_due: bool = False
 
     def __post_init__(self) -> None:
         require_sha256_hex(self.projection_digest, field="projection_digest")
         if (
             self.status not in PUBLICATION_STATUSES | {"dry_run"}
             or (self.record is not None and type(self.record) is not WeightPublicationRecord)
-            or any(type(value) is not bool for value in (self.chain_matches, self.submitted, self.dry_run))
+            or any(
+                type(value) is not bool
+                for value in (
+                    self.chain_matches,
+                    self.submitted,
+                    self.dry_run,
+                    self.refresh_due,
+                )
+            )
             or type(self.observed_block) is not int
             or self.observed_block < 0
             or self.dry_run != (self.status == "dry_run")
@@ -291,18 +299,10 @@ class WeightPublicationResult:
                 self.record is not None
                 and self.status != self.record.status
             )
+            or self.refresh_due
+            and (self.status != "confirmed" or not self.chain_matches)
         ):
             raise WeightPublicationError("publication result status is unsupported")
-
-
-def _block(subtensor) -> int:
-    try:
-        value = operator.index(subtensor.get_current_block())
-    except (AttributeError, TypeError, OverflowError, ValueError) as exc:
-        raise chain.ChainWeightStateError(f"cannot read current chain block: {exc}") from None
-    if value < 0:
-        raise chain.ChainWeightStateError("current chain block is negative")
-    return value
 
 
 def _matches(snapshot: chain.ValidatorWeightSnapshot, projection: WeightProjection) -> bool:
@@ -332,6 +332,21 @@ def _metagraph_digest(projection: WeightProjection, metagraph: chain.MetagraphVi
             "chain_scope_digest": projection.chain_scope_digest,
             "members": members,
         },
+    )
+
+
+def _authority_uids_unchanged(
+    projection: WeightProjection,
+    bound: chain.MetagraphView,
+    observed: chain.MetagraphView,
+) -> bool:
+    """Whether every identity that can affect this signed row kept its UID."""
+
+    hotkeys = (projection.validator_hotkey, *(row[0] for row in projection.weights_ppm))
+    return all(
+        bound.uid_of(hotkey) is not None
+        and bound.uid_of(hotkey) == observed.uid_of(hotkey)
+        for hotkey in hotkeys
     )
 
 
@@ -450,19 +465,28 @@ def reconcile_weight_publication(
     *,
     refresh_blocks: int,
     dry_run: bool = False,
+    reconcile_only: bool = False,
 ) -> WeightPublicationResult:
     """Reconcile and optionally publish one exact projection.
 
     The journal head and live sparse row are read before any journal mutation;
     the row is read again after every SDK attempt. Real publication persists
     ``intent`` before the signer is called; exact readback plus a sufficiently
-    new ``last_update`` is the only path to ``confirmed``.
+    new ``last_update`` is the only path to ``confirmed``. ``reconcile_only``
+    accepts no signer and either confirms exact authoritative readback or raises
+    before any submission/refresh path.
     """
 
     if type(projection) is not WeightProjection:
         raise WeightPublicationError("weight projection is not exactly typed")
     if type(refresh_blocks) is not int or refresh_blocks <= 0:
         raise WeightPublicationError("weight refresh cadence is malformed")
+    if type(reconcile_only) is not bool:
+        raise WeightPublicationError("reconcile-only mode is malformed")
+    if reconcile_only and dry_run:
+        raise WeightPublicationError("reconcile-only cannot be combined with dry-run")
+    if reconcile_only and signer_wallet is not None:
+        raise WeightPublicationError("reconcile-only forbids a signer wallet")
     current = None if dry_run else journal.load()
     if current is not None and type(current) is not WeightPublicationRecord:
         raise WeightPublicationError("journal returned an untyped publication record")
@@ -473,20 +497,43 @@ def reconcile_weight_publication(
         and current.projection_digest == projection.digest
         else None
     )
+    retained_reconcile_head = (
+        current
+        if reconcile_only
+        and current is not None
+        and current.status in {"pending", "released", "confirmed"}
+        and current.projection_digest == projection.digest
+        else None
+    )
+    retained_authority = in_flight or retained_reconcile_head
     live_metagraph = chain.fetch_metagraph(subtensor, projection.netuid)
-    if in_flight is None and (
-        live_metagraph.block != projection.effective_block
-        or _metagraph_digest(projection, live_metagraph) != projection.metagraph_digest
+    bound_metagraph = (
+        live_metagraph
+        if live_metagraph.block == projection.effective_block
+        else chain.fetch_metagraph(
+            subtensor, projection.netuid, block=projection.effective_block
+        )
+    )
+    if _metagraph_digest(projection, bound_metagraph) != projection.metagraph_digest:
+        raise WeightPublicationError(
+            "weight projection metagraph binding cannot be reopened"
+        )
+    if (
+        retained_authority is None
+        and live_metagraph.block != projection.effective_block
     ):
         raise WeightPublicationError(
             "weight projection is stale for the immediately refreshed metagraph"
         )
     if (
         in_flight is not None
-        and in_flight.submit_block != projection.effective_block
+        and (
+            in_flight.submit_block < projection.effective_block
+            or in_flight.submit_block > live_metagraph.block
+        )
     ):
         raise WeightPublicationError(
-            "in-flight publication does not bind its retained projection block"
+            "in-flight publication chronology differs from retained authority"
         )
     pre = chain.read_validator_weight_snapshot(
         subtensor,
@@ -504,10 +551,116 @@ def reconcile_weight_publication(
 
     if dry_run:
         chain.set_weights(
-            subtensor, None, projection.netuid, projection.weights, dry_run=True
+            subtensor,
+            None,
+            projection.netuid,
+            projection.weights,
+            dry_run=True,
+            metagraph_view=live_metagraph,
         )
         return WeightPublicationResult(
             projection.digest, "dry_run", None, matches, False, True, observed_block
+        )
+
+    if reconcile_only:
+        if current is None or current.status not in {
+            "pending", "released", "confirmed"
+        }:
+            raise WeightPublicationError(
+                "reconcile-only requires a pending, released, or confirmed journal head"
+            )
+        if retained_authority is not None and not _authority_uids_unchanged(
+            projection, bound_metagraph, live_metagraph
+        ):
+            raise WeightPublicationError(
+                "reconcile-only recipient UID mapping changed"
+            )
+        if current.status == "pending":
+            if current.projection_digest != projection.digest:
+                raise WeightPublicationError(
+                    "reconcile-only pending projection differs from retained authority"
+                )
+            if not matches or pre.last_update_block < current.submit_block:
+                raise WeightPublicationError(
+                    "reconcile-only pending publication lacks exact authoritative readback"
+                )
+            current = _advance(
+                journal,
+                current,
+                WeightPublicationRecord(
+                    projection.digest,
+                    "confirmed",
+                    submit_block=current.submit_block,
+                    retry_after_block=current.retry_after_block,
+                    reveal_round=current.reveal_round,
+                    confirmed_block=observed_block,
+                    confirmed_last_update=pre.last_update_block,
+                    reason="authoritative_readback",
+                ),
+            )
+            return WeightPublicationResult(
+                projection.digest,
+                "confirmed",
+                current,
+                True,
+                False,
+                False,
+                observed_block,
+                observed_block - pre.last_update_block >= refresh_blocks,
+            )
+        if not matches:
+            raise WeightPublicationError(
+                "reconcile-only authoritative row differs; a submission is required"
+            )
+        if (
+            current.status == "released"
+            and pre.last_update_block < current.submit_block
+        ):
+            raise WeightPublicationError(
+                "reconcile-only released publication lacks post-submit authoritative readback"
+            )
+        if (
+            current.status in {"released", "confirmed"}
+            and observed_block - pre.last_update_block >= refresh_blocks
+        ):
+            raise WeightPublicationError(
+                "reconcile-only confirmed row is refresh-due; a submission is required"
+            )
+        if (
+            current.status == "confirmed"
+            and current.projection_digest == projection.digest
+        ):
+            return WeightPublicationResult(
+                projection.digest,
+                "confirmed",
+                current,
+                True,
+                False,
+                False,
+                observed_block,
+            )
+        current = _advance(
+            journal,
+            current,
+            WeightPublicationRecord(
+                projection.digest,
+                "confirmed",
+                submit_block=current.submit_block,
+                retry_after_block=current.retry_after_block,
+                reveal_round=current.reveal_round,
+                confirmed_block=observed_block,
+                confirmed_last_update=pre.last_update_block,
+                reason="preexisting_authoritative_readback",
+            ),
+        )
+        return WeightPublicationResult(
+            projection.digest,
+            "confirmed",
+            current,
+            True,
+            False,
+            False,
+            observed_block,
         )
 
     if current is not None and current.status in {"intent", "pending", "held"}:
@@ -519,6 +672,13 @@ def reconcile_weight_publication(
         if current.status == "held":
             return WeightPublicationResult(
                 projection.digest, "held", current, matches, False, False, observed_block
+            )
+        if not _authority_uids_unchanged(
+            projection, bound_metagraph, live_metagraph
+        ):
+            current = _held(journal, current, "metagraph_uid_mapping_changed")
+            return WeightPublicationResult(
+                projection.digest, "held", current, False, False, False, observed_block
             )
         if matches and pre.last_update_block >= current.submit_block:
             current = _advance(
@@ -536,7 +696,14 @@ def reconcile_weight_publication(
                 ),
             )
             return WeightPublicationResult(
-                projection.digest, "confirmed", current, True, False, False, observed_block
+                projection.digest,
+                "confirmed",
+                current,
+                True,
+                False,
+                False,
+                observed_block,
+                observed_block - pre.last_update_block >= refresh_blocks,
             )
         if observed_block < current.retry_after_block:
             return WeightPublicationResult(
@@ -547,28 +714,73 @@ def reconcile_weight_publication(
             projection.digest, "held", current, False, False, False, observed_block
         )
 
-    if (
-        current is not None
-        and current.status == "confirmed"
-        and current.projection_digest == projection.digest
-    ):
-        if not matches:
+    if current is not None and current.status == "confirmed":
+        if current.projection_digest == projection.digest and not matches:
             current = _held(journal, current, "confirmed_vector_changed_on_chain")
             return WeightPublicationResult(
                 projection.digest, "held", current, False, False, False, observed_block
             )
-        if observed_block - pre.last_update_block < refresh_blocks:
+        if matches and observed_block - pre.last_update_block < refresh_blocks:
+            # A projection's finalized metagraph/evaluation identity can advance
+            # while its exact sparse vector remains unchanged.  Bind that fresh
+            # projection to authoritative readback instead of signing the same
+            # vector on every control-plane invocation.
+            if current.projection_digest != projection.digest:
+                current = _advance(
+                    journal,
+                    current,
+                    WeightPublicationRecord(
+                        projection.digest,
+                        "confirmed",
+                        confirmed_block=observed_block,
+                        confirmed_last_update=pre.last_update_block,
+                        reason="preexisting_authoritative_readback",
+                    ),
+                )
             return WeightPublicationResult(
                 projection.digest, "confirmed", current, True, False, False, observed_block
             )
 
-    if current is None and matches:
+    if (
+        current is None
+        and matches
+        and observed_block - pre.last_update_block < refresh_blocks
+    ):
         current = _advance(
             journal,
-            None,
+            current,
             WeightPublicationRecord(
                 projection.digest,
                 "confirmed",
+                confirmed_block=observed_block,
+                confirmed_last_update=pre.last_update_block,
+                reason="preexisting_authoritative_readback",
+            ),
+        )
+        return WeightPublicationResult(
+            projection.digest, "confirmed", current, True, False, False, observed_block
+        )
+
+    if (
+        current is not None
+        and current.status == "released"
+        and matches
+        and pre.last_update_block >= current.submit_block
+        and observed_block - pre.last_update_block < refresh_blocks
+    ):
+        # A late commit-reveal may become visible only after the bounded pending
+        # record was held and explicitly released.  Exact finalized readback is
+        # sufficient only when its update is not older than the retained submit
+        # chronology; never attribute a pre-submit identical row to this attempt.
+        current = _advance(
+            journal,
+            current,
+            WeightPublicationRecord(
+                projection.digest,
+                "confirmed",
+                submit_block=current.submit_block,
+                retry_after_block=current.retry_after_block,
+                reveal_round=current.reveal_round,
                 confirmed_block=observed_block,
                 confirmed_last_update=pre.last_update_block,
                 reason="preexisting_authoritative_readback",
@@ -588,6 +800,110 @@ def reconcile_weight_publication(
         raise WeightPublicationError("signer wallet differs from projection authority")
     if observed_block <= 0:
         raise chain.ChainWeightStateError("real publication requires a positive chain block")
+
+    # Re-open finalized authority immediately before journaling intent and hand
+    # that exact UID mapping to the signer. Finality may advance while the first
+    # sparse-row RPC is in flight; that is safe only when the validator and every
+    # weighted recipient retain their UIDs. The immutable projection remains an
+    # economic snapshot at ``effective_block`` while the journal records the
+    # later exact signing block.
+    signing_metagraph = chain.fetch_metagraph(subtensor, projection.netuid)
+    if signing_metagraph.block < observed_block:
+        raise chain.ChainWeightStateError(
+            "finalized weight authority regressed before signing"
+        )
+    if (
+        signing_metagraph.block == projection.effective_block
+        and _metagraph_digest(projection, signing_metagraph)
+        != projection.metagraph_digest
+    ):
+        raise chain.ChainWeightStateError(
+            "finalized weight authority changed at the projection block"
+        )
+    if not _authority_uids_unchanged(
+        projection, bound_metagraph, signing_metagraph
+    ):
+        raise WeightPublicationError(
+            "weight recipient UID mapping changed before signing"
+        )
+    if signing_metagraph.block > observed_block:
+        # A late reveal or another authorized publication may have landed while
+        # the initial sparse-row RPC was in flight. Re-read at the newer exact
+        # finalized authority before creating intent; otherwise an unchanged UID
+        # map alone could still cause a duplicate signature.
+        signing_pre = chain.read_validator_weight_snapshot(
+            subtensor,
+            projection.netuid,
+            projection.validator_hotkey,
+            metagraph_view=signing_metagraph,
+        )
+        if signing_pre.last_update_block > signing_metagraph.block:
+            raise chain.ChainWeightStateError(
+                "pre-sign weight authority chronology is inconsistent"
+            )
+        if (
+            _matches(signing_pre, projection)
+            and signing_metagraph.block - signing_pre.last_update_block
+            < refresh_blocks
+        ):
+            if current is None:
+                current = _advance(
+                    journal,
+                    current,
+                    WeightPublicationRecord(
+                        projection.digest,
+                        "confirmed",
+                        confirmed_block=signing_metagraph.block,
+                        confirmed_last_update=signing_pre.last_update_block,
+                        reason="preexisting_authoritative_readback",
+                    ),
+                )
+            elif current.status == "confirmed":
+                if current.projection_digest != projection.digest:
+                    current = _advance(
+                        journal,
+                        current,
+                        WeightPublicationRecord(
+                            projection.digest,
+                            "confirmed",
+                            confirmed_block=signing_metagraph.block,
+                            confirmed_last_update=signing_pre.last_update_block,
+                            reason="preexisting_authoritative_readback",
+                        ),
+                    )
+            elif (
+                current.status == "released"
+                and signing_pre.last_update_block >= current.submit_block
+            ):
+                current = _advance(
+                    journal,
+                    current,
+                    WeightPublicationRecord(
+                        projection.digest,
+                        "confirmed",
+                        submit_block=current.submit_block,
+                        retry_after_block=current.retry_after_block,
+                        reveal_round=current.reveal_round,
+                        confirmed_block=signing_metagraph.block,
+                        confirmed_last_update=signing_pre.last_update_block,
+                        reason="preexisting_authoritative_readback",
+                    ),
+                )
+            if (
+                current is not None
+                and current.status == "confirmed"
+                and current.projection_digest == projection.digest
+            ):
+                return WeightPublicationResult(
+                    projection.digest,
+                    "confirmed",
+                    current,
+                    True,
+                    False,
+                    False,
+                    signing_metagraph.block,
+                )
+    observed_block = signing_metagraph.block
 
     intent = _advance(
         journal,
@@ -610,6 +926,9 @@ def reconcile_weight_publication(
             projection.netuid,
             projection.weights,
             dry_run=False,
+            wait_for_inclusion=True,
+            wait_for_finalization=True,
+            metagraph_view=signing_metagraph,
         )
         submitted = bool(response.get("submitted")) if isinstance(response, dict) else False
     except Exception as exc:
@@ -627,10 +946,35 @@ def reconcile_weight_publication(
         ),
     )
     try:
+        post_metagraph = chain.fetch_metagraph(subtensor, projection.netuid)
+        if (
+            post_metagraph.block == signing_metagraph.block
+            and _metagraph_digest(projection, post_metagraph)
+            != _metagraph_digest(projection, signing_metagraph)
+        ):
+            raise chain.ChainWeightStateError(
+                "post-submit authority changed at the signing block"
+            )
+        if not _authority_uids_unchanged(
+            projection, signing_metagraph, post_metagraph
+        ):
+            held = _held(journal, pending, "post_submit_uid_mapping_changed")
+            return WeightPublicationResult(
+                projection.digest,
+                "held",
+                held,
+                False,
+                submitted,
+                False,
+                post_metagraph.block,
+            )
         post = chain.read_validator_weight_snapshot(
-            subtensor, projection.netuid, projection.validator_hotkey
+            subtensor,
+            projection.netuid,
+            projection.validator_hotkey,
+            metagraph_view=post_metagraph,
         )
-        post_block = _block(subtensor)
+        post_block = post_metagraph.block
         if post.last_update_block > post_block or post_block < observed_block:
             raise chain.ChainWeightStateError("post-submit chronology is inconsistent")
     except chain.ChainWeightStateError:

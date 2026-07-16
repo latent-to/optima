@@ -17,12 +17,8 @@ from dataclasses import asdict, dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-from optima.stack_identity import (
-    StackIdentityError,
-    canonical_digest,
-    canonical_json_bytes,
-    require_sha256_hex,
-)
+from optima.stack_identity import canonical_digest, canonical_json_bytes
+from optima._strict import require_digest
 
 
 OVERLAY_SCHEMA = "optima.dep-overlay.v3"
@@ -139,10 +135,7 @@ class ValidatedPrebuiltModule:
 
 
 def _digest(value: object, *, field: str) -> str:
-    try:
-        return require_sha256_hex(value, field=field)
-    except StackIdentityError as exc:
-        raise DepOverlayError(str(exc)) from None
+    return require_digest(value, field=field, error=DepOverlayError)
 
 
 def rebuild_phase() -> str:

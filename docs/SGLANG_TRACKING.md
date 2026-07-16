@@ -34,6 +34,15 @@ end-to-end re-validation** (broken-bundle gate FAILs, faithful kernels PASS) **a
 re-baseline are PENDING** — run them on a pod before treating 0.5.13.post1 as authoritative
 for scoring. `0.5.12.post1` was the last fully H100-validated pin.
 
+**Current identity gap:** MiniMax-M3 crown/campaign evidence used the source-built
+package `0.0.0.dev1+g56e290315` at upstream revision
+`56e290315b8fdb4c8c10f8e31360d9bc3d878633`, not `PINNED_SGLANG`.
+`optima compat` now fails that mismatch; a green source-build seam-shape probe is
+not canonical-pin evidence. Production still needs an explicit, reviewed choice:
+converge the M3 arena on the global pin, or define an authenticated per-arena pin
+registry that binds full source revision, worker image, toolchain, and rebaseline.
+An operator-provided CLI string is not authority and must not override the pin.
+
 ## What's actually coupled: the score, not the kernel
 
 The pin sounds like it locks miners to one engine version. It mostly doesn't, and

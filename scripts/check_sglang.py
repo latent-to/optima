@@ -8,9 +8,9 @@ Two checks, both cheap:
      our integration points still exist? (Full behavioral confirmation needs a GPU
      box; see docs/SGLANG_TRACKING.md.)
 
-Exit 1 ONLY on a broken seam (a chokepoint we patch moved — code-actionable). A newer
-sglang release is a WARNING (GitHub annotation), not a failure: bumping is a deliberate
-human decision (re-baseline), not a code fix, so it must not turn the weekly canary red.
+Exit 1 on a broken compatibility invariant: the installed package differs from the
+committed pin, or a seam/API moved. A newer PyPI release is only a WARNING: bumping is a
+deliberate human decision (re-baseline), not a code fix.
 
 Schedule it: the GitHub Action in .github/workflows/sglang-canary.yml, or cron:
     0 9 * * 1  cd /path/to/optima && .venv/bin/python scripts/check_sglang.py
@@ -56,11 +56,11 @@ def main() -> int:
                 pass
 
     # Two SEPARATE signals — only one is code-actionable, so only one fails CI:
-    #   * seam_broken  -> a chokepoint we patch moved/changed. Fix the adapter. HARD FAIL (exit 1).
+    #   * compat_broken -> installed pin mismatch or a moved API/chokepoint. HARD FAIL (exit 1).
     #   * newer_release -> sglang shipped a version past the pin. A human bump+re-baseline decision
     #                      (docs/SGLANG_TRACKING.md), NOT a code fix. WARNING only (does not fail CI),
     #                      else the canary goes red on every sglang release = alert fatigue.
-    seam_broken = False
+    compat_broken = False
     newer_release = False
     print("=== sglang canary ===")
     print(f"pinned (scored version): {PINNED_SGLANG}")
@@ -90,13 +90,14 @@ def main() -> int:
     print(format_checks(checks))
     if not all(c.ok for c in checks):
         broken = ", ".join(c.name for c in checks if not c.ok)
-        print(f"::error title=sglang seam broken::chokepoint(s) moved: {broken}. "
-              "Fix the seam adapter (optima/integrations/, see optima/seams.py).")
-        seam_broken = True
+        print(f"::error title=sglang compatibility broken::{broken}. "
+              "Restore the committed pin or fix the seam adapter.")
+        compat_broken = True
 
-    if newer_release and not seam_broken:
-        print("\nresult: seams INTACT; a newer release exists (informational, not a failure).")
-    return 1 if seam_broken else 0
+    if newer_release and not compat_broken:
+        print("\nresult: pin MATCHES and seams INTACT; a newer release exists "
+              "(informational, not a failure).")
+    return 1 if compat_broken else 0
 
 
 if __name__ == "__main__":

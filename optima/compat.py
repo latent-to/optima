@@ -1,4 +1,4 @@
-"""sglang compatibility canary — assert our integration points survive an upgrade.
+"""SGLang compatibility canary — enforce the pin and integration surface.
 
 Our harness patches sglang internals (the `SiluAndMul` / `RMSNorm` seams, the
 `MultiPlatformOp` base, the Engine logprob API, specific `ServerArgs` kwargs). Any
@@ -68,10 +68,11 @@ def run_checks() -> list[Check]:
         return checks
 
     ver = getattr(sglang, "__version__", "?")
+    version_matches = ver == PINNED_SGLANG
     add(
         f"sglang installed (pinned {PINNED_SGLANG})",
-        True,
-        f"found {ver}" + ("" if ver == PINNED_SGLANG else "  <-- DIFFERS from pin"),
+        version_matches,
+        f"found {ver}" + ("" if version_matches else "  <-- DIFFERS from pin"),
     )
 
     # Table-driven baseline: every adapter in the single seam table (optima/seams.py)
@@ -216,7 +217,8 @@ def format_checks(checks: list[Check]) -> str:
     n_fail = sum(1 for c in checks if not c.ok)
     lines.append("")
     lines.append(
-        "ALL SEAMS INTACT" if n_fail == 0
-        else f"{n_fail} CHECK(S) FAILED — seams need an adapter before scoring on this sglang"
+        "PIN MATCHES; ALL SEAMS INTACT"
+        if n_fail == 0
+        else f"{n_fail} CHECK(S) FAILED — restore the pin or adapt seams before scoring"
     )
     return "\n".join(lines)

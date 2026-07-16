@@ -21,7 +21,8 @@ from optima.release import (
     _container_deployment, _container_dockerfile, reopen_release,
     sign_container_reproducibility, verify_container_reproducibility,
 )
-from optima.stack_identity import canonical_json_bytes, require_sha256_hex
+from optima.stack_identity import canonical_json_bytes
+from optima._strict import require_digest
 _TAG = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}\Z")
 _NAME = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}\Z")
 _REGISTRY_HOST = re.compile(r"(?:localhost|[a-z0-9]+(?:[.-][a-z0-9]+)*)(?::[1-9][0-9]{0,4})?\Z")
@@ -46,13 +47,7 @@ _RECEIPT_DIR = "/tmp/optima-release-receipts"
 class ReleaseHostError(ReleaseError):
     """A registry object or host lifecycle action violated release policy."""
 def _digest(value: object, label: str) -> str:
-    try:
-        result = require_sha256_hex(value, field=label)
-    except ValueError as exc:
-        raise ReleaseHostError(str(exc)) from None
-    if result == "0" * 64:
-        raise ReleaseHostError(f"{label} must not be the all-zero digest")
-    return result
+    return require_digest(value, field=label, error=ReleaseHostError)
 def _json(raw: bytes, label: str) -> Any:
     def pairs(items: list[tuple[str, Any]]) -> dict[str, Any]:
         result: dict[str, Any] = {}

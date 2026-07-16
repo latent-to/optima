@@ -431,6 +431,56 @@ class SessionExecutionPlan:
                 ) from None
 
 
+def require_decode_dominant_plan(
+    plan: SessionExecutionPlan,
+    *,
+    count_tokens: Callable[[str], int],
+    min_decode_share: float = 0.85,
+) -> float:
+    """Validator-side workload review for decode-regime arenas (freeze-time gate).
+
+    The charged speed metric is a makespan over the conditioning+timed batches; on
+    prefill-heavy workloads that makespan inherits admission/interleave trajectory
+    noise (measured 2026-07-16: 9-12% leg spread on an 8k-in/1k-out serving mix vs
+    0.6% once the measurement is decode-dominated). This gate requires the CHARGED
+    batches' token budget to be decode-dominated so the frozen workload is a quiet
+    instrument. It is a plan-review helper, not consensus evidence: the workload
+    digest already pins the plan — this only gates what a validator freezes.
+    Prefill-heavy arenas (e.g. the MSA prefill block-score slot) deliberately skip
+    it. Returns the measured decode share.
+    """
+
+    if type(plan) is not SessionExecutionPlan:
+        raise OuterSessionInfrastructureError("plan must be an exact SessionExecutionPlan")
+    if not callable(count_tokens):
+        raise OuterSessionInfrastructureError("count_tokens must be callable")
+    if (
+        isinstance(min_decode_share, bool)
+        or not isinstance(min_decode_share, (int, float))
+        or not 0.0 < float(min_decode_share) < 1.0
+    ):
+        raise OuterSessionInfrastructureError("min_decode_share must be inside (0, 1)")
+    charged_start = plan.warmup_count - plan.conditioning_count
+    prompt_tokens = 0
+    decode_tokens = 0
+    for batch in plan.prompt_batches[charged_start:]:
+        for prompt in batch:
+            count = count_tokens(prompt)
+            if type(count) is not int or count <= 0:
+                raise OuterSessionInfrastructureError("count_tokens must return positive ints")
+            prompt_tokens += count
+        decode_tokens += len(batch) * plan.max_new_tokens
+    share = decode_tokens / (decode_tokens + prompt_tokens)
+    if share < float(min_decode_share):
+        raise OuterSessionInfrastructureError(
+            f"charged workload is prefill-heavy: decode share {share:.3f} < "
+            f"required {float(min_decode_share):.3f} — a makespan speed metric on this "
+            "plan inherits admission-trajectory noise; reshape the workload "
+            "(shorter prompts / longer max_new_tokens) or use a prefill-regime arena"
+        )
+    return share
+
+
 @dataclass(frozen=True)
 class BatchExecutionEvidence:
     batch_index: int

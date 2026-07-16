@@ -24,7 +24,8 @@ from optima.eval.qualification_intake import (
     QualificationPlanFactory,
     QualificationReservation,
 )
-from optima.stack_identity import canonical_digest, require_sha256_hex
+from optima.stack_identity import canonical_digest
+from optima._strict import require_digest, require_identifier
 
 
 SERVICE_SCHEMA_VERSION = 1
@@ -39,19 +40,11 @@ class ArenaServiceError(ValueError):
 
 
 def _digest(value: object, field: str) -> str:
-    try:
-        result = require_sha256_hex(value, field=field)
-    except ValueError as exc:
-        raise ArenaServiceError(str(exc)) from None
-    if result == "0" * 64:
-        raise ArenaServiceError(f"{field} must not be the all-zero digest")
-    return result
+    return require_digest(value, field=field, error=ArenaServiceError)
 
 
 def _identifier(value: object, field: str) -> str:
-    if not isinstance(value, str) or _IDENTIFIER.fullmatch(value) is None:
-        raise ArenaServiceError(f"{field} is not a canonical identifier")
-    return value
+    return require_identifier(value, field=field, error=ArenaServiceError, pattern=_IDENTIFIER)
 
 
 def _positive(value: object, field: str) -> int:

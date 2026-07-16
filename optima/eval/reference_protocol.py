@@ -12,7 +12,8 @@ import math
 import struct
 from dataclasses import dataclass
 
-from optima.stack_identity import StackIdentityError, require_sha256_hex, sha256_hex
+from optima.stack_identity import sha256_hex
+from optima._strict import require_digest, require_int
 
 
 REQUEST_MAGIC = b"ORQ1"
@@ -49,13 +50,7 @@ class ReferenceProtocolError(ValueError):
 
 
 def _digest(value: object, field: str) -> str:
-    try:
-        result = require_sha256_hex(value, field=field)
-    except StackIdentityError as exc:
-        raise ReferenceProtocolError(str(exc)) from None
-    if result == "0" * 64:
-        raise ReferenceProtocolError(f"{field} must not be the all-zero digest")
-    return result
+    return require_digest(value, field=field, error=ReferenceProtocolError)
 
 
 def _binding(value: object, field: str) -> str:
@@ -70,9 +65,7 @@ def _binding(value: object, field: str) -> str:
 
 
 def _integer(value: object, field: str, low: int, high: int) -> int:
-    if type(value) is not int or not low <= value <= high:
-        raise ReferenceProtocolError(f"{field} must be an integer in [{low}, {high}]")
-    return value
+    return require_int(value, field=field, error=ReferenceProtocolError, minimum=low, maximum=high)
 
 
 def _tuple(value: object, field: str) -> tuple:

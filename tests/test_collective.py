@@ -11,6 +11,7 @@ import json
 import pickle
 import time
 from pathlib import Path
+from unittest.mock import Mock
 
 import pytest
 
@@ -22,6 +23,8 @@ from optima.verify_collective import (  # noqa: E402
     _MAX_VERDICT_BYTES,
     _RankVerdict,
     _direct_aot_collective_callables,
+    _init_rank_process_group,
+    _rank_barrier,
     _read_rank_verdict,
     _regular_identity,
     _write_rank_verdict,
@@ -45,6 +48,61 @@ def _verify(source=ALLREDUCE_BUNDLE, **kwargs):
 
 def test_collective_kind_discriminator():
     assert get_slot("collective.all_reduce").kind == "collective"
+
+
+def test_cuda_process_group_and_barrier_bind_the_local_rank_device():
+    cuda = Mock()
+    device_factory = Mock(return_value="cuda-device-3")
+    fake_torch = Mock(cuda=cuda, device=device_factory)
+    fake_dist = Mock()
+
+    _init_rank_process_group(
+        fake_torch,
+        fake_dist,
+        backend="nccl",
+        init_method="file:///tmp/pg",
+        rank=3,
+        world_size=4,
+        device="cuda",
+    )
+    _rank_barrier(fake_dist, rank=3, device="cuda")
+
+    cuda.set_device.assert_called_once_with(3)
+    device_factory.assert_called_once_with("cuda:3")
+    fake_dist.init_process_group.assert_called_once_with(
+        backend="nccl",
+        init_method="file:///tmp/pg",
+        rank=3,
+        world_size=4,
+        device_id="cuda-device-3",
+    )
+    fake_dist.barrier.assert_called_once_with(device_ids=[3])
+
+
+def test_cpu_process_group_and_barrier_keep_gloo_call_signature():
+    fake_torch = Mock()
+    fake_dist = Mock()
+
+    _init_rank_process_group(
+        fake_torch,
+        fake_dist,
+        backend="gloo",
+        init_method="file:///tmp/pg",
+        rank=1,
+        world_size=2,
+        device="cpu",
+    )
+    _rank_barrier(fake_dist, rank=1, device="cpu")
+
+    fake_torch.cuda.set_device.assert_not_called()
+    fake_torch.device.assert_not_called()
+    fake_dist.init_process_group.assert_called_once_with(
+        backend="gloo",
+        init_method="file:///tmp/pg",
+        rank=1,
+        world_size=2,
+    )
+    fake_dist.barrier.assert_called_once_with()
 
 
 def test_collective_direct_aot_propagates_only_validator_prepare_boundary():

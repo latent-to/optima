@@ -28,12 +28,13 @@ from types import MappingProxyType
 from typing import Any
 
 from optima.engine_tree import MaterializedEngineTree, reopen_materialized_engine_tree
-from optima.stack_identity import canonical_digest, canonical_json_bytes, require_sha256_hex
+from optima.stack_identity import canonical_digest, canonical_json_bytes
 from optima.stack_manifest import (
     EngineReleaseManifest,
     IntegrationReviewRecord,
     StackManifestError,
 )
+from optima._strict import require_digest, require_exact_fields
 
 
 RELEASE_SCHEMA_VERSION = 1
@@ -76,6 +77,7 @@ _RESERVED_ENGINE_FLAGS = frozenset(
 _RUNTIME_TOP_LEVEL = frozenset(
     {
         "__init__.py",
+        "_strict.py",
         "bootstrap.py",
         "bundle_hash.py",
         "capabilities.py",
@@ -126,19 +128,13 @@ class ReleaseError(RuntimeError):
 
 
 def _digest(value: object, field: str) -> str:
-    try:
-        result = require_sha256_hex(value, field=field)
-    except ValueError as exc:
-        raise ReleaseError(str(exc)) from None
-    if result == "0" * 64:
-        raise ReleaseError(f"{field} must not be the all-zero digest")
-    return result
+    return require_digest(value, field=field, error=ReleaseError)
 
 
 def _strict(value: object, fields: set[str], name: str) -> dict[str, Any]:
-    if type(value) is not dict or set(value) != fields:
-        raise ReleaseError(f"{name} fields do not match the schema")
-    return value
+    return require_exact_fields(
+        value, fields=frozenset(fields), label=name, error=ReleaseError, exact_dict=True
+    )
 
 
 def _stable_regular(path: Path, *, limit: int = 1 << 30) -> bytes:

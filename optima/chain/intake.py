@@ -35,6 +35,17 @@ _ACTIVE = (
 )
 _TERMINAL = ("failed", "expired", "qualified")
 _STATUSES = frozenset((*_ACTIVE, *_TERMINAL, "held", "no_decision"))
+_EXPLICITLY_EXPIRABLE = (
+    "reserved", "transport_retry", "published", "promoted",
+    "reproduction_pending", "held", "no_decision",
+)
+_AUTOMATICALLY_EXPIRABLE = (
+    "reserved", "transport_retry", "published", "promoted",
+    "reproduction_pending", "held", "no_decision",
+)
+_AUTOMATIC_EXPIRY_REASON = "finalized_block_sla_expired"
+_SCHEMA3_MIGRATION_HOLD_REASON = "schema3_reproduction_required"
+_SCHEMA3_ARCHIVE_REASON_PREFIX = "schema3_archived@"
 
 
 class IntakeError(RuntimeError):
@@ -509,6 +520,7 @@ class FinalizedIntakeStore:
                 qualification_json TEXT NOT NULL,
                 attempt_ref_json TEXT NOT NULL,
                 evidence_root TEXT NOT NULL,
+                retained_block INTEGER NOT NULL DEFAULT 0 CHECK(retained_block>=0),
                 PRIMARY KEY(reservation_id, reproduction_index)
             ) STRICT;
             CREATE TABLE IF NOT EXISTS settlement_candidates (
@@ -587,6 +599,19 @@ class FinalizedIntakeStore:
                 self._db.execute(
                     f"ALTER TABLE reservations ADD COLUMN {name} {declaration}"
                 )
+        qualification_columns = {
+            row["name"] for row in self._db.execute(
+                "PRAGMA table_info(settlement_qualifications)"
+            )
+        }
+        if "retained_block" not in qualification_columns:
+            # Existing evidence predates a trustworthy progress timestamp.  Keep
+            # zero as an explicit unknown sentinel; automatic expiry must not
+            # invent a deadline for those rows.
+            self._db.execute(
+                "ALTER TABLE settlement_qualifications ADD COLUMN "
+                "retained_block INTEGER NOT NULL DEFAULT 0 CHECK(retained_block>=0)"
+            )
         settlement_columns = {
             row["name"] for row in self._db.execute(
                 "PRAGMA table_info(settlement_candidates)"
@@ -712,6 +737,10 @@ class FinalizedIntakeStore:
 
         inserted: list[str] = []
         with self._transaction():
+            # Admission capacity is finalized-chain state, not an operator-maintained
+            # cache.  Apply the already-bound arrival-block SLA in the same write
+            # transaction before counting unresolved rows.
+            self._expire_stale_rows(finalized_block)
             cursor = self._cursor()
             if cursor is not None and (
                 finalized_block < cursor[0]
@@ -744,6 +773,8 @@ class FinalizedIntakeStore:
                 status, reason = "reserved", ""
                 if not arrival.valid:
                     status, reason = "failed", arrival.invalid_reason
+                elif finalized_block - arrival.block >= self.policy.expiry_blocks:
+                    status, reason = "expired", _AUTOMATIC_EXPIRY_REASON
                 elif hotkey_count >= self.policy.max_per_hotkey_epoch:
                     status, reason = "failed", "hotkey_epoch_admission_limit"
                 elif pending >= self.policy.max_pending:
@@ -895,16 +926,38 @@ class FinalizedIntakeStore:
                 "SELECT COUNT(*) AS n FROM reservations WHERE admission_epoch=? AND target_id=?",
                 (row.admission_epoch, target_id),
             ).fetchone()["n"]
-            status, reason = "published", ""
+            status, decision, reason = "published", "", ""
             if count >= self.policy.max_per_target_epoch:
                 status, reason = "failed", "target_epoch_admission_limit"
+            if delta_fingerprint.product_kind == "discovery":
+                awarded = self._db.execute(
+                    "SELECT 1 FROM discovery_bounty_claims WHERE proposal_digest=? LIMIT 1",
+                    (delta_fingerprint.exact_payload_digest,),
+                ).fetchone()
+                predecessor = next(
+                    (
+                        prior
+                        for prior in self.all()
+                        if prior.arrival.arrival_key < row.arrival.arrival_key
+                        and prior.delta_fingerprint is not None
+                        and prior.delta_fingerprint.product_kind == "discovery"
+                        and prior.delta_fingerprint.exact_payload_digest
+                        == delta_fingerprint.exact_payload_digest
+                    ),
+                    None,
+                )
+                if awarded is not None:
+                    status, decision, reason = "failed", "FAIL", "already_awarded"
+                elif predecessor is not None:
+                    status, decision, reason = "failed", "FAIL", "duplicate_proposal"
             self._db.execute(
                 "UPDATE reservations SET status=?,target_id=?,target_members_json=?,delta_fingerprint_json=?,"
-                "publication_digest=?,publication_root=?,decision='',reason=? WHERE reservation_id=?",
+                "publication_digest=?,publication_root=?,decision=?,reason=? WHERE reservation_id=?",
                 (
                     status, target_id, json.dumps(members, separators=(",", ":")),
                     json.dumps(delta_fingerprint.to_dict(), separators=(",", ":"), sort_keys=True),
-                    publication_digest, str(publication_root), reason, reservation_id,
+                    publication_digest, str(publication_root), decision, reason,
+                    reservation_id,
                 ),
             )
         return self.get(reservation_id)
@@ -1314,6 +1367,7 @@ class FinalizedIntakeStore:
         self,
         batch,
         *,
+        current_finalized_block: int,
         evidence_root: str | Path | None = None,
     ) -> tuple[IntakeReservation, ...]:
         """Persist one typed cohort result and its retry groups atomically."""
@@ -1324,6 +1378,13 @@ class FinalizedIntakeStore:
 
         if type(batch) is not QualificationIntakeBatch:
             raise IntakeError("qualification batch is not exactly typed")
+        cursor = self._cursor()
+        if (
+            type(current_finalized_block) is not int
+            or current_finalized_block < 0
+            or (cursor is not None and current_finalized_block < cursor[0])
+        ):
+            raise IntakeError("qualification progress block is not finalized")
         if any(
             outcome.decision is QualificationDecision.PASS
             and type(outcome.settlement_qualification) is not SettlementQualification
@@ -1457,10 +1518,12 @@ class FinalizedIntakeStore:
                     self._db.execute(
                         "INSERT INTO settlement_qualifications(reservation_id,"
                         "reproduction_index,qualification_digest,qualification_json,"
-                        "attempt_ref_json,evidence_root) VALUES(?,?,?,?,?,?)",
+                        "attempt_ref_json,evidence_root,retained_block) "
+                        "VALUES(?,?,?,?,?,?,?)",
                         (
                             reservation_id, reproduction_index, qualification.digest,
                             qualification_json, attempt_json, str(root),
+                            current_finalized_block,
                         ),
                     )
                     if reproduction_index == 1:
@@ -1776,11 +1839,47 @@ class FinalizedIntakeStore:
                     (row.reservation_id,),
                 ).fetchone()
                 if economic is not None and economic["status"] in {
-                    "crowned", "neutralized", "held", "discovery_bounty"
+                    "crowned", "neutralized", "held", "discovery_bounty",
+                    "duplicate_proposal",
                 }:
                     continue
             blockers.append(row.reservation_id)
         return tuple(blockers)
+
+    def _dispose_duplicate_discovery_candidates(self) -> None:
+        """Terminally dispose legacy/recovered proposal replays before leasing."""
+
+        awarded = {
+            row["proposal_digest"]
+            for row in self._db.execute(
+                "SELECT proposal_digest FROM discovery_bounty_claims"
+            )
+        }
+        seen: set[str] = set()
+        rows = tuple(
+            self._db.execute(
+                "SELECT sc.*,r.block,r.event_index,r.event_subindex,r.hotkey,r.content_hash "
+                "FROM settlement_candidates sc JOIN reservations r USING(reservation_id) "
+                "WHERE sc.status='pending' "
+                "ORDER BY r.block,r.event_index,r.event_subindex,r.hotkey,r.content_hash"
+            )
+        )
+        for row in rows:
+            candidate = self._settlement_candidate(row)
+            if candidate.lane != "discovery":
+                continue
+            proposal = candidate.proposal_digest
+            if proposal in awarded or proposal in seen:
+                self._db.execute(
+                    "UPDATE settlement_candidates SET status='duplicate_proposal',"
+                    "lease_id='',lease_expires_block=0,reason=? WHERE reservation_id=? "
+                    "AND status='pending'",
+                    (
+                        "already_awarded" if proposal in awarded else "duplicate_proposal",
+                        candidate.reservation_digest,
+                    ),
+                )
+            seen.add(proposal)
 
     def has_pending_settlement(self) -> bool:
         """Return whether retained settlement work is waiting for a lease."""
@@ -1805,6 +1904,10 @@ class FinalizedIntakeStore:
         ):
             raise IntakeError("settlement lease bounds are malformed")
         with self._transaction():
+            # A stale unresolved predecessor must not retain economic priority
+            # after the finalized-block SLA.  Do this atomically with leasing so
+            # no caller can forget the liveness transition.
+            self._expire_stale_rows(current_block)
             self._db.execute(
                 "UPDATE settlement_candidates SET status='held',lease_id='',"
                 "lease_expires_block=0,reason='intake_no_longer_qualified' "
@@ -1818,6 +1921,7 @@ class FinalizedIntakeStore:
                 "AND lease_expires_block<=?",
                 (current_block,),
             )
+            self._dispose_duplicate_discovery_candidates()
             pending = tuple(
                 self._db.execute(
                     "SELECT sc.*,r.block,r.event_index,r.event_subindex,r.hotkey,r.content_hash "
@@ -1925,6 +2029,9 @@ class FinalizedIntakeStore:
         by_digest = {row.digest: row for row in lease.candidates}
         evidence_by_candidate = {row.candidate_digest: row for row in receipts}
         with self._transaction():
+            # Re-evaluate the same finalized-block SLA at commit time.  Opening
+            # retained evidence may cross the boundary after the lease was made.
+            self._expire_stale_rows(current_block)
             current = self.evaluation_stack(lease.stack.arena_digest)
             if current != lease.stack or self._event_head() != (
                 lease.initial_event_sequence, lease.previous_event_digest
@@ -1958,8 +2065,37 @@ class FinalizedIntakeStore:
             } != set(by_digest):
                 raise IntakeError("settlement lease is stale or incomplete")
 
+            awarded_proposals = {
+                row["proposal_digest"]
+                for row in self._db.execute(
+                    "SELECT proposal_digest FROM discovery_bounty_claims"
+                )
+            }
+            duplicate_digests = {
+                candidate.digest
+                for candidate in lease.candidates
+                if candidate.lane == "discovery"
+                and candidate.proposal_digest in awarded_proposals
+            }
+            commit_candidates = tuple(
+                candidate
+                for candidate in lease.candidates
+                if candidate.digest not in duplicate_digests
+            )
+            commit_plan = (
+                plan
+                if not duplicate_digests
+                else plan_settlement(
+                    commit_candidates,
+                    current_manifest=lease.stack.manifest,
+                    current_tree_digest=lease.stack.tree_digest,
+                    initial_event_sequence=lease.initial_event_sequence,
+                    previous_event_digest=lease.previous_event_digest,
+                )
+            )
+
             # Retire/neutralize old families before installing the winner family.
-            for event in plan.events:
+            for event in commit_plan.events:
                 if event.event_type in {
                     SettlementEventType.RETIREMENT,
                     SettlementEventType.NEUTRALIZATION,
@@ -1970,8 +2106,10 @@ class FinalizedIntakeStore:
                         (event.digest, lease.stack.arena_digest, event.target_id),
                     )
 
-            disposition: dict[str, str] = {}
-            for event in plan.events:
+            disposition: dict[str, str] = {
+                digest: "duplicate_proposal" for digest in duplicate_digests
+            }
+            for event in commit_plan.events:
                 candidate = by_digest[event.candidate_digest]
                 event_json = json.dumps(
                     event.to_dict(), separators=(",", ":"), sort_keys=True
@@ -2061,25 +2199,27 @@ class FinalizedIntakeStore:
                     "WHERE reservation_id=?",
                     (
                         status,
-                        status,
+                        "already_awarded"
+                        if status == "duplicate_proposal"
+                        else status,
                         evidence_by_candidate[digest].digest,
                         candidate.reservation_digest,
                     ),
                 )
 
-            if plan.transition is not None:
-                manifest = plan.transition.manifest
+            if commit_plan.transition is not None:
+                manifest = commit_plan.transition.manifest
                 encoded = json.dumps(
                     manifest.to_dict(), separators=(",", ":"), sort_keys=True
                 )
-                transition_id = plan.events[-1].digest
+                transition_id = commit_plan.events[-1].digest
                 cursor = self._db.execute(
                     "UPDATE evaluation_stacks SET generation=generation+1,stack_digest=?,"
                     "tree_digest=?,stack_json=?,transition_event_id=? WHERE arena_id=? "
                     "AND generation=? AND stack_digest=? AND tree_digest=?",
                     (
                         manifest.digest,
-                        plan.transition.after.tree_digest,
+                        commit_plan.transition.after.tree_digest,
                         encoded,
                         transition_id,
                         lease.stack.arena_digest,
@@ -2261,10 +2401,17 @@ class FinalizedIntakeStore:
         for claim in standing:
             by_arena.setdefault(claim.arena_digest, []).append(claim)
         states = self.evaluation_stacks()
-        if set(by_arena) - {row.arena_digest for row in states}:
+        state_ids = {row.arena_digest for row in states}
+        active_states = tuple(row for row in states if row.generation > 0)
+        active_ids = {row.arena_digest for row in active_states}
+        if set(by_arena) - state_ids:
             raise IntakeError("active reward claim belongs to an absent evaluation arena")
-        if set(catalogs) != {row.arena_digest for row in states}:
-            raise IntakeError("reward catalogs do not cover every evaluation arena")
+        if set(by_arena) - active_ids:
+            raise IntakeError("active reward claim belongs to an uncrowned evaluation arena")
+        if set(catalogs) - state_ids:
+            raise IntakeError("reward catalog names an absent evaluation arena")
+        if active_ids - set(catalogs):
+            raise IntakeError("reward catalogs do not cover every crowned evaluation arena")
         for claim in standing:
             self._reopen_claim_evidence(claim.retained_evidence_digest, "crowned")
         for claim in discovery:
@@ -2272,7 +2419,7 @@ class FinalizedIntakeStore:
                 claim.retained_evidence_digest, "discovery_bounty"
             )
         authorities = []
-        for state in states:
+        for state in active_states:
             catalog = catalogs[state.arena_digest]
             if type(catalog) is not TargetCatalog:
                 raise IntakeError("reward catalog is not exactly typed")
@@ -2305,7 +2452,7 @@ class FinalizedIntakeStore:
             projection.digest,
             context.metagraph_digest,
             projection.arena_authority_digests,
-            max((row.generation for row in states), default=0),
+            max((row.generation for row in active_states), default=0),
             context.current_block,
             len(standing),
             evidence,
@@ -2416,20 +2563,195 @@ class FinalizedIntakeStore:
             )
         return self.get(reservation_id)
 
+    def _expire_stale_rows(self, current_block: int) -> tuple[str, ...]:
+        """Expire SLA-old unresolved work inside the caller's transaction.
+
+        The arrival-block SLA bounds admission, transport, and primary qualification
+        work.  A first retained PASS resets the same SLA from its durable finalized
+        progress block, so independent reproduction gets a full bounded window
+        without regaining a permanent priority veto.  Legacy retained evidence with
+        an unknown (zero) progress block remains fail-closed for explicit operator
+        disposition.  Schema-v3 migration holds require their dedicated migration
+        path instead.
+        """
+
+        threshold = current_block - self.policy.expiry_blocks
+        if threshold < 0:
+            return ()
+        malformed = self._db.execute(
+            "SELECT r.reservation_id FROM reservations AS r WHERE "
+            "r.status='reproduction_pending' AND "
+            "((SELECT COUNT(*) FROM settlement_qualifications AS q "
+            "WHERE q.reservation_id=r.reservation_id)!=1 OR "
+            "(SELECT COUNT(*) FROM settlement_qualifications AS q "
+            "WHERE q.reservation_id=r.reservation_id "
+            "AND q.reproduction_index=0)!=1) LIMIT 1"
+        ).fetchone()
+        if malformed is not None:
+            raise IntakeError("reproduction-pending authority is inconsistent")
+        malformed_block = self._db.execute(
+            "SELECT reservation_id FROM settlement_qualifications WHERE "
+            "retained_block<0 OR retained_block>? LIMIT 1",
+            (current_block,),
+        ).fetchone()
+        if malformed_block is not None:
+            raise IntakeError("retained qualification block is not finalized")
+        placeholders = ",".join("?" for _ in _AUTOMATICALLY_EXPIRABLE)
+        predicate = (
+            f"r.status IN ({placeholders}) AND r.reason!=? AND ("
+            "(r.block<=? AND NOT EXISTS ("
+            "SELECT 1 FROM settlement_qualifications AS q "
+            "WHERE q.reservation_id=r.reservation_id)) OR EXISTS ("
+            "SELECT 1 FROM settlement_qualifications AS q "
+            "WHERE q.reservation_id=r.reservation_id "
+            "AND q.reproduction_index=0 AND q.retained_block>0 "
+            "AND q.retained_block<=?))"
+        )
+        rows = tuple(
+            row["reservation_id"]
+            for row in self._db.execute(
+                f"SELECT r.reservation_id FROM reservations AS r WHERE {predicate} "
+                "ORDER BY r.block,r.event_index,r.event_subindex,r.hotkey,r.content_hash",
+                (
+                    *_AUTOMATICALLY_EXPIRABLE,
+                    _SCHEMA3_MIGRATION_HOLD_REASON,
+                    threshold,
+                    threshold,
+                ),
+            )
+        )
+        if rows:
+            self._db.execute(
+                f"UPDATE reservations AS r SET status='expired',decision='NO_DECISION',"
+                f"reason=? WHERE {predicate}",
+                (
+                    _AUTOMATIC_EXPIRY_REASON,
+                    *_AUTOMATICALLY_EXPIRABLE,
+                    _SCHEMA3_MIGRATION_HOLD_REASON,
+                    threshold,
+                    threshold,
+                ),
+            )
+        return rows
+
+    def expire_stale(self, *, current_block: int) -> tuple[IntakeReservation, ...]:
+        """Apply finalized-block arrival/progress SLAs to eligible unresolved work."""
+
+        if type(current_block) is not int or current_block < 0:
+            raise IntakeError("automatic expiry block is malformed")
+        with self._transaction():
+            expired = self._expire_stale_rows(current_block)
+        return tuple(self.get(reservation_id) for reservation_id in expired)
+
     def expire(self, reservation_id: str, *, current_block: int, reason: str) -> IntakeReservation:
         row = self.get(reservation_id)
+        if row.reason == _SCHEMA3_MIGRATION_HOLD_REASON:
+            raise IntakeError(
+                "legacy single-PASS settlement requires explicit archival migration"
+            )
+        if not isinstance(reason, str) or not reason:
+            raise IntakeError("explicit expiry requires an operator reason")
         if type(current_block) is not int or current_block - row.arrival.block < self.policy.expiry_blocks:
             raise IntakeError("reservation is not old enough for explicit expiry")
         return self._transition(
             reservation_id,
-            {
-                "reserved", "transport_retry", "published", "promoted",
-                "reproduction_pending", "held", "no_decision",
-            },
+            set(_EXPLICITLY_EXPIRABLE),
             "expired",
             "NO_DECISION",
             reason,
         )
+
+    def archive_schema3_migration_hold(
+        self,
+        reservation_id: str,
+        *,
+        current_finalized_block: int,
+        reason: str,
+    ) -> IntakeReservation:
+        """Terminally archive one exact schema-v3 migration hold.
+
+        This is deliberately narrower than generic expiry/release.  It preserves
+        the retained candidate and qualification rows, cannot make them pending or
+        crownable, and only removes the reservation's permanent queue/priority veto
+        after an operator supplies a bounded audit reason at a finalized height.
+        """
+
+        if (
+            type(current_finalized_block) is not int
+            or current_finalized_block < 0
+            or not isinstance(reason, str)
+            or not reason
+            or reason.strip() != reason
+            or any(ord(char) < 32 or ord(char) == 127 for char in reason)
+        ):
+            raise IntakeError("schema3 archival authority is malformed")
+        archive_reason = (
+            f"{_SCHEMA3_ARCHIVE_REASON_PREFIX}{current_finalized_block}:{reason}"
+        )
+        if len(archive_reason) > 2_048:
+            raise IntakeError("schema3 archival reason is oversized")
+
+        with self._transaction():
+            row = self.get(reservation_id)
+            if (
+                row.status != "held"
+                or row.reason != _SCHEMA3_MIGRATION_HOLD_REASON
+                or current_finalized_block < row.arrival.block
+            ):
+                raise IntakeError(
+                    "only an exact schema3 reproduction migration hold may be archived"
+                )
+            candidate_row = self._db.execute(
+                "SELECT * FROM settlement_candidates WHERE reservation_id=?",
+                (reservation_id,),
+            ).fetchone()
+            if candidate_row is None:
+                raise IntakeError("schema3 migration hold lacks retained settlement authority")
+            # Legacy candidate bytes may predate the current two-PASS parser.
+            # Preserve them verbatim rather than pretending to regrade them; this
+            # transition only removes priority and can never make them crownable.
+            if (
+                not candidate_row["candidate_json"]
+                or require_sha256_hex(
+                    candidate_row["candidate_digest"], field="candidate_digest"
+                )
+                != candidate_row["candidate_digest"]
+                or candidate_row["status"] != "held"
+                or candidate_row["reason"] != _SCHEMA3_MIGRATION_HOLD_REASON
+                or candidate_row["lease_id"]
+                or candidate_row["lease_expires_block"] != 0
+                or candidate_row["settlement_evidence_digest"]
+                or self._db.execute(
+                    "SELECT 1 FROM settlement_events WHERE reservation_id=? LIMIT 1",
+                    (reservation_id,),
+                ).fetchone()
+                is not None
+            ):
+                raise IntakeError(
+                    "schema3 migration hold has settlement authority that cannot be archived"
+                )
+            reservation_update = self._db.execute(
+                "UPDATE reservations SET status='expired',decision='NO_DECISION',"
+                "reason=? WHERE reservation_id=? AND status='held' AND reason=?",
+                (
+                    archive_reason,
+                    reservation_id,
+                    _SCHEMA3_MIGRATION_HOLD_REASON,
+                ),
+            )
+            candidate_update = self._db.execute(
+                "UPDATE settlement_candidates SET reason=? WHERE reservation_id=? "
+                "AND status='held' AND reason=? AND lease_id='' "
+                "AND lease_expires_block=0 AND settlement_evidence_digest=''",
+                (
+                    archive_reason,
+                    reservation_id,
+                    _SCHEMA3_MIGRATION_HOLD_REASON,
+                ),
+            )
+            if reservation_update.rowcount != 1 or candidate_update.rowcount != 1:
+                raise IntakeError("schema3 migration hold changed during archival")
+        return self.get(reservation_id)
 
     def release_hold(self, reservation_id: str, *, reason: str) -> IntakeReservation:
         if not reason:
@@ -2438,7 +2760,7 @@ class FinalizedIntakeStore:
             row = self.get(reservation_id)
             if row.status not in {"held", "no_decision"}:
                 raise IntakeError("only held intake may be released")
-            if row.reason == "schema3_reproduction_required":
+            if row.reason == _SCHEMA3_MIGRATION_HOLD_REASON:
                 raise IntakeError(
                     "legacy single-PASS settlement requires explicit archival migration"
                 )
@@ -2475,8 +2797,11 @@ class SQLiteWeightPublicationJournal:
         self.store = store
         self.projection = projection
 
-    def _head(self) -> tuple[str, str] | None:
-        row = self.store._db.execute(
+    @staticmethod
+    def _read_head(
+        store: FinalizedIntakeStore,
+    ) -> tuple[str, str] | None:
+        row = store._db.execute(
             "SELECT value FROM metadata WHERE key='weight_publication_head'"
         ).fetchone()
         if row is None:
@@ -2492,6 +2817,52 @@ class SQLiteWeightPublicationJournal:
         require_sha256_hex(value["projection_digest"], field="projection_digest")
         require_sha256_hex(value["record_digest"], field="record_digest")
         return value["projection_digest"], value["record_digest"]
+
+    def _head(self) -> tuple[str, str] | None:
+        return self._read_head(self.store)
+
+    @classmethod
+    def reopen_from_head(
+        cls,
+        store: FinalizedIntakeStore,
+    ) -> "SQLiteWeightPublicationJournal":
+        """Reopen the exact retained projection bound to the verified journal head."""
+
+        from optima.chain.weights import WeightProjection, WeightPublicationError
+
+        if type(store) is not FinalizedIntakeStore:
+            raise IntakeError("weight publication journal store is not exactly typed")
+        head = cls._read_head(store)
+        if head is None:
+            raise IntakeError("weight publication journal has no retained head")
+        row = store._db.execute(
+            "SELECT projection_digest,projection_json FROM weight_publications "
+            "WHERE record_digest=?",
+            (head[1],),
+        ).fetchone()
+        if row is None or row["projection_digest"] != head[0]:
+            raise IntakeError("weight publication head has no retained projection")
+        try:
+            projection = WeightProjection.from_dict(
+                json.loads(row["projection_json"])
+            )
+        except (
+            TypeError,
+            ValueError,
+            json.JSONDecodeError,
+            WeightPublicationError,
+        ) as exc:
+            raise IntakeError(f"weight projection is corrupt: {exc}") from None
+        if projection.digest != head[0]:
+            raise IntakeError("retained weight projection differs from journal head")
+        journal = cls(store, projection)
+        try:
+            record = journal.load()
+        except WeightPublicationError as exc:
+            raise IntakeError(f"weight publication record is corrupt: {exc}") from None
+        if record is None or record.digest != head[1]:
+            raise IntakeError("weight publication head cannot be reopened")
+        return journal
 
     def load(self) -> WeightPublicationRecord | None:
         from optima.chain.weights import WeightPublicationRecord

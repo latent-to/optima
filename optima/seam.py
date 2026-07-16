@@ -18,6 +18,7 @@ import stat
 import sys
 from importlib import abc, import_module, machinery
 from pathlib import Path
+from optima._strict import truthy_flag
 
 logger = logging.getLogger("optima.seam")
 _ENGINE_TREE = "/optima/engine-tree"
@@ -70,8 +71,7 @@ def _install_materialized_namespace() -> bool:
     return True
 
 
-def _truthy(v: str | None) -> bool:
-    return (v or "").strip().lower() in ("1", "true", "yes", "on")
+_truthy = truthy_flag
 
 
 def _release_abort(message: str) -> None:

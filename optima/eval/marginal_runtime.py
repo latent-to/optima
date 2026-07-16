@@ -34,11 +34,13 @@ from optima.eval.oci_backend import (
     expected_runtime_preflight,
     runtime_identity_from_preflight,
 )
-from optima.eval.oci_outer_session import SessionExecutionPlan
+from optima.eval.oci_outer_session import (
+    OuterSessionWorkerError,
+    SessionExecutionPlan,
+)
 from optima.eval.runtime_preflight import RuntimePreflightReceipt
 from optima.discovery import DiscoveryArmPlan, reopen_discovery_engine_binding
 from optima.discovery_overlay import DiscoveryActivationReceipt
-from optima.stack_identity import require_sha256_hex
 from optima.stack_manifest import (
     EvaluationStackContext,
     EvaluationStackManifest,
@@ -47,6 +49,7 @@ from optima.stack_manifest import (
 )
 from optima.stack_plan import CohortPlan, MarginalArmPlan, StackPlanError
 from optima.target_catalog import TargetCatalog
+from optima._strict import require_digest
 
 
 _TREE_METADATA = "metadata/optima_engine_tree.json"
@@ -75,11 +78,37 @@ class EngineExecutor(Protocol):
 
 
 def _digest(value: object, *, field: str) -> str:
-    try:
-        result = require_sha256_hex(value, field=field)
-    except ValueError as exc:
-        raise MarginalRuntimeError(str(exc)) from exc
-    return result
+    return require_digest(value, field=field, error=MarginalRuntimeError)
+
+
+class CandidateArmWorkerError(RuntimeError):
+    """One valid worker error emitted while an exact C arm was active."""
+
+    def __init__(
+        self,
+        *,
+        candidate_index: int,
+        selected_delta_digest: str,
+        arm_digest: str,
+        launch_digest: str,
+        worker_error: OuterSessionWorkerError,
+    ) -> None:
+        if type(candidate_index) is not int or candidate_index < 0:
+            raise MarginalRuntimeError("candidate worker index is malformed")
+        if type(worker_error) is not OuterSessionWorkerError:
+            raise MarginalRuntimeError("candidate worker failure is not exactly typed")
+        self.candidate_index = candidate_index
+        self.selected_delta_digest = _digest(
+            selected_delta_digest, field="candidate worker selected delta"
+        )
+        self.arm_digest = _digest(arm_digest, field="candidate worker arm")
+        self.launch_digest = _digest(launch_digest, field="candidate worker launch")
+        self.worker_error = worker_error
+        super().__init__(
+            "candidate arm worker failed "
+            f"at index {candidate_index} for delta {self.selected_delta_digest}, "
+            f"arm {self.arm_digest}, launch {self.launch_digest}: {worker_error}"
+        )
 
 
 def _native_environment(binding: TrustedLaunchBinding) -> dict[str, object]:
@@ -288,12 +317,22 @@ class CandidateLifecycleEvidence:
 
 @dataclass(frozen=True)
 class MarginalLifecycleEvidence:
-    """Complete raw lifecycle facts; deliberately has no score or canonical verdict."""
+    """Complete raw lifecycle facts; deliberately has no score or canonical verdict.
+
+    The default shape is the historical ``B, C1..Ck, B'``. With repeated candidate
+    reads (speed evidence policy, 2026-07-16: one C read cannot measure the
+    candidate's own boot draw — 7.2% spread was measured between two honest
+    candidate legs at fixed work), the run extends to ``B, C1..Ck, B', C1'..Ck',
+    B''`` and the extra legs land in ``candidates_repeat`` / ``baseline_third`` —
+    both present or both absent, so a repeat read is always bookended.
+    """
 
     prepared: PreparedMarginalRuntime
     baseline_before: EngineExecutionEvidence
     candidates: tuple[CandidateLifecycleEvidence, ...]
     baseline_after: EngineExecutionEvidence
+    candidates_repeat: tuple[CandidateLifecycleEvidence, ...] = ()
+    baseline_third: EngineExecutionEvidence | None = None
 
     def __post_init__(self) -> None:
         if type(self.prepared) is not PreparedMarginalRuntime:
@@ -303,6 +342,7 @@ class MarginalLifecycleEvidence:
         ) is not EngineExecutionEvidence:
             raise MarginalRuntimeError("baseline lifecycle evidence has the wrong type")
         object.__setattr__(self, "candidates", tuple(self.candidates))
+        object.__setattr__(self, "candidates_repeat", tuple(self.candidates_repeat))
         if not self.candidates or any(
             type(row) is not CandidateLifecycleEvidence for row in self.candidates
         ):
@@ -314,6 +354,27 @@ class MarginalLifecycleEvidence:
             != self.prepared.candidates
         ):
             raise MarginalRuntimeError("lifecycle evidence was relabeled or reordered")
+        if bool(self.candidates_repeat) != (self.baseline_third is not None):
+            raise MarginalRuntimeError(
+                "repeated candidate reads require the third baseline bookend (and vice versa)"
+            )
+        if self.candidates_repeat:
+            if any(
+                type(row) is not CandidateLifecycleEvidence
+                for row in self.candidates_repeat
+            ) or tuple(row.candidate for row in self.candidates_repeat) != self.prepared.candidates:
+                raise MarginalRuntimeError("repeat-read lifecycle rows were relabeled or reordered")
+            if (
+                type(self.baseline_third) is not EngineExecutionEvidence
+                or self.baseline_third.launch_digest != self.prepared.baseline_launch.digest
+            ):
+                raise MarginalRuntimeError("third baseline lifecycle evidence has the wrong type")
+
+    @property
+    def final_baseline(self) -> EngineExecutionEvidence:
+        """The last baseline executed — B'' when repeat reads ran, else B-prime.
+        Teardown/quiescence ordering must bind to THIS leg."""
+        return self.baseline_third if self.baseline_third is not None else self.baseline_after
 
     @property
     def source(self) -> RuntimeSource:
@@ -769,11 +830,22 @@ def run_marginal_lifecycle(
     executor: EngineExecutor,
     model_mount: TrustedArenaModelMountReceipt,
     deadline: float,
+    candidate_reads: int = 1,
 ) -> MarginalLifecycleEvidence:
-    """Execute exactly B,C1..Ck,B-prime or raise without a partial receipt."""
+    """Execute exactly B,C1..Ck,B-prime — or, with ``candidate_reads=2``, the
+    extended B,C1..Ck,B',C1'..Ck',B'' — or raise without a partial receipt.
+
+    ``candidate_reads`` is an evidence-GENERATION policy, not a grading threshold:
+    more reads let the scorer measure the candidate's own boot draw (score_speedup
+    gates on the worse of baseline/candidate spread when two reads exist). It
+    deliberately lives here, not in SpeedCalibration, so calibration digests are
+    untouched and the historical single-read shape stays the default.
+    """
 
     if type(prepared) is not PreparedMarginalRuntime:
         raise MarginalRuntimeError("prepared runtime has the wrong type")
+    if type(candidate_reads) is not int or candidate_reads not in (1, 2):
+        raise MarginalRuntimeError("candidate_reads must be exactly 1 or 2")
     _validate_prepared_runtime(prepared)
     if type(model_mount) is not TrustedArenaModelMountReceipt:
         raise MarginalRuntimeError("model_mount has the wrong type")
@@ -832,12 +904,21 @@ def run_marginal_lifecycle(
         prepared.baseline_session_plan,
     )
     candidates: list[CandidateLifecycleEvidence] = []
-    for candidate in prepared.candidates:
-        execution = execute(
-            candidate.launch,
-            candidate.binding.launch_binding,
-            candidate.session_plan,
-        )
+    for candidate_index, candidate in enumerate(prepared.candidates):
+        try:
+            execution = execute(
+                candidate.launch,
+                candidate.binding.launch_binding,
+                candidate.session_plan,
+            )
+        except OuterSessionWorkerError as exc:
+            raise CandidateArmWorkerError(
+                candidate_index=candidate_index,
+                selected_delta_digest=candidate.arm.selected_delta_digest,
+                arm_digest=candidate.arm.digest,
+                launch_digest=candidate.launch.digest,
+                worker_error=exc,
+            ) from exc
         candidates.append(
             CandidateLifecycleEvidence(
                 candidate,
@@ -849,15 +930,51 @@ def run_marginal_lifecycle(
         prepared.incumbent_binding.launch_binding,
         prepared.baseline_session_plan,
     )
+    candidates_repeat: list[CandidateLifecycleEvidence] = []
+    baseline_third: EngineExecutionEvidence | None = None
+    if candidate_reads == 2:
+        for candidate_index, candidate in enumerate(prepared.candidates):
+            try:
+                execution = execute(
+                    candidate.launch,
+                    candidate.binding.launch_binding,
+                    candidate.session_plan,
+                )
+            except OuterSessionWorkerError as exc:
+                # C-prime is candidate-owned to exactly the same degree as C.  Do
+                # not let a repeat-read worker failure fall through as a shared
+                # B/B-prime/B-double-prime infrastructure failure and strand the
+                # rest of a cohort.
+                raise CandidateArmWorkerError(
+                    candidate_index=candidate_index,
+                    selected_delta_digest=candidate.arm.selected_delta_digest,
+                    arm_digest=candidate.arm.digest,
+                    launch_digest=candidate.launch.digest,
+                    worker_error=exc,
+                ) from exc
+            candidates_repeat.append(
+                CandidateLifecycleEvidence(
+                    candidate,
+                    execution,
+                )
+            )
+        baseline_third = execute(
+            prepared.baseline_launch,
+            prepared.incumbent_binding.launch_binding,
+            prepared.baseline_session_plan,
+        )
     return MarginalLifecycleEvidence(
         prepared,
         baseline_before,
         tuple(candidates),
         baseline_after,
+        tuple(candidates_repeat),
+        baseline_third,
     )
 
 
 __all__ = [
+    "CandidateArmWorkerError",
     "CandidateLifecycleEvidence",
     "EngineExecutor",
     "MarginalLifecycleEvidence",

@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING, Any, Iterable, Mapping, Sequence
 
 from optima.seams import normalize_seam_bindings
 from optima.stack_identity import canonical_digest
+from optima._strict import require_digest
 
 if TYPE_CHECKING:
     from optima.discovery_overlay import DiscoveryActivationReceipt
@@ -48,7 +49,6 @@ MAX_ERROR_CHARS = 16_384
 CONTAINER_MODEL_PATH = "/optima/input/model"
 
 _HEX_128 = re.compile(r"[0-9a-f]{32}\Z")
-_HEX_256 = re.compile(r"[0-9a-f]{64}\Z")
 _TOKEN = re.compile(r"[A-Za-z0-9_.:+/@-]{1,256}\Z")
 _ARCHITECTURE = re.compile(r"sm[0-9]{2,3}[a-z]?\Z")
 
@@ -122,13 +122,7 @@ def _optional_token(value: object, *, field_name: str) -> str | None:
 
 
 def _digest(value: object, *, field_name: str) -> str:
-    if (
-        not isinstance(value, str)
-        or _HEX_256.fullmatch(value) is None
-        or value == "0" * 64
-    ):
-        raise SessionProtocolError(f"{field_name} must be a nonzero lowercase SHA-256 digest")
-    return value
+    return require_digest(value, field=field_name, error=SessionProtocolError)
 
 
 def _binding_id(value: object, *, field_name: str) -> str:

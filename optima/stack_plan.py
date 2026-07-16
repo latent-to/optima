@@ -10,7 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Iterable
 
-from optima.stack_identity import canonical_digest, require_sha256_hex
+from optima.stack_identity import canonical_digest
 from optima.stack_manifest import (
     ContributionRef,
     EvaluationStackContext,
@@ -19,6 +19,7 @@ from optima.stack_manifest import (
     ProposalContributionRef,
 )
 from optima.target_catalog import TargetCatalog, TargetResolutionError
+from optima._strict import require_digest
 
 
 _PLAN_SCHEMA_VERSION = 1
@@ -34,10 +35,7 @@ class StaleStackPlanError(StackPlanError):
 
 
 def _digest(value: object, *, field: str) -> str:
-    try:
-        return require_sha256_hex(value, field=field)
-    except ValueError as exc:
-        raise StackPlanError(str(exc)) from exc
+    return require_digest(value, field=field, error=StackPlanError)
 
 
 def _ref_dict(ref: ContributionRef) -> dict[str, object]:

@@ -13,6 +13,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable
+from optima._strict import require_digest, require_identifier, require_int
 
 if TYPE_CHECKING:
     from optima.settlement import SettlementQualification
@@ -46,13 +47,13 @@ from optima.eval.qualification_runner import (
     run_causal_qualification,
 )
 from optima.eval.oci_backend import OCIBackendError
-from optima.eval.oci_outer_session import OuterSessionProcessError
-from optima.eval.scoring import RawSpeedEvidenceError
-from optima.stack_identity import (
-    canonical_digest,
-    canonical_json_bytes,
-    require_sha256_hex,
+from optima.eval.oci_outer_session import (
+    OuterSessionProcessError,
+    OuterSessionWorkerError,
 )
+from optima.eval.marginal_runtime import CandidateArmWorkerError
+from optima.eval.scoring import RawSpeedEvidenceError
+from optima.stack_identity import canonical_digest, canonical_json_bytes
 
 
 AUTHORITY_SCHEMA_VERSION = 1
@@ -66,25 +67,17 @@ class QualificationIntakeError(ValueError):
 
 
 def _digest(value: object, field: str) -> str:
-    try:
-        result = require_sha256_hex(value, field=field)
-    except ValueError as exc:
-        raise QualificationIntakeError(str(exc)) from None
-    if result == "0" * 64:
-        raise QualificationIntakeError(f"{field} must not be the all-zero digest")
-    return result
+    return require_digest(value, field=field, error=QualificationIntakeError)
 
 
 def _identifier(value: object, field: str) -> str:
-    if not isinstance(value, str) or _IDENTIFIER.fullmatch(value) is None:
-        raise QualificationIntakeError(f"{field} is not a canonical identifier")
-    return value
+    return require_identifier(
+        value, field=field, error=QualificationIntakeError, pattern=_IDENTIFIER
+    )
 
 
 def _integer(value: object, field: str) -> int:
-    if type(value) is not int or value < 0:
-        raise QualificationIntakeError(f"{field} must be a nonnegative integer")
-    return value
+    return require_int(value, field=field, error=QualificationIntakeError, minimum=0)
 
 
 @dataclass(frozen=True)
@@ -787,6 +780,26 @@ def run_qualification_intake(
         return _no_decision_batch(manifest, exc, reason="raw_speed_evidence")
     except OuterSessionProcessError as exc:
         return _no_decision_batch(manifest, exc, reason="outer_session_process")
+    except CandidateArmWorkerError as exc:
+        # The marginal lifecycle creates this type only while an exact C arm is
+        # active.  A failed multi-candidate run has no complete causal evidence,
+        # so retain NO_DECISION and use manifest-bound bisection; the offending
+        # singleton is eventually held while unrelated retry groups continue.
+        if (
+            exc.candidate_index >= len(manifest.reservations)
+            or manifest.reservations[
+                exc.candidate_index
+            ].selected_delta_digest
+            != exc.selected_delta_digest
+        ):
+            raise QualificationIntakeError(
+                "candidate worker identity differs from intake authority"
+            ) from exc
+        return _no_decision_batch(manifest, exc, reason="candidate_worker")
+    except OuterSessionWorkerError as exc:
+        # Raw worker errors can come from B/B-prime or pristine T.  They are
+        # shared-authority failures, never evidence against a candidate arm.
+        return _no_decision_batch(manifest, exc, reason="outer_session_worker")
     except OCIBackendError as exc:
         return _no_decision_batch(manifest, exc, reason="oci_backend")
     except QualificationRunnerError as exc:

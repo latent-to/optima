@@ -4,6 +4,8 @@ import hashlib
 import json
 import os
 import stat
+import subprocess
+import sys
 import zipfile
 from dataclasses import replace
 from pathlib import Path
@@ -284,11 +286,34 @@ def test_runtime_source_and_wheel_double_build_and_exclude_subnet_code(tmp_path:
     with zipfile.ZipFile(wheel) as archive:
         names = set(archive.namelist())
         assert {"optima/bootstrap.py", "optima/release_runtime.py", "optima_engine_bootstrap.pth"} <= names
+        assert "optima/_strict.py" in names
         assert "optima/eval/native_artifact.py" in names
         assert not any(name.startswith("optima/chain/") for name in names)
         assert "optima/commit_reveal.py" not in names
         assert "optima/settlement.py" not in names
         assert "optima/cli.py" not in names
+        target = tmp_path / "clean-wheel-target"
+        archive.extractall(target)
+    imports = (
+        "optima._strict",
+        "optima.seam",
+        "optima.bootstrap",
+        "optima.integrations.sglang_plugin",
+        "optima.release_runtime",
+    )
+    code = (
+        "import importlib,sys;"
+        f"sys.path.insert(0,{str(target)!r});"
+        f"[importlib.import_module(name) for name in {imports!r}]"
+    )
+    completed = subprocess.run(
+        [sys.executable, "-I", "-c", code],
+        cwd=tmp_path,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode == 0, completed.stderr
 
 
 def test_integration_record_is_required_and_cannot_be_an_opaque_digest(tmp_path: Path) -> None:

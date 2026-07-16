@@ -7,6 +7,7 @@ import pytest
 import optima.eval.qualification_intake as intake
 from optima.eval.evidence_store import EvidenceArtifactRef
 from optima.eval.oci_backend import OCIBackendError
+from optima.eval.marginal_runtime import CandidateArmWorkerError
 from optima.eval.oci_outer_session import (
     OuterSessionProcessError,
     OuterSessionWorkerError,
@@ -396,18 +397,119 @@ def test_cohort_failure_is_no_decision_with_deterministic_bisection(
     )
 
 
-def test_candidate_worker_error_is_not_reclassified_as_infrastructure(
+def test_candidate_worker_error_is_contained_by_deterministic_bisection(
     monkeypatch,
 ) -> None:
-    plan, manifest = _fake_plan(monkeypatch, count=2)
-    failure = OuterSessionWorkerError("candidate engine raised")
+    plan, manifest = _fake_plan(monkeypatch, count=3)
+    failure = CandidateArmWorkerError(
+        candidate_index=1,
+        selected_delta_digest=manifest.reservations[1].selected_delta_digest,
+        arm_digest=_d("candidate-arm"),
+        launch_digest=_d("candidate-launch"),
+        worker_error=OuterSessionWorkerError("candidate engine raised"),
+    )
     monkeypatch.setattr(
         intake,
         "run_causal_qualification",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(failure),
     )
 
-    with pytest.raises(OuterSessionWorkerError, match="candidate engine"):
+    result = intake.run_qualification_intake(
+        _factory(plan, manifest),
+        executor=object(),
+        entropy_provider=lambda *_args: None,
+        hidden_judge=lambda **_kwargs: None,
+        deadline=100.0,
+    )
+
+    assert all(
+        row.decision is QualificationDecision.NO_DECISION
+        and row.retryable
+        and row.reason == "candidate_worker"
+        and row.report_digest is None
+        and row.failure_digest is not None
+        for row in result.outcomes
+    )
+    assert result.attempt_ref is None
+    assert result.retry_plan is not None
+    assert result.retry_plan.strategy == "bisect"
+    assert result.retry_plan.reservation_groups == (
+        (manifest.reservations[0].reservation_digest,),
+        tuple(row.reservation_digest for row in manifest.reservations[1:]),
+    )
+
+
+@pytest.mark.parametrize("source", ("baseline", "reference"))
+def test_shared_worker_error_is_not_attributed_to_candidate(
+    monkeypatch, source: str
+) -> None:
+    plan, manifest = _fake_plan(monkeypatch, count=2)
+    monkeypatch.setattr(
+        intake,
+        "run_causal_qualification",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            OuterSessionWorkerError(f"{source} worker raised")
+        ),
+    )
+
+    result = intake.run_qualification_intake(
+        _factory(plan, manifest),
+        executor=object(),
+        entropy_provider=lambda *_args: None,
+        hidden_judge=lambda **_kwargs: None,
+        deadline=100.0,
+    )
+
+    assert all(
+        row.decision is QualificationDecision.NO_DECISION
+        and row.reason == "outer_session_worker"
+        and row.reason != "candidate_worker"
+        for row in result.outcomes
+    )
+    assert result.retry_plan is not None
+    assert result.retry_plan.strategy == "bisect"
+
+
+def test_candidate_worker_identity_mismatch_is_a_controller_failure(
+    monkeypatch,
+) -> None:
+    plan, manifest = _fake_plan(monkeypatch, count=2)
+    failure = CandidateArmWorkerError(
+        candidate_index=1,
+        selected_delta_digest=manifest.reservations[0].selected_delta_digest,
+        arm_digest=_d("candidate-arm"),
+        launch_digest=_d("candidate-launch"),
+        worker_error=OuterSessionWorkerError("candidate engine raised"),
+    )
+    monkeypatch.setattr(
+        intake,
+        "run_causal_qualification",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(failure),
+    )
+
+    with pytest.raises(
+        intake.QualificationIntakeError, match="candidate worker identity"
+    ):
+        intake.run_qualification_intake(
+            _factory(plan, manifest),
+            executor=object(),
+            entropy_provider=lambda *_args: None,
+            hidden_judge=lambda **_kwargs: None,
+            deadline=100.0,
+        )
+
+
+def test_unexpected_controller_failure_still_propagates(monkeypatch) -> None:
+    plan, manifest = _fake_plan(monkeypatch, count=2)
+    monkeypatch.setattr(
+        intake,
+        "run_causal_qualification",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("controller invariant failed")
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="controller invariant failed"):
         intake.run_qualification_intake(
             _factory(plan, manifest),
             executor=object(),

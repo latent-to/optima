@@ -15,6 +15,7 @@ import stat
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+from optima._strict import truthy_flag
 
 logger = logging.getLogger("optima.flashinfer_overlay")
 
@@ -84,8 +85,7 @@ def _load_only_generator(module):
     return generate
 
 
-def _truthy(value: str | None) -> bool:
-    return (value or "").strip().lower() in ("1", "true", "yes", "on")
+_truthy = truthy_flag
 
 
 def _active_overlays():

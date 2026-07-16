@@ -24,11 +24,8 @@ from optima.eval.native_artifact import (
     publish_native_artifact,
     reopen_native_artifact,
 )
-from optima.stack_identity import (
-    StackIdentityError,
-    canonical_digest,
-    require_sha256_hex,
-)
+from optima.stack_identity import canonical_digest
+from optima._strict import require_digest
 
 
 _SCHEMA = "optima.worker-bundle-publication.v1"
@@ -131,13 +128,7 @@ class WorkerBundlePublication:
 
 
 def _digest(value: object, *, field: str) -> str:
-    try:
-        result = require_sha256_hex(value, field=field)
-    except StackIdentityError as exc:
-        raise WorkerBundlePublicationError(str(exc)) from None
-    if result == "0" * 64:
-        raise WorkerBundlePublicationError(f"{field} must not be the all-zero digest")
-    return result
+    return require_digest(value, field=field, error=WorkerBundlePublicationError)
 
 
 def _excluded(relative: PurePosixPath) -> bool:

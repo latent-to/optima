@@ -38,6 +38,7 @@ _EXPECTED_SUBTENSOR_METHODS: tuple[tuple[str, str], ...] = (
     ("set_weights", "push king-of-the-hill weights on-chain (auto-routes to the "
                     "drand commit-reveal path when the subnet enables it)"),
     ("metagraph", "read uids / hotkeys / stake / validator_permit"),
+    ("weights", "read the validator sparse row at an exact historical block"),
     ("get_all_commitments", "read every hotkey's commitment (the salted commit hash)"),
     ("set_commitment", "miner posts a commitment on-chain"),
     ("set_reveal_commitment", "miner posts the timelock-encrypted submission payload"),
@@ -48,6 +49,13 @@ _EXPECTED_SUBTENSOR_METHODS: tuple[tuple[str, str], ...] = (
     ("get_block_hash", "block hash -> prompt seed (consensus + anti-prebake)"),
 )
 _REVEAL_STORAGE_ABI_VERSIONS = frozenset({"10.3.2"})
+_REQUIRED_METHOD_PARAMETERS: dict[str, frozenset[str]] = {
+    "metagraph": frozenset({"block"}),
+    "weights": frozenset({"block"}),
+    "set_weights": frozenset(
+        {"wait_for_inclusion", "wait_for_finalization"}
+    ),
+}
 
 
 def run_checks() -> list[Check]:
@@ -91,9 +99,46 @@ def run_checks() -> list[Check]:
             add(f"subtensor.{method}", False, f"MISSING — {why}")
             continue
         try:
-            sig = f"({', '.join(inspect.signature(fn).parameters)})"
+            signature = inspect.signature(fn)
+            sig = f"({', '.join(signature.parameters)})"
         except (ValueError, TypeError):
-            sig = "(signature unavailable)"
+            add(
+                f"subtensor.{method}",
+                method not in _REQUIRED_METHOD_PARAMETERS,
+                (
+                    "signature unavailable — cannot verify finalized weight ABI; "
+                    if method in _REQUIRED_METHOD_PARAMETERS
+                    else "signature unavailable; "
+                )
+                + why,
+            )
+            continue
+        has_kwargs = any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in signature.parameters.values()
+        )
+        missing = sorted(
+            parameter
+            for parameter in _REQUIRED_METHOD_PARAMETERS.get(method, ())
+            if parameter not in signature.parameters and not has_kwargs
+        )
+        if missing:
+            add(
+                f"subtensor.{method}",
+                False,
+                f"missing required parameters {missing}; {why}; sig {sig}",
+            )
+            continue
+        if method == "set_weights" and not has_kwargs:
+            finalization_default = signature.parameters["wait_for_finalization"].default
+            if finalization_default is not True:
+                add(
+                    f"subtensor.{method}",
+                    False,
+                    "wait_for_finalization must default to True; "
+                    f"{why}; sig {sig}",
+                )
+                continue
         add(f"subtensor.{method}", True, f"{why}; sig {sig}")
 
     # Discovery: the commitment / weight / metagraph member families. Names vary by

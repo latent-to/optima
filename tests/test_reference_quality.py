@@ -246,7 +246,7 @@ def test_strict_parser_rejects_extra_fields_and_noncanonical_decimals() -> None:
     calibration = _calibration()
     raw = _evidence(calibration).to_dict()
     raw["decision"] = "PASS"
-    with pytest.raises(ReferenceQualityError, match="fields do not match"):
+    with pytest.raises(ReferenceQualityError, match="fields mismatch"):
         ReferenceQualityEvidence.from_dict(raw)
     with pytest.raises(ReferenceQualityError, match="canonical"):
         TeacherNLLEvidence(10, "10.0", "2", 0)

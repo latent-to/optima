@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import ctypes
 import math
-import operator
 import re
 import struct
 from dataclasses import dataclass, field
@@ -26,6 +25,7 @@ from optima.cuda_cubin import (
     CudaCubinLibrary,
     CudaKernelABI,
 )
+from optima._strict import require_driver_integer
 
 
 CUDA_LAUNCH_SCHEMA = "optima.cuda-launch.v1"
@@ -469,20 +469,7 @@ def pack_kernel_parameters(
 
 
 def _driver_integer(value: object, *, field_name: str) -> int:
-    if isinstance(value, bool):
-        raise CudaLaunchError(f"CUDA driver returned a malformed {field_name}")
-    try:
-        return operator.index(value)
-    except TypeError:
-        enum_value = getattr(value, "value", None)
-        if isinstance(enum_value, bool):
-            raise CudaLaunchError(f"CUDA driver returned a malformed {field_name}")
-        try:
-            return operator.index(enum_value)
-        except TypeError:
-            raise CudaLaunchError(
-                f"CUDA driver returned a malformed {field_name}"
-            ) from None
+    return require_driver_integer(value, field=field_name, error=CudaLaunchError)
 
 
 def _driver_member(owner: object, name: str, *, field_name: str) -> object:

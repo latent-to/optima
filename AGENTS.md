@@ -8,8 +8,9 @@
 **Optima** is a Bittensor-style subnet that incentivizes **inference-throughput
 optimization**. Miners submit GPU **kernels** (Triton / CuteDSL) for individual
 ops in a *fixed* model; a validator swaps each kernel into the model it controls,
-runs it, and scores it on **throughput** gated by **output fidelity** (in-engine
-audit + pristine-reference distribution and task checks). The endgame is a continuously-improving SOTA
+runs it, and scores it on **throughput** gated by **output fidelity**. The intended
+gate combines an in-engine audit with pristine-reference distribution and task checks;
+the current production-wiring caveat is called out below. The endgame is a continuously-improving SOTA
 inference stack sold as a managed service; the validator endgame is an 8×B200
 fleet evaluating submissions.
 
@@ -82,7 +83,8 @@ This repo is the **validator harness** (the referee), plus example miner bundles
   cripples the baseline ~4.5–6.5×). Op seams capture directly; a block/collective kernel must
   declare `graph_safe: true` in metadata to run under capture, else it falls back in-graph.
   Beating sglang/vLLM/TensorRT graphs-on is the whole point.
-- **Fidelity has two modes** (docs/FIDELITY.md — read it before touching the quality gate):
+- **Fidelity implementation status:** the 2026-07-07 evaluator had two modes
+  (docs/FIDELITY.md — read it before touching the quality gate):
   `--fidelity-mode kl` (legacy rollout-KL, valid ONLY on arenas where a stock-vs-stock
   control measures ~0) and `--fidelity-mode audit` — the **in-engine audit**
   (`optima/audit.py`): an extra untimed EAGER candidate launch randomly samples dispatcher
@@ -96,7 +98,13 @@ This repo is the **validator harness** (the referee), plus example miner bundles
   Known residuals (see the doc's adversarial matrix): timed-workload fingerprinting and
   attention-slot audit coverage. Crownable candidate execution is fenced in validator-
   owned OCI sessions with no network egress; the trusted controller never loads miner
-  Python or native extensions.
+  Python or native extensions. **But the current causal production qualification path does
+  not arm or consume this audit:** `optima/eval/engine_worker.py` clears both audit env vars,
+  the worker protocol transports no audit facts, and qualification/settlement grade only
+  graph, speed, and pristine-T quality evidence. The July 7 audit receipts remain valid
+  historical campaign evidence, not proof that the current production path enforces the
+  gate. Meaningful-emission launch remains blocked until audit evidence is generated in an
+  untimed candidate role, transported, host-regraded, and bound into report/settlement.
 - **Scoring is noise-robust without clock-locking** (`optima/eval/scoring.py`): the candidate is
   bracketed by a baseline before AND after (B,C,B'), paired against the mean, with the bar
   derived from measured baseline noise (`1 + max(margin, k·noise)`) and a NO-DECISION verdict
@@ -205,11 +213,16 @@ matters — sglang uses `mp spawn`).
   It **must** satisfy the four invariants in `docs/SLOT_CONTRACT.md` (the waist); a
   block/collective kernel also declares `graph_safe` to be scored under CUDA graphs. If it
   can't satisfy the invariants, it belongs in the fenced escape hatch, not the core.
-- **The seam patches a pinned, unmodified sglang at runtime** — we never fork,
-  commit, or reconfigure sglang, so the gitignored `sglang/` clone is a dev
-  reference only. Runtime injection is how a miner changes a *backend* (e.g.
+- **The seam normally patches an exact validator-owned sglang runtime in memory**;
+  miner submissions never patch the engine install. The default stable/discovery pin is
+  `PINNED_SGLANG`, while the current MiniMax-M3 arena evidence names source build
+  `0.0.0.dev1+g56e290315` plus reviewed validator overlays. The exact full-source/image
+  consensus relationship is still an open production policy gap. Runtime injection
+  is how a miner changes a *backend* (e.g.
   attention via the `RadixAttention.forward` chokepoint) while every validator runs
-  the same pinned package (consensus via `PINNED_SGLANG` + `optima compat`). This is
+  the same exact arena package/image identities. `optima compat` fails when the
+  installed version differs from its default `PINNED_SGLANG`; it does not by itself
+  reconcile the M3 source-build policy. This is
   strictly better than the `--attention-backend` flag: it accepts *novel* kernels and
   needs no per-submission reconfigure. **Hard line: a slot must stay upstream of the
   logprobs/sampler**, or the output-substitution attack (run gibberish, fetch the
@@ -220,10 +233,14 @@ matters — sglang uses `mp spawn`).
   worker; the trusted controller validates bounded protocol evidence and owns teardown.
 - Don't claim a kernel "drifts" without measuring the **stock-vs-stock KL noise
   floor** first (we got burned on this).
-- **sglang is pinned** (`PINNED_SGLANG` in `optima/compat.py`) — all validators
-  must run the same version (consensus). After any sglang change run `optima
-  compat` (static seam canary) + the broken-bundle smoke; bump deliberately and
-  re-baseline the champion. See `docs/SGLANG_TRACKING.md`.
+- **sglang identity is consensus-critical.** `PINNED_SGLANG` in `optima/compat.py`
+  is the default stable/discovery version; arena/preflight/release facts record the M3
+  source build separately, but do not yet close one unified pin policy. Do not mix results
+  across those identities or describe the source build
+  as validating the default pin. After any SGLang change run the strict `optima compat`
+  canary against the intended pin plus the broken-bundle smoke, then re-baseline the
+  champion. The still-open governance choice is whether production converges on one global
+  pin or adopts a reviewed per-arena pin registry. See `docs/SGLANG_TRACKING.md`.
 
 ## Persistence note for future agents
 

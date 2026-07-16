@@ -15,14 +15,23 @@ from enum import Enum
 from typing import Iterable
 
 from optima.eval.evidence_store import EvidenceArtifactRef
-from optima.stack_identity import canonical_digest, require_sha256_hex
+from optima.stack_identity import canonical_digest
 from optima.stack_manifest import EvaluationStackManifest
 from optima.stack_plan import StackArmIdentity
 from optima.target_catalog import TargetCatalog, TargetResolutionError
+from optima._strict import require_digest, require_identifier, require_int
 
 
 _ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,255}\Z")
 _LANES = frozenset({"registered", "discovery"})
+_LEGACY_SPEED_POLICY_DIGEST = canonical_digest(
+    "optima.qualification.speed-evidence-policy",
+    {
+        "candidate_reads": 1,
+        "estimator": "bcbp-baseline-range.v1",
+        "version": 1,
+    },
+)
 
 
 class SettlementError(ValueError):
@@ -30,24 +39,15 @@ class SettlementError(ValueError):
 
 
 def _digest(value: object, field: str, *, optional: bool = False) -> str:
-    if optional and value == "":
-        return ""
-    try:
-        return require_sha256_hex(value, field=field)
-    except ValueError as exc:
-        raise SettlementError(str(exc)) from None
+    return require_digest(value, field=field, error=SettlementError, optional=optional)
 
 
 def _identifier(value: object, field: str) -> str:
-    if not isinstance(value, str) or _ID.fullmatch(value) is None:
-        raise SettlementError(f"{field} is not a canonical identifier")
-    return value
+    return require_identifier(value, field=field, error=SettlementError, pattern=_ID)
 
 
 def _integer(value: object, field: str) -> int:
-    if type(value) is not int or value < 0:
-        raise SettlementError(f"{field} must be a nonnegative integer")
-    return value
+    return require_int(value, field=field, error=SettlementError, minimum=0)
 
 
 def _speedup(value: object) -> str:
@@ -134,6 +134,7 @@ class SettlementQualification:
     incumbent_manifest: EvaluationStackManifest
     proposal_digest: str = ""
     candidate_manifest: EvaluationStackManifest | None = None
+    speed_evidence_policy_digest: str = _LEGACY_SPEED_POLICY_DIGEST
 
     def __post_init__(self) -> None:
         if self.lane not in _LANES:
@@ -154,6 +155,7 @@ class SettlementQualification:
             "incumbent_tree_digest",
             "candidate_stack_digest",
             "candidate_tree_digest",
+            "speed_evidence_policy_digest",
         ):
             object.__setattr__(self, field, _digest(getattr(self, field), field))
         for field in ("finalized_block", "event_index", "event_subindex"):
@@ -371,10 +373,11 @@ class SettlementQualification:
             incumbent_manifest=arm.incumbent,
             proposal_digest=(arm.proposal_digest if lane == "discovery" else ""),
             candidate_manifest=manifest,
+            speed_evidence_policy_digest=report.speed_witness.policy.digest,
         )
 
     def to_dict(self) -> dict[str, object]:
-        return {
+        result = {
             "arena_digest": self.arena_digest,
             "arm_digest": self.arm_digest,
             "candidate_manifest": (
@@ -404,13 +407,22 @@ class SettlementQualification:
             "speedup": self.speedup,
             "target_id": self.target_id,
         }
+        # Historical B/C/B-prime settlement bytes remain byte-identical.  The
+        # repeat policy is serialized because it is new consensus authority.
+        if self.speed_evidence_policy_digest != _LEGACY_SPEED_POLICY_DIGEST:
+            result["speed_evidence_policy_digest"] = self.speed_evidence_policy_digest
+        return result
 
     @classmethod
     def from_dict(cls, value: object) -> "SettlementQualification":
-        fields = set(cls.__dataclass_fields__)
-        if type(value) is not dict or set(value) != fields:
+        fields_v2 = set(cls.__dataclass_fields__)
+        fields_v1 = fields_v2 - {"speed_evidence_policy_digest"}
+        if type(value) is not dict or frozenset(value) not in {
+            frozenset(fields_v1), frozenset(fields_v2)
+        }:
             raise SettlementError("settlement qualification fields do not match")
         row = dict(value)
+        row.setdefault("speed_evidence_policy_digest", _LEGACY_SPEED_POLICY_DIGEST)
         members = row.get("members")
         if type(members) is not list:
             raise SettlementError("settlement qualification members are malformed")
@@ -452,6 +464,7 @@ class SettlementCandidate:
             "selected_delta_digest", "arm_digest", "incumbent_stack_digest",
             "incumbent_tree_digest", "candidate_stack_digest", "candidate_tree_digest",
             "incumbent_manifest", "proposal_digest", "candidate_manifest",
+            "speed_evidence_policy_digest",
         )
         if any(
             getattr(self.primary, field) != getattr(self.reproduction, field)

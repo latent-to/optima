@@ -1,8 +1,8 @@
 name: sglang canary
 
 # Weekly: is there a newer sglang, and do our seams still hold? Activates once
-# this repo is pushed to GitHub. A failing run (newer release and/or red seam
-# canary) surfaces on the Actions tab and emails the repo owner.
+# this repo is pushed to GitHub. A pin/API/seam failure turns the run red; a newer
+# upstream release is an informational warning until a deliberate rebaseline.
 
 on:
   schedule:
@@ -19,8 +19,10 @@ jobs:
           python-version: "3.12"
       - name: Install harness (no GPU deps)
         run: pip install -e .
-      - name: Best-effort install sglang (CPU runner may not build sgl-kernel)
-        run: pip install sglang || echo "sglang not installable on CPU runner — the PyPI release check still runs"
+      - name: Best-effort install pinned sglang (CPU runner may not build sgl-kernel)
+        run: |
+          PIN=$(python -c 'from optima.compat import PINNED_SGLANG; print(PINNED_SGLANG)')
+          pip install "sglang==$PIN" || echo "pinned sglang not installable on CPU runner — the PyPI release check still runs"
         continue-on-error: true
       - name: Run the canary
         run: python scripts/check_sglang.py

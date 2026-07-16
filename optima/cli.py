@@ -42,7 +42,7 @@ def cmd_compat(_: argparse.Namespace) -> int:
     from optima.compat import format_checks, run_checks
 
     checks = run_checks()
-    print("sglang compatibility canary (run after any sglang bump):")
+    print("sglang pin + compatibility canary (run after any sglang bump):")
     print(format_checks(checks))
     return 0 if all(c.ok for c in checks) else 2
 

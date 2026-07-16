@@ -16,9 +16,10 @@ It points at every file. Paths are relative to this doc (`docs/`), so
 
 > **Current scope:** eleven slots across three kinds (op / block / collective) — run
 > `python -m optima.cli slots` for the live catalog; `STATE_OF_RECORD.md` carries
-> the slot list of record. Fidelity is gated by the **in-engine audit** or per-token **KL**
-> (arena-dependent — see `docs/FIDELITY.md`) *plus* real **benchmark accuracy**
-> (Part 6). Validated on real GPUs up to gpt-oss-120b (1×H100) and
+> the slot list of record. The current causal production path grades pristine-T
+> distribution/task evidence but does **not** arm or consume the in-engine audit;
+> [FIDELITY.md](FIDELITY.md) distinguishes the historical/target audit design from
+> current enforcement. Validated on real GPUs up to gpt-oss-120b (1×H100) and
 > MiniMax-M3-NVFP4 (4×B300).
 > `STATE_OF_RECORD.md` is the live state-of-record (results + calibration); prose
 > below may lag it — where they disagree, **the state of record wins**. Since
@@ -483,9 +484,10 @@ position 0 always has identical context (same prompt), so a kernel that derails
 the very first token still gets a huge KL instead of "zero comparable positions."
 
 > Honest limitation: top-k truncation approximates the true full-vocab KL. It's
-> sharp enough to catch the cheats that matter (calibration collapse, dropped
-> work) at k≥20; the in-engine audit (Part 6.5, [FIDELITY.md](FIDELITY.md))
-> closes the rest by re-running stock on clones of the candidate's real calls.
+> useful for catching calibration collapse and dropped work at k≥20. The intended
+> in-engine audit (Part 6.5, [FIDELITY.md](FIDELITY.md)) re-runs stock on clones of
+> the candidate's real calls, but the current causal production path does not yet
+> transport or grade that audit evidence.
 
 ### 6.4 Gates and verdict
 
@@ -502,14 +504,13 @@ The gate philosophy, unchanged since the first evaluator:
 ### 6.5 The realistic workload + the quality authority
 
 Throughput must be scored on the regime the arena sells (decode-heavy serving; a
-prefill-heavy slot needs a prefill-heavy workload). Quality has **two modes**
-(see [FIDELITY.md](FIDELITY.md)): rollout-KL statistics against the pristine
-reference — valid only where a stock-vs-stock control measures ~0 — and the
-**in-engine audit**, which randomly samples the candidate's real dispatcher calls,
-re-runs the captured stock baseline on pre-call clones, and compares under the
-slot's own verify tolerances (zero violations + minimum coverage required). The
-arena's `task_score` evidence additionally gates the model getting *dumber* on
-real tasks, paired against the same run's baseline.
+prefill-heavy slot needs a prefill-heavy workload). The current causal path grades
+pristine-T distribution and task evidence. Historically, and in the target design,
+quality also used rollout-KL where stock-vs-stock measured ~0 or an **in-engine
+audit** that sampled real dispatcher calls and compared them with stock on pre-call
+clones. That audit mechanism exists and has B300 evidence, but it is not presently
+armed, transported, or graded by production qualification. See
+[FIDELITY.md](FIDELITY.md) before changing or relying on this boundary.
 
 ### 6.6 Calibration (learned on real hardware)
 
@@ -660,7 +661,7 @@ specific coverage remain ongoing concerns rather than isolation gaps.
 |---|---|---|---|
 | 22 | Reference itself wrong/drifting (if pinned to an API) | **Avoided** | Local stock-kernel reference, not an API (Part 2.2). |
 | 23 | Per-op tolerance ≠ end-to-end quality | **Mitigated** | We gate end-to-end KL, not just per-op correctness. |
-| 24 | Cross-validator score divergence (noise, HW) | **Partial** | Median-of-K + margin now; locked clocks + determinism + pinned HW still needed. |
+| 24 | Cross-validator score divergence (noise, HW) | **Partial** | Pooled charged arm rates + B/C/B′ noise margin now; locked clocks + determinism + pinned HW still needed. |
 | 25 | Numerical nondeterminism fails a faithful kernel | **Mitigated** | Tolerance in verify; `enable_deterministic_inference` available; greedy decoding for alignment. |
 
 ---
@@ -671,8 +672,9 @@ Validated on a real H100 (sglang 0.5.12.post1 / CUDA 13, torch 2.11+cu130), Qwen
 up to gpt-oss-120b:
 
 - **The seam works on real models, including a 120B MoE.** Confirmed because the
-  *broken* kernel changes the output. Ten slots across op / block / collective kinds;
-  e.g. `norm.rmsnorm` fires on gpt-oss (whose activation is fused into the MoE kernel so
+  *broken* kernel changes the output. The catalog later grew to eleven slots across
+  op / block / collective kinds; this H100 evidence covers specific seam paths, not
+  every current slot. For example, `norm.rmsnorm` fires on gpt-oss (whose activation is fused into the MoE kernel so
   silu is inert), and the `FusedMoE.forward` block seam routes gpt-oss's experts to the
   miner kernel.
 - **The anti-cheat gate works**, both ways it's measured:
@@ -684,8 +686,9 @@ up to gpt-oss-120b:
 - **End-to-end KL catches subtle drift op-correctness misses.** A "faithful"
   rmsnorm passed per-op correctness but sat at KL 9.2e-3 vs a measured stock-vs-stock
   noise floor of 3.9e-4 (~24×) — correctly flagged. (The layered gate working.)
-- **Robust scoring**: median-of-K with spread; tamper-resistant timing
-  (`mark_driver`); a faithful-but-slower kernel correctly earns no title.
+- **Robust scoring**: current authority recomputes one pooled charged rate per arm,
+  brackets C with B/B′, and derives the bar from their spread; tamper-resistant timing
+  (`mark_driver`) remains in place, and a faithful-but-slower kernel earns no title.
 - **The current authority is stricter than the original mechanism:** finalized native
   commit-reveal intake, immutable publication, registered non-crown screening, isolated
   B/C/B′/T qualification, independent reproduction, and transactional target settlement.
@@ -746,7 +749,7 @@ The harness package, [../optima/](../optima):
 | [integrations/sglang_attention.py](../optima/integrations/sglang_attention.py) | Patches `RadixAttention.forward` (the attention **block** chokepoint; gathers paged KV for the decode swap). |
 | [integrations/sglang_moe.py](../optima/integrations/sglang_moe.py) | Patches `FusedMoE.forward` (the MoE **block** chokepoint; opt-in `OPTIMA_MOE_SEAM=1`). |
 | [integrations/sglang_allreduce.py](../optima/integrations/sglang_allreduce.py) | Patches `GroupCoordinator.all_reduce` (the **collective** chokepoint; opt-in `OPTIMA_COLLECTIVE_SEAM=1`). |
-| [integrations/sglang_plugin.py](../optima/integrations/sglang_plugin.py) | Entry-point shim for sglang builds that *have* the plugin framework (not the pin). |
+| [integrations/sglang_plugin.py](../optima/integrations/sglang_plugin.py) | Entry-point shim for SGLang's plugin framework (present at the default stable pin); `.pth` remains the primary spawn-safe path. |
 | [verify.py](../optima/verify.py) | `verify_entry` — op/block correctness vs the slot's HP reference (`allclose` / `matched_ratio` / `cosine`); refuses `kind="collective"`. |
 | [verify_collective.py](../optima/verify_collective.py) | `verify_collective` — DISTRIBUTED verify for collective slots: mp-spawns `world_size` ranks, runs the kernel as the real collective, compares to the fp32 cross-rank reduce. |
 | [compat.py](../optima/compat.py) | `PINNED_SGLANG` + `run_checks` — the static seam canary (`optima compat`), re-run on every sglang bump. |

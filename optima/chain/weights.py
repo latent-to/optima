@@ -466,6 +466,8 @@ def reconcile_weight_publication(
     refresh_blocks: int,
     dry_run: bool = False,
     reconcile_only: bool = False,
+    allow_stale_initial: bool = False,
+    require_current_crown: bool = True,
 ) -> WeightPublicationResult:
     """Reconcile and optionally publish one exact projection.
 
@@ -483,6 +485,10 @@ def reconcile_weight_publication(
         raise WeightPublicationError("weight refresh cadence is malformed")
     if type(reconcile_only) is not bool:
         raise WeightPublicationError("reconcile-only mode is malformed")
+    if type(allow_stale_initial) is not bool:
+        raise WeightPublicationError("stale-initial authority is malformed")
+    if type(require_current_crown) is not bool:
+        raise WeightPublicationError("current-crown requirement is malformed")
     if reconcile_only and dry_run:
         raise WeightPublicationError("reconcile-only cannot be combined with dry-run")
     if reconcile_only and signer_wallet is not None:
@@ -522,9 +528,16 @@ def reconcile_weight_publication(
         retained_authority is None
         and live_metagraph.block != projection.effective_block
     ):
-        raise WeightPublicationError(
-            "weight projection is stale for the immediately refreshed metagraph"
-        )
+        if not allow_stale_initial:
+            raise WeightPublicationError(
+                "weight projection is stale for the immediately refreshed metagraph"
+            )
+        if not _authority_uids_unchanged(
+            projection, bound_metagraph, live_metagraph
+        ):
+            raise WeightPublicationError(
+                "stale weight projection recipient UID mapping changed"
+            )
     if (
         in_flight is not None
         and (
@@ -790,7 +803,7 @@ def reconcile_weight_publication(
             projection.digest, "confirmed", current, True, False, False, observed_block
         )
 
-    if projection.crown_count <= 0:
+    if require_current_crown and projection.crown_count <= 0:
         raise WeightPublicationError("real weight submission requires a current crown")
     try:
         wallet_hotkey = signer_wallet.hotkey.ss58_address

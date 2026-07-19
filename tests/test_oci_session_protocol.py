@@ -32,12 +32,17 @@ from optima.eval.oci_session_protocol import (
     MAX_CONTROL_BYTES,
     MAX_ERROR_CHARS,
     MAX_INIT_BYTES,
+    AuditReceiptFacts,
     BatchEvidence,
     BatchRequest,
     EngineSessionConfig,
     PromptEvidence,
     RuntimePreflightFacts,
     SessionProtocolError,
+    SlotAuditControl,
+    SlotAuditPolicy,
+    audit_evidence_message,
+    audit_policy_from_init,
     batch_request,
     decode_message,
     encode_message,
@@ -53,6 +58,7 @@ from optima.eval.oci_session_protocol import (
     preflight_message,
     ready_message,
     validate_batch_request,
+    validate_audit_evidence,
     validate_init,
     validate_preflight,
     validate_preflight_accept,
@@ -781,3 +787,81 @@ def test_protocol_control_limits_are_separate_and_bounded() -> None:
         ready_message(session_id=SESSION, launch_digest=LAUNCH),
         max_bytes=MAX_CONTROL_BYTES,
     )) > FRAME_HEADER_BYTES
+
+
+def test_slot_audit_policy_init_and_raw_evidence_are_exactly_bound() -> None:
+    config = _config()
+    policy = SlotAuditPolicy(
+        "a" * 32, 125_000, 32, ("norm.rmsnorm",), config.tp_size
+    )
+    assert policy.control == SlotAuditControl(
+        125_000, 32, ("norm.rmsnorm",), config.tp_size
+    )
+    assert SlotAuditControl.from_dict(policy.control.to_dict()) == policy.control
+    assert replace(policy, validator_seed="b" * 32).control.digest == policy.control.digest
+    init = make_init(
+        config,
+        session_id=SESSION,
+        launch_digest=LAUNCH,
+        expected_engine_config_digest=config.digest,
+        audit_policy=policy,
+    )
+    assert audit_policy_from_init(init) == policy
+    assert validate_init(
+        init, expected_audit_policy_digest=policy.digest
+    ) == (SESSION, LAUNCH, config)
+
+    request = validate_batch_request(
+        batch_request(
+            session_id=SESSION,
+            launch_digest=LAUNCH,
+            request_id=REQUEST,
+            nonce=NONCE,
+            batch_index=0,
+            prompts=("prompt",),
+            max_new_tokens=2,
+            top_logprobs_num=1,
+            temperature=0.0,
+        )
+    )
+    receipts = tuple(
+        AuditReceiptFacts(
+            "norm.rmsnorm", 40, 0, 0, 0, 1.0, 0.995,
+            "allclose", 100 + rank, rank, config.tp_size,
+        )
+        for rank in range(config.tp_size)
+    )
+    message = audit_evidence_message(
+        request=request, policy=policy, receipts=receipts
+    )
+    assert validate_audit_evidence(
+        message, request=request, policy=policy
+    ) == receipts
+
+    with pytest.raises(SessionProtocolError, match="binding"):
+        validate_audit_evidence(
+            {**message, "nonce": "4" * 32}, request=request, policy=policy
+        )
+    with pytest.raises(SessionProtocolError, match="binding"):
+        validate_audit_evidence(
+            message,
+            request=request,
+            policy=replace(policy, validator_seed="b" * 32),
+        )
+
+
+def test_slot_audit_policy_and_receipts_reject_ambiguous_coverage() -> None:
+    with pytest.raises(SessionProtocolError, match="sorted unique"):
+        SlotAuditPolicy(
+            "a" * 32, 1, 1, ("norm.rmsnorm", "norm.rmsnorm"), 1
+        )
+    with pytest.raises(SessionProtocolError, match="rank"):
+        AuditReceiptFacts(
+            "norm.rmsnorm", 1, 0, 0, 0, 1.0, 0.995,
+            "allclose", 100, 1, 1,
+        )
+    with pytest.raises(SessionProtocolError, match="internally inconsistent"):
+        AuditReceiptFacts(
+            "norm.rmsnorm", 32, 0, 0, 0, 0.1, 0.995,
+            "allclose", 100, 0, 1,
+        )

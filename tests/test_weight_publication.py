@@ -356,6 +356,56 @@ def test_stale_projection_is_rejected_before_journal_or_signing():
     assert journal.history == [] and chain.submit_calls == 0
 
 
+def test_explicit_stale_initial_catch_up_requires_stable_recipient_uids():
+    projection = _projection(block=100)
+    stable = Chain(apply=True, block=101)
+    journal = Journal()
+
+    result = reconcile_weight_publication(
+        stable,
+        _wallet(),
+        projection,
+        journal,
+        refresh_blocks=20,
+        allow_stale_initial=True,
+    )
+
+    assert result.status == "confirmed"
+    assert result.submitted is True
+    assert stable.submit_calls == 1
+
+    reassigned = ReassigningChain(finalized_heads=[101, 101])
+    reassigned.block = 101
+    journal = Journal()
+    with pytest.raises(WeightPublicationError, match="UID mapping changed"):
+        reconcile_weight_publication(
+            reassigned,
+            _wallet(),
+            projection,
+            journal,
+            refresh_blocks=20,
+            allow_stale_initial=True,
+        )
+    assert journal.history == [] and reassigned.submit_calls == 0
+
+
+def test_explicit_v2_mode_can_publish_reserve_only_projection():
+    chain, journal = Chain(apply=True), Journal()
+
+    result = reconcile_weight_publication(
+        chain,
+        _wallet(),
+        _projection(crowns=0),
+        journal,
+        refresh_blocks=20,
+        require_current_crown=False,
+    )
+
+    assert result.status == "confirmed"
+    assert result.submitted is True
+    assert chain.submit_calls == 1
+
+
 def test_finalized_head_advance_before_signing_aborts_on_uid_reassignment():
     chain = ReassigningChain(finalized_heads=[100, 100, 101])
     journal = Journal()

@@ -216,14 +216,76 @@ def run(slot: str, actual: Sequence[torch.Tensor], baseline_thunk) -> None:
         logger.exception("optima.audit: baseline call failed (slot=%s)", slot)
 
 
-def gate(audit_receipts: list[dict], *, min_calls: int) -> tuple[bool, str]:
+def gate(
+    audit_receipts: list[dict],
+    *,
+    min_calls: int,
+    expected_slots: Sequence[str] | None = None,
+    expected_member_count: int | None = None,
+) -> tuple[bool, str]:
     """Eval-driver side: fold per-rank rolling receipts into a verdict.
 
     Pass iff every audited slot has zero violations and the total audited-call
     count is at least ``min_calls`` (insufficient coverage is a FAIL — an
     unaudited kernel is unproven, not innocent)."""
+    if type(min_calls) is not int or min_calls < 1:
+        return False, "audit minimum coverage is malformed"
     if not audit_receipts:
         return False, f"no audit receipts (need >= {min_calls} audited calls)"
+    if (expected_slots is None) != (expected_member_count is None):
+        return False, "audit coverage authority is incomplete"
+    if expected_slots is not None:
+        slots = tuple(expected_slots)
+        members = expected_member_count
+        if (
+            not slots
+            or slots != tuple(sorted(set(slots)))
+            or any(not isinstance(slot, str) or not slot for slot in slots)
+            or type(members) is not int
+            or members < 1
+        ):
+            return False, "audit coverage authority is malformed"
+        observed: dict[tuple[str, int], dict] = {}
+        rank_pids: dict[int, int] = {}
+        pid_ranks: dict[int, int] = {}
+        for receipt in audit_receipts:
+            if type(receipt) is not dict:
+                return False, "audit receipt is not an object"
+            slot = receipt.get("slot")
+            pid = receipt.get("pid")
+            rank = receipt.get("rank")
+            world_size = receipt.get("world_size")
+            if (
+                slot not in slots
+                or type(pid) is not int
+                or pid < 1
+                or type(rank) is not int
+                or not 0 <= rank < members
+                or world_size != members
+                or (rank in rank_pids and rank_pids[rank] != pid)
+                or (pid in pid_ranks and pid_ranks[pid] != rank)
+                or (slot, rank) in observed
+            ):
+                return False, "audit slot/member receipt coverage is malformed"
+            rank_pids[rank] = pid
+            pid_ranks[pid] = rank
+            observed[(slot, rank)] = receipt
+        expected = {(slot, rank) for slot in slots for rank in range(members)}
+        if set(observed) != expected:
+            return False, (
+                "audit slot/member receipt coverage is incomplete "
+                f"({len(observed)}/{len(expected)})"
+            )
+        under = [
+            (slot, rank, row.get("n"))
+            for (slot, rank), row in sorted(observed.items())
+            if type(row.get("n")) is not int or row["n"] < min_calls
+        ]
+        if under:
+            return False, (
+                "audit per-slot/member coverage is insufficient; "
+                f"need >= {min_calls}, under-covered={under[:8]}"
+            )
     total_n = sum(r.get("n", 0) for r in audit_receipts)
     total_viol = sum(r.get("violations", 0) for r in audit_receipts)
     total_err = sum(r.get("compare_errors", 0) for r in audit_receipts)

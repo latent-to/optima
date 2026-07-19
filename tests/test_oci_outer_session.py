@@ -34,11 +34,14 @@ from optima.eval.oci_session_protocol import (
     CONTROL_MAGIC,
     EVIDENCE_MAGIC,
     MAX_CONTROL_BYTES,
+    AuditReceiptFacts,
     BatchEvidence,
     BatchRequest,
     EngineSessionConfig,
     PromptEvidence,
     RuntimePreflightFacts,
+    SlotAuditPolicy,
+    audit_evidence_message,
     batch_request,
     error_message,
     evidence_frame,
@@ -336,6 +339,53 @@ def test_happy_path_accepts_preflight_before_ready_and_returns_raw_host_interval
     )
     assert result.preflight == plan.expected_preflight
     assert result.discovery_activation is None
+
+
+def test_audit_role_transports_policy_bound_raw_slot_rank_facts() -> None:
+    policy = SlotAuditPolicy(
+        "a" * 32,
+        250_000,
+        8,
+        ("norm.rmsnorm",),
+        8,
+    )
+    plan = _plan(audit_policy=policy)
+
+    class AuditTransport(_FakeTransport):
+        def read_control(self, *, max_bytes: int, deadline: float) -> dict:
+            if self.control_reads < 2:
+                return super().read_control(max_bytes=max_bytes, deadline=deadline)
+            self._advance(self.control_read_s, deadline, "audit-control-read")
+            self.control_reads += 1
+            request = self.requests[-1]
+            receipts = tuple(
+                AuditReceiptFacts(
+                    "norm.rmsnorm", 16, 0, 0, 0, 1.0, 0.995,
+                    "allclose", 100 + rank, rank, 8,
+                )
+                for rank in range(8)
+            )
+            return audit_evidence_message(
+                request=request, policy=policy, receipts=receipts
+            )
+
+    clock = _Clock()
+    transport = AuditTransport(clock, plan.expected_preflight)
+    result = run_outer_session(
+        plan,
+        transport=transport,
+        deadline=1000.0,
+        init_timeout_s=30.0,
+        batch_timeout_s=30.0,
+        clock=clock,
+    )
+
+    assert transport.messages[0]["audit_policy"] == policy.to_dict()
+    assert result.audit_policy_digest == policy.digest
+    assert len(result.audit_receipts) == 8
+    assert {(row.slot, row.rank) for row in result.audit_receipts} == {
+        ("norm.rmsnorm", rank) for rank in range(8)
+    }
 
 
 def test_discovery_ready_receipt_is_retained_and_role_exact() -> None:

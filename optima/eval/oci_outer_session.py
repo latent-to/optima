@@ -33,11 +33,13 @@ from optima.eval.oci_session_protocol import (
     MAX_BATCH_RESPONSE_BYTES,
     MAX_CONTROL_BYTES,
     MAX_INIT_BYTES,
+    AuditReceiptFacts,
     BatchEvidence,
     BatchRequest,
     EngineSessionConfig,
     RuntimePreflightFacts,
     SessionProtocolError,
+    SlotAuditPolicy,
     batch_request,
     decode_evidence_payload,
     decode_message,
@@ -47,6 +49,7 @@ from optima.eval.oci_session_protocol import (
     parse_error_message,
     preflight_accept_message,
     validate_batch_request,
+    validate_audit_evidence,
     validate_preflight,
     validate_ready,
 )
@@ -351,10 +354,18 @@ class SessionExecutionPlan:
     top_logprobs_num: int
     temperature: float
     expected_discovery_overlay_identity_digest: str | None = None
+    audit_policy: SlotAuditPolicy | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.engine_config, EngineSessionConfig):
             raise OuterSessionInfrastructureError("engine_config is not typed")
+        if self.audit_policy is not None and (
+            type(self.audit_policy) is not SlotAuditPolicy
+            or self.audit_policy.expected_member_count != self.engine_config.tp_size
+        ):
+            raise OuterSessionInfrastructureError(
+                "audit policy is not typed or differs from engine TP"
+            )
         if self.engine_config.digest != self.expected_engine_config_digest:
             raise OuterSessionInfrastructureError("engine config digest differs from plan")
         if self.expected_discovery_overlay_identity_digest is not None:
@@ -399,6 +410,7 @@ class SessionExecutionPlan:
                 session_id=probe_session,
                 launch_digest=self.launch_digest,
                 expected_engine_config_digest=self.expected_engine_config_digest,
+                audit_policy=self.audit_policy,
             )
             frame_message(init, max_bytes=MAX_INIT_BYTES)
             accept = preflight_accept_message(
@@ -490,6 +502,7 @@ class BatchExecutionEvidence:
     response_completed_at: float
     token_numerator: int
     evidence: BatchEvidence
+    audit_receipts: tuple[AuditReceiptFacts, ...] = ()
 
     @property
     def elapsed_seconds(self) -> float:
@@ -510,10 +523,15 @@ class SessionExecutionEvidence:
     conditioning_token_numerator: int
     session_completed_at: float
     discovery_activation: DiscoveryActivationReceipt | None = None
+    audit_policy_digest: str | None = None
 
     @property
     def conditioning_interval_seconds(self) -> float:
         return self.first_timed_completed_at - self.conditioning_started_at
+
+    @property
+    def audit_receipts(self) -> tuple[AuditReceiptFacts, ...]:
+        return self.batches[-1].audit_receipts if self.batches else ()
 
 
 BoundaryCallback = Callable[[str, int, float], None]
@@ -624,6 +642,7 @@ def run_outer_session(
             session_id=session_id,
             launch_digest=plan.launch_digest,
             expected_engine_config_digest=plan.expected_engine_config_digest,
+            audit_policy=plan.audit_policy,
         )
         transport.write_frame(
             frame_message(init, max_bytes=MAX_INIT_BYTES), deadline=init_deadline
@@ -716,6 +735,21 @@ def run_outer_session(
                 deadline=batch_deadline,
             )
             evidence = transport.read_evidence(request, deadline=batch_deadline)
+            audit_receipts: tuple[AuditReceiptFacts, ...] = ()
+            if plan.audit_policy is not None:
+                try:
+                    audit_receipts = validate_audit_evidence(
+                        _control_or_error(
+                            transport,
+                            session_id=session_id,
+                            launch_digest=plan.launch_digest,
+                            deadline=batch_deadline,
+                        ),
+                        request=request,
+                        policy=plan.audit_policy,
+                    )
+                except SessionProtocolError as exc:
+                    raise OuterSessionProtocolError(str(exc)) from None
             completed = _now(clock, previous=request_started)
             if completed <= request_started:
                 raise OuterSessionInfrastructureError("host batch clock did not advance")
@@ -725,7 +759,7 @@ def run_outer_session(
                 raise OuterSessionProtocolError("worker evidence token count is not exact")
             batch_rows.append(BatchExecutionEvidence(
                 index, request_id, nonce, request_started, completed,
-                token_numerator, evidence,
+                token_numerator, evidence, audit_receipts,
             ))
             if index + 1 == conditioning_start_index:
                 conditioning_started_at = completed
@@ -779,4 +813,7 @@ def run_outer_session(
         conditioning_token_numerator=conditioning_tokens,
         session_completed_at=session_completed_at,
         discovery_activation=discovery_activation,
+        audit_policy_digest=(
+            None if plan.audit_policy is None else plan.audit_policy.digest
+        ),
     )

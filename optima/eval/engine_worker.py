@@ -273,6 +273,7 @@ def _require_execution_completion(
 class EngineWorkerHandle:
     engine: object
     require_completion: Any
+    collect_audit_receipts: Any
 
 
 @contextlib.contextmanager
@@ -297,6 +298,7 @@ def isolated_engine_session(
     active: bool,
     framework_mode: bool,
     install_seams: bool = True,
+    audit_policy: object | None = None,
 ) -> Iterator[EngineWorkerHandle]:
     """Construct one engine only inside the already-proven OCI worker fence."""
 
@@ -313,6 +315,13 @@ def isolated_engine_session(
         or (active and not install_seams)
     ):
         raise RuntimeError("isolated engine session lacks its trusted OCI fence")
+    if audit_policy is not None:
+        from optima.eval.oci_session_protocol import SlotAuditPolicy
+
+        if type(audit_policy) is not SlotAuditPolicy or not active:
+            raise RuntimeError(
+                "slot audit requires an exact policy and an active candidate engine"
+            )
     receipts = None
     if install_seams:
         from optima import receipts as receipt_module, seam
@@ -331,8 +340,16 @@ def isolated_engine_session(
             "OPTIMA_BUNDLE_PATH": bundle_path if active else "",
             "OPTIMA_FRAMEWORK_MODE": "1" if framework_mode else "0",
             "OPTIMA_SEAM_RECEIPT_DIR": receipt_dir,
-            "OPTIMA_SLOT_AUDIT": "",
-            "OPTIMA_SLOT_AUDIT_SEED": "",
+            "OPTIMA_SLOT_AUDIT": (
+                ""
+                if audit_policy is None
+                else format(audit_policy.sample_rate_ppm / 1_000_000, ".17g")
+            ),
+            "OPTIMA_SLOT_AUDIT_SEED": (
+                ""
+                if audit_policy is None
+                else str(int(audit_policy.validator_seed, 16))
+            ),
             "SGLANG_PLUGINS": "optima" if install_seams else "",
             **gate_environment,
         }
@@ -340,6 +357,11 @@ def isolated_engine_session(
             import sglang as sgl
 
             kwargs = engine_kwargs(cfg, active=active)
+            if audit_policy is not None:
+                # This is a separate, untimed fidelity role.  Timed B/C/B' plans
+                # carry no audit policy and therefore retain their sealed graph
+                # configuration and zero audit overhead.
+                kwargs["disable_cuda_graph"] = True
             engine = sgl.Engine(**kwargs)
             active_receipts: list[dict] = []
             expected_slots: list[str] = []
@@ -353,6 +375,13 @@ def isolated_engine_session(
                     expected_slots = _active_execution_members(
                         active_receipts, expected_member_count=expected_members
                     )
+                    if audit_policy is not None and (
+                        tuple(expected_slots) != audit_policy.expected_slots
+                        or expected_members != audit_policy.expected_member_count
+                    ):
+                        raise RuntimeError(
+                            "slot audit policy differs from active slot/TP membership"
+                        )
 
                 def complete() -> None:
                     if active:
@@ -363,7 +392,18 @@ def isolated_engine_session(
                             expected_member_count=expected_members,
                         )
 
-                yield EngineWorkerHandle(engine, complete)
+                def collect_audits() -> list[dict]:
+                    if not active:
+                        return []
+                    assert receipts is not None
+                    observed = receipts.collect(receipt_dir, "audit")
+                    if audit_policy is None and observed:
+                        raise RuntimeError(
+                            "timed candidate engine unexpectedly emitted audit receipts"
+                        )
+                    return observed
+
+                yield EngineWorkerHandle(engine, complete, collect_audits)
             finally:
                 try:
                     engine.shutdown()

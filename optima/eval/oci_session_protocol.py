@@ -45,6 +45,7 @@ MAX_TOTAL_PROMPT_CHARS = 96_000_000
 MAX_NEW_TOKENS = 32_768
 MAX_TOP_LOGPROBS = 4096
 MAX_ERROR_CHARS = 16_384
+MAX_AUDIT_RECEIPTS = 4_096
 
 CONTAINER_MODEL_PATH = "/optima/input/model"
 
@@ -84,6 +85,275 @@ topology_digest tree_digest worker_distribution_digest
 
 class SessionProtocolError(ValueError):
     """A session value or frame is malformed, ambiguous, or out of bounds."""
+
+
+@dataclass(frozen=True)
+class SlotAuditControl:
+    """Seed-independent controls that both qualification passes must reproduce."""
+
+    sample_rate_ppm: int
+    minimum_calls: int
+    expected_slots: tuple[str, ...]
+    expected_member_count: int
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "sample_rate_ppm",
+            _bounded_int(
+                self.sample_rate_ppm,
+                field_name="audit sample_rate_ppm",
+                minimum=1,
+                maximum=1_000_000,
+            ),
+        )
+        object.__setattr__(
+            self,
+            "minimum_calls",
+            _bounded_int(
+                self.minimum_calls,
+                field_name="audit minimum_calls",
+                minimum=1,
+                maximum=1_000_000_000,
+            ),
+        )
+        slots = tuple(self.expected_slots)
+        if (
+            not slots
+            or len(slots) > MAX_AUDIT_RECEIPTS
+            or slots != tuple(sorted(set(slots)))
+            or any(_TOKEN.fullmatch(slot) is None for slot in slots)
+        ):
+            raise SessionProtocolError(
+                "audit expected_slots must be a nonempty sorted unique token array"
+            )
+        object.__setattr__(self, "expected_slots", slots)
+        object.__setattr__(
+            self,
+            "expected_member_count",
+            _bounded_int(
+                self.expected_member_count,
+                field_name="audit expected_member_count",
+                minimum=1,
+                maximum=64,
+            ),
+        )
+        if len(slots) * self.expected_member_count > MAX_AUDIT_RECEIPTS:
+            raise SessionProtocolError("audit slot/member receipt bound is exceeded")
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "expected_member_count": self.expected_member_count,
+            "expected_slots": list(self.expected_slots),
+            "minimum_calls": self.minimum_calls,
+            "sample_rate_ppm": self.sample_rate_ppm,
+        }
+
+    @classmethod
+    def from_dict(cls, value: object) -> "SlotAuditControl":
+        row = _exact_object(
+            value,
+            fields=frozenset(
+                "expected_member_count expected_slots minimum_calls sample_rate_ppm".split()
+            ),
+            label="slot audit control",
+        )
+        slots = row["expected_slots"]
+        if not isinstance(slots, list):
+            raise SessionProtocolError("audit expected_slots must be an array")
+        return cls(
+            row["sample_rate_ppm"],
+            row["minimum_calls"],
+            tuple(slots),
+            row["expected_member_count"],
+        )  # type: ignore[arg-type]
+
+    @property
+    def digest(self) -> str:
+        return canonical_digest("optima.eval.slot-audit-control.v1", self.to_dict())
+
+
+@dataclass(frozen=True)
+class SlotAuditPolicy:
+    """Validator-owned policy for one separate untimed candidate audit role."""
+
+    validator_seed: str
+    sample_rate_ppm: int
+    minimum_calls: int
+    expected_slots: tuple[str, ...]
+    expected_member_count: int
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "validator_seed",
+            _binding_id(self.validator_seed, field_name="audit validator_seed"),
+        )
+        control = SlotAuditControl(
+            self.sample_rate_ppm,
+            self.minimum_calls,
+            self.expected_slots,
+            self.expected_member_count,
+        )
+        for field in SlotAuditControl.__dataclass_fields__:
+            object.__setattr__(self, field, getattr(control, field))
+
+    @property
+    def control(self) -> SlotAuditControl:
+        return SlotAuditControl(
+            self.sample_rate_ppm,
+            self.minimum_calls,
+            self.expected_slots,
+            self.expected_member_count,
+        )
+
+    def to_dict(self) -> dict[str, object]:
+        return {**self.control.to_dict(), "validator_seed": self.validator_seed}
+
+    @classmethod
+    def from_dict(cls, value: object) -> "SlotAuditPolicy":
+        row = _exact_object(
+            value,
+            fields=frozenset(
+                "expected_member_count expected_slots minimum_calls "
+                "sample_rate_ppm validator_seed".split()
+            ),
+            label="slot audit policy",
+        )
+        slots = row["expected_slots"]
+        if not isinstance(slots, list):
+            raise SessionProtocolError("audit expected_slots must be an array")
+        return cls(
+            row["validator_seed"],
+            row["sample_rate_ppm"],
+            row["minimum_calls"],
+            tuple(slots),
+            row["expected_member_count"],
+        )  # type: ignore[arg-type]
+
+    @property
+    def digest(self) -> str:
+        return canonical_digest("optima.eval.slot-audit-policy.v1", self.to_dict())
+
+
+_AUDIT_RECEIPT_FIELDS = frozenset(
+    "baseline_refused compare_errors min_ratio mode n pid rank slot "
+    "violations world_size worst_frac".split()
+)
+
+
+@dataclass(frozen=True)
+class AuditReceiptFacts:
+    """Strict raw scheduler-rank facts; no worker-produced verdict is accepted."""
+
+    slot: str
+    n: int
+    violations: int
+    baseline_refused: int
+    compare_errors: int
+    worst_frac: float
+    min_ratio: float | None
+    mode: str | None
+    pid: int
+    rank: int
+    world_size: int
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.slot, str) or _TOKEN.fullmatch(self.slot) is None:
+            raise SessionProtocolError("audit receipt slot is invalid")
+        for name in ("n", "violations", "baseline_refused", "compare_errors"):
+            object.__setattr__(
+                self,
+                name,
+                _bounded_int(
+                    getattr(self, name),
+                    field_name=f"audit receipt {name}",
+                    minimum=0,
+                    maximum=1_000_000_000,
+                ),
+            )
+        if self.violations > self.n:
+            raise SessionProtocolError("audit violations exceed compared calls")
+        object.__setattr__(
+            self,
+            "worst_frac",
+            _bounded_float(
+                self.worst_frac,
+                field_name="audit receipt worst_frac",
+                minimum=-1.0,
+                maximum=1.0,
+            ),
+        )
+        if self.min_ratio is not None:
+            object.__setattr__(
+                self,
+                "min_ratio",
+                _bounded_float(
+                    self.min_ratio,
+                    field_name="audit receipt min_ratio",
+                    minimum=0.0,
+                    maximum=1.0,
+                ),
+            )
+        if self.mode is not None and self.mode not in {
+            "allclose", "cosine", "matched_ratio", "topk_overlap"
+        }:
+            raise SessionProtocolError("audit receipt mode is invalid")
+        if self.n > 0 and (
+            self.mode is None
+            or self.min_ratio is None
+            or ((self.violations == 0) != (self.worst_frac >= self.min_ratio))
+        ):
+            raise SessionProtocolError(
+                "audit receipt comparison summary is internally inconsistent"
+            )
+        object.__setattr__(
+            self,
+            "pid",
+            _bounded_int(
+                self.pid,
+                field_name="audit receipt pid",
+                minimum=1,
+                maximum=2_147_483_647,
+            ),
+        )
+        object.__setattr__(
+            self,
+            "world_size",
+            _bounded_int(
+                self.world_size,
+                field_name="audit receipt world_size",
+                minimum=1,
+                maximum=64,
+            ),
+        )
+        object.__setattr__(
+            self,
+            "rank",
+            _bounded_int(
+                self.rank,
+                field_name="audit receipt rank",
+                minimum=0,
+                maximum=self.world_size - 1,
+            ),
+        )
+
+    @classmethod
+    def from_receipt_dict(cls, value: object) -> "AuditReceiptFacts":
+        row = _exact_object(
+            value, fields=_AUDIT_RECEIPT_FIELDS, label="audit receipt"
+        )
+        return cls(**row)  # type: ignore[arg-type]
+
+    @classmethod
+    def from_dict(cls, value: object) -> "AuditReceiptFacts":
+        return cls.from_receipt_dict(value)
+
+    def to_dict(self) -> dict[str, object]:
+        return {name: getattr(self, name) for name in _AUDIT_RECEIPT_FIELDS}
+
+    def to_gate_dict(self) -> dict[str, object]:
+        return self.to_dict()
 
 
 def _exact_object(value: object, *, fields: frozenset[str], label: str) -> Mapping[str, object]:
@@ -528,13 +798,14 @@ def make_init(
     session_id: str,
     launch_digest: str,
     expected_engine_config_digest: str,
+    audit_policy: SlotAuditPolicy | None = None,
 ) -> dict[str, object]:
     if not isinstance(config, EngineSessionConfig):
         raise SessionProtocolError("init engine_config is not typed")
     expected = _digest(expected_engine_config_digest, field_name="expected_engine_config_digest")
     if config.digest != expected:
         raise SessionProtocolError("engine_config does not match its launch digest")
-    return {
+    message: dict[str, object] = {
         "engine_config": config.to_dict(),
         "engine_config_digest": expected,
         "launch_digest": _digest(launch_digest, field_name="launch_digest"),
@@ -542,6 +813,19 @@ def make_init(
         "session_id": _binding_id(session_id, field_name="session_id"),
         "type": "init",
     }
+    if audit_policy is not None:
+        if type(audit_policy) is not SlotAuditPolicy:
+            raise SessionProtocolError("init audit_policy is not exactly typed")
+        message["audit_policy"] = audit_policy.to_dict()
+    return message
+
+
+def audit_policy_from_init(message: object) -> SlotAuditPolicy | None:
+    if not isinstance(message, Mapping):
+        raise SessionProtocolError("init must be an object")
+    if "audit_policy" not in message:
+        return None
+    return SlotAuditPolicy.from_dict(message["audit_policy"])
 
 
 def validate_init(
@@ -549,8 +833,13 @@ def validate_init(
     *,
     expected_launch_digest: str | None = None,
     expected_engine_config_digest: str | None = None,
+    expected_audit_policy_digest: str | None = None,
 ) -> tuple[str, str, EngineSessionConfig]:
-    fields = frozenset("engine_config engine_config_digest launch_digest schema session_id type".split())
+    base_fields = frozenset(
+        "engine_config engine_config_digest launch_digest schema session_id type".split()
+    )
+    has_audit = isinstance(message, Mapping) and "audit_policy" in message
+    fields = base_fields | ({"audit_policy"} if has_audit else set())
     row = _exact_object(message, fields=fields, label="init")
     if row["schema"] != SESSION_SCHEMA or row["type"] != "init":
         raise SessionProtocolError("init schema/type mismatch")
@@ -568,6 +857,14 @@ def validate_init(
         expected_engine_config_digest, field_name="expected_engine_config_digest"
     ):
         raise SessionProtocolError("init engine_config binding is stale")
+    audit_policy = audit_policy_from_init(row)
+    if expected_audit_policy_digest is not None:
+        expected_audit = _digest(
+            expected_audit_policy_digest,
+            field_name="expected_audit_policy_digest",
+        )
+        if audit_policy is None or audit_policy.digest != expected_audit:
+            raise SessionProtocolError("init audit policy binding is stale")
     return session_id, launch_digest, config
 
 
@@ -788,6 +1085,72 @@ def validate_batch_request(message: object) -> BatchRequest:
         row["batch_index"], tuple(prompts), row["max_new_tokens"],
         row["top_logprobs_num"], row["temperature"],
     )  # type: ignore[arg-type]
+
+
+_AUDIT_EVIDENCE_FIELDS = frozenset(
+    "audit_policy_digest batch_index launch_digest nonce receipts request_id "
+    "schema session_id type".split()
+)
+
+
+def audit_evidence_message(
+    *,
+    request: BatchRequest,
+    policy: SlotAuditPolicy,
+    receipts: Sequence[AuditReceiptFacts],
+) -> dict[str, object]:
+    if type(request) is not BatchRequest or type(policy) is not SlotAuditPolicy:
+        raise SessionProtocolError("audit evidence binding is not exactly typed")
+    facts = tuple(receipts)
+    if len(facts) > MAX_AUDIT_RECEIPTS or any(
+        type(row) is not AuditReceiptFacts for row in facts
+    ):
+        raise SessionProtocolError("audit evidence receipt sequence is invalid")
+    return {
+        "audit_policy_digest": policy.digest,
+        "batch_index": request.batch_index,
+        "launch_digest": request.launch_digest,
+        "nonce": request.nonce,
+        "receipts": [row.to_dict() for row in facts],
+        "request_id": request.request_id,
+        "schema": SESSION_SCHEMA,
+        "session_id": request.session_id,
+        "type": "audit_evidence",
+    }
+
+
+def validate_audit_evidence(
+    message: object,
+    *,
+    request: BatchRequest,
+    policy: SlotAuditPolicy,
+) -> tuple[AuditReceiptFacts, ...]:
+    if type(request) is not BatchRequest or type(policy) is not SlotAuditPolicy:
+        raise SessionProtocolError("audit evidence expectation is not exactly typed")
+    row = _exact_object(
+        message, fields=_AUDIT_EVIDENCE_FIELDS, label="audit evidence"
+    )
+    expected = {
+        "audit_policy_digest": policy.digest,
+        "batch_index": request.batch_index,
+        "launch_digest": request.launch_digest,
+        "nonce": request.nonce,
+        "request_id": request.request_id,
+        "schema": SESSION_SCHEMA,
+        "session_id": request.session_id,
+        "type": "audit_evidence",
+    }
+    if any(row[name] != value for name, value in expected.items()):
+        raise SessionProtocolError(
+            "audit evidence nonce/request/session/launch/policy binding mismatch"
+        )
+    raw_receipts = row["receipts"]
+    if not isinstance(raw_receipts, list) or len(raw_receipts) > MAX_AUDIT_RECEIPTS:
+        raise SessionProtocolError("audit evidence receipts must be a bounded array")
+    receipts = tuple(AuditReceiptFacts.from_dict(value) for value in raw_receipts)
+    if len({(row.slot, row.rank) for row in receipts}) != len(receipts):
+        raise SessionProtocolError("audit evidence duplicates one slot/rank receipt")
+    return receipts
 
 
 _EVIDENCE_BINDING = struct.Struct(">16s32s16s16sIIIH2x")

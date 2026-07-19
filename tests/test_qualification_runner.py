@@ -99,6 +99,7 @@ class _Harness:
         graph: tuple[QualificationDecision, ...],
         speed: tuple[QualificationDecision, ...],
         quality: tuple[QualificationDecision, ...],
+        audit: tuple[QualificationDecision, ...] | None = None,
         swap_exchanges: bool = False,
         fail_pre_t_quiescence: bool = False,
         exercise_judge_cache: bool = False,
@@ -106,6 +107,8 @@ class _Harness:
     ) -> None:
         assert len(graph) == len(speed)
         assert len(quality) == len(graph) * (2 if repeat else 1)
+        audit = audit or (QualificationDecision.PASS,) * len(graph)
+        assert len(audit) == len(graph)
         # This runner harness predates the typed authority constructor and
         # intentionally replaces the fully validated input boundary with
         # lightweight records. Preserve exact production type checks while
@@ -243,6 +246,16 @@ class _Harness:
                 if repeat
                 else runner.SpeedEvidencePolicy.legacy()
             ),
+            audit_policies=tuple(
+                runner.SlotAuditPolicy(
+                    f"{700 + index:032x}",
+                    250_000,
+                    32,
+                    ("norm.rmsnorm",),
+                    1,
+                )
+                for index in range(len(authorities))
+            ),
             calibration_threshold_policy=SimpleNamespace(
                 digest=_d("calibration-threshold-policy")
             ),
@@ -342,6 +355,60 @@ class _Harness:
             "run_marginal_lifecycle",
             lambda *_args, **_kwargs: self.calls.append("lifecycle") or self.lifecycle,
         )
+
+        def run_audits(value, _lifecycle, **_kwargs):
+            self.calls.append("audit")
+            witnesses = {}
+            for index, (authority, prepared, policy, decision) in enumerate(
+                zip(
+                    value.candidates,
+                    value.prepared.candidates,
+                    value.audit_policies,
+                    audit,
+                    strict=True,
+                )
+            ):
+                receipts = tuple(
+                    runner.AuditReceiptFacts(
+                        slot,
+                        32,
+                        1 if decision is QualificationDecision.FAIL else 0,
+                        0,
+                        0,
+                        0.0 if decision is QualificationDecision.FAIL else 1.0,
+                        0.995,
+                        "allclose",
+                        900 + index * 100 + rank,
+                        rank,
+                        policy.expected_member_count,
+                    )
+                    for slot in policy.expected_slots
+                    for rank in range(policy.expected_member_count)
+                )
+                from optima.audit import gate
+
+                passed, detail = gate(
+                    [receipt.to_gate_dict() for receipt in receipts],
+                    min_calls=policy.minimum_calls,
+                    expected_slots=policy.expected_slots,
+                    expected_member_count=policy.expected_member_count,
+                )
+                assert passed == (decision is QualificationDecision.PASS)
+                witness = runner.AuditWitness(
+                    authority.selected_delta_digest,
+                    prepared.launch.digest,
+                    _d(f"audit-execution-{index}"),
+                    f"{900 + index:032x}",
+                    value.expected_runtime_resource_policy_digest,
+                    policy,
+                    receipts,
+                    decision,
+                    detail,
+                )
+                witnesses[authority.selected_delta_digest] = witness
+            return witnesses, 2.5
+
+        monkeypatch.setattr(runner, "_run_slot_audits", run_audits)
         monkeypatch.setattr(runner, "cohort_trajectory_digest", lambda _row: _d("cohort"))
 
         def entropy_provider(commitment, teardown):
@@ -707,6 +774,15 @@ def _discovery_harness(monkeypatch, tmp_path: Path) -> _Harness:
     )
     harness.value.prepared = prepared
     harness.value.candidates = (authority,)
+    harness.value.audit_policies = (
+        runner.SlotAuditPolicy(
+            "7" * 32,
+            250_000,
+            32,
+            ("norm.rmsnorm",),
+            prepared.candidates[0].session_plan.engine_config.tp_size,
+        ),
+    )
     harness.value.commitment = commitment
     harness.value.evidence_root = tmp_path / "quality"
 
@@ -765,10 +841,11 @@ def test_causal_order_uses_one_multi_candidate_t_lifetime(monkeypatch) -> None:
 
     assert harness.reference_calls == 1
     assert harness.reference_request_counts == [2]
-    assert harness.calls[:8] == [
+    assert harness.calls[:9] == [
         "prevalidate",
         "transaction.enter",
         "lifecycle",
+        "audit",
         "quiescence.1",
         "entropy",
         "reference",
@@ -878,7 +955,7 @@ def test_discovery_authority_attempt_roundtrip_and_cross_lane_rejection(
     real_digest = runner.canonical_digest
 
     def capture(domain: str, value: object) -> str:
-        if domain == "optima.qualification.discovery-causal-authority":
+        if domain == "optima.qualification.discovery-causal-authority.audit-v1":
             captured["payload"] = value
         return real_digest(domain, value)
 
@@ -1007,6 +1084,25 @@ def test_candidate_headlines_recompute_pass_fail_and_no_decision(monkeypatch) ->
         runner.CandidateQualificationReport(
             **{**reports[0].__dict__, "decision": QualificationDecision.FAIL}
         )
+
+
+def test_slot_audit_violation_is_a_hard_nonretryable_qualification_fail(
+    monkeypatch,
+) -> None:
+    harness = _Harness(
+        monkeypatch,
+        graph=(QualificationDecision.PASS,),
+        speed=(QualificationDecision.PASS,),
+        quality=(QualificationDecision.PASS,),
+        audit=(QualificationDecision.FAIL,),
+    )
+    report = harness.run().reports[0]
+
+    assert report.audit_decision is QualificationDecision.FAIL
+    assert report.audit_witness.receipts[0].violations == 1
+    assert report.decision is QualificationDecision.FAIL
+    assert report.reason == "slot_audit_failed"
+    assert not report.retryable
 
 
 def test_t_exchange_substitution_is_rejected(monkeypatch) -> None:
@@ -1158,7 +1254,7 @@ def test_reports_and_attempt_expose_no_score_crown_or_settlement_fields(monkeypa
     assert not ({"score", "crown", "crownable", "settlement", "winner"} & emitted)
 
 
-def test_registered_authority_digest_and_report_wire_format_remain_stable(
+def test_registered_authority_digest_versions_slot_audit_policy_and_report_wire(
     monkeypatch, tmp_path: Path
 ) -> None:
     harness = _Harness(
@@ -1173,7 +1269,7 @@ def test_registered_authority_digest_and_report_wire_format_remain_stable(
     real_digest = runner.canonical_digest
 
     def capture(domain: str, payload: object) -> str:
-        if domain == "optima.qualification.causal-authority":
+        if domain == "optima.qualification.causal-authority.audit-v1":
             captured["payload"] = payload
         return real_digest(domain, payload)
 
@@ -1181,7 +1277,7 @@ def test_registered_authority_digest_and_report_wire_format_remain_stable(
     monkeypatch.setattr(runner, "canonical_digest", capture)
     authority_digest = _REAL_QUALIFICATION_AUTHORITY(value)
     assert authority_digest == real_digest(
-        "optima.qualification.causal-authority", captured["payload"]
+        "optima.qualification.causal-authority.audit-v1", captured["payload"]
     )
     authority_payload = captured["payload"]
     assert set(authority_payload) == {
@@ -1189,10 +1285,11 @@ def test_registered_authority_digest_and_report_wire_format_remain_stable(
         "candidates",
         "commitment",
         "incumbent_preflight",
-        "model_mount",
-        "policies",
-        "reference",
-        "source",
+            "model_mount",
+            "policies",
+            "reference",
+            "slot_audit_policies",
+            "source",
     }
     assert set(authority_payload["candidates"][0]) == {
         "arm",
@@ -1225,14 +1322,19 @@ def test_registered_authority_digest_and_report_wire_format_remain_stable(
         "candidate_mean_teacher_nll",
         "raw_quality_artifact",
         "raw_quality_binding",
-        "speed_witness",
-        "t_request_sha256",
-        "decision",
+            "speed_witness",
+            "t_request_sha256",
+            "audit_evidence_digest",
+            "audit_decision",
+            "audit_witness",
+            "decision",
         "reason",
         "retryable",
     )
     report = attempt.reports[0]
     assert tuple(report.to_dict()) == report_fields
+    assert report.speed_witness.to_dict() == report.to_dict()["speed_witness"]
+    assert report.audit_witness.to_dict() == report.to_dict()["audit_witness"]
     assert runner.canonical_json_bytes(report.to_dict()) == runner.canonical_json_bytes(
         {
             field: runner._encode_record(getattr(report, field))

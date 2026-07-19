@@ -19,6 +19,7 @@ from optima.chain.weights import WeightProjection, WeightPublicationRecord
 from optima.copy_fingerprint import SubmittedDeltaFingerprint
 from optima.discovery import DiscoveryArmPlan
 from optima.eval.evidence_store import EvidenceArtifactRef, publish_evidence
+from optima.eval.oci_session_protocol import SlotAuditPolicy
 from optima.eval.qualification import QualificationDecision
 from optima.eval.qualification_intake import (
     QualificationIntakeBatch,
@@ -91,6 +92,10 @@ def _fingerprint(
 
 def _h(label: str) -> str:
     return sha256_hex(label.encode())
+
+
+def _audit_policy(label: str, slots: tuple[str, ...]) -> SlotAuditPolicy:
+    return SlotAuditPolicy(_h(f"audit-seed:{label}")[:32], 100_000, 32, slots, 1)
 
 
 def _promote(store: FinalizedIntakeStore, reservation_id: str) -> None:
@@ -194,6 +199,7 @@ def _qualified_settlement_candidate(
     )
     _promote(store, row.reservation_id)
     def qualification(marker: str, authority: str, attempt, speedup: str):
+        audit_policy = _audit_policy(marker, (target,))
         return SettlementQualification(
             lane="registered",
             arena_digest=incumbent.arena_digest,
@@ -220,6 +226,9 @@ def _qualified_settlement_candidate(
             speedup=speedup,
             incumbent_manifest=incumbent,
             candidate_manifest=arm.candidate,
+            audit_control_digest=audit_policy.control.digest,
+            audit_policy=audit_policy,
+            audit_evidence_digest=_h("audit-evidence-" + marker),
         )
 
     authorities = (_h("primary-authority"), _h("reproduction-authority"))
@@ -352,6 +361,9 @@ def _qualified_discovery_candidate(
         assert published.status == "published"
 
     def qualification(lane: str, attempt, speedup: str) -> SettlementQualification:
+        audit_policy = _audit_policy(
+            f"discovery:{index}:{lane}", ("discovery",)
+        )
         return SettlementQualification(
             lane="discovery",
             arena_digest=incumbent.arena_digest,
@@ -378,6 +390,9 @@ def _qualified_discovery_candidate(
             speedup=speedup,
             incumbent_manifest=incumbent,
             proposal_digest=proposal_digest,
+            audit_control_digest=audit_policy.control.digest,
+            audit_policy=audit_policy,
+            audit_evidence_digest=_h(f"audit-evidence:{index}:{lane}"),
         )
 
     qualifications = (

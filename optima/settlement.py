@@ -15,6 +15,7 @@ from enum import Enum
 from typing import Iterable
 
 from optima.eval.evidence_store import EvidenceArtifactRef
+from optima.eval.oci_session_protocol import SlotAuditPolicy
 from optima.stack_identity import canonical_digest
 from optima.stack_manifest import EvaluationStackManifest
 from optima.stack_plan import StackArmIdentity
@@ -31,6 +32,12 @@ _LEGACY_SPEED_POLICY_DIGEST = canonical_digest(
         "estimator": "bcbp-baseline-range.v1",
         "version": 1,
     },
+)
+_LEGACY_AUDIT_CONTROL_DIGEST = canonical_digest(
+    "optima.settlement.legacy-audit-control", {"status": "absent"}
+)
+_LEGACY_AUDIT_EVIDENCE_DIGEST = canonical_digest(
+    "optima.settlement.legacy-audit-evidence", {"status": "absent"}
 )
 
 
@@ -135,6 +142,9 @@ class SettlementQualification:
     proposal_digest: str = ""
     candidate_manifest: EvaluationStackManifest | None = None
     speed_evidence_policy_digest: str = _LEGACY_SPEED_POLICY_DIGEST
+    audit_control_digest: str = _LEGACY_AUDIT_CONTROL_DIGEST
+    audit_policy: SlotAuditPolicy | None = None
+    audit_evidence_digest: str = _LEGACY_AUDIT_EVIDENCE_DIGEST
 
     def __post_init__(self) -> None:
         if self.lane not in _LANES:
@@ -156,6 +166,8 @@ class SettlementQualification:
             "candidate_stack_digest",
             "candidate_tree_digest",
             "speed_evidence_policy_digest",
+            "audit_control_digest",
+            "audit_evidence_digest",
         ):
             object.__setattr__(self, field, _digest(getattr(self, field), field))
         for field in ("finalized_block", "event_index", "event_subindex"):
@@ -171,6 +183,21 @@ class SettlementQualification:
             raise SettlementError("settlement members are not canonical")
         object.__setattr__(self, "members", members)
         object.__setattr__(self, "speedup", _speedup(self.speedup))
+        if self.audit_policy is None:
+            if (
+                self.audit_control_digest != _LEGACY_AUDIT_CONTROL_DIGEST
+                or self.audit_evidence_digest != _LEGACY_AUDIT_EVIDENCE_DIGEST
+            ):
+                raise SettlementError(
+                    "legacy auditless qualification has nonlegacy audit authority"
+                )
+        elif (
+            type(self.audit_policy) is not SlotAuditPolicy
+            or self.audit_policy.control.digest != self.audit_control_digest
+        ):
+            raise SettlementError(
+                "settlement audit policy differs from its seed-independent control"
+            )
         if (
             type(self.incumbent_manifest) is not EvaluationStackManifest
             or self.incumbent_manifest.digest != self.incumbent_stack_digest
@@ -374,6 +401,9 @@ class SettlementQualification:
             proposal_digest=(arm.proposal_digest if lane == "discovery" else ""),
             candidate_manifest=manifest,
             speed_evidence_policy_digest=report.speed_witness.policy.digest,
+            audit_control_digest=report.audit_witness.policy.control.digest,
+            audit_policy=report.audit_witness.policy,
+            audit_evidence_digest=report.audit_evidence_digest,
         )
 
     def to_dict(self) -> dict[str, object]:
@@ -409,20 +439,47 @@ class SettlementQualification:
         }
         # Historical B/C/B-prime settlement bytes remain byte-identical.  The
         # repeat policy is serialized because it is new consensus authority.
-        if self.speed_evidence_policy_digest != _LEGACY_SPEED_POLICY_DIGEST:
+        if (
+            self.speed_evidence_policy_digest != _LEGACY_SPEED_POLICY_DIGEST
+            or self.audit_policy is not None
+        ):
             result["speed_evidence_policy_digest"] = self.speed_evidence_policy_digest
+        if self.audit_policy is not None:
+            result.update(
+                {
+                    "audit_control_digest": self.audit_control_digest,
+                    "audit_evidence_digest": self.audit_evidence_digest,
+                    "audit_policy": self.audit_policy.to_dict(),
+                }
+            )
         return result
 
     @classmethod
     def from_dict(cls, value: object) -> "SettlementQualification":
-        fields_v2 = set(cls.__dataclass_fields__)
+        fields_v3 = set(cls.__dataclass_fields__)
+        audit_fields = {
+            "audit_control_digest",
+            "audit_evidence_digest",
+            "audit_policy",
+        }
+        fields_v2 = fields_v3 - audit_fields
         fields_v1 = fields_v2 - {"speed_evidence_policy_digest"}
         if type(value) is not dict or frozenset(value) not in {
-            frozenset(fields_v1), frozenset(fields_v2)
+            frozenset(fields_v1), frozenset(fields_v2), frozenset(fields_v3)
         }:
             raise SettlementError("settlement qualification fields do not match")
         row = dict(value)
         row.setdefault("speed_evidence_policy_digest", _LEGACY_SPEED_POLICY_DIGEST)
+        if "audit_policy" in row:
+            row["audit_policy"] = SlotAuditPolicy.from_dict(row["audit_policy"])
+        else:
+            row.update(
+                {
+                    "audit_control_digest": _LEGACY_AUDIT_CONTROL_DIGEST,
+                    "audit_evidence_digest": _LEGACY_AUDIT_EVIDENCE_DIGEST,
+                    "audit_policy": None,
+                }
+            )
         members = row.get("members")
         if type(members) is not list:
             raise SettlementError("settlement qualification members are malformed")
@@ -438,7 +495,12 @@ class SettlementQualification:
 
     @property
     def digest(self) -> str:
-        return canonical_digest("optima.settlement.qualification", self.to_dict())
+        domain = (
+            "optima.settlement.qualification"
+            if self.audit_policy is None
+            else "optima.settlement.qualification.audit-v1"
+        )
+        return canonical_digest(domain, self.to_dict())
 
 
 @dataclass(frozen=True)
@@ -465,6 +527,7 @@ class SettlementCandidate:
             "incumbent_tree_digest", "candidate_stack_digest", "candidate_tree_digest",
             "incumbent_manifest", "proposal_digest", "candidate_manifest",
             "speed_evidence_policy_digest",
+            "audit_control_digest",
         )
         if any(
             getattr(self.primary, field) != getattr(self.reproduction, field)
@@ -486,6 +549,22 @@ class SettlementCandidate:
             raise SettlementError(
                 "independent reproduction reuses primary authority or evidence"
             )
+        primary_audit = self.primary.audit_policy
+        reproduction_audit = self.reproduction.audit_policy
+        if (primary_audit is None) != (reproduction_audit is None):
+            raise SettlementError(
+                "independent reproduction mixes audited and auditless qualifications"
+            )
+        if primary_audit is not None and reproduction_audit is not None:
+            if (
+                primary_audit.control != reproduction_audit.control
+                or primary_audit.validator_seed == reproduction_audit.validator_seed
+                or self.primary.audit_evidence_digest
+                == self.reproduction.audit_evidence_digest
+            ):
+                raise SettlementError(
+                    "independent reproduction reuses or changes slot-audit authority"
+                )
 
     @classmethod
     def from_reproductions(
@@ -493,7 +572,15 @@ class SettlementCandidate:
         primary: SettlementQualification,
         reproduction: SettlementQualification,
     ) -> "SettlementCandidate":
-        return cls(primary, reproduction)
+        candidate = cls(primary, reproduction)
+        if (
+            candidate.primary.audit_policy is None
+            or candidate.reproduction.audit_policy is None
+        ):
+            raise SettlementError(
+                "new settlement candidate requires two audited qualifications"
+            )
+        return candidate
 
     def __getattr__(self, field: str):
         # Keep common identity access explicit to the pair while callers migrate from
@@ -544,7 +631,12 @@ class SettlementCandidate:
 
     @property
     def digest(self) -> str:
-        return canonical_digest("optima.settlement.candidate.v2", self.to_dict())
+        domain = (
+            "optima.settlement.candidate.v2"
+            if self.primary.audit_policy is None
+            else "optima.settlement.candidate.v3"
+        )
+        return canonical_digest(domain, self.to_dict())
 
 
 @dataclass(frozen=True)

@@ -6,6 +6,7 @@ import pytest
 
 from optima.discovery import DiscoveryArmPlan
 from optima.eval.evidence_store import EvidenceArtifactRef
+from optima.eval.oci_session_protocol import SlotAuditPolicy
 from optima.settlement import (
     SettlementCandidate,
     SettlementError,
@@ -36,6 +37,10 @@ SILU = "activation.silu_and_mul"
 
 def _h(label: str) -> str:
     return sha256_hex(label.encode())
+
+
+def _audit_policy(label: str, slots: tuple[str, ...]) -> SlotAuditPolicy:
+    return SlotAuditPolicy(_h(f"audit-seed:{label}")[:32], 100_000, 32, slots, 1)
 
 
 def _context(catalog: TargetCatalog) -> EvaluationStackContext:
@@ -97,6 +102,8 @@ def _candidate(
         expected_context=_context(catalog),
     )
     members = catalog.require(replacement.target_id).members
+    audit_slots = tuple(sorted(members))
+    primary_audit = _audit_policy(f"primary:{label}", audit_slots)
     primary = SettlementQualification(
         lane="registered",
         arena_digest=incumbent.arena_digest,
@@ -123,7 +130,11 @@ def _candidate(
         speedup=speedup,
         incumbent_manifest=incumbent,
         candidate_manifest=plan.candidate,
+        audit_control_digest=primary_audit.control.digest,
+        audit_policy=primary_audit,
+        audit_evidence_digest=_h(f"audit-evidence:{label}"),
     )
+    reproduction_audit = _audit_policy(f"reproduction:{label}", audit_slots)
     reproduction = replace(
         primary,
         qualification_authority_digest=_h(f"reproduction-authority:{label}"),
@@ -133,6 +144,8 @@ def _candidate(
         selection_commitment_digest=_h(f"reproduction-selection-commitment:{label}"),
         selection_secret_commitment_digest=_h(f"reproduction-selection-secret:{label}"),
         selection_evidence_digest=_h(f"reproduction-selection-evidence:{label}"),
+        audit_policy=reproduction_audit,
+        audit_evidence_digest=_h(f"reproduction-audit-evidence:{label}"),
         speedup=("1.04" if speedup == "1.05" else speedup),
     )
     return SettlementCandidate.from_reproductions(primary, reproduction)
@@ -150,6 +163,8 @@ def _discovery(
         build_profile_digest=_h("build-profile"),
         overlay_identity_digest=_h(f"overlay:{label}"),
     )
+    audit_slots = ("sglang.inference.v1",)
+    primary_audit = _audit_policy(f"primary:{label}", audit_slots)
     primary = SettlementQualification(
         lane="discovery",
         arena_digest=incumbent.arena_digest,
@@ -176,7 +191,11 @@ def _discovery(
         speedup="1.03",
         incumbent_manifest=incumbent,
         proposal_digest=arm.proposal_digest,
+        audit_control_digest=primary_audit.control.digest,
+        audit_policy=primary_audit,
+        audit_evidence_digest=_h(f"audit-evidence:{label}"),
     )
+    reproduction_audit = _audit_policy(f"reproduction:{label}", audit_slots)
     return SettlementCandidate.from_reproductions(
         primary,
         replace(
@@ -192,6 +211,8 @@ def _discovery(
                 f"reproduction-selection-secret:{label}"
             ),
             selection_evidence_digest=_h(f"reproduction-selection-evidence:{label}"),
+            audit_policy=reproduction_audit,
+            audit_evidence_digest=_h(f"reproduction-audit-evidence:{label}"),
             speedup="1.02",
         ),
     )
@@ -273,6 +294,82 @@ def test_reproduction_must_use_the_same_speed_evidence_policy() -> None:
     )
     with pytest.raises(SettlementError, match="contribution identity"):
         SettlementCandidate.from_reproductions(candidate.primary, mismatched)
+
+
+@pytest.mark.parametrize("field", ("sample_rate_ppm", "minimum_calls"))
+def test_reproduction_must_use_the_same_seed_independent_audit_control(
+    field: str,
+) -> None:
+    catalog = default_target_catalog()
+    candidate = _candidate(
+        _stack(catalog), _ref(catalog, MSA, "a"), catalog, label="a"
+    )
+    assert candidate.reproduction.audit_policy is not None
+    changed_policy = replace(
+        candidate.reproduction.audit_policy,
+        **{
+            field: getattr(candidate.reproduction.audit_policy, field) + 1,
+        },
+    )
+    mismatched = replace(
+        candidate.reproduction,
+        audit_control_digest=changed_policy.control.digest,
+        audit_policy=changed_policy,
+    )
+    with pytest.raises(SettlementError, match="contribution identity"):
+        SettlementCandidate.from_reproductions(candidate.primary, mismatched)
+
+
+def test_reproduction_requires_distinct_audit_seed_and_evidence() -> None:
+    catalog = default_target_catalog()
+    candidate = _candidate(
+        _stack(catalog), _ref(catalog, MSA, "a"), catalog, label="a"
+    )
+    assert candidate.primary.audit_policy is not None
+    reused_seed = replace(
+        candidate.reproduction,
+        audit_policy=replace(
+            candidate.reproduction.audit_policy,
+            validator_seed=candidate.primary.audit_policy.validator_seed,
+        ),
+    )
+    with pytest.raises(SettlementError, match="slot-audit authority"):
+        SettlementCandidate.from_reproductions(candidate.primary, reused_seed)
+    reused_evidence = replace(
+        candidate.reproduction,
+        audit_evidence_digest=candidate.primary.audit_evidence_digest,
+    )
+    with pytest.raises(SettlementError, match="slot-audit authority"):
+        SettlementCandidate.from_reproductions(candidate.primary, reused_evidence)
+
+
+def test_new_candidate_rejects_legacy_auditless_qualification_but_reopens_history() -> None:
+    catalog = default_target_catalog()
+    candidate = _candidate(
+        _stack(catalog), _ref(catalog, MSA, "a"), catalog, label="a"
+    )
+    legacy_primary = replace(
+        candidate.primary,
+        audit_control_digest=SettlementQualification.__dataclass_fields__[  # type: ignore[index]
+            "audit_control_digest"
+        ].default,
+        audit_policy=None,
+        audit_evidence_digest=SettlementQualification.__dataclass_fields__[  # type: ignore[index]
+            "audit_evidence_digest"
+        ].default,
+    )
+    legacy_reproduction = replace(
+        candidate.reproduction,
+        audit_control_digest=legacy_primary.audit_control_digest,
+        audit_policy=None,
+        audit_evidence_digest=legacy_primary.audit_evidence_digest,
+    )
+    with pytest.raises(SettlementError, match="requires two audited"):
+        SettlementCandidate.from_reproductions(
+            legacy_primary, legacy_reproduction
+        )
+    historical = SettlementCandidate(legacy_primary, legacy_reproduction)
+    assert SettlementCandidate.from_dict(historical.to_dict()) == historical
 
 
 def test_settlement_evidence_binds_both_retained_attempts() -> None:

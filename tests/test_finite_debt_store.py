@@ -1,11 +1,23 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 
 import pytest
 
-from optima.chain.finite_debt_store import SeededFamilyClock, reward_family_id
+from optima.chain.finite_debt_store import (
+    _ATOMIC_COMPOSITION_ACTIVATION,
+    FiniteDebtStoreError,
+    SeededFamilyClock,
+    reward_family_id,
+)
+from optima.chain.debt_publication import (
+    PUBLICATION_KIND_CORE,
+    build_confirmed_debt_weight_publication,
+    build_debt_weight_publication_binding,
+)
 from optima.chain.intake import IntakeError
+from optima.chain.weights import WeightPublicationRecord
 from optima.finite_debt import (
     CampaignBudgetShare,
     IMPROVEMENT_GROSS,
@@ -65,13 +77,84 @@ def _policy(
 def _activate(store, candidate, *, policy=None, seeds=()):
     selected = policy or _policy(_family(candidate))
     block_hash = "0x" + f"{10:064x}"
-    activation = store.activate_finite_debt_policy(
+    activation = store._finite_debt.activate_policy(
         selected,
         activation_block=10,
         activation_block_hash=block_hash,
         seeded_family_clocks=seeds,
+        _atomic_composition_authority=_ATOMIC_COMPOSITION_ACTIVATION,
     )
     return selected, activation
+
+
+def _activate_raw(store, policy, *, block: int, seeds=()):
+    try:
+        return store._finite_debt.activate_policy(
+            policy,
+            activation_block=block,
+            activation_block_hash="0x" + f"{block:064x}",
+            seeded_family_clocks=seeds,
+            _atomic_composition_authority=_ATOMIC_COMPOSITION_ACTIVATION,
+        )
+    except FiniteDebtStoreError as exc:
+        raise IntakeError(f"finite-debt authority failed: {exc}") from None
+
+
+def _confirmed_debt_publication(
+    store,
+    projection,
+    activation,
+    *,
+    publication_kind: str = PUBLICATION_KIND_CORE,
+    confirmed_block: int | None = None,
+    marker: str = "test confirmation",
+):
+    boundary = projection.effective_block
+    boundary_hash = "0x" + f"{boundary:064x}"
+    hotkeys = tuple(sorted({"validator", *(row.hotkey for row in projection.weights)}))
+    metagraph = SimpleNamespace(
+        block=boundary,
+        block_hash=boundary_hash,
+        hotkeys=list(hotkeys),
+        uids=list(range(len(hotkeys))),
+    )
+    epoch_index = (
+        boundary - activation.activation_block
+    ) // activation.policy.epoch_blocks
+    binding = build_debt_weight_publication_binding(
+        projection,
+        publication_kind=publication_kind,
+        activation_digest=activation.digest,
+        chain_scope_digest=store.scope.digest,
+        netuid=store.scope.netuid,
+        validator_hotkey="validator",
+        boundary_metagraph=metagraph,
+        epoch_index=epoch_index,
+    )
+    journal = store.debt_weight_publication_journal(binding)
+    head = journal.load()
+    confirmed = boundary if confirmed_block is None else confirmed_block
+    record = WeightPublicationRecord(
+        binding.weight_projection.digest,
+        "confirmed",
+        prior_record_digest=None if head is None else head.digest,
+        confirmed_block=confirmed,
+        confirmed_last_update=confirmed,
+        reason=marker,
+    )
+    journal.compare_and_swap(None if head is None else head.digest, record)
+    return build_confirmed_debt_weight_publication(
+        binding,
+        record,
+        confirmed_metagraph=SimpleNamespace(
+            block=confirmed,
+            block_hash="0x" + f"{confirmed:064x}",
+        ),
+        confirmed_snapshot=SimpleNamespace(
+            weights=binding.weight_projection.weights,
+            last_update_block=confirmed,
+        ),
+    )
 
 
 def _commit(store, candidate, *, current_block: int = 12, with_hash: bool = True):
@@ -300,7 +383,7 @@ def test_reopen_rejects_seed_not_listed_by_activation(tmp_path) -> None:
     with _store(tmp_path) as store:
         candidate = _qualified_settlement_candidate(store)
         assert isinstance(candidate, SettlementCandidate)
-        policy, _activation = _activate(store, candidate)
+        policy, activation = _activate(store, candidate)
         activation_event = store.finite_debt_reward_events()[0]
         with store._transaction():
             store._db.execute(
@@ -456,11 +539,7 @@ def test_missing_family_rolls_back_entire_crown_and_non_crowns_issue_nothing(
         store.reserve_finalized(
             (), finalized_block=10, finalized_block_hash=activation_hash
         )
-        store.activate_finite_debt_policy(
-            _policy(_h("unused-family")),
-            activation_block=10,
-            activation_block_hash=activation_hash,
-        )
+        _activate_raw(store, _policy(_h("unused-family")), block=10)
         rows = store.reserve_finalized(
             (_arrival(0, block=11), _arrival(1, block=11)),
             finalized_block=11,
@@ -508,7 +587,7 @@ def test_lifecycle_forfeits_departure_and_expiry_and_guards_policy_upgrade(
     with _store(departure_root) as store:
         candidate = _qualified_settlement_candidate(store)
         assert isinstance(candidate, SettlementCandidate)
-        policy, _activation = _activate(store, candidate)
+        policy, activation = _activate(store, candidate)
         _commit(store, candidate)
         next_policy = _policy(_family(candidate), beta_ppm=100_001)
         block13 = "0x" + f"{13:064x}"
@@ -516,11 +595,7 @@ def test_lifecycle_forfeits_departure_and_expiry_and_guards_policy_upgrade(
             (), finalized_block=13, finalized_block_hash=block13
         )
         with pytest.raises(IntakeError, match="open debt"):
-            store.activate_finite_debt_policy(
-                next_policy,
-                activation_block=13,
-                activation_block_hash=block13,
-            )
+            _activate_raw(store, next_policy, block=13)
         changed = store.reconcile_finite_debt_lifecycle(
             current_block=13,
             current_block_hash=block13,
@@ -538,11 +613,7 @@ def test_lifecycle_forfeits_departure_and_expiry_and_guards_policy_upgrade(
         store.reserve_finalized(
             (), finalized_block=14, finalized_block_hash=block14
         )
-        upgraded = store.activate_finite_debt_policy(
-            next_policy,
-            activation_block=14,
-            activation_block_hash=block14,
-        )
+        upgraded = _activate_raw(store, next_policy, block=14)
         assert upgraded.previous_policy_digest == policy.digest
 
     expiry_root = tmp_path / "expiry"
@@ -595,10 +666,10 @@ def test_policy_upgrade_reopens_terminal_balance_before_acceptance(tmp_path) -> 
         block14 = "0x" + f"{14:064x}"
         store.reserve_finalized((), finalized_block=14, finalized_block_hash=block14)
         with pytest.raises(IntakeError, match="balance is corrupt"):
-            store.activate_finite_debt_policy(
+            _activate_raw(
+                store,
                 _policy(_family(candidate), beta_ppm=policy.beta_ppm + 1),
-                activation_block=14,
-                activation_block_hash=block14,
+                block=14,
             )
 
 
@@ -899,9 +970,7 @@ def test_no_debt_clock_rejects_unrelated_claim_not_issued_event(tmp_path) -> Non
         policy = _policy(_family(candidate))
         block11 = "0x" + f"{11:064x}"
         store.reserve_finalized((), finalized_block=11, finalized_block_hash=block11)
-        store.activate_finite_debt_policy(
-            policy, activation_block=11, activation_block_hash=block11
-        )
+        _activate_raw(store, policy, block=11)
         _commit(store, candidate, current_block=12)
         event = store.finite_debt_reward_events()[-1]
         assert event["event_type"] == "claim_not_issued"
@@ -934,7 +1003,7 @@ def test_projection_is_read_only_and_confirmed_close_is_exactly_once(tmp_path) -
     with _store(tmp_path) as store:
         candidate = _qualified_settlement_candidate(store)
         assert isinstance(candidate, SettlementCandidate)
-        policy, _activation = _activate(store, candidate)
+        policy, activation = _activate(store, candidate)
         _commit(store, candidate)
         before = store.finite_debt_claim_states()[0]
 
@@ -961,22 +1030,18 @@ def test_projection_is_read_only_and_confirmed_close_is_exactly_once(tmp_path) -
         store.reserve_finalized(
             (), finalized_block=20, finalized_block_hash=boundary_hash
         )
-        publication = _h("confirmed-debt-publication")
-        with pytest.raises(IntakeError, match="expected digest"):
+        confirmation = _confirmed_debt_publication(
+            store, projection, activation
+        )
+        with pytest.raises(IntakeError, match="typed publication confirmation"):
             store.close_confirmed_debt_epoch(
                 projection,
-                expected_projection_digest=_h("wrong-projection"),
-                finalized_block=20,
-                finalized_block_hash=boundary_hash,
-                publication_record_digest=publication,
+                confirmation=_h("not-a-confirmation"),
                 eligible_hotkeys=("miner", "reserve"),
             )
         epoch = store.close_confirmed_debt_epoch(
             projection,
-            expected_projection_digest=projection.digest,
-            finalized_block=20,
-            finalized_block_hash=boundary_hash,
-            publication_record_digest=publication,
+            confirmation=confirmation,
             eligible_hotkeys=("miner", "reserve"),
         )
         after = store.finite_debt_claim_states()[0]
@@ -991,10 +1056,7 @@ def test_projection_is_read_only_and_confirmed_close_is_exactly_once(tmp_path) -
         event_count = len(store.finite_debt_reward_events())
         retry = store.close_confirmed_debt_epoch(
             projection,
-            expected_projection_digest=projection.digest,
-            finalized_block=20,
-            finalized_block_hash=boundary_hash,
-            publication_record_digest=publication,
+            confirmation=confirmation,
             eligible_hotkeys=("miner", "reserve"),
         )
         assert retry == epoch
@@ -1004,13 +1066,16 @@ def test_projection_is_read_only_and_confirmed_close_is_exactly_once(tmp_path) -
             effective_block=20,
             eligible_hotkeys=("miner", "reserve"),
         ) == projection
+        another_confirmation = _confirmed_debt_publication(
+            store,
+            projection,
+            activation,
+            marker="another confirmation",
+        )
         with pytest.raises(IntakeError, match="retry differs"):
             store.close_confirmed_debt_epoch(
                 projection,
-                expected_projection_digest=projection.digest,
-                finalized_block=20,
-                finalized_block_hash=boundary_hash,
-                publication_record_digest=_h("another-publication"),
+                confirmation=another_confirmation,
                 eligible_hotkeys=("miner", "reserve"),
             )
 
@@ -1029,7 +1094,7 @@ def test_epoch_reopen_rejects_extra_balance_revision_reusing_payout_event(
     with _store(tmp_path) as store:
         candidate = _qualified_settlement_candidate(store)
         assert isinstance(candidate, SettlementCandidate)
-        _activate(store, candidate)
+        _policy_row, activation = _activate(store, candidate)
         _commit(store, candidate)
         projection = store.project_finite_debt_epoch(
             effective_block=20,
@@ -1041,10 +1106,9 @@ def test_epoch_reopen_rejects_extra_balance_revision_reusing_payout_event(
         )
         epoch = store.close_confirmed_debt_epoch(
             projection,
-            expected_projection_digest=projection.digest,
-            finalized_block=20,
-            finalized_block_hash=boundary_hash,
-            publication_record_digest=_h("extra-revision-publication"),
+            confirmation=_confirmed_debt_publication(
+                store, projection, activation
+            ),
             eligible_hotkeys=("miner", "reserve"),
         )
         after = store.finite_debt_claim_states()[0]

@@ -26,6 +26,7 @@ from optima.discovery import (
     reopen_discovery_engine_binding,
 )
 from optima.eval.evidence_store import EvidenceArtifactRef, publish_evidence
+from optima.eval.oci_session_protocol import SlotAuditPolicy
 from optima.engine_tree import (
     EngineTreeError,
     inspect_contribution,
@@ -66,6 +67,10 @@ OVERRIDE = Path(__file__).parents[1] / "examples" / "miner_m3_swigluoai_override
 
 def _digest(label: str) -> str:
     return hashlib.sha256(label.encode()).hexdigest()
+
+
+def _audit_policy(label: str, slots: tuple[str, ...]) -> SlotAuditPolicy:
+    return SlotAuditPolicy(_digest(f"audit-seed:{label}")[:32], 100_000, 32, slots, 1)
 
 
 def _evidence(domain: str, digest: str) -> EvidenceArtifactRef:
@@ -820,6 +825,8 @@ def test_integration_promotion_binds_crown_evidence_source_and_review_commit(
     )
     primary_attempt_payload = b'{"attempt":"primary"}'
     reproduction_attempt_payload = b'{"attempt":"reproduction"}'
+    audit_slots = tuple(sorted(catalog.require(proposal.target_id).members))
+    primary_audit = _audit_policy("promotion-primary", audit_slots)
     primary = SettlementQualification(
         lane="registered",
         arena_digest=incumbent.arena_digest,
@@ -846,7 +853,11 @@ def test_integration_promotion_binds_crown_evidence_source_and_review_commit(
         speedup="1.05",
         incumbent_manifest=incumbent,
         candidate_manifest=arm.candidate,
+        audit_control_digest=primary_audit.control.digest,
+        audit_policy=primary_audit,
+        audit_evidence_digest=_digest("promotion-audit-evidence"),
     )
+    reproduction_audit = _audit_policy("promotion-reproduction", audit_slots)
     reproduction = replace(
         primary,
         qualification_authority_digest=_digest("promotion-reproduction-authority"),
@@ -864,6 +875,8 @@ def test_integration_promotion_binds_crown_evidence_source_and_review_commit(
         selection_evidence_digest=_digest(
             "promotion-reproduction-selection-evidence"
         ),
+        audit_policy=reproduction_audit,
+        audit_evidence_digest=_digest("promotion-reproduction-audit-evidence"),
         speedup="1.04",
     )
     candidate = SettlementCandidate.from_reproductions(primary, reproduction)

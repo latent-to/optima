@@ -1,14 +1,23 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
+from optima.chain.debt_publication import (
+    PUBLICATION_KIND_COMPOSED,
+    build_debt_weight_publication_binding,
+)
 from optima.chain.finite_debt_store import reward_family_id
+from optima.chain.incentive_activation import selected_model_campaign_id
 from optima.chain.incentive_composition_store import (
     IncentiveCompositionStoreError,
     SELECTED_CORE_SELECTION_REPORT_DIGEST,
     SELECTED_SELECTION_REPORT_DIGEST,
+    SelectedIncentiveActivationApproval,
 )
 from optima.chain.intake import IntakeError
+from optima.chain.weights import WeightPublicationRecord
 from optima.finite_debt import (
     CampaignBudgetShare,
     IMPROVEMENT_GROSS,
@@ -32,11 +41,36 @@ from tests.test_chain_intake import (
     _qualified_settlement_candidate,
     _store,
 )
-from tests.test_finite_debt_store import _commit, _family
+from tests.test_finite_debt_store import (
+    _commit,
+    _confirmed_debt_publication,
+    _family,
+)
+
+
+_APPROVED_ARENA_DIGEST = _h("selected incentive activation arena")
+_APPROVED_CATALOG_DIGEST = _h("selected incentive activation catalog")
+_APPROVED_EVALUATION_STACK_DIGEST = _h(
+    "selected incentive activation evaluation stack"
+)
+_APPROVED_MEMBERSHIP_DIGEST = _h("selected incentive activation membership")
+_APPROVED_AUDIT_CONTROL_MANIFEST_DIGEST = _h(
+    "selected incentive activation audit controls"
+)
+_APPROVED_AUDIT_CANARY_RECEIPT_DIGEST = _h(
+    "selected incentive activation audit canary"
+)
+_APPROVED_AUDIT_RISK_ACCEPTANCE_DIGEST = _h(
+    "selected incentive activation audit residual-risk acceptance"
+)
 
 
 def _selected_core(family_id: str) -> FiniteDebtPolicyManifest:
-    campaign_id = _h("minimax-m3 campaign")
+    campaign_id = selected_model_campaign_id(
+        arena_digest=_APPROVED_ARENA_DIGEST,
+        catalog_digest=_APPROVED_CATALOG_DIGEST,
+        reward_family_ids=(family_id,),
+    )
     return FiniteDebtPolicyManifest(
         campaign_budget_shares=(CampaignBudgetShare(campaign_id, PPM),),
         reward_family_campaigns=(RewardFamilyCampaign(family_id, campaign_id),),
@@ -67,22 +101,82 @@ def _selected_composition(
     )
 
 
-def _activate_selected(store, candidate):
-    core = _selected_core(_family(candidate))
-    block_hash = "0x" + f"{10:064x}"
-    core_activation = store.activate_finite_debt_policy(
-        core,
-        activation_block=10,
-        activation_block_hash=block_hash,
+def _approval(store, core, composition, *, block: int = 10):
+    block_hash = "0x" + f"{block:064x}"
+    return SelectedIncentiveActivationApproval(
+        store.scope.digest,
+        core.digest,
+        composition.digest,
+        core.campaign_budget_shares[0].campaign_id,
+        _APPROVED_ARENA_DIGEST,
+        _APPROVED_EVALUATION_STACK_DIGEST,
+        _APPROVED_CATALOG_DIGEST,
+        _APPROVED_MEMBERSHIP_DIGEST,
+        _APPROVED_AUDIT_CONTROL_MANIFEST_DIGEST,
+        _APPROVED_AUDIT_CANARY_RECEIPT_DIGEST,
+        _APPROVED_AUDIT_RISK_ACCEPTANCE_DIGEST,
+        core.family_ids,
+        core.reserve_hotkey,
+        block,
+        block_hash,
     )
+
+
+def _activate_core(store, core, *, block: int = 10):
+    block_hash = "0x" + f"{block:064x}"
+    store.reserve_finalized((), finalized_block=block, finalized_block_hash=block_hash)
     composition = _selected_composition(core)
-    activation = store.activate_incentive_composition(
+    approval = _approval(store, core, composition, block=block)
+    activation = store.activate_selected_incentives(
+        core,
         composition,
-        activation_block=10,
-        activation_block_hash=block_hash,
+        approval,
+        expected_approval_digest=approval.digest,
     )
-    assert activation.core_activation_digest == core_activation.digest
+    assert activation.approval == approval
+    return composition, activation
+
+
+def _activate_selected(store, candidate):
+    family_id = candidate if isinstance(candidate, str) else _family(candidate)
+    core = _selected_core(family_id)
+    composition, activation = _activate_core(store, core)
     return core, composition, activation
+
+
+def _default_family() -> str:
+    from optima.target_catalog import default_target_catalog
+
+    catalog = default_target_catalog()
+    target = "activation.silu_and_mul"
+    return reward_family_id(
+        _h("arena"), target, catalog.target_spec_digest(target)
+    )
+
+
+def _composition_publication_binding(store, activation):
+    boundary = (
+        activation.activation_block + activation.policy.epoch_blocks
+    )
+    projection = store.project_incentive_composition_epoch(
+        effective_block=boundary,
+        eligible_hotkeys=("reserve",),
+    )
+    return build_debt_weight_publication_binding(
+        projection,
+        publication_kind=PUBLICATION_KIND_COMPOSED,
+        activation_digest=activation.digest,
+        chain_scope_digest=store.scope.digest,
+        netuid=store.scope.netuid,
+        validator_hotkey="validator",
+        boundary_metagraph=SimpleNamespace(
+            block=boundary,
+            block_hash="0x" + f"{boundary:064x}",
+            hotkeys=["reserve", "validator"],
+            uids=[0, 1],
+        ),
+        epoch_index=1,
+    )
 
 
 def _review(
@@ -116,24 +210,13 @@ def _review(
 def _retain_discovery_win(store, *, marker: str):
     from optima.settlement import plan_settlement
 
+    core = _selected_core(_h(f"unused lifecycle family:{marker}"))
+    policy, _activation = _activate_core(store, core)
     candidate = _qualified_discovery_candidate(
         store,
         index=1,
         proposal_digest=_h(f"lifecycle:{marker}"),
         hotkey="lifecycle-discoverer",
-    )
-    core = _selected_core(_h(f"unused lifecycle family:{marker}"))
-    block10 = "0x" + f"{10:064x}"
-    store.activate_finite_debt_policy(
-        core,
-        activation_block=10,
-        activation_block_hash=block10,
-    )
-    policy = _selected_composition(core)
-    store.activate_incentive_composition(
-        policy,
-        activation_block=10,
-        activation_block_hash=block10,
     )
     lease = store.lease_settlement_cohort(current_block=11)
     assert lease is not None and lease.candidates == (candidate,)
@@ -198,15 +281,15 @@ def test_schema4_to5_is_empty_no_retro_and_immutable(tmp_path) -> None:
 
 def test_activation_is_exact_and_legacy_discovery_fails_closed(tmp_path) -> None:
     with _store(tmp_path) as store:
-        candidate = _qualified_settlement_candidate(store)
-        assert isinstance(candidate, SettlementCandidate)
-        core = _selected_core(_family(candidate))
+        core = _selected_core(_default_family())
         block_hash = "0x" + f"{10:064x}"
-        store.activate_finite_debt_policy(
-            core,
-            activation_block=10,
-            activation_block_hash=block_hash,
-        )
+        store.reserve_finalized((), finalized_block=10, finalized_block_hash=block_hash)
+        with pytest.raises(IntakeError, match="standalone finite-debt activation"):
+            store.activate_finite_debt_policy(
+                core,
+                activation_block=10,
+                activation_block_hash=block_hash,
+            )
         wrong = IncentiveCompositionPolicyManifest(
             innovation_policy_digest=core.digest,
             selection_report_digest=_h("wrong selection report"),
@@ -216,38 +299,63 @@ def test_activation_is_exact_and_legacy_discovery_fails_closed(tmp_path) -> None
             per_award_principal_cap_epochs=1,
             discovery_lifetime_blocks=648_000,
         )
-        with pytest.raises(IntakeError, match="exact D-013"):
+        with pytest.raises(IntakeError, match="standalone composition activation"):
             store.activate_incentive_composition(
                 wrong,
                 activation_block=10,
                 activation_block_hash=block_hash,
             )
+        wrong_approval = _approval(store, core, wrong)
+        with pytest.raises(IntakeError, match="exact D-013"):
+            store.activate_selected_incentives(
+                core,
+                wrong,
+                wrong_approval,
+                expected_approval_digest=wrong_approval.digest,
+            )
+        assert store._finite_debt.policy_activations() == ()
+        selected = _selected_composition(core)
+        selected_approval = _approval(store, core, selected)
+        with pytest.raises(IntakeError, match="pinned digest"):
+            store.activate_selected_incentives(
+                core,
+                selected,
+                selected_approval,
+                expected_approval_digest=_h("different operator approval"),
+            )
+        assert store._finite_debt.policy_activations() == ()
         store._db.execute(
             "INSERT INTO discovery_bounty_claims(claim_digest,proposal_digest,"
             "claim_json,status,event_id) VALUES(?,?,?,'active',?)",
             (_h("legacy claim"), _h("legacy proposal"), "{}", _h("legacy event")),
         )
-        with pytest.raises(IntakeError, match="legacy discovery"):
-            store.activate_incentive_composition(
-                _selected_composition(core),
-                activation_block=10,
-                activation_block_hash=block_hash,
+        with pytest.raises(
+            IntakeError, match="discovery reward claim is corrupt|legacy discovery"
+        ):
+            selected = _selected_composition(core)
+            approval = _approval(store, core, selected)
+            store.activate_selected_incentives(
+                core,
+                selected,
+                approval,
+                expected_approval_digest=approval.digest,
             )
         store._db.execute(
             "UPDATE discovery_bounty_claims SET status='forged_terminal'"
         )
         with pytest.raises(IntakeError, match="legacy discovery"):
-            store.activate_incentive_composition(
-                _selected_composition(core),
-                activation_block=10,
-                activation_block_hash=block_hash,
+            selected = _selected_composition(core)
+            approval = _approval(store, core, selected)
+            store.activate_selected_incentives(
+                core,
+                selected,
+                approval,
+                expected_approval_digest=approval.digest,
             )
 
     stale_core_root = tmp_path / "stale-core-selection"
     with _store(stale_core_root) as store:
-        candidate = _qualified_settlement_candidate(store)
-        assert isinstance(candidate, SettlementCandidate)
-        selected = _selected_core(_family(candidate))
+        selected = _selected_core(_default_family())
         stale = FiniteDebtPolicyManifest(
             **{
                 **{
@@ -258,26 +366,56 @@ def test_activation_is_exact_and_legacy_discovery_fails_closed(tmp_path) -> None
             }
         )
         block_hash = "0x" + f"{10:064x}"
-        store.activate_finite_debt_policy(
-            stale,
-            activation_block=10,
-            activation_block_hash=block_hash,
-        )
+        store.reserve_finalized((), finalized_block=10, finalized_block_hash=block_hash)
+        composition = _selected_composition(stale)
+        approval = _approval(store, stale, composition)
         with pytest.raises(IntakeError, match="exact D-013"):
-            store.activate_incentive_composition(
-                _selected_composition(stale),
-                activation_block=10,
-                activation_block_hash=block_hash,
+            store.activate_selected_incentives(
+                stale,
+                composition,
+                approval,
+                expected_approval_digest=approval.digest,
             )
+        assert store._finite_debt.policy_activations() == ()
 
 
-def test_selected_composition_accepts_two_equal_model_campaigns(tmp_path) -> None:
+def test_active_composition_raises_schema_floor_and_rejects_runtime_rollback(
+    tmp_path,
+) -> None:
     with _store(tmp_path) as store:
-        candidate = _qualified_settlement_candidate(store)
-        assert isinstance(candidate, SettlementCandidate)
-        family_a = _family(candidate)
+        _activate_selected(store, _default_family())
+        assert store._db.execute(
+            "SELECT value FROM metadata WHERE key='schema'"
+        ).fetchone()["value"] == "6"
+        store._db.execute(
+            "UPDATE metadata SET value='5' WHERE key='schema' AND value='6'"
+        )
+
+    with pytest.raises(IntakeError, match="schema-6 rollback fencing"):
+        with _store(tmp_path):
+            pass
+
+
+def test_schema6_without_selected_activation_fails_closed(tmp_path) -> None:
+    with _store(tmp_path) as store:
+        store._db.execute(
+            "UPDATE metadata SET value='6' WHERE key='schema' AND value='5'"
+        )
+
+    with pytest.raises(IntakeError, match="exactly one selected activation"):
+        with _store(tmp_path):
+            pass
+
+
+def test_selected_composition_rejects_a_second_model_campaign(tmp_path) -> None:
+    with _store(tmp_path) as store:
+        family_a = _default_family()
         family_b = _h("second model family")
-        campaign_a = _h("minimax-m3 campaign")
+        campaign_a = selected_model_campaign_id(
+            arena_digest=_APPROVED_ARENA_DIGEST,
+            catalog_digest=_APPROVED_CATALOG_DIGEST,
+            reward_family_ids=tuple(sorted((family_a, family_b))),
+        )
         campaign_b = _h("second model campaign")
         core = FiniteDebtPolicyManifest(
             campaign_budget_shares=(
@@ -300,21 +438,33 @@ def test_selected_composition_accepts_two_equal_model_campaigns(tmp_path) -> Non
             clock_reset_threshold_log_units_ppm=1,
         )
         block_hash = "0x" + f"{10:064x}"
-        store.activate_finite_debt_policy(
-            core,
-            activation_block=10,
-            activation_block_hash=block_hash,
+        store.reserve_finalized((), finalized_block=10, finalized_block_hash=block_hash)
+        composition = _selected_composition(core)
+        approval = SelectedIncentiveActivationApproval(
+            store.scope.digest,
+            core.digest,
+            composition.digest,
+            campaign_a,
+            _APPROVED_ARENA_DIGEST,
+            _APPROVED_EVALUATION_STACK_DIGEST,
+            _APPROVED_CATALOG_DIGEST,
+            _APPROVED_MEMBERSHIP_DIGEST,
+            _APPROVED_AUDIT_CONTROL_MANIFEST_DIGEST,
+            _APPROVED_AUDIT_CANARY_RECEIPT_DIGEST,
+            _APPROVED_AUDIT_RISK_ACCEPTANCE_DIGEST,
+            core.family_ids,
+            core.reserve_hotkey,
+            10,
+            block_hash,
         )
-        activation = store.activate_incentive_composition(
-            _selected_composition(core),
-            activation_block=10,
-            activation_block_hash=block_hash,
-        )
-        assert activation.policy.innovation_policy_digest == core.digest
-        assert tuple(row.share_ppm for row in core.campaign_budget_shares) == (
-            500_000,
-            500_000,
-        )
+        with pytest.raises(IntakeError, match="exact D-013"):
+            store.activate_selected_incentives(
+                core,
+                composition,
+                approval,
+                expected_approval_digest=approval.digest,
+            )
+        assert store._finite_debt.policy_activations() == ()
 
 
 def test_legacy_standing_title_survives_composition_without_retro_debt(tmp_path) -> None:
@@ -336,14 +486,10 @@ def test_legacy_standing_title_survives_composition_without_retro_debt(tmp_path)
 
         core = _selected_core(_family(candidate))
         block12 = "0x" + f"{12:064x}"
-        store.activate_finite_debt_policy(
-            core, activation_block=12, activation_block_hash=block12
-        )
-        store.activate_incentive_composition(
-            _selected_composition(core),
-            activation_block=12,
-            activation_block_hash=block12,
-        )
+        _composition, activation = _activate_core(store, core, block=12)
+        assert activation.approval.reward_family_ids == (_family(candidate),)
+        clocks = store.finite_debt_family_clocks(policy_digest=core.digest)
+        assert len(clocks) == 1 and clocks[0].source == "seed"
         assert store.active_reward_claims()[0] == standing_before
         assert store.reopen_active_crown(
             candidate.arena_digest, candidate.target_id
@@ -368,9 +514,9 @@ def test_legacy_standing_title_survives_composition_without_retro_debt(tmp_path)
 
 def test_composed_disposition_projection_close_and_restart(tmp_path) -> None:
     with _store(tmp_path) as store:
+        core, _composition, activation = _activate_selected(store, _default_family())
         candidate = _qualified_settlement_candidate(store)
         assert isinstance(candidate, SettlementCandidate)
-        core, _composition, activation = _activate_selected(store, candidate)
         _commit(store, candidate, current_block=12)
 
         core_before = store.finite_debt_claim_states()[0]
@@ -399,13 +545,15 @@ def test_composed_disposition_projection_close_and_restart(tmp_path) -> None:
         store.reserve_finalized(
             (), finalized_block=7_210, finalized_block_hash=boundary_hash
         )
-        publication = _h("externally confirmed composed publication")
+        confirmation = _confirmed_debt_publication(
+            store,
+            projection,
+            activation,
+            publication_kind=PUBLICATION_KIND_COMPOSED,
+        )
         epoch = store.close_confirmed_composed_epoch(
             projection,
-            expected_projection_digest=projection.digest,
-            finalized_block=7_210,
-            finalized_block_hash=boundary_hash,
-            publication_record_digest=publication,
+            confirmation=confirmation,
             eligible_hotkeys=("miner", "reserve"),
         )
         core_after = store.finite_debt_claim_states()[0]
@@ -416,19 +564,13 @@ def test_composed_disposition_projection_close_and_restart(tmp_path) -> None:
         assert epoch.activation_digest == activation.digest
         assert store.close_confirmed_composed_epoch(
             projection,
-            expected_projection_digest=projection.digest,
-            finalized_block=7_210,
-            finalized_block_hash=boundary_hash,
-            publication_record_digest=publication,
+            confirmation=confirmation,
             eligible_hotkeys=("miner", "reserve"),
         ) == epoch
         with pytest.raises(IntakeError, match="core-only close"):
             store.close_confirmed_debt_epoch(
                 core_only_projection,
-                expected_projection_digest=core_only_projection.digest,
-                finalized_block=7_210,
-                finalized_block_hash=boundary_hash,
-                publication_record_digest=publication,
+                confirmation=confirmation,
                 eligible_hotkeys=("miner", "reserve"),
             )
         events = store.finite_debt_reward_events()
@@ -449,11 +591,420 @@ def test_composed_disposition_projection_close_and_restart(tmp_path) -> None:
         ) == projection
 
 
+@pytest.mark.parametrize(
+    ("status", "record_fields"),
+    (
+        ("intent", {"submit_block": 7_210, "retry_after_block": 7_220}),
+        ("pending", {"submit_block": 7_210, "retry_after_block": 7_220}),
+        ("held", {}),
+        ("released", {"reason": "operator released retry hold"}),
+        (
+            "confirmed",
+            {"confirmed_block": 7_210, "confirmed_last_update": 7_210},
+        ),
+    ),
+)
+def test_every_unclosed_v2_publication_status_fences_economic_mutation(
+    tmp_path, status: str, record_fields: dict[str, object]
+) -> None:
+    with _store(tmp_path) as store:
+        _core, _composition, activation = _activate_selected(
+            store, _default_family()
+        )
+        binding = _composition_publication_binding(store, activation)
+        boundary = binding.economic_projection.effective_block
+        store.reserve_finalized(
+            (),
+            finalized_block=boundary,
+            finalized_block_hash=binding.effective_block_hash,
+        )
+        journal = store.debt_weight_publication_journal(binding)
+        journal.compare_and_swap(
+            None,
+            WeightPublicationRecord(
+                binding.weight_projection.digest,
+                status,
+                reason=record_fields.get("reason", f"retained {status}"),
+                submit_block=record_fields.get("submit_block", 0),
+                retry_after_block=record_fields.get("retry_after_block", 0),
+                confirmed_block=record_fields.get("confirmed_block", 0),
+                confirmed_last_update=record_fields.get(
+                    "confirmed_last_update", 0
+                ),
+            ),
+        )
+        assert store.unclosed_debt_publication_bindings() == (binding,)
+        with pytest.raises(IntakeError, match="unclosed V2 debt publication"):
+            store.reconcile_incentive_composition_lifecycle(
+                current_block=10,
+                current_block_hash="0x" + f"{10:064x}",
+                eligible_hotkeys=("reserve",),
+            )
+
+
+def test_dry_run_binding_without_journal_row_does_not_fence_settlement(
+    tmp_path,
+) -> None:
+    with _store(tmp_path) as store:
+        _core, _composition, activation = _activate_selected(
+            store, _default_family()
+        )
+        binding = _composition_publication_binding(store, activation)
+        journal = store.debt_weight_publication_journal(binding)
+        assert journal.load() is None
+        assert store.unclosed_debt_publication_bindings() == ()
+
+        candidate = _qualified_settlement_candidate(store)
+        assert isinstance(candidate, SettlementCandidate)
+        assert store.has_pending_settlement()
+        lease = store.lease_settlement_cohort(current_block=11)
+        assert lease is not None and lease.candidates == (candidate,)
+
+
+def test_first_publication_cas_reprojects_after_pre_intent_state_change(
+    tmp_path,
+) -> None:
+    with _store(tmp_path, expiry_blocks=10_000) as store:
+        _core, _composition, activation = _activate_selected(
+            store, _default_family()
+        )
+        stale_binding = _composition_publication_binding(store, activation)
+        journal = store.debt_weight_publication_journal(stale_binding)
+        assert journal.load() is None
+
+        candidate = _qualified_settlement_candidate(store)
+        assert isinstance(candidate, SettlementCandidate)
+        _commit(store, candidate, current_block=11)
+        boundary = stale_binding.economic_projection.effective_block
+        store.reserve_finalized(
+            (),
+            finalized_block=boundary,
+            finalized_block_hash=stale_binding.effective_block_hash,
+        )
+
+        with pytest.raises(
+            IntakeError, match="economic state changed before V2 publication intent"
+        ):
+            journal.compare_and_swap(
+                None,
+                WeightPublicationRecord(
+                    stale_binding.weight_projection.digest,
+                    "intent",
+                    submit_block=boundary,
+                    retry_after_block=boundary + 10,
+                    reason="must reproject under BEGIN IMMEDIATE",
+                ),
+            )
+        assert journal.load() is None
+        assert store.unclosed_debt_publication_bindings() == ()
+
+
+def test_publication_fence_survives_restart_and_holds_pending_settlement(
+    tmp_path,
+) -> None:
+    with _store(tmp_path, expiry_blocks=10_000) as store:
+        _core, _composition, activation = _activate_selected(
+            store, _default_family()
+        )
+        candidate = _qualified_settlement_candidate(store)
+        assert isinstance(candidate, SettlementCandidate)
+        binding = _composition_publication_binding(store, activation)
+        boundary = binding.economic_projection.effective_block
+        store.reserve_finalized(
+            (),
+            finalized_block=boundary,
+            finalized_block_hash=binding.effective_block_hash,
+        )
+        journal = store.debt_weight_publication_journal(binding)
+        journal.compare_and_swap(
+            None,
+            WeightPublicationRecord(
+                binding.weight_projection.digest,
+                "intent",
+                submit_block=7_210,
+                retry_after_block=7_220,
+                reason="before signer call",
+            ),
+        )
+        assert not store.has_pending_settlement()
+        assert store.lease_settlement_cohort(current_block=boundary) is None
+        assert store._db.execute(
+            "SELECT status FROM settlement_candidates WHERE candidate_digest=?",
+            (candidate.digest,),
+        ).fetchone()["status"] == "pending"
+
+    with _store(tmp_path, expiry_blocks=10_000) as reopened:
+        assert reopened.unclosed_debt_publication_bindings() == (binding,)
+        assert not reopened.has_pending_settlement()
+        assert reopened.lease_settlement_cohort(current_block=boundary) is None
+        assert reopened._db.execute(
+            "SELECT status FROM settlement_candidates WHERE candidate_digest=?",
+            (candidate.digest,),
+        ).fetchone()["status"] == "pending"
+
+
+def test_publication_intent_after_lease_blocks_commit_without_partial_crown(
+    tmp_path,
+) -> None:
+    from optima.settlement import plan_settlement
+
+    with _store(tmp_path, expiry_blocks=10_000) as store:
+        _core, _composition, activation = _activate_selected(
+            store, _default_family()
+        )
+        candidate = _qualified_settlement_candidate(store)
+        assert isinstance(candidate, SettlementCandidate)
+        boundary = (
+            activation.activation_block + activation.policy.epoch_blocks
+        )
+        lease = store.lease_settlement_cohort(current_block=boundary - 1)
+        assert lease is not None and lease.candidates == (candidate,)
+        plan = plan_settlement(
+            lease.candidates,
+            current_manifest=lease.stack.manifest,
+            current_tree_digest=lease.stack.tree_digest,
+            initial_event_sequence=lease.initial_event_sequence,
+            previous_event_digest=lease.previous_event_digest,
+        )
+        evidence = tuple(
+            store.reopen_settlement_evidence(row) for row in lease.candidates
+        )
+        boundary_hash = "0x" + f"{boundary:064x}"
+        store.reserve_finalized(
+            (), finalized_block=boundary, finalized_block_hash=boundary_hash
+        )
+        binding = _composition_publication_binding(store, activation)
+        journal = store.debt_weight_publication_journal(binding)
+        journal.compare_and_swap(
+            None,
+            WeightPublicationRecord(
+                binding.weight_projection.digest,
+                "intent",
+                submit_block=7_210,
+                retry_after_block=7_220,
+                reason="raced a retained lease",
+            ),
+        )
+
+        with pytest.raises(IntakeError, match="unclosed V2 debt publication"):
+            store.commit_settlement(
+                lease,
+                plan,
+                evidence,
+                current_block=boundary,
+                current_block_hash=boundary_hash,
+            )
+        assert store.finite_debt_claim_states() == ()
+        assert store.active_reward_claims() == ((), ())
+        assert all(
+            row["event_type"] != "claim_issued"
+            for row in store.finite_debt_reward_events()
+        )
+        assert store._db.execute(
+            "SELECT status FROM settlement_candidates WHERE candidate_digest=?",
+            (candidate.digest,),
+        ).fetchone()["status"] == "leased"
+
+
+def test_publication_fence_clears_only_after_exact_epoch_close(tmp_path) -> None:
+    with _store(tmp_path) as store:
+        _core, _composition, activation = _activate_selected(
+            store, _default_family()
+        )
+        binding = _composition_publication_binding(store, activation)
+        boundary = binding.economic_projection.effective_block
+        boundary_hash = "0x" + f"{boundary:064x}"
+        store.reserve_finalized(
+            (), finalized_block=boundary, finalized_block_hash=boundary_hash
+        )
+        confirmation = _confirmed_debt_publication(
+            store,
+            binding.economic_projection,
+            activation,
+            publication_kind=PUBLICATION_KIND_COMPOSED,
+        )
+        assert store.unclosed_debt_publication_bindings() == (binding,)
+
+        with pytest.raises(IntakeError):
+            store.close_confirmed_composed_epoch(
+                binding.economic_projection,
+                confirmation=confirmation,
+                eligible_hotkeys=("validator",),
+            )
+        assert store.unclosed_debt_publication_bindings() == (binding,)
+
+        store.close_confirmed_composed_epoch(
+            binding.economic_projection,
+            confirmation=confirmation,
+            eligible_hotkeys=("reserve",),
+        )
+        assert store.unclosed_debt_publication_bindings() == ()
+        store.reconcile_incentive_composition_lifecycle(
+            current_block=boundary,
+            current_block_hash=boundary_hash,
+            eligible_hotkeys=("reserve",),
+        )
+
+    with _store(tmp_path) as reopened:
+        assert reopened.unclosed_debt_publication_bindings() == ()
+
+
+def test_missed_boundaries_freeze_crowns_until_gapless_catch_up(tmp_path) -> None:
+    from optima.settlement import plan_settlement
+
+    with _store(tmp_path, expiry_blocks=30_000) as store:
+        _core, _composition, activation = _activate_selected(
+            store, _default_family()
+        )
+        candidate = _qualified_settlement_candidate(store)
+        assert isinstance(candidate, SettlementCandidate)
+        first_boundary = (
+            activation.activation_block + activation.policy.epoch_blocks
+        )
+        second_boundary = first_boundary + activation.policy.epoch_blocks
+        second_hash = "0x" + f"{second_boundary:064x}"
+        store.reserve_finalized(
+            (),
+            finalized_block=second_boundary,
+            finalized_block_hash=second_hash,
+        )
+
+        assert store.due_debt_publication_boundary() == first_boundary
+        assert not store.has_pending_settlement()
+        assert store.lease_settlement_cohort(
+            current_block=second_boundary
+        ) is None
+        assert store.finite_debt_claim_states() == ()
+
+        for boundary in (first_boundary, second_boundary):
+            projection = store.project_incentive_composition_epoch(
+                effective_block=boundary,
+                eligible_hotkeys=("reserve",),
+            )
+            confirmation = _confirmed_debt_publication(
+                store,
+                projection,
+                activation,
+                publication_kind=PUBLICATION_KIND_COMPOSED,
+                confirmed_block=boundary,
+                marker=f"gapless catch-up {boundary}",
+            )
+            store.close_confirmed_composed_epoch(
+                projection,
+                confirmation=confirmation,
+                eligible_hotkeys=("reserve",),
+            )
+
+        assert store.due_debt_publication_boundary() is None
+        assert store.has_pending_settlement()
+        lease = store.lease_settlement_cohort(current_block=second_boundary)
+        assert lease is not None and lease.candidates == (candidate,)
+        plan = plan_settlement(
+            lease.candidates,
+            current_manifest=lease.stack.manifest,
+            current_tree_digest=lease.stack.tree_digest,
+            initial_event_sequence=lease.initial_event_sequence,
+            previous_event_digest=lease.previous_event_digest,
+        )
+        evidence = tuple(
+            store.reopen_settlement_evidence(row) for row in lease.candidates
+        )
+        store.commit_settlement(
+            lease,
+            plan,
+            evidence,
+            current_block=second_boundary,
+            current_block_hash=second_hash,
+        )
+        claim = store.finite_debt_claim_states()[0]
+        assert claim.claim.settlement_block == second_boundary
+        assert all(
+            claim.digest not in epoch.projection.innovation_input_state_digests
+            for epoch in store.incentive_composition_reward_epochs()
+        )
+
+
+def test_composed_catch_up_cannot_compress_live_emission_epochs(tmp_path) -> None:
+    with _store(tmp_path) as store:
+        _core, _composition, activation = _activate_selected(
+            store, _default_family()
+        )
+        first = store.project_incentive_composition_epoch(
+            effective_block=7_210,
+            eligible_hotkeys=("reserve",),
+        )
+        store.reserve_finalized(
+            (),
+            finalized_block=7_300,
+            finalized_block_hash="0x" + f"{7300:064x}",
+        )
+        first_confirmation = _confirmed_debt_publication(
+            store,
+            first,
+            activation,
+            publication_kind=PUBLICATION_KIND_COMPOSED,
+            confirmed_block=7_300,
+            marker="late first boundary",
+        )
+        store.close_confirmed_composed_epoch(
+            first,
+            confirmation=first_confirmation,
+            eligible_hotkeys=("reserve",),
+        )
+
+        second = store.project_incentive_composition_epoch(
+            effective_block=14_410,
+            eligible_hotkeys=("reserve",),
+        )
+        store.reserve_finalized(
+            (),
+            finalized_block=14_410,
+            finalized_block_hash="0x" + f"{14410:064x}",
+        )
+        compressed = _confirmed_debt_publication(
+            store,
+            second,
+            activation,
+            publication_kind=PUBLICATION_KIND_COMPOSED,
+            confirmed_block=14_410,
+            marker="compressed second boundary",
+        )
+        with pytest.raises(IntakeError, match="compress live emission epochs"):
+            store.close_confirmed_composed_epoch(
+                second,
+                confirmation=compressed,
+                eligible_hotkeys=("reserve",),
+            )
+
+        store.reserve_finalized(
+            (),
+            finalized_block=14_500,
+            finalized_block_hash="0x" + f"{14500:064x}",
+        )
+        rate_limited = _confirmed_debt_publication(
+            store,
+            second,
+            activation,
+            publication_kind=PUBLICATION_KIND_COMPOSED,
+            confirmed_block=14_500,
+            marker="rate-limited second boundary",
+        )
+        epoch = store.close_confirmed_composed_epoch(
+            second,
+            confirmation=rate_limited,
+            eligible_hotkeys=("reserve",),
+        )
+        assert epoch.effective_block == 14_410
+
+
 @pytest.mark.parametrize("reward_class", ("core", "discovery"))
 def test_composed_epoch_reopen_rejects_extra_revision_reusing_payout_event(
     tmp_path, reward_class: str,
 ) -> None:
     with _store(tmp_path) as store:
+        _core, composition, activation = _activate_selected(
+            store, _default_family()
+        )
         candidate = _qualified_settlement_candidate(store)
         assert isinstance(candidate, SettlementCandidate)
         discoveries = (
@@ -470,8 +1021,6 @@ def test_composed_epoch_reopen_rejects_extra_revision_reusing_payout_event(
                 hotkey="discoverer-b",
             ),
         )
-        _core, composition, _activation = _activate_selected(store, candidate)
-
         from optima.settlement import plan_settlement
 
         # Keep the registered candidate from advancing the incumbent between
@@ -544,10 +1093,12 @@ def test_composed_epoch_reopen_rejects_extra_revision_reusing_payout_event(
         )
         epoch = store.close_confirmed_composed_epoch(
             projection,
-            expected_projection_digest=projection.digest,
-            finalized_block=7_210,
-            finalized_block_hash=boundary_hash,
-            publication_record_digest=_h("extra-composed-revision-publication"),
+            confirmation=_confirmed_debt_publication(
+                store,
+                projection,
+                activation,
+                publication_kind=PUBLICATION_KIND_COMPOSED,
+            ),
             eligible_hotkeys=eligible,
         )
         if reward_class == "core":
@@ -600,6 +1151,8 @@ def test_active_composition_retains_review_pending_wins_and_binds_dispositions(
     tmp_path,
 ) -> None:
     with _store(tmp_path) as store:
+        core = _selected_core(_h("unused selected family"))
+        _composition, _activation = _activate_core(store, core)
         first = _qualified_discovery_candidate(
             store,
             index=1,
@@ -611,18 +1164,6 @@ def test_active_composition_retains_review_pending_wins_and_binds_dispositions(
             index=2,
             proposal_digest=_h("post-composition discovery two"),
             hotkey="discoverer-two",
-        )
-        core = _selected_core(_h("unused selected family"))
-        block10 = "0x" + f"{10:064x}"
-        store.activate_finite_debt_policy(
-            core,
-            activation_block=10,
-            activation_block_hash=block10,
-        )
-        store.activate_incentive_composition(
-            _selected_composition(core),
-            activation_block=10,
-            activation_block_hash=block10,
         )
         from optima.settlement import plan_settlement
 
@@ -730,20 +1271,13 @@ def test_discovery_bounty_cannot_refresh_or_outlive_retained_win(tmp_path) -> No
     from optima.settlement import plan_settlement
 
     with _store(tmp_path) as store:
+        core = _selected_core(_h("unused bounded family"))
+        policy, activation = _activate_core(store, core)
         candidate = _qualified_discovery_candidate(
             store,
             index=1,
             proposal_digest=_h("bounded discovery win"),
             hotkey="bounded-discoverer",
-        )
-        core = _selected_core(_h("unused bounded family"))
-        block10 = "0x" + f"{10:064x}"
-        store.activate_finite_debt_policy(
-            core, activation_block=10, activation_block_hash=block10
-        )
-        policy = _selected_composition(core)
-        store.activate_incentive_composition(
-            policy, activation_block=10, activation_block_hash=block10
         )
         lease = store.lease_settlement_cohort(current_block=11)
         assert lease is not None and lease.candidates == (candidate,)
@@ -772,6 +1306,26 @@ def test_discovery_bounty_cannot_refresh_or_outlive_retained_win(tmp_path) -> No
         store.reserve_finalized(
             (), finalized_block=expiry, finalized_block_hash=expiry_hash
         )
+        # Advancing finalized intake across 90 unpaid boundaries freezes all
+        # reward-state mutation.  Catch them up gaplessly before exercising the
+        # review-expiry authority at this later block.
+        while (boundary := store.due_debt_publication_boundary()) is not None:
+            projection = store.project_incentive_composition_epoch(
+                effective_block=boundary,
+                eligible_hotkeys=("reserve",),
+            )
+            store.close_confirmed_composed_epoch(
+                projection,
+                confirmation=_confirmed_debt_publication(
+                    store,
+                    projection,
+                    activation,
+                    publication_kind=PUBLICATION_KIND_COMPOSED,
+                    confirmed_block=boundary,
+                    marker=f"review expiry catch-up {boundary}",
+                ),
+                eligible_hotkeys=("reserve",),
+            )
 
         refreshed = review_discovery_disposition(
             policy,
@@ -901,21 +1455,13 @@ def test_review_pending_win_reopens_exact_typed_settlement_event(tmp_path) -> No
     from optima.settlement import plan_settlement
 
     with _store(tmp_path) as store:
+        core = _selected_core(_h("unused event-bound family"))
+        _composition, _activation = _activate_core(store, core)
         candidate = _qualified_discovery_candidate(
             store,
             index=1,
             proposal_digest=_h("event-bound discovery win"),
             hotkey="event-bound-discoverer",
-        )
-        core = _selected_core(_h("unused event-bound family"))
-        block10 = "0x" + f"{10:064x}"
-        store.activate_finite_debt_policy(
-            core, activation_block=10, activation_block_hash=block10
-        )
-        store.activate_incentive_composition(
-            _selected_composition(core),
-            activation_block=10,
-            activation_block_hash=block10,
         )
         lease = store.lease_settlement_cohort(current_block=11)
         assert lease is not None and lease.candidates == (candidate,)
@@ -960,12 +1506,14 @@ def test_core_policy_upgrade_and_legacy_v1_projection_publication_are_fenced(
     from optima.target_catalog import default_target_catalog
 
     with _store(tmp_path / "active") as store:
+        _core, _composition, _activation = _activate_selected(
+            store, _default_family()
+        )
         candidate = _qualified_settlement_candidate(store)
         assert isinstance(candidate, SettlementCandidate)
-        _core, _composition, _activation = _activate_selected(store, candidate)
         block20 = "0x" + f"{20:064x}"
         store.reserve_finalized((), finalized_block=20, finalized_block_hash=block20)
-        with pytest.raises(IntakeError, match="core policy upgrades are disabled"):
+        with pytest.raises(IntakeError, match="standalone finite-debt activation"):
             store.activate_finite_debt_policy(
                 _selected_core(_h("different selected family")),
                 activation_block=20,
@@ -1006,13 +1554,7 @@ def test_core_policy_upgrade_and_legacy_v1_projection_publication_are_fenced(
             SQLiteWeightPublicationJournal(store, projection)
 
     with _store(tmp_path / "retained-object") as store:
-        candidate = _qualified_settlement_candidate(store)
-        assert isinstance(candidate, SettlementCandidate)
-        core = _selected_core(_family(candidate))
-        block10 = "0x" + f"{10:064x}"
-        store.activate_finite_debt_policy(
-            core, activation_block=10, activation_block_hash=block10
-        )
+        core = _selected_core(_default_family())
         projection = WeightProjection(
             _h("object scope"),
             307,
@@ -1029,11 +1571,7 @@ def test_core_policy_upgrade_and_legacy_v1_projection_publication_are_fenced(
             (("reserve", PPM),),
         )
         retained_journal = SQLiteWeightPublicationJournal(store, projection)
-        store.activate_incentive_composition(
-            _selected_composition(core),
-            activation_block=10,
-            activation_block_hash=block10,
-        )
+        _composition, _activation = _activate_core(store, core)
         intent = WeightPublicationRecord(
             projection.digest,
             "intent",
@@ -1048,13 +1586,9 @@ def test_core_policy_upgrade_and_legacy_v1_projection_publication_are_fenced(
         ).fetchone()["n"] == 0
 
     with _store(tmp_path / "existing-journal") as store:
-        candidate = _qualified_settlement_candidate(store)
-        assert isinstance(candidate, SettlementCandidate)
-        core = _selected_core(_family(candidate))
+        core = _selected_core(_default_family())
         block10 = "0x" + f"{10:064x}"
-        store.activate_finite_debt_policy(
-            core, activation_block=10, activation_block_hash=block10
-        )
+        store.reserve_finalized((), finalized_block=10, finalized_block_hash=block10)
         projection = WeightProjection(
             _h("existing scope"),
             307,
@@ -1081,106 +1615,74 @@ def test_core_policy_upgrade_and_legacy_v1_projection_publication_are_fenced(
                 reason="unresolved legacy publication",
             ),
         )
+        composition = _selected_composition(core)
+        approval = _approval(store, core, composition)
         with pytest.raises(IntakeError, match="explicit cutover"):
-            store.activate_incentive_composition(
-                _selected_composition(core),
-                activation_block=10,
-                activation_block_hash=block10,
+            store.activate_selected_incentives(
+                core,
+                composition,
+                approval,
+                expected_approval_digest=approval.digest,
             )
 
 
-def test_cutover_terminally_handles_pre_activation_candidates_without_retry_poison(
+def test_atomic_cutover_requires_quiescence_and_exact_replay_is_idempotent(
     tmp_path,
 ) -> None:
-    from optima.settlement import plan_settlement
-
-    def activate_late(store, family_id: str, *, core_block: int = 10) -> int:
-        core = _selected_core(family_id)
-        core_hash = "0x" + f"{core_block:064x}"
-        store.reserve_finalized(
-            (), finalized_block=core_block, finalized_block_hash=core_hash
-        )
-        store.activate_finite_debt_policy(
-            core, activation_block=core_block, activation_block_hash=core_hash
-        )
-        cutover = core_block + 7_200
-        cutover_hash = "0x" + f"{cutover:064x}"
-        store.reserve_finalized(
-            (), finalized_block=cutover, finalized_block_hash=cutover_hash
-        )
-        store.activate_incentive_composition(
-            _selected_composition(core),
-            activation_block=cutover,
-            activation_block_hash=cutover_hash,
-        )
-        return cutover
-
-    def commit_at_cutover(store, expected: SettlementCandidate, cutover: int):
-        settlement_block = cutover + 1
-        lease = store.lease_settlement_cohort(current_block=settlement_block)
-        assert lease is not None and lease.candidates == (expected,)
-        plan = plan_settlement(
-            lease.candidates,
-            current_manifest=lease.stack.manifest,
-            current_tree_digest=lease.stack.tree_digest,
-            initial_event_sequence=lease.initial_event_sequence,
-            previous_event_digest=lease.previous_event_digest,
-        )
-        evidence = tuple(
-            store.reopen_settlement_evidence(row) for row in lease.candidates
-        )
-        block_hash = "0x" + f"{settlement_block:064x}"
-        store.reserve_finalized(
-            (), finalized_block=settlement_block, finalized_block_hash=block_hash
-        )
-        store.commit_settlement(
-            lease,
-            plan,
-            evidence,
-            current_block=settlement_block,
-            current_block_hash=block_hash,
-        )
-        return settlement_block
-
-    with _store(tmp_path / "core", expiry_blocks=10_000) as store:
+    with _store(tmp_path, expiry_blocks=10_000) as store:
         candidate = _qualified_settlement_candidate(store)
         assert isinstance(candidate, SettlementCandidate)
-        cutover = activate_late(store, _family(candidate), core_block=11)
-        commit_at_cutover(store, candidate, cutover)
-        assert store.evaluation_stack(candidate.arena_digest).generation == 1
-        assert store.finite_debt_claim_states() == ()
-        assert store._db.execute(
-            "SELECT status FROM settlement_candidates WHERE candidate_digest=?",
-            (candidate.digest,),
-        ).fetchone()["status"] == "crowned"
-        assert [
-            row["event_type"] for row in store.finite_debt_reward_events()
-        ][-1] == "claim_not_issued"
+        core = _selected_core(_family(candidate))
+        composition = _selected_composition(core)
+        approval = _approval(store, core, composition)
 
-    with _store(tmp_path / "core-before-composition", expiry_blocks=10_000) as store:
-        candidate = _qualified_settlement_candidate(store)
-        assert isinstance(candidate, SettlementCandidate)
-        cutover = activate_late(store, _family(candidate))
-        commit_at_cutover(store, candidate, cutover)
-        assert len(store.finite_debt_claim_states()) == 1
-        assert store.finite_debt_claim_states()[0].claim.accepted_crown_block == 10
+        with pytest.raises(IntakeError, match="quiescent pre-activation intake"):
+            store.activate_selected_incentives(
+                core,
+                composition,
+                approval,
+                expected_approval_digest=approval.digest,
+            )
+        assert store._finite_debt.policy_activations() == ()
+        assert store.active_incentive_composition(at_block=10) is None
 
-    with _store(tmp_path / "discovery", expiry_blocks=10_000) as store:
-        candidate = _qualified_discovery_candidate(
-            store,
-            index=1,
-            proposal_digest=_h("pre-cutover discovery"),
-            hotkey="discoverer",
+        _commit(store, candidate, current_block=11)
+        activation_block = 12
+        block_hash = "0x" + f"{activation_block:064x}"
+        store.reserve_finalized(
+            (),
+            finalized_block=activation_block,
+            finalized_block_hash=block_hash,
         )
-        cutover = activate_late(store, _h("unused late family"))
-        commit_at_cutover(store, candidate, cutover)
-        assert store.review_pending_discovery_wins() == ()
-        assert store.reviewed_discovery_dispositions() == ()
-        assert store.active_reward_claims() == ((), ())
-        assert store._db.execute(
-            "SELECT status FROM settlement_candidates WHERE candidate_digest=?",
-            (candidate.digest,),
-        ).fetchone()["status"] == "review_ineligible"
-        assert store._db.execute(
-            "SELECT COUNT(*) AS n FROM settlement_events WHERE event_type='DISCOVERY_BOUNTY'"
-        ).fetchone()["n"] == 1
+        approval = SelectedIncentiveActivationApproval(
+            store.scope.digest,
+            core.digest,
+            composition.digest,
+            core.campaign_budget_shares[0].campaign_id,
+            _APPROVED_ARENA_DIGEST,
+            _APPROVED_EVALUATION_STACK_DIGEST,
+            _APPROVED_CATALOG_DIGEST,
+            _APPROVED_MEMBERSHIP_DIGEST,
+            _APPROVED_AUDIT_CONTROL_MANIFEST_DIGEST,
+            _APPROVED_AUDIT_CANARY_RECEIPT_DIGEST,
+            _APPROVED_AUDIT_RISK_ACCEPTANCE_DIGEST,
+            core.family_ids,
+            core.reserve_hotkey,
+            activation_block,
+            block_hash,
+        )
+        first = store.activate_selected_incentives(
+            core,
+            composition,
+            approval,
+            expected_approval_digest=approval.digest,
+        )
+        replay = store.activate_selected_incentives(
+            core,
+            composition,
+            approval,
+            expected_approval_digest=approval.digest,
+        )
+        assert replay == first
+        assert len(store._finite_debt.policy_activations()) == 1
+        assert len(store._incentive_composition.policy_activations()) == 1

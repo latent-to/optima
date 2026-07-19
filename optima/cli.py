@@ -175,6 +175,35 @@ def cmd_chain_incentive_composition_shadow(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_chain_activate_incentives(args: argparse.Namespace) -> int:
+    """Atomically activate one reviewed MiniMax-M3 campaign without a wallet."""
+
+    from optima import chain
+    from optima.chain.incentive_activation import (
+        execute_selected_incentive_activation,
+    )
+
+    result = execute_selected_incentive_activation(
+        network=args.network,
+        netuid=args.netuid,
+        intake_db=args.intake_db,
+        core_policy_path=args.core_policy,
+        composition_policy_path=args.composition_policy,
+        approval_path=args.approval,
+        expected_approval_digest=args.expected_approval_digest,
+        connect=chain.connect,
+        read_finalized_head=chain.read_finalized_head,
+        fetch_metagraph=chain.fetch_metagraph,
+    )
+    print(
+        json.dumps(
+            {**result.to_dict(), "result_digest": result.digest},
+            sort_keys=True,
+        )
+    )
+    return 0
+
+
 def cmd_set_weights(args: argparse.Namespace) -> int:
     from optima import chain
     from optima.chain.intake import (
@@ -294,6 +323,249 @@ def cmd_set_weights(args: argparse.Namespace) -> int:
         f"refresh_due={result.refresh_due}"
     )
     if result.refresh_due:
+        return 3
+    return 0 if result.status in {"dry_run", "confirmed", "pending"} else 2
+
+
+def cmd_set_debt_weights(args: argparse.Namespace) -> int:
+    """Publish and consume the next gapless active V2 reward boundary."""
+
+    from optima import chain
+    from optima.chain.debt_publication import (
+        PUBLICATION_KIND_COMPOSED,
+        DebtPublicationError,
+        build_confirmed_debt_weight_publication,
+        build_debt_weight_publication_binding,
+        next_debt_boundary_schedule,
+    )
+    from optima.chain.intake import FinalizedIntakeStore, IntakeError, IntakeScope
+    from optima.chain.weights import (
+        WeightPublicationError,
+        reconcile_weight_publication,
+        release_weight_publication_hold,
+    )
+
+    if args.reconcile_only and args.dry_run:
+        raise SystemExit("--reconcile-only cannot be combined with --dry-run")
+    if args.reconcile_only and args.release_hold:
+        raise SystemExit("--reconcile-only cannot be combined with --release-hold")
+    if args.release_hold and args.dry_run:
+        raise SystemExit("--release-hold cannot be combined with --dry-run")
+    head_only = args.reconcile_only or bool(args.release_hold)
+    if head_only and args.validator_hotkey:
+        validator_hotkey = args.validator_hotkey
+        wallet = None
+    elif args.reconcile_only:
+        raise SystemExit("--reconcile-only requires --validator-hotkey")
+    else:
+        import bittensor as bt
+
+        public_wallet = bt.Wallet(name=args.wallet, hotkey=args.hotkey)
+        validator_hotkey = public_wallet.hotkey.ss58_address
+        wallet = None if args.release_hold else public_wallet
+
+    subtensor = chain.connect(args.network)
+    scope = IntakeScope(str(subtensor.get_block_hash(0)).lower(), args.netuid)
+    finalized_block, _finalized_hash = chain.read_finalized_head(subtensor)
+    with FinalizedIntakeStore(args.intake_db, scope=scope) as store:
+        cursor = store.finalized_cursor()
+        if cursor is None:
+            raise IntakeError(
+                "V2 publication requires a retained finalized intake cursor"
+            )
+        activation = store.active_incentive_composition(at_block=cursor[0])
+        if activation is None:
+            raise IntakeError("V2 incentive composition is not active")
+        live_activation = store.active_incentive_composition(
+            at_block=finalized_block
+        )
+        if live_activation is None or live_activation.digest != activation.digest:
+            raise IntakeError(
+                "active composition differs between retained intake and chain head"
+            )
+
+        epochs = store.incentive_composition_reward_epochs()
+        if any(
+            row.activation_digest != activation.digest
+            or row.composition_policy_digest != activation.policy.digest
+            for row in epochs
+        ):
+            raise IntakeError("retained composed epochs differ from active policy")
+        prior_confirmed = (
+            None
+            if not epochs
+            else store.confirmed_debt_weight_publication(
+                epochs[-1].publication_record_digest
+            ).readback.block
+        )
+        schedule = next_debt_boundary_schedule(
+            policy_digest=activation.policy.digest,
+            activation_block=activation.activation_block,
+            epoch_blocks=activation.policy.epoch_blocks,
+            closed_effective_blocks=tuple(row.effective_block for row in epochs),
+            finalized_block=finalized_block,
+            previous_confirmed_block=prior_confirmed,
+        )
+
+        journal = None
+        current = None
+        try:
+            journal = store.debt_weight_publication_journal()
+        except IntakeError as exc:
+            if "has no retained head" not in str(exc):
+                raise
+        if journal is not None:
+            current = journal.load()
+        closed_projection_digests = {
+            row.projection.digest for row in epochs
+        }
+        use_retained = (
+            current is not None
+            and (
+                head_only
+                or current.status in {"intent", "pending", "held", "released"}
+                or (
+                    current.status == "confirmed"
+                    and journal.head_binding().economic_projection_digest
+                    not in closed_projection_digests
+                )
+            )
+        )
+        if use_retained:
+            binding = journal.head_binding()
+            if binding is None:
+                raise DebtPublicationError(
+                    "V2 publication head lacks its retained binding"
+                )
+            if (
+                binding.publication_kind != PUBLICATION_KIND_COMPOSED
+                or binding.activation_digest != activation.digest
+                or binding.policy_digest != activation.policy.digest
+                or binding.weight_projection.chain_scope_digest != scope.digest
+                or binding.weight_projection.netuid != args.netuid
+                or binding.weight_projection.validator_hotkey != validator_hotkey
+            ):
+                raise DebtPublicationError(
+                    "retained V2 publication differs from active chain authority"
+                )
+            if (
+                binding.economic_projection_digest
+                not in closed_projection_digests
+                and binding.economic_projection.effective_block
+                != schedule.next_effective_block
+            ):
+                raise DebtPublicationError(
+                    "retained V2 publication would skip the next gapless boundary"
+                )
+        else:
+            if head_only:
+                raise DebtPublicationError(
+                    "V2 publication journal has no retained head to reconcile"
+                )
+            if schedule.status == "not_due":
+                print(
+                    f"debt boundary={schedule.next_effective_block} status=not_due "
+                    f"not_before={schedule.not_before_block} finalized={finalized_block}"
+                )
+                return 0
+            boundary_metagraph = chain.fetch_metagraph(
+                subtensor,
+                args.netuid,
+                block=schedule.next_effective_block,
+            )
+            economic = store.project_incentive_composition_epoch(
+                effective_block=schedule.next_effective_block,
+                eligible_hotkeys=tuple(boundary_metagraph.hotkeys),
+            )
+            binding = build_debt_weight_publication_binding(
+                economic,
+                publication_kind=PUBLICATION_KIND_COMPOSED,
+                activation_digest=activation.digest,
+                chain_scope_digest=scope.digest,
+                netuid=args.netuid,
+                validator_hotkey=validator_hotkey,
+                boundary_metagraph=boundary_metagraph,
+                epoch_index=schedule.next_epoch_index,
+            )
+            journal = store.debt_weight_publication_journal(binding)
+
+        if args.release_hold:
+            released = release_weight_publication_hold(
+                journal, reason=args.release_hold
+            )
+            print(
+                f"released held V2 weight publication "
+                f"{released.projection_digest}; run set-debt-weights again"
+            )
+            return 0
+
+        projection = binding.weight_projection
+        if args.dry_run:
+            print(json.dumps(
+                {"debt_weight_publication_binding": binding.to_dict()},
+                separators=(",", ":"),
+                sort_keys=True,
+            ))
+        result = reconcile_weight_publication(
+            subtensor,
+            None if args.dry_run else wallet,
+            projection,
+            journal,
+            refresh_blocks=args.refresh_blocks,
+            dry_run=args.dry_run,
+            reconcile_only=args.reconcile_only,
+            allow_stale_initial=True,
+            require_current_crown=False,
+        )
+        closed_epoch = None
+        awaiting_intake = False
+        if result.status == "confirmed":
+            if result.record is None:
+                raise WeightPublicationError(
+                    "confirmed V2 publication lacks its journal record"
+                )
+            confirmed_metagraph = chain.fetch_metagraph(
+                subtensor,
+                args.netuid,
+                block=result.record.confirmed_block,
+            )
+            confirmed_snapshot = chain.read_validator_weight_snapshot(
+                subtensor,
+                args.netuid,
+                validator_hotkey,
+                metagraph_view=confirmed_metagraph,
+            )
+            confirmation = build_confirmed_debt_weight_publication(
+                binding,
+                result.record,
+                confirmed_metagraph=confirmed_metagraph,
+                confirmed_snapshot=confirmed_snapshot,
+            )
+            close_cursor = store.finalized_cursor()
+            awaiting_intake = close_cursor is None or close_cursor[0] < (
+                confirmation.readback.block
+            )
+            if not awaiting_intake:
+                closed_epoch = store.close_confirmed_composed_epoch(
+                    binding.economic_projection,
+                    confirmation=confirmation,
+                    eligible_hotkeys=tuple(
+                        chain.fetch_metagraph(
+                            subtensor,
+                            args.netuid,
+                            block=binding.economic_projection.effective_block,
+                        ).hotkeys
+                    ),
+                )
+
+    print(
+        f"debt projection={binding.economic_projection_digest} "
+        f"weight_projection={projection.digest} status={result.status} "
+        f"chain_matches={result.chain_matches} submitted={result.submitted} "
+        f"closed={closed_epoch is not None} awaiting_intake={awaiting_intake} "
+        f"catch_up={schedule.status == 'catch_up_required'}"
+    )
+    if awaiting_intake or result.refresh_due or result.status == "pending":
         return 3
     return 0 if result.status in {"dry_run", "confirmed", "pending"} else 2
 
@@ -714,7 +986,8 @@ def build_parser() -> argparse.ArgumentParser:
             "  develop a kernel (miner) ... slots, scan, verify\n"
             "  submit on-chain (miner) .... chain-register, chain-package,\n"
             "                               chain-submit, chain-status\n"
-            "  referee + settlement ....... chain-validate, set-weights\n"
+            "  referee + settlement ....... chain-validate, "
+            "chain-activate-incentives, set-debt-weights\n"
             "  environment checks ......... compat, chain-compat\n"
             "\n"
             "New to Optima? Start with docs/MINER_GUIDE.md."
@@ -822,6 +1095,30 @@ def build_parser() -> argparse.ArgumentParser:
     sp.set_defaults(func=cmd_chain_incentive_composition_shadow)
 
     sp = sub.add_parser(
+        "chain-activate-incentives",
+        help=(
+            "wallet-free atomic cutover to one independently reviewed MiniMax-M3 "
+            "incentive campaign"
+        ),
+    )
+    sp.add_argument("--intake-db", default="chain_intake/intake.sqlite3")
+    sp.add_argument("--netuid", type=int, required=True)
+    sp.add_argument(
+        "--network",
+        required=True,
+        help="named network or an explicit wss:// endpoint URL",
+    )
+    sp.add_argument("--core-policy", required=True)
+    sp.add_argument("--composition-policy", required=True)
+    sp.add_argument("--approval", required=True)
+    sp.add_argument(
+        "--expected-approval-digest",
+        required=True,
+        help="independently recorded digest of the exact one-campaign approval",
+    )
+    sp.set_defaults(func=cmd_chain_activate_incentives)
+
+    sp = sub.add_parser(
         "set-weights",
         help="control-plane reconcile of the transactional global reward projection",
     )
@@ -861,6 +1158,52 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--dry-run", action="store_true",
                     help="build + print the (uids, weights) payload, do NOT submit")
     sp.set_defaults(func=cmd_set_weights)
+
+    sp = sub.add_parser(
+        "set-debt-weights",
+        help=(
+            "publish, confirm, and debit the next gapless active V2 incentive "
+            "composition boundary"
+        ),
+    )
+    sp.add_argument("--intake-db", default="chain_intake/intake.sqlite3")
+    sp.add_argument("--netuid", type=int, required=True)
+    sp.add_argument(
+        "--network",
+        default="finney",
+        help="named network or an explicit wss:// endpoint URL",
+    )
+    sp.add_argument("--wallet", default="default")
+    sp.add_argument("--hotkey", default="default")
+    sp.add_argument("--refresh-blocks", type=int, required=True)
+    sp.add_argument(
+        "--reconcile-only",
+        action="store_true",
+        help=(
+            "reopen an in-flight V2 publication and confirm only from exact "
+            "authoritative readback; never construct or invoke a signer"
+        ),
+    )
+    sp.add_argument(
+        "--validator-hotkey",
+        default="",
+        help=(
+            "public validator hotkey required by --reconcile-only and usable "
+            "for a signer-free --release-hold"
+        ),
+    )
+    sp.add_argument(
+        "--release-hold",
+        default="",
+        metavar="REASON",
+        help="append an audited release of the current V2 hold; does not submit",
+    )
+    sp.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="build + print the next exact boundary payload; do not submit or debit",
+    )
+    sp.set_defaults(func=cmd_set_debt_weights)
 
     # ---- chain: miner submission + the validator loop ----
     sp = sub.add_parser("chain-package",

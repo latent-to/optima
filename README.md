@@ -5,11 +5,12 @@ Bittensor subnet. Miners submit GPU **kernels** (Triton / CuteDSL) targeting
 individual operations in a **fixed** model; the validator swaps each kernel into
 the model it controls, measures **throughput** under CUDA graphs, and gates the
 result on **output fidelity** through validator-owned reference and task checks.
-Historical B300 campaigns proved the sampled in-engine comparison against stock,
-but the current causal production path does not yet transport and host-regrade
-that audit evidence. Meaningful-emission launch remains blocked until it does; see
-[docs/FIDELITY.md](docs/FIDELITY.md). A kernel earns only if it is faster at equal
-quality.
+Historical B300 campaigns proved the sampled in-engine comparison against stock.
+The causal path now transports bounded raw audit facts from a separate eager,
+untimed candidate role and requires a typed, host-regraded witness in every durable
+qualification report. Those new bytes are CPU/mock-covered but not yet qualified on
+the exact production MiniMax-M3 arena; see [docs/FIDELITY.md](docs/FIDELITY.md).
+A kernel earns only if it is faster at equal quality.
 
 The normal competition lane uses registered singleton or atomic kernel targets.
 Cross-cutting work can instead enter a fenced reviewed-discovery route; it does
@@ -84,23 +85,26 @@ scored on GPU — setup in [docs/GPU_SETUP.md](docs/GPU_SETUP.md).
   results were 2,135 passed/19 skipped locally and 111 historical conformance tests
   on the pod. D-015 itself has no pod receipt. A fresh live
   intake-only pass then restarted with zero duplicate work. It used no wallet and
-  supplies no review, settlement, publication, or activation authority; legacy V1
-  remains the sole wired publisher. The selected pure policy's
+  supplies no review, settlement, publication, or activation authority. At that
+  checkpoint, legacy V1 remained the sole wired publisher. The selected pure policy's
   promotion-or-bounty rule is not yet end-to-end enforcement: schema 5 retains
   `review_pending` wins and can issue bounded `bounty_only` debt, but rejects
   `registered_promotion` until typed promotion transport, target registration,
   fresh requalification/CROWN linkage, and cross-lane work identity exist. The
-  90-day bounty clock starts at the retained win, not the later review. Activation
-  also remains blocked on the actual catalog/reserve rerun, atomic/quiescent
-  V1→core→composition cutover, retained-boundary publication/debit catch-up,
-  independent review/runtime-invalidation authority, membership-departure history,
-  reliable review-expiry scheduling, promotion/cross-lane linkage, and production
-  audit transport. Its registered-CROWN policy divided capacity by target family;
+  90-day bounty clock starts at the retained win, not the later review. The
+  wallet-free atomic one-campaign cutover, schema-6 rollback fence, gapless
+  publication/readback/debit path, and causal audit transport are now implemented
+  but have no live activation/publication or new-path GPU receipt. Launch still needs
+  the exact catalog/reserve manifests and fresh shadow, independent review/runtime-
+  invalidation authority, membership-departure history, reliable review-expiry
+  scheduling, promotion/cross-lane linkage, the production audit GPU canary, and
+  actual operator activation. Its registered-CROWN policy divided capacity by target family;
   D-015 below supersedes that claim-sizing hierarchy, so the old testnet shadows do
   not authorize current policy bytes.
 - **2026-07-19 — D-015 selected model-campaign claim sizing.** Claims in the sole
-  MiniMax-M3 campaign use 100% sizing; in a later two-model roster, claims in either
-  campaign use 50% sizing. Schema 2 rejects more than two. Target families remain
+  MiniMax-M3 launch campaign use 100% sizing. Historical two-campaign 50/50 cells
+  remain arithmetic research; rotation, a second campaign, and successor activation
+  have no live path. Target families remain
   independent frontiers and clocks, but adding 1, 10, or 100 of them causes zero
   principal dilution. All 14 preregistered screens passed. With `k=1`, the normal
   weekly load was one full-sized 4.4%/5% claim for one campaign, or one half-sized
@@ -113,12 +117,12 @@ scored on GPU — setup in [docs/GPU_SETUP.md](docs/GPU_SETUP.md).
   was plainly overloaded. Report digest
   `7975a10b2924330cd527e29b0dfe6f2d9dcb40039f9d8f695b558ec6c6f46590`;
   the raw D-015 sweep is retained in local-only experiment records.
-  The `optima.finite-debt.v2` manifest, durable validation, and tests are implemented
-  in this draft but remain inactive. Current local validation is 2,137 passed/19
-  skipped repository-wide plus 8/8 D-015 simulator tests; there is no D-015 pod
-  receipt. A fresh MiniMax-M3 roster/reserve shadow plus
-  an atomic successor protocol for later model rotation or one-to-two expansion
-  remain activation work.
+  The one-campaign policy, atomic activation, confirmed publisher/debit path, and
+  audit witness transport are implemented in this draft but remain inactive.
+  Current local validation is 2,191 passed/19 skipped; the tracked 64-cell D-015
+  launch-load replay has semantic digest
+  `505fed4d40a6acc6bc92d6330170e8e2260a52e5f3099c22a6c0eb4b2308c672`.
+  There is no D-015 pod, activation, publication, or new audit-path GPU receipt.
 - Most faithful kernels measure *slower* than the pinned baseline — sglang's
   kernels are heavily tuned. The record above is what passing actually looks
   like: a ~1.04–1.07× measured speedup at zero fidelity violations.

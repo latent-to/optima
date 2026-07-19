@@ -40,6 +40,10 @@ from optima.eval.oci_session_protocol import (
     PromptEvidence,
     RuntimePreflightFacts,
     SessionProtocolError,
+    AuditReceiptFacts,
+    SlotAuditPolicy,
+    audit_evidence_message,
+    audit_policy_from_init,
     decode_message,
     error_message,
     evidence_frame,
@@ -501,7 +505,12 @@ def _prepare_descendant_bootstrap() -> None:
 
 
 @contextlib.contextmanager
-def _engine_session(config: EngineSessionConfig, tree: object) -> Iterator[object]:
+def _engine_session(
+    config: EngineSessionConfig,
+    tree: object,
+    *,
+    audit_policy: SlotAuditPolicy | None = None,
+) -> Iterator[object]:
     """Construct one content-selected engine without any scheduling role."""
 
     reference_mode = os.environ.get("OPTIMA_SESSION_PROTOCOL") == "reference"
@@ -583,7 +592,15 @@ def _engine_session(config: EngineSessionConfig, tree: object) -> Iterator[objec
                 active=active,
                 framework_mode=framework_mode,
                 install_seams=not reference_mode,
+                audit_policy=audit_policy,
             ) as handle:
+                audit_collector = getattr(handle, "collect_audit_receipts", None)
+                if audit_policy is not None and not callable(audit_collector):
+                    raise SessionWorkerError(
+                        "audited engine lacks a raw audit receipt collector"
+                    )
+                if not callable(audit_collector):
+                    audit_collector = lambda: []
                 receipt = None
                 if discovery is not None:
                     sglang_module = sys.modules.get("sglang")
@@ -601,6 +618,7 @@ def _engine_session(config: EngineSessionConfig, tree: object) -> Iterator[objec
                 yield SimpleNamespace(
                     engine=handle.engine,
                     require_completion=handle.require_completion,
+                    collect_audit_receipts=audit_collector,
                     discovery_activation_receipt=receipt,
                 )
     finally:
@@ -927,6 +945,11 @@ def run_session(*, input_fd: int = 0, output_fd: int | None = None) -> int:
                 "OPTIMA_ENGINE_CONFIG_DIGEST", ""
             ),
         )
+        audit_policy = audit_policy_from_init(init)
+        if session_protocol == "reference" and audit_policy is not None:
+            raise SessionProtocolError(
+                "pristine reference sessions cannot carry slot audit policy"
+            )
         stage = "preflight"
         facts, tree = _validate_live_preflight(config, launch_digest=launch_digest)
         _write_all(
@@ -953,7 +976,12 @@ def run_session(*, input_fd: int = 0, output_fd: int | None = None) -> int:
             raise SessionProtocolError(
                 "pristine reference tree must contain no contribution manifest"
             )
-        with _engine_session(config, tree) as handle:
+        engine_context = (
+            _engine_session(config, tree)
+            if audit_policy is None
+            else _engine_session(config, tree, audit_policy=audit_policy)
+        )
+        with engine_context as handle:
             _write_all(
                 protocol_fd,
                 frame_message(
@@ -1001,9 +1029,30 @@ def run_session(*, input_fd: int = 0, output_fd: int | None = None) -> int:
                 seen_nonces.add(request.nonce)
                 evidence = _generate(handle.engine, request)
                 handle.require_completion()
+                collector = getattr(handle, "collect_audit_receipts", None)
+                if audit_policy is not None and not callable(collector):
+                    raise SessionProtocolError(
+                        "audited engine lacks its raw audit receipt collector"
+                    )
+                audit_receipts = tuple(
+                    AuditReceiptFacts.from_receipt_dict(row)
+                    for row in (collector() if callable(collector) else ())
+                )
                 _write_all(
                     protocol_fd, evidence_frame(evidence, request=request)
                 )
+                if audit_policy is not None:
+                    _write_all(
+                        protocol_fd,
+                        frame_message(
+                            audit_evidence_message(
+                                request=request,
+                                policy=audit_policy,
+                                receipts=audit_receipts,
+                            ),
+                            max_bytes=MAX_CONTROL_BYTES,
+                        ),
+                    )
                 expected_index += 1
                 request = None
     except BaseException as exc:  # noqa: BLE001 - bounded untrusted diagnostic

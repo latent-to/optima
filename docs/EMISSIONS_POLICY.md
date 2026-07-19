@@ -15,9 +15,11 @@ There are currently three deliberately separate policy authorities:
 - **Selected finite-debt V2:** “V2” names the emissions-generation migration from
   standing legacy claims; the serialized registered-CROWN manifest itself correctly
   says `policy_version="optima.finite-debt.v2"` and schema 2. D-015's pure
-  campaign-sized arithmetic and additive durable validation are implemented but
-  inactive. D-012 and its signer-free chain shadow are immutable historical evidence
-  for the superseded family-share manifest; they do not authorize D-015 bytes.
+  campaign-sized arithmetic and durable validation are implemented but inactive.
+  The selected activation path accepts exactly one immutable MiniMax-M3 campaign;
+  historical two-campaign cells are research only. D-012 and its signer-free chain
+  shadow are immutable historical evidence for the superseded family-share manifest;
+  they do not authorize D-015 bytes.
 - **Selected reviewed-discovery composition:** D-013 adds a separately versioned
   `optima.incentive-composition.v1` manifest, pure two-class arithmetic, schema-5
   review-pending/bounty-only durable state, and signer-free
@@ -26,17 +28,26 @@ There are currently three deliberately separate policy authorities:
   explicitly synthetic states with `submitted=false`; its exact bounded receipt is
   recorded below and carries no review, settlement, publication, or activation authority.
 
-Legacy V1 remains the sole wired publisher. Activation still lacks the exact
-MiniMax-M3 campaign identity, production family map, and reserve identity plus a
-fresh campaign-policy shadow; an
-atomic or quiescent V1→core→composition cutover; retained-boundary publication,
-confirmation, catch-up, and debt debit; independently graded review and
-runtime-invalidation authority; an atomic successor protocol for later campaign
-rotation or one-to-two expansion; retained membership-departure history rather than
-only a current snapshot; durable promotion transport/linkage; and production audit
-evidence transport. The current `review_digest` is controller-supplied and
-content-bound, not independently reopened and graded. See
-[FIDELITY.md](FIDELITY.md) for the audit gap.
+Legacy V1 remains the only publisher exercised live, but it is no longer the only
+implemented publisher. `chain-activate-incentives` atomically binds the exact core,
+composition, independent approval, finalized block/hash, and equal intake cursor in a
+wallet-free schema-5→6 cutover. Preflight derives the one campaign from exactly one
+retained arena's complete catalog/family roster, checks reserve membership at the
+approved finalized metagraph, and must reproduce the arena/stack/catalog/membership
+digests already pinned by the independent approval; those bytes are retained in the
+activation row and reward event.
+`set-debt-weights` implements restart-safe gapless
+projection, signing, finalized readback, confirmation, only-then debit, and rate-limited
+catch-up. Neither path has a live receipt and V2 remains inactive.
+
+Launch still needs the exact MiniMax-M3 family and reserve manifests plus a fresh
+campaign-policy shadow; retained membership-departure history; independently graded
+review and runtime-invalidation authority; durable promotion transport/linkage; the
+production audit GPU canary plus explicit acceptance of in-process tampering, audit-role
+fingerprinting, and timed-workload fingerprinting; and actual activation/mainnet operations.
+The current `review_digest` is controller-supplied and content-bound, not independently
+reopened and graded. Model rotation, a second campaign, and successor activation are
+unsupported future work. See [FIDELITY.md](FIDELITY.md) for the audit status.
 
 Policy migration creates no retroactive V2 debt for legacy crowns. An activation
 record has its own policy digest and exact finalized block/hash; it never rewrites
@@ -76,9 +87,10 @@ F_c = floor(900_000 * B_c / 1_000_000)
 Q   = floor(F_c * k * G * M / 1_000_000^3)
 ```
 
-The manifest enforces 1,000,000-ppm claim sizing for a sole campaign or
-500,000-ppm claim sizing for claims in either of two campaigns, and rejects more
-than two. Every family maps exactly once and every
+The pure manifest arithmetic represents 1,000,000-ppm claim sizing for a sole
+campaign or the historical 500,000-ppm two-campaign research cells, and rejects
+more than two. The selected activation approval and durable store accept only one
+immutable MiniMax-M3 campaign. Every family maps exactly once and every
 campaign has a family. Target count never divides a campaign share: adding 1, 10,
 or 100 unused families changes principal by zero, while each family retains its
 own elapsed-time clock. Campaign shares size claims rather than creating hard
@@ -92,6 +104,11 @@ The sensitivity sweep made `k=1.25` marginal. At `k=1.5` the worst rows crossed
 into overload while other rows remained marginal; `k=2` was plainly overloaded,
 retaining `k=1`. Report semantic digest:
 `7975a10b2924330cd527e29b0dfe6f2d9dcb40039f9d8f695b558ec6c6f46590`.
+
+A tracked one-campaign supplement covered 64 launch/stress cells over 1/2/5/10
+independently winning M3 families, four cadences, and empty/saturated discovery.
+Its semantic report digest is
+`505fed4d40a6acc6bc92d6330170e8e2260a52e5f3099c22a6c0eb4b2308c672`.
 
 Registered-CROWN claims start aging at settlement. Discovery bounty age instead
 starts at the retained qualified-win block, so a later review consumes rather than
@@ -206,13 +223,24 @@ required before activation.
   retained, not when review later mints the claim.
 - A reserve anchor is a policy-bound hotkey, not a UID. Missing reserve authority
   fails closed, and the reserve cannot own a miner claim.
-- Policy upgrades with open debt are forbidden in the first implementation.
-  The current composition generation also permits only one activation, so model
-  rotation or one-to-two campaign expansion requires an atomic successor protocol.
+- Policy upgrades with open debt are forbidden. The current generation permits
+  exactly one activation of one immutable MiniMax-M3 campaign; model rotation, a
+  second campaign, and successor activation are unsupported future work.
 - Schema-4→5 migration creates only empty immutable composition tables: it imports
   no historical CROWNs or legacy discovery awards and creates no retroactive debt.
-  Composition activation additionally requires clean open-debt state and fails if
-  any legacy discovery claim is active.
+  Atomic activation additionally requires clean open-debt state, no retained legacy
+  discovery or V1 publication state, and quiescent pre-cutover intake. It commits
+  core plus composition together only after the complete approved family roster identifies
+  exactly one retained arena, the campaign ID matches that arena/catalog/roster, and the
+  reserve belongs to the approved finalized metagraph. The independently pinned approval
+  binds the arena, evaluation stack, catalog, and membership; preflight must reproduce all
+  four. It also binds the production audit-control manifest, final B300 canary receipt,
+  and explicit residual-risk acceptance digests. The activation row/event retain the
+  complete approval. Existing V1 publication databases have
+  no automatic bridge and remain fail-closed; launch uses a fresh/quiescent activation
+  database rather than deleting history. A V1 projection or dry run that retained only
+  `emissions_policy_digest` also makes that database non-fresh. The transaction raises schema 5→6;
+  schema 6 is a rollback fence against older runtimes.
 - Once composition is active, legacy settlement cannot auto-award a discovery
   bounty. Active settlement can retain a review-pending discovery win and the
   durable disposition ledger can issue only `bounty_only`; registered promotion is
@@ -222,22 +250,29 @@ required before activation.
   consumes an external `invalidation_digest`; it does not independently decide or
   grade runtime invalidity, so that authority remains an activation blocker.
 - A projection build, dry run, restart, SDK success, or retry never reduces debt.
-  Only an exact confirmed completed-epoch record may do so once. The durable API
-  currently binds an externally supplied publication-record digest but does not
-  reopen and grade a V2 confirmation journal. Epochs are gapless from activation,
-  so a missed or slowly confirmed retained boundary currently wedges later closure;
-  production needs retained-boundary catch-up rather than skipping it.
-- V1 and V2 must never publish concurrently. Core activation and composition
-  activation are two distinct finalized steps; before the second step, legacy
-  settlement/publication can still race. Activation requires an atomic handoff or
-  operator-enforced quiescence and proof that failure cannot leave both (or neither)
-  publishing silently.
+  `set-debt-weights` reopens or creates the earliest gapless boundary, binds its
+  economic projection to the signer-facing vector, journals signing, grades an exact
+  finalized chain readback, and debits only after the intake cursor reaches that
+  readback. A missed or slow boundary is retained and caught up before later ones;
+  confirmations are rate-limited to at least one full policy cadence. This authority
+  is implemented but has no live receipt.
+- V1 and V2 must never publish concurrently. `chain-activate-incentives` is one
+  wallet-free local transaction over exact independently approved bytes; it rejects
+  legacy V1 publication state and non-quiescent pre-cutover intake rather than exposing
+  separate core and composition activation windows.
 - Lifecycle reconciliation currently consumes an eligible-hotkey snapshot. Production
   must retain boundary-specific membership/departure history so a later snapshot is
-  not misread as the authoritative historical departure event.
+  not misread as the authoritative historical departure event. The constrained initial
+  launch therefore requires stable reserve/validator/positive-recipient registrations
+  and an operator halt on any departure or UID change; it never skips or rewrites the
+  affected boundary. The 90-day claim lifetime means ordinary expiry cannot occur during
+  the planned first 1–2 weeks.
 - The MiniMax-M3 campaign identity, its real production family map, and reserve
   identity must be frozen into exact manifests and a campaign-policy shadow run
-  against those bytes before activation.
+  against those bytes before activation. Retained membership-departure history,
+  independently graded review/runtime invalidation, promotion linkage, the production
+  audit GPU canary plus explicit acceptance of its in-process/audit-role/timed-workload
+  residuals, and actual activation/mainnet operations remain open.
 
 ## Legacy V1 standing reward families
 

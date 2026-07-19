@@ -10,7 +10,7 @@ import hashlib
 import json
 import math
 import secrets
-from dataclasses import dataclass, field, fields, is_dataclass
+from dataclasses import dataclass, field, fields, is_dataclass, replace
 from enum import Enum
 from pathlib import Path
 from typing import Callable, ClassVar, Protocol
@@ -26,12 +26,14 @@ from optima.eval.marginal_runtime import (
     MarginalLifecycleEvidence, PreparedMarginalRuntime, run_marginal_lifecycle,
 )
 from optima.eval.oci_backend import (
-    OCIEngineExecutor, PristineReferenceExecutionEvidence,
+    EngineExecutionEvidence, OCIEngineExecutor, PristineReferenceExecutionEvidence,
     TrustedArenaModelMountReceipt, runtime_identity_from_preflight,
 )
 from optima.eval.oci_process import OCIQuiescenceReceipt
 from optima.eval.oci_reference_session import ReferenceSessionPlan
-from optima.eval.oci_session_protocol import EngineSessionConfig, RuntimePreflightFacts
+from optima.eval.oci_session_protocol import (
+    AuditReceiptFacts, EngineSessionConfig, RuntimePreflightFacts, SlotAuditPolicy,
+)
 from optima.eval.qualification import (
     DiscoveryExecutionGrade, DiscoveryExecutionRequirement,
     DiscoveryQualificationProfile,
@@ -325,6 +327,7 @@ class CausalQualificationInput:
     expected_launch_resource_policy_digest: str
     expected_runtime_resource_policy_digest: str
     expected_device_policy_digest: str
+    audit_policies: tuple[SlotAuditPolicy, ...]
     # Legacy remains the production default until repeat-read is GPU-calibrated.
     # A v2 plan must opt in before B and is then authority-bound end to end.
     speed_evidence_policy: SpeedEvidencePolicy = field(
@@ -372,6 +375,26 @@ class CausalQualificationInput:
         ):
             raise QualificationRunnerError("candidate authority order differs from the sealed cohort")
         object.__setattr__(self, "candidates", candidates)
+        audit_policies = tuple(self.audit_policies)
+        if (
+            len(audit_policies) != len(candidates)
+            or any(type(row) is not SlotAuditPolicy for row in audit_policies)
+            or any(
+                row.expected_member_count != prepared.session_plan.engine_config.tp_size
+                for row, prepared in zip(
+                    audit_policies, self.prepared.candidates, strict=True
+                )
+            )
+            or self.prepared.baseline_session_plan.audit_policy is not None
+            or any(
+                prepared.session_plan.audit_policy is not None
+                for prepared in self.prepared.candidates
+            )
+        ):
+            raise QualificationRunnerError(
+                "slot audit authority differs from the candidate cohort"
+            )
+        object.__setattr__(self, "audit_policies", audit_policies)
         for authority in candidates:
             profile = authority.profile
             support_union = min(
@@ -420,9 +443,9 @@ def _decision(value: str | QualificationDecision) -> QualificationDecision:
     except (TypeError, ValueError) as exc:
         raise QualificationRunnerError("component decision is unsupported") from exc
 
-def _aggregate_decision(graph: QualificationDecision, speed: QualificationDecision,
-                        quality: QualificationDecision) -> QualificationDecision:
-    values = (graph, speed, quality)
+def _aggregate_decision(*values: QualificationDecision) -> QualificationDecision:
+    if not values or any(type(row) is not QualificationDecision for row in values):
+        raise QualificationRunnerError("aggregate decisions are not exactly typed")
     if QualificationDecision.FAIL in values:
         return QualificationDecision.FAIL
     if QualificationDecision.NO_DECISION in values:
@@ -564,6 +587,167 @@ class SpeedWitness:
 
 
 @dataclass(frozen=True)
+class AuditWitness:
+    """Raw untimed eager slot-audit facts regraded only by the trusted host."""
+
+    selected_delta_digest: str
+    candidate_launch_digest: str
+    execution_identity_digest: str
+    session_id: str
+    runtime_resource_policy_digest: str
+    policy: SlotAuditPolicy
+    receipts: tuple[AuditReceiptFacts, ...]
+    decision: QualificationDecision
+    detail: str
+
+    def __post_init__(self) -> None:
+        for name in (
+            "selected_delta_digest",
+            "candidate_launch_digest",
+            "execution_identity_digest",
+            "runtime_resource_policy_digest",
+        ):
+            object.__setattr__(
+                self, name, require_sha256_hex(getattr(self, name), field=name)
+            )
+        if (
+            not isinstance(self.session_id, str)
+            or len(self.session_id) != 32
+            or any(char not in "0123456789abcdef" for char in self.session_id)
+            or self.session_id == "0" * 32
+            or type(self.policy) is not SlotAuditPolicy
+        ):
+            raise QualificationRunnerError("audit witness identity is malformed")
+        receipts = tuple(self.receipts)
+        if any(type(row) is not AuditReceiptFacts for row in receipts):
+            raise QualificationRunnerError("audit witness receipts are not typed")
+        object.__setattr__(self, "receipts", receipts)
+        object.__setattr__(self, "decision", _decision(self.decision))
+        passed, detail = self.regrade()
+        expected = (
+            QualificationDecision.PASS if passed else QualificationDecision.FAIL
+        )
+        if (
+            self.decision is not expected
+            or not isinstance(self.detail, str)
+            or self.detail != detail
+        ):
+            raise QualificationRunnerError(
+                "audit witness verdict was not independently host-regraded"
+            )
+
+    def regrade(self) -> tuple[bool, str]:
+        from optima.audit import gate
+
+        return gate(
+            [row.to_gate_dict() for row in self.receipts],
+            min_calls=self.policy.minimum_calls,
+            expected_slots=self.policy.expected_slots,
+            expected_member_count=self.policy.expected_member_count,
+        )
+
+    @classmethod
+    def from_execution(
+        cls,
+        execution: EngineExecutionEvidence,
+        *,
+        selected_delta_digest: str,
+        policy: SlotAuditPolicy,
+    ) -> "AuditWitness":
+        if type(execution) is not EngineExecutionEvidence:
+            raise QualificationRunnerError("audit execution evidence is not typed")
+        session = execution.session
+        if (
+            session.audit_policy_digest != policy.digest
+            or not session.audit_receipts
+        ):
+            raise QualificationRunnerError(
+                "audit session lacks policy-bound raw receipt evidence"
+            )
+        execution_identity = canonical_digest(
+            "optima.qualification.slot-audit-execution.v1",
+            {
+                "arena_model_receipt": execution.arena_model_receipt_digest,
+                "launch": execution.launch_digest,
+                "native_publication": execution.native_publication_digest,
+                "prebuild": execution.prebuild.build_spec_digest,
+                "recovered_leases": list(execution.recovered_lease_ids),
+                "runtime_argv": execution.runtime_argv_sha256,
+                "runtime_preflight": execution.runtime_preflight_receipt_sha256,
+                "runtime_resource_policy": execution.resource_policy_digest,
+                "session_id": session.session_id,
+                "audit_policy": policy.digest,
+                "receipts": [row.to_dict() for row in session.audit_receipts],
+            },
+        )
+        from optima.audit import gate
+
+        passed, detail = gate(
+            [row.to_gate_dict() for row in session.audit_receipts],
+            min_calls=policy.minimum_calls,
+            expected_slots=policy.expected_slots,
+            expected_member_count=policy.expected_member_count,
+        )
+        return cls(
+            selected_delta_digest,
+            execution.launch_digest,
+            execution_identity,
+            session.session_id,
+            execution.resource_policy_digest,
+            policy,
+            session.audit_receipts,
+            QualificationDecision.PASS if passed else QualificationDecision.FAIL,
+            detail,
+        )
+
+    def to_dict(self) -> dict[str, object]:
+        return _record_dict(self)
+
+    @classmethod
+    def from_dict(cls, value: object) -> "AuditWitness":
+        raw = _strict(value, set(cls.__dataclass_fields__), "audit witness")
+        raw_receipts = raw["receipts"]
+        if not isinstance(raw_receipts, list):
+            raise QualificationRunnerError("audit witness receipts must be an array")
+        receipts: list[AuditReceiptFacts] = []
+        for value in raw_receipts:
+            if not isinstance(value, dict):
+                raise QualificationRunnerError("audit witness receipt is not an object")
+            row = dict(value)
+            for name, optional in (("worst_frac", False), ("min_ratio", True)):
+                encoded = row.get(name)
+                if optional and encoded is None:
+                    continue
+                if not isinstance(encoded, str):
+                    raise QualificationRunnerError(
+                        f"audit witness {name} is not a canonical decimal string"
+                    )
+                try:
+                    decoded = float(encoded)
+                except ValueError as exc:
+                    raise QualificationRunnerError(
+                        f"audit witness {name} is malformed"
+                    ) from exc
+                if not math.isfinite(decoded) or format(decoded, ".17g") != encoded:
+                    raise QualificationRunnerError(
+                        f"audit witness {name} is not canonical"
+                    )
+                row[name] = decoded
+            receipts.append(AuditReceiptFacts.from_dict(row))
+        return cls(
+            **{
+                **raw,
+                "policy": SlotAuditPolicy.from_dict(raw["policy"]),
+                "receipts": tuple(receipts),
+            }
+        )  # type: ignore[arg-type]
+
+    @property
+    def digest(self) -> str:
+        return canonical_digest("optima.qualification.slot-audit-witness.v1", self.to_dict())
+
+
+@dataclass(frozen=True)
 class RepeatQualityWitness:
     """The independently teacher-graded B-prime/C-prime/B-double-prime leg."""
 
@@ -628,7 +812,7 @@ def _report_fields(value: object, *, include_repeat: bool) -> dict[str, object]:
 
 @dataclass(frozen=True)
 class CandidateQualificationReport:
-    _domain: ClassVar[str] = "optima.qualification.candidate-report.v1"
+    _domain: ClassVar[str] = "optima.qualification.candidate-report.v2"
     selected_delta_digest: str
     marginal_arm_digest: str
     candidate_launch_digest: str
@@ -647,6 +831,9 @@ class CandidateQualificationReport:
     raw_quality_binding: ReferenceQualityRawBinding
     speed_witness: SpeedWitness
     t_request_sha256: str
+    audit_evidence_digest: str
+    audit_decision: QualificationDecision
+    audit_witness: AuditWitness
     decision: QualificationDecision
     reason: str
     retryable: bool
@@ -657,14 +844,19 @@ class CandidateQualificationReport:
             "selected_delta_digest", "marginal_arm_digest", "candidate_launch_digest",
             "profile_digest", "calibration_digest", "graph_grade_digest",
             "speed_evidence_digest", "quality_evidence_digest", "t_request_sha256",
+            "audit_evidence_digest",
         ):
             object.__setattr__(self, field, require_sha256_hex(getattr(self, field), field=field))
-        for field in ("graph_decision", "speed_decision", "quality_decision", "decision"):
+        for field in (
+            "graph_decision", "speed_decision", "quality_decision",
+            "audit_decision", "decision",
+        ):
             object.__setattr__(self, field, _decision(getattr(self, field)))
         if (
             type(self.raw_quality_artifact) is not EvidenceArtifactRef
             or type(self.raw_quality_binding) is not ReferenceQualityRawBinding
             or type(self.speed_witness) is not SpeedWitness
+            or type(self.audit_witness) is not AuditWitness
         ):
             raise QualificationRunnerError("candidate evidence witness is not typed")
         if (self.speed_witness.policy.version == 2) != (
@@ -674,10 +866,17 @@ class CandidateQualificationReport:
                 "candidate repeat quality coverage differs from speed policy"
             )
         expected = _aggregate_decision(
-            self.graph_decision, self.speed_decision, self.quality_decision
+            self.graph_decision, self.speed_decision, self.quality_decision,
+            self.audit_decision,
         )
         if (
-            self.decision is not expected
+            self.audit_witness.digest != self.audit_evidence_digest
+            or self.audit_witness.decision is not self.audit_decision
+            or self.audit_witness.selected_delta_digest != self.selected_delta_digest
+            or self.audit_witness.candidate_launch_digest != self.candidate_launch_digest
+            or self.audit_witness.runtime_resource_policy_digest
+            != self.speed_witness.runtime_resource_policy_digest
+            or self.decision is not expected
             or type(self.retryable) is not bool
             or self.retryable != (expected is QualificationDecision.NO_DECISION)
             or not isinstance(self.reason, str)
@@ -713,6 +912,7 @@ class CandidateQualificationReport:
             "raw_quality_artifact": EvidenceArtifactRef.from_dict(raw["raw_quality_artifact"]),
             "raw_quality_binding": ReferenceQualityRawBinding.from_dict(raw["raw_quality_binding"]),
             "speed_witness": SpeedWitness.from_dict(raw["speed_witness"]),
+            "audit_witness": AuditWitness.from_dict(raw["audit_witness"]),
             "repeat_quality": (
                 RepeatQualityWitness.from_dict(raw["repeat_quality"])
                 if "repeat_quality" in raw
@@ -728,7 +928,7 @@ class CandidateQualificationReport:
 
 @dataclass(frozen=True)
 class DiscoveryCandidateQualificationReport:
-    _domain: ClassVar[str] = "optima.qualification.discovery-candidate-report.v1"
+    _domain: ClassVar[str] = "optima.qualification.discovery-candidate-report.v2"
     selected_delta_digest: str
     discovery_arm_digest: str
     proposal_digest: str
@@ -746,6 +946,9 @@ class DiscoveryCandidateQualificationReport:
     raw_quality_binding: ReferenceQualityRawBinding
     speed_witness: SpeedWitness
     t_request_sha256: str
+    audit_evidence_digest: str
+    audit_decision: QualificationDecision
+    audit_witness: AuditWitness
     decision: QualificationDecision
     reason: str
     retryable: bool
@@ -757,17 +960,21 @@ class DiscoveryCandidateQualificationReport:
             "candidate_launch_digest", "profile_digest", "calibration_digest",
             "speed_evidence_digest",
             "quality_evidence_digest", "t_request_sha256",
+            "audit_evidence_digest",
         ):
             object.__setattr__(
                 self, field, require_sha256_hex(getattr(self, field), field=field)
             )
-        for field in ("speed_decision", "quality_decision", "decision"):
+        for field in (
+            "speed_decision", "quality_decision", "audit_decision", "decision"
+        ):
             object.__setattr__(self, field, _decision(getattr(self, field)))
         if (
             type(self.execution_grade) is not DiscoveryExecutionGrade
             or type(self.raw_quality_artifact) is not EvidenceArtifactRef
             or type(self.raw_quality_binding) is not ReferenceQualityRawBinding
             or type(self.speed_witness) is not SpeedWitness
+            or type(self.audit_witness) is not AuditWitness
         ):
             raise QualificationRunnerError("discovery evidence witness is not typed")
         if (self.speed_witness.policy.version == 2) != (
@@ -777,10 +984,17 @@ class DiscoveryCandidateQualificationReport:
                 "discovery repeat quality coverage differs from speed policy"
             )
         expected = _aggregate_decision(
-            self.execution_grade.decision, self.speed_decision, self.quality_decision
+            self.execution_grade.decision, self.speed_decision,
+            self.quality_decision, self.audit_decision,
         )
         if (
-            self.decision is not expected
+            self.audit_witness.digest != self.audit_evidence_digest
+            or self.audit_witness.decision is not self.audit_decision
+            or self.audit_witness.selected_delta_digest != self.selected_delta_digest
+            or self.audit_witness.candidate_launch_digest != self.candidate_launch_digest
+            or self.audit_witness.runtime_resource_policy_digest
+            != self.speed_witness.runtime_resource_policy_digest
+            or self.decision is not expected
             or type(self.retryable) is not bool
             or self.retryable != (expected is QualificationDecision.NO_DECISION)
             or not isinstance(self.reason, str)
@@ -823,6 +1037,7 @@ class DiscoveryCandidateQualificationReport:
                 raw["raw_quality_binding"]
             ),
             "speed_witness": SpeedWitness.from_dict(raw["speed_witness"]),
+            "audit_witness": AuditWitness.from_dict(raw["audit_witness"]),
             "repeat_quality": (
                 RepeatQualityWitness.from_dict(raw["repeat_quality"])
                 if "repeat_quality" in raw
@@ -1505,14 +1720,79 @@ def _speed_decision(speed: MarginalSpeedProjection) -> QualificationDecision:
         return QualificationDecision.NO_DECISION
     return QualificationDecision.PASS if speed.verdict.passed_speedup else QualificationDecision.FAIL
 
+
+def _run_slot_audits(
+    value: CausalQualificationInput,
+    lifecycle: MarginalLifecycleEvidence,
+    *,
+    executor: OCIEngineExecutor,
+    deadline: float,
+) -> tuple[dict[str, AuditWitness], float]:
+    """Run one independent eager, untimed candidate role per sealed C arm."""
+
+    timed_session_ids = {
+        lifecycle.baseline_before.session.session_id,
+        lifecycle.baseline_after.session.session_id,
+        *(row.execution.session.session_id for row in lifecycle.candidates),
+        *(
+            row.execution.session.session_id
+            for row in lifecycle.candidates_repeat
+        ),
+        *(
+            (lifecycle.baseline_third.session.session_id,)
+            if lifecycle.baseline_third is not None
+            else ()
+        ),
+    }
+    witnesses: dict[str, AuditWitness] = {}
+    last_completed = 0.0
+    for prepared, authority, policy in zip(
+        value.prepared.candidates,
+        value.candidates,
+        value.audit_policies,
+        strict=True,
+    ):
+        audit_plan = replace(prepared.session_plan, audit_policy=policy)
+        execution = executor.execute(
+            prepared.launch,
+            prepared.binding.launch_binding,
+            value.model_mount,
+            audit_plan,
+            deadline=deadline,
+        )
+        if (
+            execution.session.session_id in timed_session_ids
+            or execution.resource_policy_digest
+            != value.expected_runtime_resource_policy_digest
+        ):
+            raise QualificationRunnerError(
+                "slot audit execution reused a timed role or changed runtime policy"
+            )
+        witness = AuditWitness.from_execution(
+            execution,
+            selected_delta_digest=authority.selected_delta_digest,
+            policy=policy,
+        )
+        witnesses[authority.selected_delta_digest] = witness
+        last_completed = max(
+            last_completed,
+            execution.device_receipts[-1].completed_monotonic_s,
+        )
+    if len(witnesses) != len(value.candidates):
+        raise QualificationRunnerError("slot audit cohort coverage is incomplete")
+    return witnesses, last_completed
+
 def _report_reason(
     graph: GraphVerificationGrade,
     speed: QualificationDecision,
     quality: ReferenceQualityVerdict,
+    audit: AuditWitness,
     repeat_quality: ReferenceQualityVerdict | None = None,
 ) -> str:
     if graph.decision is not QualificationDecision.PASS:
         return graph.reason
+    if audit.decision is not QualificationDecision.PASS:
+        return "slot_audit_failed"
     if speed is QualificationDecision.NO_DECISION:
         return "speed_noise"
     if speed is QualificationDecision.FAIL:
@@ -1532,10 +1812,13 @@ def _discovery_report_reason(
     execution: DiscoveryExecutionGrade,
     speed: QualificationDecision,
     quality: ReferenceQualityVerdict,
+    audit: AuditWitness,
     repeat_quality: ReferenceQualityVerdict | None = None,
 ) -> str:
     if execution.decision is not QualificationDecision.PASS:
         return execution.reason
+    if audit.decision is not QualificationDecision.PASS:
+        return "slot_audit_failed"
     if speed is QualificationDecision.NO_DECISION:
         return "speed_noise"
     if speed is QualificationDecision.FAIL:
@@ -1571,6 +1854,7 @@ def qualification_authority_digest(value: CausalQualificationInput) -> str:
         "incumbent_preflight": value.prepared.incumbent_binding.launch_binding.runtime_preflight_receipt.sha256,
         "policies": [value.expected_launch_resource_policy_digest,
                      value.expected_runtime_resource_policy_digest, value.expected_device_policy_digest],
+        "slot_audit_policies": [row.to_dict() for row in value.audit_policies],
         "reference": [value.pristine_stack.digest, value.pristine_launch.digest,
                       value.pristine_binding.native_build_spec.digest,
                       value.pristine_binding.controller_distribution_digest,
@@ -1579,10 +1863,13 @@ def qualification_authority_digest(value: CausalQualificationInput) -> str:
         "source": value.prepared.source.digest,
         }
         if value.speed_evidence_policy.version == 1:
-            # Byte-for-byte historical authority identity.
-            return canonical_digest("optima.qualification.causal-authority", payload)
+            return canonical_digest(
+                "optima.qualification.causal-authority.audit-v1", payload
+            )
         payload["speed_evidence_policy"] = value.speed_evidence_policy.to_dict()
-        return canonical_digest("optima.qualification.causal-authority.v2", payload)
+        return canonical_digest(
+            "optima.qualification.causal-authority.v2.audit-v1", payload
+        )
     if len(value.candidates) != 1 or type(
         value.candidates[0]
     ) is not DiscoveryCandidateQualificationAuthority:
@@ -1613,6 +1900,7 @@ def qualification_authority_digest(value: CausalQualificationInput) -> str:
         "policies": [value.expected_launch_resource_policy_digest,
                      value.expected_runtime_resource_policy_digest,
                      value.expected_device_policy_digest],
+        "slot_audit_policies": [row.to_dict() for row in value.audit_policies],
         "reference": [value.pristine_stack.digest, value.pristine_launch.digest,
                       value.pristine_binding.native_build_spec.digest,
                       value.pristine_binding.controller_distribution_digest,
@@ -1622,9 +1910,13 @@ def qualification_authority_digest(value: CausalQualificationInput) -> str:
         "source": value.prepared.source.digest,
     }
     if value.speed_evidence_policy.version == 1:
-        return canonical_digest("optima.qualification.discovery-causal-authority", payload)
+        return canonical_digest(
+            "optima.qualification.discovery-causal-authority.audit-v1", payload
+        )
     payload["speed_evidence_policy"] = value.speed_evidence_policy.to_dict()
-    return canonical_digest("optima.qualification.discovery-causal-authority.v2", payload)
+    return canonical_digest(
+        "optima.qualification.discovery-causal-authority.v2.audit-v1", payload
+    )
 
 def _validate_reference_execution(
     attempt: QualificationAttempt, expected: CausalQualificationInput
@@ -1774,8 +2066,12 @@ def reopen_causal_qualification(
             expected_manifest=expected.calibration_manifest,
             expected_context=expected.calibration_context,
         )
-        for report, authority, prepared in zip(
-            attempt.reports, expected.candidates, expected.prepared.candidates, strict=True
+        for report, authority, prepared, audit_policy in zip(
+            attempt.reports,
+            expected.candidates,
+            expected.prepared.candidates,
+            expected.audit_policies,
+            strict=True,
         ):
             raw = report.raw_quality_binding
             quality = score_reference_quality(
@@ -1823,6 +2119,28 @@ def reopen_causal_qualification(
                 expected.calibration_context,
                 expected_policy=expected.speed_evidence_policy,
             )
+            audit_witness = report.audit_witness
+            audit_passed, audit_detail = audit_witness.regrade()
+            audit_grade = (
+                QualificationDecision.PASS
+                if audit_passed
+                else QualificationDecision.FAIL
+            )
+            if (
+                audit_witness.policy != audit_policy
+                or audit_witness.selected_delta_digest
+                != authority.selected_delta_digest
+                or audit_witness.candidate_launch_digest != prepared.launch.digest
+                or audit_witness.runtime_resource_policy_digest
+                != expected.expected_runtime_resource_policy_digest
+                or audit_witness.session_id in {row.session_id for row in rates}
+                or audit_witness.decision is not audit_grade
+                or audit_witness.detail != audit_detail
+                or audit_witness.digest != report.audit_evidence_digest
+            ):
+                raise QualificationRunnerError(
+                    "slot audit witness differs from its candidate authority"
+                )
             identity_common = {
                 "calibration_digest": calibration.digest,
                 "candidate_lifecycle_digest": raw.candidate_lifecycle_digest,
@@ -1866,7 +2184,7 @@ def reopen_causal_qualification(
                     },
                 )
                 decision = _aggregate_decision(
-                    graph.decision, speed_grade, quality_grade
+                    graph.decision, speed_grade, quality_grade, audit_grade
                 )
                 headline = (
                     report.marginal_arm_digest, report.candidate_launch_digest,
@@ -1875,7 +2193,9 @@ def reopen_causal_qualification(
                     report.graph_decision, report.speed_evidence_digest,
                     report.speed_decision, report.speedup,
                     report.quality_evidence_digest, report.quality_decision,
-                    report.candidate_mean_teacher_nll, report.decision,
+                    report.candidate_mean_teacher_nll,
+                    report.audit_evidence_digest, report.audit_decision,
+                    report.decision,
                     report.reason, report.retryable,
                 )
                 expected_headline = (
@@ -1884,8 +2204,12 @@ def reopen_causal_qualification(
                     calibration.digest, graph.digest, graph.decision,
                     report.speed_witness.evidence_digest, speed_grade, speedup,
                     quality.evidence_digest, quality_grade,
-                    candidate_mean_teacher_nll, decision,
-                    _report_reason(graph, speed_grade, quality, repeat_quality),
+                    candidate_mean_teacher_nll,
+                    audit_witness.digest, audit_grade, decision,
+                    _report_reason(
+                        graph, speed_grade, quality, audit_witness,
+                        repeat_quality,
+                    ),
                     decision is QualificationDecision.NO_DECISION,
                 )
             elif type(authority) is DiscoveryCandidateQualificationAuthority:
@@ -1911,7 +2235,7 @@ def reopen_causal_qualification(
                     },
                 )
                 decision = _aggregate_decision(
-                    execution.decision, speed_grade, quality_grade
+                    execution.decision, speed_grade, quality_grade, audit_grade
                 )
                 headline = (
                     report.discovery_arm_digest, report.proposal_digest,
@@ -1920,6 +2244,7 @@ def reopen_causal_qualification(
                     report.speed_evidence_digest, report.speed_decision,
                     report.speedup, report.quality_evidence_digest,
                     report.quality_decision, report.candidate_mean_teacher_nll,
+                    report.audit_evidence_digest, report.audit_decision,
                     report.decision, report.reason, report.retryable,
                 )
                 expected_headline = (
@@ -1929,9 +2254,11 @@ def reopen_causal_qualification(
                     calibration.digest, execution,
                     report.speed_witness.evidence_digest, speed_grade, speedup,
                     quality.evidence_digest, quality_grade,
-                    candidate_mean_teacher_nll, decision,
+                    candidate_mean_teacher_nll,
+                    audit_witness.digest, audit_grade, decision,
                     _discovery_report_reason(
-                        execution, speed_grade, quality, repeat_quality
+                        execution, speed_grade, quality, audit_witness,
+                        repeat_quality,
                     ),
                     decision is QualificationDecision.NO_DECISION,
                 )
@@ -2100,6 +2427,12 @@ def run_causal_qualification(
             deadline=float(deadline),
             candidate_reads=value.speed_evidence_policy.candidate_reads,
         )
+        audit_witnesses, audit_last_completed = _run_slot_audits(
+            value,
+            lifecycle,
+            executor=executor,
+            deadline=float(deadline),
+        )
         discovery_grades: dict[str, DiscoveryExecutionGrade] = {}
         for authority in value.candidates:
             if type(authority) is DiscoveryCandidateQualificationAuthority:
@@ -2111,7 +2444,10 @@ def run_causal_qualification(
         teardown_before = executor.prove_quiescent()
         # Bind quiescence to the FINAL executed baseline (B'' under repeat reads,
         # B-prime otherwise) — baseline_after is mid-run in the 5-leg shape.
-        last_post = lifecycle.final_baseline.device_receipts[-1].completed_monotonic_s
+        last_post = max(
+            lifecycle.final_baseline.device_receipts[-1].completed_monotonic_s,
+            audit_last_completed,
+        )
         if teardown_before.observed_monotonic_s < last_post:
             raise QualificationRunnerError("pre-T quiescence predates the final baseline teardown")
         entropy = entropy_provider(value.commitment, teardown_before)
@@ -2313,10 +2649,12 @@ def run_causal_qualification(
             row for row in lifecycle.candidates
             if row.arm.selected_delta_digest == authority.selected_delta_digest
         )
+        audit_witness = audit_witnesses[authority.selected_delta_digest]
         if type(authority) is CandidateQualificationAuthority:
             graph = graph_grades[authority.selected_delta_digest]
             decision = _aggregate_decision(
-                graph.decision, speed_grade, quality_grade
+                graph.decision, speed_grade, quality_grade,
+                audit_witness.decision,
             )
             reports.append(CandidateQualificationReport(
                 authority.selected_delta_digest,
@@ -2337,8 +2675,14 @@ def run_causal_qualification(
                 raw_binding,
                 speed_witness,
                 t_request_sha256,
+                audit_witness.digest,
+                audit_witness.decision,
+                audit_witness,
                 decision,
-                _report_reason(graph, speed_grade, quality, repeat_quality_verdict),
+                _report_reason(
+                    graph, speed_grade, quality, audit_witness,
+                    repeat_quality_verdict,
+                ),
                 decision is QualificationDecision.NO_DECISION,
                 repeat_quality,
             ))
@@ -2349,7 +2693,8 @@ def run_causal_qualification(
                 )
             execution = discovery_grades[authority.selected_delta_digest]
             decision = _aggregate_decision(
-                execution.decision, speed_grade, quality_grade
+                execution.decision, speed_grade, quality_grade,
+                audit_witness.decision,
             )
             reports.append(DiscoveryCandidateQualificationReport(
                 authority.selected_delta_digest,
@@ -2369,9 +2714,13 @@ def run_causal_qualification(
                 raw_binding,
                 speed_witness,
                 t_request_sha256,
+                audit_witness.digest,
+                audit_witness.decision,
+                audit_witness,
                 decision,
                 _discovery_report_reason(
-                    execution, speed_grade, quality, repeat_quality_verdict
+                    execution, speed_grade, quality, audit_witness,
+                    repeat_quality_verdict,
                 ),
                 decision is QualificationDecision.NO_DECISION,
                 repeat_quality,
@@ -2403,7 +2752,7 @@ def run_causal_qualification(
     return reference
 
 __all__ = [
-    "CandidateQualificationAuthority", "CandidateQualificationReport",
+    "AuditWitness", "CandidateQualificationAuthority", "CandidateQualificationReport",
     "DiscoveryCandidateQualificationAuthority",
     "DiscoveryCandidateQualificationReport", "DiscoveryQualificationAttempt",
     "CausalQualificationInput", "CohortQualificationAttempt", "EntropyProvider",

@@ -48,9 +48,10 @@ This repo is the **validator harness** (the referee), plus example miner bundles
 ## Current state (keep this honest)
 
 - **The kernel mechanism is validated on real GPUs** (H100, up to gpt-oss-120b).
-  The hardened authority adds typed targets, correctness/graph proof, bookended B/C/B′
-  throughput with pristine-T quality authority, independent reproduction, finalized
-  commit-reveal intake, and transactional target settlement. A slot is a single **op**,
+  The hardened authority adds typed targets, correctness/graph proof, graph-on/audit-free
+  charged B/C/B′ throughput, a mandatory separate eager/untimed audit role with a typed
+  host-regraded witness, pristine-T quality authority, independent reproduction,
+  finalized commit-reveal intake, and transactional target settlement. A slot is a single **op**,
   a fused **block**, *or* a cross-GPU **collective**
   (same cheat-resistant contract — validator allocates outputs, miner fills them, the
   kernel never reaches the sampler — just a wider boundary): `activation.silu_and_mul`,
@@ -87,8 +88,8 @@ This repo is the **validator harness** (the referee), plus example miner bundles
   Beating sglang/vLLM/TensorRT graphs-on is the whole point.
 - **Fidelity implementation status:** the 2026-07-07 evaluator had two modes
   (docs/FIDELITY.md — read it before touching the quality gate):
-  `--fidelity-mode kl` (legacy rollout-KL, valid ONLY on arenas where a stock-vs-stock
-  control measures ~0) and `--fidelity-mode audit` — the **in-engine audit**
+  `kl` (legacy rollout-KL, valid ONLY on arenas where a stock-vs-stock control
+  measures ~0) and `audit` — the **in-engine audit**
   (`optima/audit.py`): an extra untimed EAGER candidate launch randomly samples dispatcher
   calls, re-runs the captured stock baseline on pre-call clones, and compares under the
   slot's own verify tolerances (receipted; zero violations + minimum coverage required;
@@ -97,16 +98,17 @@ This repo is the **validator harness** (the referee), plus example miner bundles
   deterministic mode refuses fa4) — rollout-KL there punishes ANY timing change, i.e.
   exactly what miners are paid for. Pod-validated: honest kernel 2,996 audited calls /
   0 violations = PASS while advisory KL read 0.89; sabotage kernel 3,120/3,120 = FAIL.
-  Known residuals (see the doc's adversarial matrix): timed-workload fingerprinting and
-  attention-slot audit coverage. Crownable candidate execution is fenced in validator-
+  Known residuals (see the doc's adversarial matrix): in-process tampering, audit-role
+  fingerprinting, and timed-workload fingerprinting. Stateful attention slots without a
+  save-free stock baseline are unauditable and therefore fail closed rather than crown.
+  Crownable candidate execution is fenced in validator-
   owned OCI sessions with no network egress; the trusted controller never loads miner
-  Python or native extensions. **But the current causal production qualification path does
-  not arm or consume this audit:** `optima/eval/engine_worker.py` clears both audit env vars,
-  the worker protocol transports no audit facts, and qualification/settlement grade only
-  graph, speed, and pristine-T quality evidence. The July 7 audit receipts remain valid
-  historical campaign evidence, not proof that the current production path enforces the
-  gate. Meaningful-emission launch remains blocked until audit evidence is generated in an
-  untimed candidate role, transported, host-regraded, and bound into report/settlement.
+  Python or native extensions. The separate eager/untimed role, policy-bound transport,
+  exact slot×TP-rank coverage, typed witness, and trusted-host regrade are implemented and
+  CPU/mock-covered. Charged B/C/B′ roles remain graph-on and reject audit state/evidence.
+  These new causal bytes are **not GPU-qualified** until the exact production MiniMax-M3
+  canary passes. The July 7 audit receipts validate the underlying mechanism, not the new
+  transport/report path.
 - **Scoring is noise-robust without clock-locking** (`optima/eval/scoring.py`): the candidate is
   bracketed by a baseline before AND after (B,C,B'), paired against the mean, with the bar
   derived from measured baseline noise (`1 + max(margin, k·noise)`) and a NO-DECISION verdict
@@ -176,13 +178,14 @@ This repo is the **validator harness** (the referee), plus example miner bundles
   paid 98.7203% of principal over the simulation horizon with maximum measured
   split/withhold/sybil distortion 3.0287%. The live pod
   `chain-incentive-shadow` receipt tested this registered-CROWN class only. D-015
-  supersedes its target-family claim division with schema-2 model-campaign sizing:
-  claims in one campaign use 100% sizing, or claims in either of two campaigns use
-  50% sizing; more than two is rejected.
+  supersedes its target-family claim division with schema-2 model-campaign sizing.
+  **The implemented launch path accepts exactly one immutable MiniMax-M3 campaign at
+  100% sizing.** The historical two-campaign 50/50 cells remain arithmetic research;
+  model rotation, a second campaign, and any successor activation are unsupported live.
   Families remain independent frontiers and clocks, but 1/10/100-family catalogs
   caused zero principal dilution. All 14 preregistered D-015 screens passed. At
-  `k=1`, the normal weekly load was one full-sized 4.4%/5% claim for one campaign,
-  or one half-sized claim in each of two campaigns (one full share aggregate),
+  `k=1`, the historical normal weekly load was one full-sized 4.4%/5% claim for one
+  campaign, or one half-sized claim in each of two campaigns (one full share aggregate),
   rotated across families. It paid 100%, expired zero, drained to zero, and had
   five-day maximum latency under empty and saturated discovery; sustained
   simultaneous per-family wins were not the normal-tape assumption.
@@ -190,9 +193,13 @@ This repo is the **validator harness** (the referee), plus example miner bundles
   marginal. At `k=1.5` the worst rows overloaded while other rows remained
   marginal; `k=2` was plainly overloaded. Report semantic digest:
   `7975a10b2924330cd527e29b0dfe6f2d9dcb40039f9d8f695b558ec6c6f46590`.
+  A tracked one-campaign supplement then exercised 64 launch/stress cells over
+  1/2/5/10 independently winning M3 families, 7/14/30/90-day cadence, and empty or
+  saturated discovery. Its semantic digest is
+  `505fed4d40a6acc6bc92d6330170e8e2260a52e5f3099c22a6c0eb4b2308c672`.
   The raw D-015 sweep remains a local-only experiment record. Current local
-  validation is 2,137 passed/19 skipped repository-wide plus 8/8 D-015 simulator
-  tests; D-015 has no pod receipt.
+  validation is 2,191 passed/19 skipped repository-wide; the tracked 64-cell
+  D-015 supplement replays at the digest above. D-015 has no pod receipt.
   The old testnet shadow does not test D-015 bytes.
   D-013 then selected a separately reviewed discovery bounty capped at 50,000 ppm
   per epoch and at one such epoch of principal per award, with 648,000-block
@@ -246,32 +253,40 @@ This repo is the **validator harness** (the referee), plus example miner bundles
   at block 7,586,144 had all counters zero. Schema-5 migration starts empty and creates
   no retroactive debt; activation rejects any retained legacy discovery row because V1
   has no journal that proves mutable terminal status, and active composition
-  disables legacy discovery auto-award. Legacy V1 remains the sole wired publisher.
+  disables legacy discovery auto-award. The wallet-free `chain-activate-incentives`
+  command atomically binds the exact core manifest, composition manifest, independent
+  approval digest, finalized chain block/hash, and equal intake cursor. It derives the
+  campaign from exactly one retained arena's complete catalog/family roster, checks the
+  reserve in the approved finalized membership, reproduces the arena/stack/catalog/
+  membership digests pinned in that approval, and requires audit-control-manifest,
+  final-canary-receipt, and residual-risk-acceptance digests. It retains the complete
+  approval in the activation row/event,
+  and raises the durable schema floor 5→6 in the same transaction. It permits
+  exactly one immutable MiniMax-M3 campaign. `set-debt-weights` implements restart-safe
+  gapless projection, signing, finalized readback, confirmation, and only-then debt debit.
+  Delayed boundaries retain their nominal order and catch up no faster than one policy
+  cadence after the prior confirmation. Neither command has a live activation/publication
+  receipt.
   A landed finalized `invalidate_finite_debt_family` API can cancel one registered
   family's open debt and reset its next-CROWN clock, but the runtime-invalidity
   decision/digest is still external authority. Meaningful V2 emissions still require:
-  the exact MiniMax-M3 campaign identity, production family map, and reserve plus a
-  fresh campaign-policy shadow; an atomic or quiescent two-step
-  V1→core→composition cutover (the
-  interval between the two activations can still race legacy work/publication);
-  retained-boundary publication confirmation and debt-debit catch-up (a missed or
-  slow boundary currently wedges gapless epochs); independently graded review and
-  runtime-invalidation authority; retained membership-departure history rather than
-  only a current snapshot; an atomic successor protocol for later model rotation or
-  one-to-two campaign expansion; the promotion transport/linkage above; and
-  production audit evidence transport.
+  exact MiniMax-M3 family and reserve manifests plus a fresh shadow; retained
+  membership-departure history rather than only a current snapshot; independently
+  graded review and runtime-invalidation authority; the promotion transport/linkage
+  above; the production audit GPU canary; and actual activation/mainnet
+  operations. Later model rotation, a second campaign, and successor activation are
+  explicitly unsupported rather than launch blockers hidden behind configuration.
 - **Release path:** evaluation and serving are separate products. Approved integration
   reviews authorize contributions in an `EngineReleaseManifest`; model provisioning
   receipts seal every model file; signed, chain-independent releases carry deterministic
   source/wheel artifacts, SBOM/provenance, a pinned serving specification, and an OCI
   build context. Chain or wallet code is not included in the serving wheel.
-- **Open — the next goals:** V2 activation/publication authority and mainnet operations
-  (MiniMax-M3 campaign/family map/reserve plus a fresh shadow, independently graded discovery
-  review and runtime invalidation, retained-boundary publication/debit catch-up,
-  atomic/quiescent V1→core→composition cutover, campaign-successor protocol,
-  membership history, discovery
-  promotion transport/linkage, owned subnet, validator permits, hosted bundle
-  storage); more slots
+- **Open — the next goals:** execute and canary the implemented one-campaign V2 cutover and
+  publication path, then mainnet operations (exact MiniMax-M3 family/reserve manifests plus
+  a fresh shadow, independently graded discovery review and runtime invalidation,
+  membership-departure history, discovery promotion transport/linkage, the production
+  audit GPU canary, owned subnet, validator permits, hosted bundle storage);
+  more slots
   (MLA/weight-absorbed attention, FP8/FP4
   GEMM, graph-safe paged attention); and B300-only qualification of SM103/CuTe,
   NVLink/custom-collective behavior, topology-specific calibration, and the existing
@@ -289,7 +304,8 @@ python -m optima.cli verify examples/miner_silu_torch --device cpu --dtype float
 # GPU: see docs/DEV_ENVIRONMENT.md for the env setup, then
 python -m optima.cli verify examples/miner_silu_triton --device cuda --dtype bfloat16
 # authoritative scoring is validator-side: chain intake -> qualification
-# (B/C/B'/pristine-T in no-egress workers) -> reproduction -> settlement
+# (graph-on/audit-free B/C/B' + eager/untimed audit witness + pristine-T,
+#  all in no-egress workers) -> reproduction -> settlement
 # (docs/TESTNET.md; the legacy local evaluate/bench diagnostics were deleted)
 ```
 

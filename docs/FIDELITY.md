@@ -7,15 +7,18 @@
 > failed on all 3,120 audited calls (worst_frac 0.0029). Full record:
 > `experiments/minimax_m3/frontier_2026-07-07/02_FE_BUNDLE_INGEST_LEDGER.md`.
 
-> **Production wiring status (2026-07-16): NOT ENFORCED.** The numbers above are
-> valid historical evaluator evidence. In the current causal OCI qualification path,
-> `optima/eval/engine_worker.py` explicitly clears `OPTIMA_SLOT_AUDIT` and
-> `OPTIMA_SLOT_AUDIT_SEED`; the worker protocol transports no audit facts;
-> qualification reports and settlement do not grade audit evidence. The current path
-> grades graph execution, calibrated speed, and pristine-T distribution/task evidence.
-> Sections 3–6 below describe the intended gate and historically exercised mechanism,
-> not an active production invariant. Do not enable meaningful emissions on the
-> assumption that this audit is armed.
+> **Production wiring status (2026-07-19): IMPLEMENTED, NOT YET GPU-QUALIFIED.**
+> Causal qualification now requires a validator-owned `SlotAuditPolicy`, launches a
+> separate eager/untimed candidate role, transports bounded raw receipts bound to the
+> session/request/nonce/launch/policy, requires exact slot×TP-rank coverage, and
+> regrades them with `optima.audit.gate` on the trusted host. The typed audit witness
+> is mandatory in the aggregate report and durable reopen; missing or malformed
+> evidence fails closed. Charged B/C/B′ (and optional repeat) roles reject audit
+> receipts and carry neither audit environment variable. This wiring has CPU/mock
+> protocol and qualification coverage only. The July 7 B300 results validate the
+> underlying audit mechanism, **not these new causal transport/report bytes**. Do not
+> enable meaningful emissions until the exact production MiniMax-M3 arena passes the
+> GPU canary below.
 
 ## 1. What the fidelity gate is actually for
 
@@ -65,7 +68,7 @@ fails *every* candidate, honest or not, including stock itself. Worse, the
 divergence scales with any *timing* change, so the gate structurally punishes
 the one thing the subnet exists to buy: speed.
 
-## 3. The target replacement stack (historically exercised, not production-wired)
+## 3. The production-wired stack (implemented and CPU/mock-covered, not GPU-qualified)
 
 ```
 scan  →  verify  →  IN-ENGINE AUDIT  →  benchmark no-regression  →  timed bracket
@@ -120,9 +123,9 @@ proxy. Properties:
 
 ## 4. The adversarial matrix — target/historical audit path
 
-The statuses in this table assume the audit launch and receipt gate actually run.
-They are not claims about the current causal production path; without that wiring,
-every row whose only active control is the audit remains open.
+The causal transport now runs the audit launch and receipt gate. These statuses still
+describe the complete defense-in-depth stack, not a claim that the audit role is
+indistinguishable from a charged role.
 
 | # | Attack | Caught by | Status |
 |---|--------|-----------|--------|
@@ -135,30 +138,29 @@ every row whose only active control is the audit remains open.
 | 7 | Approximation inside slot tolerance (internal fp8 etc.) | ALLOWED by definition — that's the tolerance contract; bench backstops task quality | closed *by definition* (this is the freedom miners are paid to use) |
 | 8 | Output substitution (gibberish + external fetch) | slots upstream of sampler; framework-mode = token-match + no-egress isolation | closed structurally (unchanged) |
 | 9 | **In-process tampering**: monkeypatch `optima.audit`/the baseline fn, forge/suppress receipts, introspect the RNG | policy scan raises the bar; **not closed** — miner host code shares the rank process | **OPEN — the known isolation gap** (AGENTS.md), unchanged by this redesign but now with a sharper attack list. Closure = process/namespace isolation + receipts over an authenticated channel. Until then, scan + human review of host code is the control. |
-| 10 | **Launch fingerprinting**: behave when `OPTIMA_SLOT_AUDIT` is set (or eager-vs-graphs), cheat otherwise | any env/graphs-keyed cheat also hits the BENCH launch (graphs-on, no audit env, accuracy-graded) → task quality tanks | closed **only because the bench gate is mandatory** — the stack is sound as a whole, not layer-by-layer |
-| 11 | **Timed-workload fingerprinting**: detect the timed launch's workload shape (short fixed-budget repeated batches) and run fast-garbage only there — "phantom speed" | numerator is driver-computed a priori (`prompts × max_new_tokens` — can't be inflated); per-epoch prompt reseeding; champions re-run every round, so phantom speed must fool every epoch; production non-reproduction → re-baseline/dethrone | **PARTIALLY OPEN** (economic-grade, not correctness-grade: the outputs of the timed launch are no longer graded). Roadmap closure: draw timed workloads from the bench/serving distribution + randomize regimes so "timed" has no stable fingerprint. |
-| 12 | Attention-slot cheats in-engine | verify (matched-ratio vs fp32 GT) + bench only — **audit not wired** (re-running the baseline re-drives the stateful KV-cache write path) | **OPEN for attention specifically**, documented in `dispatch.py`; needs a save-free baseline call. Attention slots are eager-only MVP anyway. The MSA *indexer* slots are NOT in this class: the score pass is stateless (no KV write), so `attention.msa_prefill_block_score` is audited — stock runs first on pristine inputs, and the comparison is the consumed product (selection rows, per-row set overlap at the slot's own `min_overlap`). |
+| 10 | **Launch fingerprinting**: behave when `OPTIMA_SLOT_AUDIT` is set (or eager-vs-graphs), cheat otherwise | mandatory graphs-on pristine-T/bench grading exercises the no-audit role and should punish a material fidelity drop | **PARTIALLY OPEN at the audit layer.** The new transport deliberately exposes an audit env marker and forces eager execution; in-process miner code can distinguish it. The quality gate is a mitigation, not proof of role indistinguishability. Closure requires isolating miner code from audit control state or an audit design indistinguishable from charged execution. |
+| 11 | **Timed-workload fingerprinting**: detect the timed launch's workload shape (short fixed-budget repeated batches) and run fast-garbage only there — "phantom speed" | driver-known numerator; pristine-T distribution/task grading of selected C evidence; per-epoch prompt reseeding; independent reproduction and champion re-evaluation | **PARTIALLY OPEN.** Stable workload/role features remain visible, and a quality-preserving targeted cheat is not cryptographically excluded. Roadmap closure: draw charged work from the serving distribution and randomize regimes so “timed” has no stable fingerprint. |
+| 12 | Attention-slot cheats in-engine | verify + pristine-T/bench; the generic audit transport is wired, but re-running a stateful KV-cache baseline is not | **FAIL-CLOSED / NOT CROWNABLE for unauditable attention slots** under exact slot×rank coverage: absent audit receipts cannot pass qualification. A save-free baseline call is required before activation. The MSA *indexer* slots are not in this class: their score pass is stateless and auditable. |
 | 13 | Copy a champion's kernel | copy fingerprints (containment, normalized, skeleton) | closed (unchanged) |
 | 14 | Tamper with timing | driver-process timing; miner code never loads in the driver | closed (unchanged) |
 | 15 | Honest kernel, different rounding (the v6 case) | PASSES audit (tolerance absorbs ULP-class drift) — the false-negative rollout-KL created | **fixed** — this was the point |
 
-The honest bottom line: the audit closes every *output-correctness* cheat an
-out-of-process adversary can mount, and turns "watched vs unwatched" into a
-losing game. The two structural residuals — in-process tampering (#9) and
-timed-workload fingerprinting (#11) — are not new holes introduced by the
-redesign; #9 predates it explicitly, and #11 replaces rollout-KL's implicit
-(and broken) coverage of the timed launch. Both have named closures on the
-roadmap; neither has a working exploit that survives scan + bench + per-epoch
-re-evaluation today, but they are where a motivated adversary would dig.
+The honest bottom line: the transport now makes sampled tensor comparisons a
+mandatory, durable gate, but it does **not** make the eager audit role secret from
+miner code in the same rank process. In-process tampering (#9), audit-role
+fingerprinting (#10), and timed-workload fingerprinting (#11) remain named residuals.
+Hiding an environment variable alone cannot close them: eager-vs-graphs state and
+other process observations are also visible. The durable closure is process/namespace
+isolation of miner code from audit control state, or a calibrated audit regime that is
+indistinguishable from charged execution without contaminating timing.
 
-## 5. Knobs & usage
+## 5. Knobs, usage, and the required GPU canary
 
-The historical evaluator armed the audit on a separate untimed candidate launch.
-The current causal qualification bracket does not: it clears the audit environment
-and does not transport audit receipts. Restoring the gate requires a distinct untimed
-candidate role, exact slot×TP-rank coverage, bounded raw facts over the worker protocol,
-trusted host regrading, and report/settlement schema binding. The legacy local
-`optima evaluate --fidelity-mode ...` diagnostic was deleted in the post-arc trim.
+The causal bracket now implements the separate audit role and transport. Its
+`SlotAuditPolicy` (private seed, integer sample-rate ppm, per-slot/per-rank minimum
+calls, exact registered slots, and TP member count) is sealed into the qualification
+authority before B. The legacy local `optima evaluate --fidelity-mode ...`
+diagnostic was deleted in the post-arc trim.
 
 * `OPTIMA_SLOT_AUDIT` / `OPTIMA_SLOT_AUDIT_SEED` — set by the launcher
   for the quality launch only; never set them on a timed launch.
@@ -175,6 +177,34 @@ trusted host regrading, and report/settlement schema binding. The legacy local
   `_MATCHED_RATIO_AUDIT_MARGIN = 0.005` in `optima/audit.py` (audit bar =
   verify bar − margin). Honest implementations measure ≥0.989; sabotage 0.003.
 
+Before mainnet emissions, run one final-source canary on the exact production
+MiniMax-M3 image/model/topology and retain the complete qualification artifacts:
+
+1. Seal the intended sample-rate and minimum-call policy before B, then run the
+   honest champion through full primary qualification and independent reproduction.
+   Every registered slot on every TP rank must meet the minimum with zero violations
+   and compare errors, and both durable attempts must reopen independently.
+2. Run the residual-drop sabotage control through the same path and prove the typed
+   audit witness makes the aggregate report a non-retryable FAIL.
+3. Inspect the worker/container evidence for every charged B/C/B′ leg: both audit
+   environment variables must be empty, no audit receipt may appear, and the charged
+   throughput result must remain the graph-on measurement.
+4. Delete or alter one slot/rank receipt and alter one policy/request binding in copied
+   artifacts; protocol validation or durable reopen must reject each mutation. Confirm
+   settlement cannot accept an auditless historical report.
+
+Until all four pass, the code is fail-closed launch machinery, not GPU evidence that
+the production arena has sufficient audit call volume or that its controls separate
+honest and sabotaged kernels under the newly wired path.
+
+Passing the canary still does not close #9–#11. The one-campaign activation approval
+now requires the production audit-control manifest digest, exact canary receipt digest,
+and a separate explicit residual-risk-acceptance digest; activation retains all three.
+Those residuals are not safely repairable by removing
+`OPTIMA_SLOT_AUDIT` in a launch-day patch because eager execution itself remains
+observable and sampling collectives inside charged timing would change the measured
+workload.
+
 ## 6. Which fidelity mode for which arena
 
 As a target policy, rollout-KL remains valid where its premise holds — the premise is a
@@ -182,6 +212,6 @@ As a target policy, rollout-KL remains valid where its premise holds — the pre
 that arena config** (deterministic-capable backend, pinned autotune, fixed
 batching). Record the control result in the arena row. Where the control
 fails (any nondeterministic stack — e.g. M3/fa4/NVFP4), the in-engine audit is the
-intended primary control, but it is not presently production-wired. The arena registry
-is the intended home for this choice, together with bench budgets, stop cues, and
-template policy.
+primary control. Its causal transport is now wired but remains activation-blocked on
+the production-arena canary above. The arena registry is the intended home for this
+choice, together with audit policy, bench budgets, stop cues, and template policy.

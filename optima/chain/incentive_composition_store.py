@@ -17,9 +17,11 @@ from typing import Callable, Iterable
 
 from optima._strict import require_digest, require_exact_fields, require_int
 from optima.chain.finite_debt_store import (
+    _ATOMIC_COMPOSITION_ACTIVATION,
     FiniteDebtPolicyActivation,
     FiniteDebtStore,
     FiniteDebtStoreError,
+    SeededFamilyClock,
 )
 from optima.finite_debt import (
     IMPROVEMENT_GROSS,
@@ -102,6 +104,127 @@ def _canonical_json(value: object) -> str:
 
 
 @dataclass(frozen=True)
+class SelectedIncentiveActivationApproval:
+    """Operator-reviewed identity for the one immutable launch campaign.
+
+    The selected economic constants are still enforced independently.  This
+    manifest binds the deployment-specific facts those constants cannot know:
+    the chain scope, exact policy bytes, MiniMax campaign, retained launch
+    arena/evaluation stack/catalog, finalized metagraph membership, registered
+    reward families, reserve recipient, production audit controls and canary,
+    explicit residual-risk acceptance, and the finalized cutover point.
+    """
+
+    chain_scope_digest: str
+    core_policy_digest: str
+    composition_policy_digest: str
+    campaign_id: str
+    arena_digest: str
+    evaluation_stack_digest: str
+    catalog_digest: str
+    membership_digest: str
+    audit_control_manifest_digest: str
+    audit_canary_receipt_digest: str
+    audit_residual_risk_acceptance_digest: str
+    reward_family_ids: tuple[str, ...]
+    reserve_hotkey: str
+    activation_block: int
+    activation_block_hash: str
+
+    def __post_init__(self) -> None:
+        for field in (
+            "chain_scope_digest",
+            "core_policy_digest",
+            "composition_policy_digest",
+            "campaign_id",
+            "arena_digest",
+            "evaluation_stack_digest",
+            "catalog_digest",
+            "membership_digest",
+            "audit_control_manifest_digest",
+            "audit_canary_receipt_digest",
+            "audit_residual_risk_acceptance_digest",
+        ):
+            object.__setattr__(self, field, _digest(getattr(self, field), field))
+        families = tuple(self.reward_family_ids)
+        if (
+            not families
+            or any(_digest(row, "reward_family_id") != row for row in families)
+            or families != tuple(sorted(set(families)))
+        ):
+            raise IncentiveCompositionStoreError(
+                "approved reward-family roster is not canonical"
+            )
+        object.__setattr__(self, "reward_family_ids", families)
+        expected_campaign = canonical_digest(
+            "optima.economics.model-campaign.v1",
+            {
+                "arena_digest": self.arena_digest,
+                "catalog_digest": self.catalog_digest,
+                "reward_family_ids": list(families),
+            },
+        )
+        if self.campaign_id != expected_campaign:
+            raise IncentiveCompositionStoreError(
+                "approved campaign_id is not derived from its "
+                "arena/catalog/reward-family roster"
+            )
+        object.__setattr__(self, "reserve_hotkey", _hotkey(self.reserve_hotkey))
+        _integer(self.activation_block, "activation_block")
+        object.__setattr__(
+            self,
+            "activation_block_hash",
+            _block_hash(self.activation_block_hash, "activation_block_hash"),
+        )
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "activation_block": self.activation_block,
+            "activation_block_hash": self.activation_block_hash,
+            "arena_digest": self.arena_digest,
+            "audit_canary_receipt_digest": self.audit_canary_receipt_digest,
+            "audit_control_manifest_digest": self.audit_control_manifest_digest,
+            "audit_residual_risk_acceptance_digest": (
+                self.audit_residual_risk_acceptance_digest
+            ),
+            "campaign_id": self.campaign_id,
+            "catalog_digest": self.catalog_digest,
+            "chain_scope_digest": self.chain_scope_digest,
+            "composition_policy_digest": self.composition_policy_digest,
+            "core_policy_digest": self.core_policy_digest,
+            "evaluation_stack_digest": self.evaluation_stack_digest,
+            "membership_digest": self.membership_digest,
+            "reserve_hotkey": self.reserve_hotkey,
+            "reward_family_ids": list(self.reward_family_ids),
+        }
+
+    @classmethod
+    def from_dict(cls, value: object) -> "SelectedIncentiveActivationApproval":
+        row = dict(
+            require_exact_fields(
+                value,
+                fields=frozenset(cls.__dataclass_fields__),
+                label="selected incentive activation approval",
+                error=IncentiveCompositionStoreError,
+                exact_dict=True,
+            )
+        )
+        families = row["reward_family_ids"]
+        if type(families) is not list:
+            raise IncentiveCompositionStoreError(
+                "approved reward_family_ids must be an array"
+            )
+        row["reward_family_ids"] = tuple(families)
+        return cls(**row)  # type: ignore[arg-type]
+
+    @property
+    def digest(self) -> str:
+        return canonical_digest(
+            "optima.chain.selected-incentive-activation-approval", self.to_dict()
+        )
+
+
+@dataclass(frozen=True)
 class IncentiveCompositionActivation:
     """One exact selection activated over one exact core policy."""
 
@@ -111,6 +234,7 @@ class IncentiveCompositionActivation:
     selection_report_digest: str
     activation_block: int
     activation_block_hash: str
+    approval: SelectedIncentiveActivationApproval
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -138,6 +262,19 @@ class IncentiveCompositionActivation:
             "activation_block_hash",
             _block_hash(self.activation_block_hash, "activation_block_hash"),
         )
+        if type(self.approval) is not SelectedIncentiveActivationApproval:
+            raise IncentiveCompositionStoreError(
+                "composition activation approval is not exactly typed"
+            )
+        if (
+            self.approval.chain_scope_digest != self.chain_scope_digest
+            or self.approval.composition_policy_digest != self.policy.digest
+            or self.approval.activation_block != self.activation_block
+            or self.approval.activation_block_hash != self.activation_block_hash
+        ):
+            raise IncentiveCompositionStoreError(
+                "composition activation differs from its approval"
+            )
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -147,6 +284,7 @@ class IncentiveCompositionActivation:
             "core_activation_digest": self.core_activation_digest,
             "policy": self.policy.to_dict(),
             "selection_report_digest": self.selection_report_digest,
+            "approval": self.approval.to_dict(),
         }
 
     @classmethod
@@ -162,6 +300,9 @@ class IncentiveCompositionActivation:
         )
         try:
             row["policy"] = IncentiveCompositionPolicyManifest.from_dict(row["policy"])
+            row["approval"] = SelectedIncentiveActivationApproval.from_dict(
+                row["approval"]
+            )
         except (IncentiveCompositionError, ValueError, TypeError) as exc:
             raise IncentiveCompositionStoreError(
                 f"composition activation policy is invalid: {exc}"
@@ -661,7 +802,7 @@ def migrate_schema4_to5(db: sqlite3.Connection) -> None:
     schema = db.execute("SELECT value FROM metadata WHERE key='schema'").fetchone()
     if schema is None:
         raise IncentiveCompositionStoreError("intake schema metadata is absent")
-    if schema["value"] == str(SCHEMA_VERSION):
+    if schema["value"] in {str(SCHEMA_VERSION), "6"}:
         _verify_schema(db)
         return
     if schema["value"] != "4":
@@ -756,6 +897,7 @@ class IncentiveCompositionStore:
     def _selected_policy(
         policy: IncentiveCompositionPolicyManifest,
         core: FiniteDebtPolicyActivation,
+        approval: SelectedIncentiveActivationApproval,
     ) -> None:
         if type(policy) is not IncentiveCompositionPolicyManifest:
             raise IncentiveCompositionStoreError(
@@ -773,6 +915,8 @@ class IncentiveCompositionStore:
             == SELECTED_SELECTION_REPORT_DIGEST
         )
         core_policy = core.policy
+        campaigns = core_policy.campaign_budget_shares
+        families = tuple(row.family_id for row in core_policy.reward_family_campaigns)
         selected_core = (
             core_policy.epoch_blocks == SELECTED_EPOCH_BLOCKS
             and core_policy.reserve_ppm == SELECTED_RESERVE_PPM
@@ -784,10 +928,20 @@ class IncentiveCompositionStore:
             and core_policy.clock_reset_threshold_log_units_ppm == 1
             and core_policy.selection_report_digest
             == SELECTED_CORE_SELECTION_REPORT_DIGEST
-            and core_policy.campaign_budget_shares
-            == equal_campaign_budget_shares(
-                row.campaign_id for row in core_policy.campaign_budget_shares
+            # Tomorrow's launch is deliberately one immutable MiniMax
+            # campaign.  A later model rotation or one-to-two expansion needs
+            # a separately reviewed successor protocol; it cannot be smuggled
+            # into these activation bytes.
+            and len(campaigns) == 1
+            and campaigns == equal_campaign_budget_shares(
+                row.campaign_id for row in campaigns
             )
+            and approval.chain_scope_digest == core.chain_scope_digest
+            and approval.core_policy_digest == core_policy.digest
+            and approval.composition_policy_digest == policy.digest
+            and approval.campaign_id == campaigns[0].campaign_id
+            and approval.reward_family_ids == families
+            and approval.reserve_hotkey == core_policy.reserve_hotkey
         )
         try:
             policy.validate_innovation_policy(core_policy)
@@ -803,6 +957,13 @@ class IncentiveCompositionStore:
     def _activation_from_row(
         self, row: sqlite3.Row
     ) -> IncentiveCompositionActivation:
+        schema = self.db.execute(
+            "SELECT value FROM metadata WHERE key='schema'"
+        ).fetchone()
+        if schema is None or schema["value"] != "6":
+            raise IncentiveCompositionStoreError(
+                "active incentive composition requires schema-6 rollback fencing"
+            )
         try:
             activation = IncentiveCompositionActivation.from_dict(
                 json.loads(row["activation_json"])
@@ -818,7 +979,7 @@ class IncentiveCompositionStore:
                 f"composition activation is corrupt: {exc}"
             ) from None
         core = self.core_store._activation_by_policy(row["core_policy_digest"])
-        self._selected_policy(activation.policy, core)
+        self._selected_policy(activation.policy, core, activation.approval)
         if (
             activation.digest != row["activation_digest"]
             or activation.chain_scope_digest != self.chain_scope_digest
@@ -831,6 +992,7 @@ class IncentiveCompositionStore:
             != row["selection_report_digest"]
             or activation.selection_report_digest
             != activation.policy.selection_report_digest
+            or activation.approval.core_policy_digest != core.policy.digest
             or _canonical_json(activation.policy.to_dict()) != row["policy_json"]
             or activation.activation_block != row["activation_block"]
             or activation.activation_block_hash != row["activation_block_hash"]
@@ -869,6 +1031,16 @@ class IncentiveCompositionStore:
                 "ORDER BY activation_block,activation_digest"
             )
         )
+        schema = self.db.execute(
+            "SELECT value FROM metadata WHERE key='schema'"
+        ).fetchone()
+        if schema is None or (
+            (schema["value"] == "6" and len(rows) != 1)
+            or (schema["value"] != "6" and bool(rows))
+        ):
+            raise IncentiveCompositionStoreError(
+                "schema-6 rollback fence requires exactly one selected activation"
+            )
         if len(rows) > 1:
             raise IncentiveCompositionStoreError(
                 "schema-5 selected composition permits one activation"
@@ -891,22 +1063,76 @@ class IncentiveCompositionStore:
         activation_block: int,
         activation_block_hash: str,
     ) -> IncentiveCompositionActivation:
-        """Activate exact D-013 composition over the selected D-015 core."""
+        """Reject the removed second half of the former two-call cutover."""
+
+        del policy, activation_block, activation_block_hash
+        raise IncentiveCompositionStoreError(
+            "standalone composition activation is disabled; use the atomic "
+            "selected incentive cutover"
+        )
+
+    def _require_quiescent_cutover(self, activation_block: int) -> None:
+        """Prove no pre-cutover intake can later acquire V2 economics."""
 
         height = _integer(activation_block, "activation_block")
-        authority_hash = _block_hash(activation_block_hash, "activation_block_hash")
+        unsettled = self.db.execute(
+            "SELECT r.reservation_id FROM reservations AS r LEFT JOIN "
+            "settlement_candidates AS s USING(reservation_id) WHERE r.block<=? AND "
+            "(r.status NOT IN ('failed','expired','qualified') OR "
+            "(r.status='qualified' AND (s.reservation_id IS NULL OR s.status NOT IN "
+            "('crowned','neutralized','discovery_bounty','duplicate_proposal',"
+            "'review_pending','reviewed_bounty','reviewed_promotion',"
+            "'review_ineligible','review_expired')))) LIMIT 1",
+            (height,),
+        ).fetchone()
+        if unsettled is not None:
+            raise IncentiveCompositionStoreError(
+                "atomic incentive cutover requires quiescent pre-activation intake"
+            )
+
+    def activate_selected_policy(
+        self,
+        core_policy,
+        policy: IncentiveCompositionPolicyManifest,
+        approval: SelectedIncentiveActivationApproval,
+        *,
+        expected_approval_digest: str,
+        seeded_family_clocks: Iterable[SeededFamilyClock] = (),
+    ) -> IncentiveCompositionActivation:
+        """Atomically activate the exact one-campaign D-013/D-015 selection."""
+
+        from optima.finite_debt import FiniteDebtPolicyManifest
+
+        if type(core_policy) is not FiniteDebtPolicyManifest:
+            raise IncentiveCompositionStoreError(
+                "core activation policy is not exactly typed"
+            )
+        if type(policy) is not IncentiveCompositionPolicyManifest:
+            raise IncentiveCompositionStoreError(
+                "composition policy is not exactly typed"
+            )
+        if type(approval) is not SelectedIncentiveActivationApproval:
+            raise IncentiveCompositionStoreError(
+                "selected incentive approval is not exactly typed"
+            )
+        expected_approval = _digest(
+            expected_approval_digest, "expected_approval_digest"
+        )
+        if approval.digest != expected_approval:
+            raise IncentiveCompositionStoreError(
+                "selected incentive approval differs from the pinned digest"
+            )
+        height = approval.activation_block
+        authority_hash = approval.activation_block_hash
+        seeds = tuple(seeded_family_clocks)
+        if any(type(row) is not SeededFamilyClock for row in seeds):
+            raise IncentiveCompositionStoreError(
+                "seeded family clocks are not exactly typed"
+            )
+        seeds = tuple(sorted(seeds, key=lambda row: row.family_id))
+
         with self._transaction():
             self._require_finalized_authority(height, authority_hash)
-            core = self.core_store.active_policy_activation(at_block=height)
-            if core is None:
-                raise IncentiveCompositionStoreError(
-                    "composition activation requires an active core policy"
-                )
-            self._selected_policy(policy, core)
-            if (height - core.activation_block) % core.policy.epoch_blocks:
-                raise IncentiveCompositionStoreError(
-                    "composition activation is not aligned to the core cadence"
-                )
             exact = self.db.execute(
                 "SELECT * FROM incentive_composition_activations "
                 "WHERE activation_block=? AND activation_block_hash=?",
@@ -914,14 +1140,28 @@ class IncentiveCompositionStore:
             ).fetchone()
             if exact is not None:
                 retained = self._activation_from_row(exact)
-                if retained.policy == policy and retained.core_activation_digest == core.digest:
+                retained_core = self.core_store._activation_by_policy(
+                    core_policy.digest
+                )
+                if (
+                    retained.policy == policy
+                    and retained.approval == approval
+                    and retained.core_activation_digest == retained_core.digest
+                    and retained_core.policy == core_policy
+                    and retained_core.seeded_family_clocks == seeds
+                ):
                     return retained
                 raise IncentiveCompositionStoreError(
                     "composition activation block already binds other bytes"
                 )
             if self.policy_activations():
                 raise IncentiveCompositionStoreError(
-                    "schema-5 selected composition was already activated"
+                    "selected incentive campaign is immutable; successor activation "
+                    "is disabled"
+                )
+            if self.core_store.policy_activations():
+                raise IncentiveCompositionStoreError(
+                    "retained core-only activation proves a non-atomic cutover"
                 )
             if any(
                 row.balance.status == "open"
@@ -958,6 +1198,33 @@ class IncentiveCompositionStore:
                 raise IncentiveCompositionStoreError(
                     "legacy V1 projection/publication state requires an explicit cutover"
                 )
+            self._require_quiescent_cutover(height)
+            try:
+                from optima.chain.debt_publication import (
+                    DebtPublicationError,
+                    activate_debt_publication_schema,
+                )
+
+                activate_debt_publication_schema(self.db)
+            except DebtPublicationError as exc:
+                raise IncentiveCompositionStoreError(
+                    f"debt publication schema activation failed: {exc}"
+                ) from None
+            try:
+                core = self.core_store.activate_policy(
+                    core_policy,
+                    activation_block=height,
+                    activation_block_hash=authority_hash,
+                    seeded_family_clocks=seeds,
+                    _atomic_composition_authority=(
+                        _ATOMIC_COMPOSITION_ACTIVATION
+                    ),
+                )
+            except FiniteDebtStoreError as exc:
+                raise IncentiveCompositionStoreError(
+                    f"atomic core activation failed: {exc}"
+                ) from None
+            self._selected_policy(policy, core, approval)
             activation = IncentiveCompositionActivation(
                 self.chain_scope_digest,
                 policy,
@@ -965,6 +1232,7 @@ class IncentiveCompositionStore:
                 policy.selection_report_digest,
                 height,
                 authority_hash,
+                approval,
             )
             event_digest = self.core_store._append_event(
                 "composition_policy_activated",
@@ -2515,41 +2783,57 @@ class IncentiveCompositionStore:
         self,
         projection: ComposedEpochProjection,
         *,
-        expected_projection_digest: str,
-        finalized_block: int,
-        finalized_block_hash: str,
-        publication_record_digest: str,
+        confirmation,
         eligible_hotkeys: Iterable[str],
     ) -> IncentiveCompositionRewardEpoch:
-        """Debit both classes once after an externally confirmed publication.
+        """Debit both classes once after a retained, exact chain readback."""
 
-        ``publication_record_digest`` is bound immutably, but this store does not
-        independently reopen or grade the publisher's confirmation journal.
-        """
+        from optima.chain.debt_publication import (
+            PUBLICATION_KIND_COMPOSED,
+            ConfirmedDebtWeightPublication,
+            DebtPublicationError,
+            SQLiteDebtWeightPublicationJournal,
+            reopen_confirmed_debt_publication,
+            retain_confirmed_debt_publication,
+        )
 
         if type(projection) is not ComposedEpochProjection:
             raise IncentiveCompositionStoreError(
                 "composed projection is not exactly typed"
             )
-        expected = _digest(expected_projection_digest, "expected_projection_digest")
-        publication = _digest(
-            publication_record_digest, "publication_record_digest"
-        )
-        height = _integer(finalized_block, "finalized boundary block")
-        authority_hash = _block_hash(
-            finalized_block_hash, "finalized boundary block hash"
-        )
+        if type(confirmation) is not ConfirmedDebtWeightPublication:
+            raise IncentiveCompositionStoreError(
+                "composed close requires a typed publication confirmation"
+            )
+        expected = projection.digest
+        publication = confirmation.digest
+        height = projection.effective_block
+        authority_hash = confirmation.effective_block_hash
         eligible = self.core_store._eligible_hotkeys(eligible_hotkeys)
-        if projection.digest != expected:
-            raise IncentiveCompositionStoreError(
-                "composed projection differs from expected digest"
-            )
-        if projection.effective_block != height:
-            raise IncentiveCompositionStoreError(
-                "composed projection is not for this boundary"
-            )
 
         with self._transaction():
+            try:
+                journal = SQLiteDebtWeightPublicationJournal.reopen_from_head(
+                    self.db, transaction=self._transaction
+                )
+                retained_record, binding = journal.retained_authority(
+                    confirmation.publication_record.digest
+                )
+                confirmation.validate_binding(binding)
+            except DebtPublicationError as exc:
+                raise IncentiveCompositionStoreError(
+                    f"composed publication authority failed: {exc}"
+                ) from None
+            if (
+                retained_record != confirmation.publication_record
+                or binding.publication_kind != PUBLICATION_KIND_COMPOSED
+                or binding.weight_projection.chain_scope_digest
+                != self.chain_scope_digest
+                or binding.economic_projection.to_dict() != projection.to_dict()
+            ):
+                raise IncentiveCompositionStoreError(
+                    "composed publication differs from retained projection authority"
+                )
             retained = self.db.execute(
                 "SELECT * FROM incentive_composed_epochs "
                 "WHERE composition_policy_digest=? AND effective_block=?",
@@ -2569,7 +2853,6 @@ class IncentiveCompositionStore:
                 self._require_projection_eligibility(epoch.projection, eligible)
                 return epoch
 
-            self._require_finalized_authority(height, authority_hash)
             activation = self.active_policy_activation(at_block=height)
             if (
                 activation is None
@@ -2579,6 +2862,46 @@ class IncentiveCompositionStore:
                 raise IncentiveCompositionStoreError(
                     "composed projection policy is not active at its boundary"
                 )
+            if binding.activation_digest != activation.digest:
+                raise IncentiveCompositionStoreError(
+                    "composed publication differs from active policy authority"
+                )
+            cursor = self._finalized_cursor()
+            if (
+                cursor is None
+                or cursor[0] < confirmation.readback.block
+                or (
+                    cursor[0] == confirmation.readback.block
+                    and cursor[1] != confirmation.readback.block_hash
+                )
+            ):
+                raise IncentiveCompositionStoreError(
+                    "composed confirmation is newer than retained finalized intake"
+                )
+            prior_row = self.db.execute(
+                "SELECT * FROM incentive_composed_epochs WHERE "
+                "composition_policy_digest=? AND effective_block<? "
+                "ORDER BY effective_block DESC LIMIT 1",
+                (projection.composition_policy_digest, height),
+            ).fetchone()
+            if prior_row is not None:
+                prior_epoch = self._epoch_from_row(prior_row)
+                try:
+                    prior_confirmation = reopen_confirmed_debt_publication(
+                        self.db, prior_epoch.publication_record_digest
+                    )
+                except DebtPublicationError as exc:
+                    raise IncentiveCompositionStoreError(
+                        f"prior composed publication cannot reopen: {exc}"
+                    ) from None
+                if (
+                    confirmation.readback.block
+                    < prior_confirmation.readback.block
+                    + activation.policy.epoch_blocks
+                ):
+                    raise IncentiveCompositionStoreError(
+                        "composed catch-up would compress live emission epochs"
+                    )
             epoch_index, start_block = self._epoch_coordinates(activation, height)
             authoritative = self._project_epoch(
                 effective_block=height,
@@ -2589,6 +2912,12 @@ class IncentiveCompositionStore:
                 raise IncentiveCompositionStoreError(
                     "composed balances changed after projection was built"
                 )
+            try:
+                retain_confirmed_debt_publication(self.db, confirmation)
+            except DebtPublicationError as exc:
+                raise IncentiveCompositionStoreError(
+                    f"composed confirmation cannot be retained: {exc}"
+                ) from None
             core_states = self.core_store._claim_states(
                 policy_digest=activation.policy.innovation_policy_digest
             )
@@ -2744,6 +3073,7 @@ __all__ = [
     "IncentiveCompositionStoreError",
     "ReviewPendingDiscoveryWin",
     "ReviewedDiscoveryDispositionRecord",
+    "SelectedIncentiveActivationApproval",
     "SCHEMA_VERSION",
     "SELECTED_CORE_SELECTION_REPORT_DIGEST",
     "SELECTED_DISCOVERY_CAP_UNITS",

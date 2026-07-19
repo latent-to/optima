@@ -40,6 +40,11 @@ _HASH = re.compile(r"[0-9a-f]{64}\Z")
 _BLOCK_HASH = re.compile(r"0x[0-9a-f]{64}\Z")
 _HOTKEY = re.compile(r"[^\s]{1,256}\Z")
 _TARGET = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,255}\Z")
+# Core policy activation is a lower-level half of the selected incentive
+# cutover.  Keeping the capability private prevents the owning intake API from
+# durably activating arbitrary core bytes without the composition fence in the
+# same SQLite transaction.
+_ATOMIC_COMPOSITION_ACTIVATION = object()
 _CLOCK_SOURCES = frozenset(
     {"seed", "crown", "crown_no_debt", "invalidation"}
 )
@@ -625,7 +630,7 @@ def migrate_schema3_to4(db: sqlite3.Connection) -> None:
         raise FiniteDebtStoreError("intake schema metadata is absent")
     # Schema 5 is an additive composition extension.  Reopening it must still
     # verify every schema-4 authority table before the schema-5 verifier runs.
-    if schema["value"] in {str(SCHEMA_VERSION), "5"}:
+    if schema["value"] in {str(SCHEMA_VERSION), "5", "6"}:
         _verify_schema(db)
         return
     if schema["value"] != "3":
@@ -962,8 +967,22 @@ class FiniteDebtStore:
         activation_block: int,
         activation_block_hash: str,
         seeded_family_clocks: Iterable[SeededFamilyClock] = (),
+        _atomic_composition_authority: object | None = None,
     ) -> FiniteDebtPolicyActivation:
-        """Activate one retained policy without deriving any historical claims."""
+        """Activate the core half of one atomic selected-composition cutover.
+
+        This method is intentionally inaccessible through the public intake
+        authority.  The composition store supplies the private capability and
+        calls it inside the same outer transaction that inserts the selected
+        composition activation.  A savepoint may be released here, but the
+        durable commit remains owned by that outer transaction.
+        """
+
+        if _atomic_composition_authority is not _ATOMIC_COMPOSITION_ACTIVATION:
+            raise FiniteDebtStoreError(
+                "standalone finite-debt activation is disabled; use the atomic "
+                "selected incentive cutover"
+            )
 
         if type(policy) is not FiniteDebtPolicyManifest:
             raise FiniteDebtStoreError("finite-debt activation policy is not exactly typed")
@@ -2840,30 +2859,59 @@ class FiniteDebtStore:
         self,
         projection: DebtEpochProjection,
         *,
-        expected_projection_digest: str,
-        finalized_block: int,
-        finalized_block_hash: str,
-        publication_record_digest: str,
+        confirmation,
         eligible_hotkeys: Iterable[str],
     ) -> FiniteDebtRewardEpoch:
-        """Apply one confirmed exact-boundary projection once, or reopen its closure."""
+        """Apply one journal-bound publication once, or reopen its closure."""
+
+        from optima.chain.debt_publication import (
+            PUBLICATION_KIND_CORE,
+            ConfirmedDebtWeightPublication,
+            DebtPublicationError,
+            SQLiteDebtWeightPublicationJournal,
+            reopen_confirmed_debt_publication,
+            retain_confirmed_debt_publication,
+        )
 
         if type(projection) is not DebtEpochProjection:
             raise FiniteDebtStoreError("finite-debt projection is not exactly typed")
-        expected = _digest(expected_projection_digest, "expected_projection_digest")
-        publication = _digest(publication_record_digest, "publication_record_digest")
-        height = _integer(finalized_block, "finalized boundary block")
-        authority_hash = _block_hash(
-            finalized_block_hash,
-            "finalized boundary block hash",
-        )
+        if type(confirmation) is not ConfirmedDebtWeightPublication:
+            raise FiniteDebtStoreError(
+                "finite-debt close requires a typed publication confirmation"
+            )
+        expected = projection.digest
+        publication = confirmation.digest
+        height = projection.effective_block
+        authority_hash = confirmation.effective_block_hash
         eligible = self._eligible_hotkeys(eligible_hotkeys)
-        if projection.digest != expected:
-            raise FiniteDebtStoreError("finite-debt projection differs from expected digest")
-        if projection.effective_block != height:
-            raise FiniteDebtStoreError("finite-debt projection is not for this boundary")
 
         with self._transaction():
+            if self.composition_active_at(height):
+                raise FiniteDebtStoreError(
+                    "core-only close is disabled after incentive composition activation"
+                )
+            try:
+                journal = SQLiteDebtWeightPublicationJournal.reopen_from_head(
+                    self.db, transaction=self._transaction
+                )
+                retained_record, binding = journal.retained_authority(
+                    confirmation.publication_record.digest
+                )
+                confirmation.validate_binding(binding)
+            except DebtPublicationError as exc:
+                raise FiniteDebtStoreError(
+                    f"finite-debt publication authority failed: {exc}"
+                ) from None
+            if (
+                retained_record != confirmation.publication_record
+                or binding.publication_kind != PUBLICATION_KIND_CORE
+                or binding.weight_projection.chain_scope_digest
+                != self.chain_scope_digest
+                or binding.economic_projection.to_dict() != projection.to_dict()
+            ):
+                raise FiniteDebtStoreError(
+                    "finite-debt publication differs from retained projection authority"
+                )
             retained = self.db.execute(
                 "SELECT * FROM finite_debt_reward_epochs WHERE policy_digest=? "
                 "AND effective_block=?",
@@ -2883,17 +2931,50 @@ class FiniteDebtStore:
                 self._require_projection_eligibility(epoch.projection, eligible)
                 return epoch
 
-            if self.composition_active_at(height):
-                raise FiniteDebtStoreError(
-                    "core-only close is disabled after incentive composition activation"
-                )
-
-            self._require_finalized_authority(height, authority_hash)
             activation = self.active_policy_activation(at_block=height)
             if activation is None or activation.policy.digest != projection.policy_digest:
                 raise FiniteDebtStoreError(
                     "finite-debt projection policy is not active at its boundary"
                 )
+            if binding.activation_digest != activation.digest:
+                raise FiniteDebtStoreError(
+                    "finite-debt publication differs from active policy authority"
+                )
+            cursor = self._finalized_cursor()
+            if (
+                cursor is None
+                or cursor[0] < confirmation.readback.block
+                or (
+                    cursor[0] == confirmation.readback.block
+                    and cursor[1] != confirmation.readback.block_hash
+                )
+            ):
+                raise FiniteDebtStoreError(
+                    "finite-debt confirmation is newer than retained finalized intake"
+                )
+            prior_row = self.db.execute(
+                "SELECT * FROM finite_debt_reward_epochs WHERE policy_digest=? "
+                "AND effective_block<? ORDER BY effective_block DESC LIMIT 1",
+                (projection.policy_digest, height),
+            ).fetchone()
+            if prior_row is not None:
+                prior_epoch = self._epoch_from_row(prior_row)
+                try:
+                    prior_confirmation = reopen_confirmed_debt_publication(
+                        self.db, prior_epoch.publication_record_digest
+                    )
+                except DebtPublicationError as exc:
+                    raise FiniteDebtStoreError(
+                        f"prior finite-debt publication cannot reopen: {exc}"
+                    ) from None
+                if (
+                    confirmation.readback.block
+                    < prior_confirmation.readback.block
+                    + activation.policy.epoch_blocks
+                ):
+                    raise FiniteDebtStoreError(
+                        "finite-debt catch-up would compress live emission epochs"
+                    )
             epoch_index, start_block = self._epoch_coordinates(activation, height)
             authoritative = self._project_epoch(
                 effective_block=height,
@@ -2904,6 +2985,12 @@ class FiniteDebtStore:
                 raise FiniteDebtStoreError(
                     "finite-debt balances changed after projection was built"
                 )
+            try:
+                retain_confirmed_debt_publication(self.db, confirmation)
+            except DebtPublicationError as exc:
+                raise FiniteDebtStoreError(
+                    f"finite-debt confirmation cannot be retained: {exc}"
+                ) from None
             states = self._claim_states(policy_digest=activation.policy.digest)
             try:
                 updated = apply_debt_epoch_projection(states, authoritative)

@@ -62,8 +62,8 @@ function?" — not the real anti-cheat. It catches a kernel that computes the wr
 thing (e.g. SiLU where the model wants SwiGLU). Run it yourself with `optima verify`.
 
 ### Gate B — fidelity (the load-bearing anti-cheat, on the real model)
-Fidelity has **two modes**, selected per arena (`--fidelity-mode`, see
-[FIDELITY.md](FIDELITY.md)):
+Fidelity has two policy regimes selected and sealed by the validator-owned arena
+authority; miners cannot select the regime. See [FIDELITY.md](FIDELITY.md):
 
 - **`audit` — the in-engine audit** (used on arenas where two identical stock runs
   are *not* logit-identical, which includes the current MiniMax-M3 arena): an extra
@@ -85,6 +85,13 @@ Fidelity has **two modes**, selected per arena (`--fidelity-mode`, see
 In **both** modes, the arena's **task-accuracy evidence** (the `task_score` in the
 pristine reference-quality record) gates the model getting *dumber*, paired against
 the same run's baseline.
+
+The mandatory separate eager/untimed audit role, exact slot×TP-rank receipt transport,
+typed host-regraded witness, and fail-closed durable reopen are implemented and
+CPU/mock-covered. Charged B/C/B′ stay graph-on and audit-free. These new causal bytes are
+not GPU-qualified until the exact production M3 canary passes; unauditable attention slots
+fail closed. In-process tampering, audit-role fingerprinting, and timed-workload
+fingerprinting remain open residuals even after that canary.
 
 The KL threshold is **per-slot** and is calibrated to the model's own
 nondeterminism floor (running the *same* stock kernel twice isn't bitwise identical).
@@ -132,18 +139,21 @@ so neither a champion nor a tiny lone win is normalized into permanent full emis
 At launch, MiniMax M3 is the only model campaign, so its claims use 100% of
 registered claim sizing. A first 1% CROWN earns `0.9` full-vector days of principal; 4.4%
 earns about `3.895`, and 5% about `4.413`. Adding more M3 target families does not
-divide those amounts. If Optima later runs two model campaigns simultaneously,
-claims in either campaign use 50% sizing and those examples halve. This policy version rejects
-more than two campaigns. Campaign share sizes the finite claim; it is not a hard
-daily payout silo, so all open claims share available CROWN capacity pro rata and
-can wait or expire under overload.
+divide those amounts. The launch generation accepts exactly this one immutable campaign;
+a second campaign, model rotation, and successor activation are unsupported future work.
+Campaign share sizes the finite
+claim; it is not a hard daily payout silo, so all open claims share available CROWN
+capacity pro rata and can wait or expire under overload.
 
-At 25% success probability and the historical conservative collection factor, a
-`$1,000-$1,500` campaign targeting a 4.4% launch win breaks even only if a full
-Optima vector-day is worth roughly `$1,040-$1,561`; for 5%, roughly
-`$918-$1,377`. With two active campaigns those thresholds double. These are
-sensitivity figures, not promised token prices. A 1% optimization is much harder to
-justify at that rental budget unless success odds or emissions are materially higher.
+The tracked 14-day launch study gave 1, 2, and 5 independently winning weekly
+families 100% collection even with saturated discovery. Its deliberately harsh
+10-family weekly row collected 99.0211%; the year-long version falls much lower
+under sustained overload. At 25% success probability, those measured launch rows
+put a `$1,000-$1,500` campaign targeting a 4.4% win at roughly
+`$1,027-$1,556` break-even value per full Optima vector-day. These are sensitivity
+figures, not promised token prices or an assurance that real collection stays near
+100% after the launch. A 1% optimization is much harder to justify at that rental
+budget unless success odds or emissions are materially higher.
 
 The campaign-sized registered-CROWN rule is implemented but inactive. The earlier
 family-share rule's signer-free testnet shadow passed; it is historical evidence and
@@ -160,7 +170,8 @@ all 108 synthetic 0/1/7-day rows paid discovery principal fully, with no
 expiry/unissued debt or CROWN paid-fraction regression and no more than the selected
 55,555-ppm instantaneous CROWN-capacity dilution. Longer 30/60/89-day delays were
 diagnostic only, and 90/120-day review issued no stale debt. This does not mean the
-external review service, publication path, or V2 activation exists yet.
+external review service is authoritative or that V2 has been activated. The publication
+path is implemented but has no live receipt.
 
 The selected pure policy intends promotion plus fresh requalification/CROWN or the
 finite bounty, never both. The durable implementation currently retains
@@ -174,14 +185,13 @@ reserve, totaling 1,000,000 ppm, with `submitted=false` (semantic digest
 `3dbb3cc27dfd013023c42ba68dd03413d5e5ab1dc8e8626dda3c1a0db18cabaa`,
 file SHA-256
 `ac695810671cdc6f635a9b30a7fb67f1a885e13bd4fba7e64f2456a08ae88aed`).
-It constructed no wallet and carries no review, settlement, publication, or
+It constructed no wallet and carries no review, settlement, D-015 publication, or
 activation authority. Meaningful-emission activation has not been authorized.
-It also still needs the exact MiniMax-M3 campaign/family map and reserve plus a
-fresh campaign-policy shadow, atomic or quiescent
-V1→core→composition cutover, retained-boundary publication/debit catch-up,
-independent review/runtime-invalidity authority, membership-departure history, an
-atomic successor protocol for later model rotation or two-campaign expansion, the
-promotion linkage above, and production audit transport.
+The wallet-free one-campaign cutover and restart-safe debt publisher are implemented,
+but neither has a live receipt. Launch still needs the exact MiniMax-M3 family/reserve
+manifests plus a fresh shadow, independent review/runtime-invalidity authority,
+membership-departure history, the promotion linkage above, the production audit GPU
+canary, and actual activation/mainnet operations.
 The exact formulas, examples, payout rules, and activation status are in
 [INCENTIVES.md](INCENTIVES.md).
 
@@ -490,9 +500,10 @@ Always launch via `python -m optima.cli` — sglang spawns the scheduler with
 `mp spawn` and the `__main__` guard matters.
 
 The authoritative throughput + fidelity measurement is **validator-side**: your
-bundle goes through the qualification bracket (baseline, candidate, baseline again,
-plus an untimed pristine reference launch) inside no-egress workers, and a PASS must
-then be **independently reproduced** before settlement. There is no local command
+bundle goes through graph-on/audit-free baseline, candidate, and baseline roles; a
+separate eager/untimed audit role that produces a typed host-regraded witness; and an
+untimed pristine reference launch inside no-egress workers. A PASS must then be
+**independently reproduced** before settlement. There is no local command
 that reproduces that authority — and that's deliberate: a score you could compute
 locally would be a score you could game.
 
@@ -670,8 +681,9 @@ with the record).
   (a `.pth` import hook), so a swap needs no fork of sglang.
 - **baseline / candidate** — the model running stock (baseline) vs with your kernel
   (candidate). Your speedup is candidate ÷ baseline.
-- **fidelity** — how faithfully your kernel reproduces the model's outputs. Gated by
-  KL + benchmark accuracy.
+- **fidelity** — how faithfully your kernel reproduces the model's outputs. M3 gates it
+  with the in-engine audit plus pristine-reference task/distribution evidence; deterministic
+  arenas may gate rollout-KL after a near-zero stock control.
 - **KL (divergence)** — distance between the stock and your per-token output
   distributions; the fidelity gate on deterministic arenas (advisory where the
   audit is the gate).

@@ -170,6 +170,62 @@ def test_gate_clean_passes_and_sums_ranks():
     assert ok and "40 audited calls" in desc
 
 
+def test_gate_requires_exact_slot_by_rank_cartesian_coverage():
+    rows = [
+        {
+            "slot": slot,
+            "pid": 100 + rank,
+            "rank": rank,
+            "world_size": 2,
+            "n": 32,
+            "violations": 0,
+            "compare_errors": 0,
+            "worst_frac": 1.0,
+        }
+        for slot in ("norm.rmsnorm", "activation.silu_and_mul")
+        for rank in range(2)
+    ]
+    slots = ("activation.silu_and_mul", "norm.rmsnorm")
+    ok, _ = audit.gate(
+        rows,
+        min_calls=32,
+        expected_slots=slots,
+        expected_member_count=2,
+    )
+    assert ok
+
+    ok, desc = audit.gate(
+        rows[:-1],
+        min_calls=32,
+        expected_slots=slots,
+        expected_member_count=2,
+    )
+    assert not ok and "incomplete" in desc
+
+
+def test_gate_requires_minimum_calls_on_every_slot_rank_receipt():
+    rows = [
+        {
+            "slot": "norm.rmsnorm",
+            "pid": 100 + rank,
+            "rank": rank,
+            "world_size": 2,
+            "n": 31 if rank else 100,
+            "violations": 0,
+            "compare_errors": 0,
+            "worst_frac": 1.0,
+        }
+        for rank in range(2)
+    ]
+    ok, desc = audit.gate(
+        rows,
+        min_calls=32,
+        expected_slots=("norm.rmsnorm",),
+        expected_member_count=2,
+    )
+    assert not ok and "per-slot/member coverage" in desc
+
+
 # ---- dispatcher wiring (rmsnorm: the pure-op case) -------------------------------
 
 

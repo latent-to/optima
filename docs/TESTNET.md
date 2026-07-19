@@ -81,11 +81,14 @@ registered service binds the runtime, model, topology, workload mixture, capacit
 retry policy, screen policy, and qualification-plan factory. Its non-crown screen runs
 the fixed static/build/ABI/graph/abbreviated-serving stages before promotion.
 
-Full qualification uses the isolated B/C/B′/pristine-T authority. One passing report is
-stored as `reproduction_pending`; a second pass must use independent authority and
-selection evidence while matching the same arena, target, delta, incumbent and candidate
-stack identities. Settlement receives only the paired candidate and uses the lower
-speedup. The currently wired weight command below is the retained **legacy-V1**
+Full qualification uses isolated graph-on/audit-free charged B/C/B′ roles, a mandatory
+separate eager/untimed audit role whose exact slot×TP-rank receipts are host-regraded into
+a typed witness, and pristine-T authority. This wiring is implemented and CPU/mock-covered
+but not yet GPU-qualified; unauditable attention slots fail closed. One passing report is
+stored as `reproduction_pending`; a second pass must use independent authority and selection
+evidence while matching the same arena, target, delta, incumbent and candidate stack
+identities. Settlement receives only the paired candidate and uses the lower speedup. The
+currently wired weight command below is the retained **legacy-V1**
 standing-credit/discovery policy. It does not exercise or activate finite debt:
 
 ```bash
@@ -164,11 +167,41 @@ digests as a campaign-policy activation shadow.
 
 Opening an existing intake database migrates schema 4→5 by creating empty immutable
 composition tables; it imports no historical CROWN or discovery claims and creates
-no retroactive debt. Do not activate composition operationally from this runbook.
-The durable guard rejects activation while any legacy discovery row is retained
-(V1 has no journal that proves mutable terminal status), reopens all V2 histories
-before requiring clean open-debt state, and disables legacy discovery auto-award
-once composition is active.
+no retroactive debt. Activation is now one wallet-free atomic command, but **do not
+run it with placeholder or historical-shadow bytes**:
+
+```bash
+optima chain-activate-incentives \
+  --intake-db chain_intake/intake.sqlite3 \
+  --network "$NET" --netuid 307 \
+  --core-policy <canonical-minimax-m3-core-policy.json> \
+  --composition-policy <canonical-composition-policy.json> \
+  --approval <independently-reviewed-activation-approval.json> \
+  --expected-approval-digest <independently-recorded-approval-digest>
+```
+
+The command constructs no wallet and signs nothing. It accepts exactly one immutable
+MiniMax-M3 campaign, reopens chain genesis and finalized ancestry, requires the intake
+cursor to equal the approval's exact finalized block/hash, and atomically binds the
+core policy, composition policy, approval, family roster, and reserve. The independently
+pinned approval itself contains the arena, evaluation-stack, catalog, and finalized
+membership digests. It also requires the production audit-control manifest digest, the
+exact final B300 canary receipt digest, and a separate digest of the operator's explicit
+acceptance of the three residual risks named in `FIDELITY.md`; these are retained in the
+atomic activation row and public result. Preflight must reproduce the four retained
+arena/chain facts. The complete approved roster
+must match that retained arena/catalog, and the campaign ID is derived from the
+arena/catalog/roster rather than chosen independently.
+
+Activation also requires quiescent pre-cutover intake, no open V2 debt, no retained
+legacy discovery row, and **a database that has never retained V1 projection/publication
+state**. There is intentionally no automatic V1-history bridge in this command: launch
+must use a fresh/quiescent activation database, while an existing V1 publisher database
+remains an explicit fail-closed blocker. Do not delete or rewrite V1 history to force the
+cutover. “Fresh” is literal: even a metadata-only `emissions_policy_digest` left by
+building or dry-running a V1 projection makes that database ineligible. Success raises
+the database schema floor 5→6 in the same transaction; an older
+schema-5 runtime then fails closed. There is no live activation receipt yet.
 
 The selected pure policy describes promotion-or-bounty, but the schema-5 settlement
 surface currently retains qualified discovery wins as `review_pending` and can issue
@@ -181,17 +214,25 @@ blocks and review at or after expiry cannot mint. A finalized durable API can ma
 overdue pending wins `review_expired` and append `discovery_review_expired`, but no
 operator scheduler for that reconciliation is established here.
 
-D-015 tested the one/two-campaign hierarchy offline. All 14 preregistered screens
-passed: target-family counts caused zero principal dilution; the normal weekly tape
-issued one full-sized 4.4%/5% claim for one campaign, or one half-sized claim in
-each of two campaigns (one full share aggregate), and paid fully with zero
-expiry/outstanding; and the required marginal/overload controls were detected.
+D-015 tested the one/two-campaign arithmetic hierarchy offline. All 14 preregistered
+screens passed: target-family counts caused zero principal dilution; the normal weekly
+tape issued one full-sized 4.4%/5% claim for one campaign, or one half-sized claim in
+each of two research campaigns (one full share aggregate), and paid fully with zero
+expiry/outstanding; and the required marginal/overload controls were detected. The
+operator activation path nevertheless accepts only one MiniMax-M3 campaign; two-campaign
+cells, rotation, and successor activation are unsupported historical research.
 Sustained simultaneous per-family wins were not the normal-tape assumption. Report
 semantic digest:
 `7975a10b2924330cd527e29b0dfe6f2d9dcb40039f9d8f695b558ec6c6f46590`.
-The raw sweep is a local-only experiment record. Current validation is 2,137
-passed/19 skipped repository-wide plus 8/8 local simulator tests. It is
+The raw sweep is a local-only experiment record. Current validation is 2,191
+passed/19 skipped repository-wide. It is
 deterministic control-plane and ROI evidence, not a new GPU or testnet run.
+
+A tracked one-campaign supplement covers 64 launch/stress cells over 1/2/5/10
+independently winning M3 families, 7/14/30/90-day cadences, and empty/saturated
+discovery. Its semantic report digest is
+`505fed4d40a6acc6bc92d6330170e8e2260a52e5f3099c22a6c0eb4b2308c672`.
+This is deterministic accounting evidence and has no pod or live-chain receipt.
 
 D-014 tested that win-anchored lifetime offline rather than through a chain command.
 The 288-row matrix replayed byte-identically on arm64/Python 3.11 and
@@ -216,22 +257,60 @@ Likewise, `invalidate_finite_debt_family` can durably cancel a registered family
 open debt and reset its next-CROWN clock, but it accepts an external invalidation
 digest and is not an independent runtime-invalidity authority.
 
-Legacy V1 remains the sole wired publisher. Before activation, operators still need:
+Legacy V1 remains the only publisher exercised live. After a successful schema-6
+activation, the implemented V2 publisher is:
 
-- the exact MiniMax-M3 campaign identity, production family map, and reserve,
-  followed by a fresh campaign-policy shadow and activation manifest;
-- an atomic handoff or enforced quiescence across the two distinct
-  V1→core→composition activation steps—the interval can otherwise race legacy
-  settlement or publication;
-- retained-boundary publication confirmation and debt-debit catch-up. Composed
-  epochs are gapless, so a missed or slow boundary currently wedges later epochs;
+```bash
+# First inspect the exact next retained projection without signing.
+optima set-debt-weights \
+  --intake-db chain_intake/intake.sqlite3 \
+  --network "$NET" --netuid 307 \
+  --wallet default --hotkey default \
+  --refresh-blocks <FINALITY_PLUS_REVEAL_MARGIN> --dry-run
+
+# Remove --dry-run only after reviewing the retained projection.
+optima set-debt-weights \
+  --intake-db chain_intake/intake.sqlite3 \
+  --network "$NET" --netuid 307 \
+  --wallet default --hotkey default \
+  --refresh-blocks <FINALITY_PLUS_REVEAL_MARGIN>
+```
+
+`set-debt-weights` always targets the earliest unclosed nominal boundary. It reuses
+an in-flight journal after restart, binds the economic projection to the exact signer-
+facing vector, confirms only from finalized chain readback, and debits claims only when
+the intake cursor has reached that readback. If a boundary lands late, later boundaries
+remain gapless and catch up no faster than one full policy cadence after the preceding
+confirmation. The dry run prints a canonical JSON object containing the complete
+economic projection and exact hotkey/UID/PPM signer binding; review and retain those
+bytes before enabling the wallet-backed invocation. Exit 3 means a submission is still
+pending, readback/intake work remains, or a confirmed row is refresh-due; it is not
+permission to skip the boundary. `--reconcile-only --validator-hotkey <SS58>` reopens an in-flight
+publication without constructing a wallet. The existing `--release-hold <REASON>` flow
+is also available for an audited V2 hold. This command has no live receipt yet.
+
+For the constrained first 1–2 week launch, keep the reserve and validator registrations
+stable and monitor every positively weighted miner at each boundary. Claims live for 90
+days, so ordinary expiry cannot arise in that window. If the reserve, validator, or a
+positive recipient departs or changes UID, stop the publisher. There is deliberately no
+launch-day remap or abandon protocol: do not skip the gapless boundary, rebuild an
+in-flight vector against different UIDs, release the hold as if it fixed membership, or
+rewrite the journal. General retained membership/departure reconciliation remains
+post-launch work.
+
+Before activation/mainnet operation, operators still need:
+
+- exact MiniMax-M3 family and reserve manifests, followed by a fresh campaign-policy
+  shadow and independently reviewed activation approval;
+- retained membership-departure history rather than only the current metagraph snapshot;
 - independently graded review and runtime-invalidation authority;
-- retained membership-departure history rather than only the current metagraph
-  snapshot;
-- an atomic core-plus-composition successor protocol for later model rotation or
-  one-to-two campaign expansion;
-- the promotion transport/linkage above; and
-- production audit-evidence transport.
+- the discovery promotion transport/linkage above;
+- the production audit GPU canary plus explicit acceptance of in-process tampering,
+  audit-role fingerprinting, and timed-workload fingerprinting; and
+- owned-subnet operational authority, stake/permits, storage, and the actual activation.
+
+Model rotation, a second campaign, and successor activation are unsupported future work,
+not options in this launch runbook.
 
 ### Legacy-V1 publication reconciliation
 

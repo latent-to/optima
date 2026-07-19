@@ -7,7 +7,7 @@ This document describes the end-to-end architecture:
 - **what a miner submits** and why it's a kernel-slot, not a whole model,
 - the entire lifecycle of a submission, file by file,
 - the deep trick that gets an untrusted kernel *into* a running model,
-- exactly how scoring (throughput + KL) and anti-copy (commit-reveal) work,
+- exactly how scoring (throughput + fidelity) and anti-copy (commit-reveal) work,
 - the principal failure modes, their controls, and remaining limitations,
 - what is *proven on real hardware* vs what is still a stub.
 
@@ -16,10 +16,12 @@ It points at every file. Paths are relative to this doc (`docs/`), so
 
 > **Current scope:** eleven slots across three kinds (op / block / collective) — run
 > `python -m optima.cli slots` for the live catalog; `STATE_OF_RECORD.md` carries
-> the slot list of record. The current causal production path grades pristine-T
-> distribution/task evidence but does **not** arm or consume the in-engine audit;
-> [FIDELITY.md](FIDELITY.md) distinguishes the historical/target audit design from
-> current enforcement. Validated on real GPUs up to gpt-oss-120b (1×H100) and
+> the slot list of record. The mandatory separate eager/untimed audit role, typed
+> host-regraded witness, and fail-closed durable transport are implemented and
+> CPU/mock-covered, but these new bytes are not GPU-qualified until the exact production
+> MiniMax-M3 canary passes;
+> [FIDELITY.md](FIDELITY.md) distinguishes historical receipts from current enforcement.
+> Validated on real GPUs up to gpt-oss-120b (1×H100) and
 > MiniMax-M3-NVFP4 (4×B300).
 > `STATE_OF_RECORD.md` is the live state-of-record (results + calibration); prose
 > below may lag it — where they disagree, **the state of record wins**. Since
@@ -50,8 +52,8 @@ subnet. There are three roles:
 - **The validator** is the **referee**. It takes each miner's kernel, plugs it
   into a model *it* controls, runs the model, and measures two things:
   1. **throughput** — did the kernel make the model faster?
-  2. **fidelity** — did the model's output stay correct? (measured as KL
-     divergence against a trusted reference run)
+  2. **fidelity** — did the model's output stay correct? (M3 uses an in-engine
+     audit as the primary gate and treats rollout-KL as advisory)
   It turns those into a **score** and tells the chain how to pay miners.
 - **The chain** (Bittensor) handles identity (miner hotkeys), the token
   emissions that pay miners, and consensus across validators.
@@ -113,17 +115,18 @@ the **stock** kernels (this is the reference / "gold standard") and once with th
 deterministic, and adversary-independent. "Another GPU pod" is the same idea with
 the reference on separate hardware; it's compatible, just more plumbing.
 
-Crownable qualification uses the strict causal authority:
-baseline B, candidate C, baseline B′, then a separately launched pristine T worker that
-teacher-forces the sealed trajectories and supplies hidden quality evidence. The candidate
-worker is never the grading oracle.
+Crownable qualification uses the strict causal authority: graph-on/audit-free baseline B,
+candidate C, and baseline B′; a mandatory separate eager/untimed candidate audit role whose
+exact slot×TP-rank receipts become a typed host-regraded witness; then a separately launched
+pristine T worker that teacher-forces the sealed trajectories and supplies hidden quality
+evidence. The candidate worker is never the grading oracle.
 
 > Nuance for later: today's reference is "the same model with stock kernels."
 > That's perfect for kernels meant to be *numerically equivalent* (a faster
 > silu). For kernels that legitimately change precision (a new quantization
 > kernel), you'd instead reference a frozen **full-precision** run and widen the
-> KL threshold. The machinery is the same; only the reference run and threshold
-> change.
+> slot/distribution tolerance. The machinery is the same; only the reference and
+> calibrated contract change.
 
 ---
 
@@ -254,7 +257,7 @@ Here is the entire pipeline, with the file/function that does each step.
 4                                         immutable worker publication
 5                                         registered arena admission
 6                                         non-crown static/build/ABI/graph/serve screen
-7                                         isolated B/C/B'/pristine-T qualification
+7                                         isolated B/C/B' + audit witness + pristine-T qualification
 8                                         independent reproduction of the same delta
 9                                         transactional target/stack settlement
 10                                        journaled weight reconciliation
@@ -275,30 +278,37 @@ The production stages are:
    an exact runtime/model/topology/workload policy. The fixed static, build, ABI, graph, and
    abbreviated-serving screens are non-economic: they can reject, retry, hold, or promote,
    but cannot crown.
-4. **Qualification.** Promoted candidates run under the causal B/C/B′/pristine-T authority.
-   Candidate import and native build occur only in the no-egress OCI worker. The controller
-   owns roles, timing, graph proof, raw quality evidence, evidence authentication, and
-   teardown.
+4. **Qualification.** Promoted candidates run graph-on/audit-free charged B/C/B′ roles,
+   a mandatory separate eager/untimed audit role with a typed host-regraded witness, and
+   pristine-T authority. Candidate import and native build occur only in the no-egress OCI
+   worker. The controller owns roles, timing, graph proof, raw quality evidence, evidence
+   authentication, and teardown. Unauditable attention slots fail closed.
 5. **Independent reproduction.** The first PASS is retained as
    `reproduction_pending`. A second PASS must bind the same arena, target, delta, incumbent
    and candidate stack identities while using independent authority and selection evidence.
 6. **Settlement and incentives.** `settlement.py` plans the target-level stack transition
    from the paired candidate and uses the lower speedup. `FinalizedIntakeStore` commits it
-   transactionally. The current `set-weights` command separately reconciles the retained
-   legacy-V1 projection against finalized metagraph state; it remains the sole wired
-   publisher. The selected V2 registered-CROWN and reviewed-discovery classes have inactive
-   schema-4/5 durable state APIs, including review-pending retention, bounded bounty issuance,
-   terminal pending-review expiry, and registered-family runtime invalidation. Promotion is
-   deliberately fail-closed and the invalidity decision remains external authority.
+   transactionally. The current `set-weights` command separately reconciles retained
+   legacy-V1 projection state. The selected V2 registered-CROWN and reviewed-discovery
+   classes have schema-4/5 pre-activation state APIs, including review-pending retention,
+   bounded bounty issuance, terminal pending-review expiry, and registered-family runtime
+   invalidation. Promotion is deliberately fail-closed and the invalidity decision remains
+   external authority.
    `chain-incentive-shadow` has a live registered-CROWN-only
    synthetic receipt; the signer-free `chain-incentive-composition-shadow` also passed
    live finalized-membership projection over explicitly synthetic states and wrote
    `submitted=false`. Neither receipt is review, settlement, publication, debt-debit,
-   or activation authority. Activation still needs the actual catalog/reserve rerun;
-   atomic or quiescent V1→core→composition cutover; retained-boundary publication/debit
-   catch-up; independently graded review and runtime-invalidity authority; membership-
-   departure history; reliable pending-review-expiry scheduling; promotion
-   transport/linkage; and production audit transport.
+   or activation authority. `chain-activate-incentives` now performs a wallet-free atomic
+   schema-5→6 cutover for exactly one immutable MiniMax-M3 campaign. It binds exact
+   core/composition/approval bytes at the exact finalized intake cursor, preflights the
+   complete catalog-derived family roster against exactly one retained arena, derives the
+   campaign ID from that arena/catalog/roster, checks reserve membership, and receipts the
+   arena/stack/catalog/membership identities. `set-debt-weights` implements restart-safe
+   gapless projection, finalized readback, only-then debit, and rate-limited catch-up.
+   Neither path has a live receipt. Launch still needs exact production family/reserve
+   manifests and a fresh shadow, independently graded review/runtime invalidation,
+   membership-departure history, reliable pending-review expiry, promotion linkage, the
+   production audit GPU canary, and actual activation/mainnet operations.
 7. **Integration and release.** An approved `IntegrationReviewRecord` binds the two crown
    attempts, exact source, provenance/license/security/compatibility/test evidence, and
    review commit. Only integrated refs enter `EngineReleaseManifest`. Model provisioning and
@@ -451,8 +461,8 @@ the timer stays clean.
 The measurement principles below were developed on the original two-launch
 developer evaluator (deleted in the post-arc trim) and now live inside the
 production qualification authority: robust bracketing in
-[../optima/eval/scoring.py](../optima/eval/scoring.py), the B/C/B′/pristine-T
-role schedule in
+[../optima/eval/scoring.py](../optima/eval/scoring.py), the graph-on/audit-free
+charged B/C/B′ schedule plus mandatory separate eager/untimed audit role and pristine-T in
 [../optima/eval/qualification_runner.py](../optima/eval/qualification_runner.py),
 the quality record in
 [../optima/eval/reference_quality.py](../optima/eval/reference_quality.py), and
@@ -489,10 +499,11 @@ tiny model — exactly why the noise-derived bar exists).
 With `return_logprob=True, top_logprobs_num=k`, sglang exposes, per generated
 position, the top-k `(logprob, token_id, text)` — its actual output distribution.
 The pristine T worker teacher-forces the sealed trajectories and the quality
-record (`reference_quality.py`) gates on the resulting statistics: `mean_nll` /
-`worst_nll`, top-k rollout KL (`topk_kl`), `argmax_rate` (sparse flips),
-`coverage_dev` (a flattened head-matching distribution that fools top-k KL), and
-the arena's `task_score`.
+record (`reference_quality.py`) carries `mean_nll` / `worst_nll`, top-k rollout KL
+(`topk_kl`), `argmax_rate` (sparse flips), `coverage_dev` (a flattened head-matching
+distribution that fools top-k KL), and the arena's `task_score`. The arena policy grades
+these facts; M3 treats rollout-KL as advisory while the audit is primary and pristine-T
+task/distribution evidence remains the semantic backstop.
 
 The **alignment** subtlety was a real bug fix and still governs how per-position
 comparison works: greedy decoding means baseline and candidate can *diverge* in
@@ -505,8 +516,9 @@ the very first token still gets a huge KL instead of "zero comparable positions.
 > Honest limitation: top-k truncation approximates the true full-vocab KL. It's
 > useful for catching calibration collapse and dropped work at k≥20. The intended
 > in-engine audit (Part 6.5, [FIDELITY.md](FIDELITY.md)) re-runs stock on clones of
-> the candidate's real calls, but the current causal production path does not yet
-> transport or grade that audit evidence.
+> the candidate's real calls. Its separate role, typed host-regraded witness, and durable
+> fail-closed transport are implemented and CPU/mock-covered, but a real-GPU canary has
+> not yet qualified these new causal bytes.
 
 ### 6.4 Gates and verdict
 
@@ -523,12 +535,13 @@ The gate philosophy, unchanged since the first evaluator:
 ### 6.5 The realistic workload + the quality authority
 
 Throughput must be scored on the regime the arena sells (decode-heavy serving; a
-prefill-heavy slot needs a prefill-heavy workload). The current causal path grades
-pristine-T distribution and task evidence. Historically, and in the target design,
-quality also used rollout-KL where stock-vs-stock measured ~0 or an **in-engine
-audit** that sampled real dispatcher calls and compared them with stock on pre-call
-clones. That audit mechanism exists and has B300 evidence, but it is not presently
-armed, transported, or graded by production qualification. See
+prefill-heavy slot needs a prefill-heavy workload). The causal path uses a mandatory
+separate eager/untimed **in-engine audit** with exact slot×TP-rank coverage and a typed
+host-regraded witness, plus pristine-T distribution/task evidence. Charged graph-on B/C/B′
+roles carry no audit state or receipts. MiniMax M3 uses the audit as its primary fidelity
+gate and rollout-KL as advisory. The underlying audit mechanism has B300 evidence; the new
+causal transport/report bytes have CPU/mock coverage but still require the production GPU
+canary. Unauditable attention slots fail closed. See
 [FIDELITY.md](FIDELITY.md) before changing or relying on this boundary.
 
 ### 6.6 Calibration (learned on real hardware)
@@ -597,8 +610,9 @@ side effect of evaluation.
 The selected V2 registered-CROWN rule instead issues finite principal in multiplicative
 1%-log units, uses a rational elapsed-family bonus capped at 10%, keeps a 10% reserve, and
 expires unpaid principal after 90 days. D-015 makes the model campaign the claim-sizing
-unit: claims in the sole MiniMax M3 campaign use 100% sizing, or claims in either
-campaign of a later two-model roster use 50% sizing; more than two is rejected.
+unit. Launch accepts exactly one immutable MiniMax M3 campaign at 100% sizing.
+Historical two-model 50/50 cells remain arithmetic research; a second campaign,
+rotation, and successor activation are unsupported by this generation.
 Reward families remain independent frontiers and clocks, and
 adding families within a campaign causes no principal dilution. Campaign shares size
 claims rather than hard-siloing epoch payout; registered claims share the global pool pro
@@ -612,12 +626,18 @@ reserve = 1,000,000 - P_d - P_c
 ```
 
 All 14 preregistered D-015 screens passed. At `k=1`, the normal weekly load was
-one full-sized 4.4%/5% claim with one campaign, or one half-sized claim in each of
-two campaigns (one full share aggregate), rotated across families. It paid 100%,
+one full-sized 4.4%/5% claim with one campaign, or—in the historical research
+cells—one half-sized claim in each of two campaigns (one full share aggregate),
+rotated across families. It paid 100%,
 expired zero, and drained to zero; five-day cadence was marginal and four-day
 cadence overloaded. Sustained simultaneous per-family wins were not the normal-tape
 assumption. Report semantic digest:
 `7975a10b2924330cd527e29b0dfe6f2d9dcb40039f9d8f695b558ec6c6f46590`.
+
+A tracked one-campaign supplement then exercised 64 launch/stress cells across
+1/2/5/10 independently winning M3 families, four cadences, and empty/saturated
+discovery. Its semantic report digest is
+`505fed4d40a6acc6bc92d6330170e8e2260a52e5f3099c22a6c0eb4b2308c672`.
 
 Each class has its own claim-digest largest-remainder allocation. A discovery award is
 capped at one 50,000-unit pool epoch and has no campaign share, family clock, time bonus, renewal,
@@ -644,13 +664,19 @@ instantaneous CROWN-capacity dilution, and no CROWN paid-fraction regression; th
 This is synthetic accounting evidence only; see [INCENTIVES.md](INCENTIVES.md) for
 the report digest and limits.
 
-This composition is not active. Production must freeze the MiniMax-M3 campaign identity,
-family map, and reserve then run a fresh campaign-policy shadow; quiesce or atomically bridge the two-step
-V1→core→composition cutover; retain and catch up a missed/slow publication boundary before
-later gapless epochs; grade review and runtime invalidation independently; retain membership
+This composition is not active. The wallet-free `chain-activate-incentives` command
+implements one atomic schema-5→6 cutover over exact approved core/composition bytes and the
+exact finalized intake cursor. It preflights the complete catalog-derived family roster
+against exactly one retained evaluation arena, deterministically derives the campaign from
+the arena/catalog/roster, checks reserve membership, and reproduces the arena, stack,
+catalog, and membership identities pinned in the independent approval before retaining
+them in the activation row/event. `set-debt-weights` implements restart-safe gapless publication,
+finalized readback, only-then debit, and rate-limited catch-up. Neither path has a live receipt.
+Production must still freeze the exact MiniMax-M3 family/reserve manifests and run a fresh
+campaign-policy shadow; grade review and runtime invalidation independently; retain membership
 departure history rather than only a current snapshot; schedule pending-review expiry
-reliably; add an atomic successor protocol for later model rotation or one-to-two campaign
-expansion; complete promotion linkage; and transport production audit evidence. The landed
+reliably; complete promotion linkage; pass the production audit GPU canary; and perform
+actual activation/mainnet operations. The landed
 family-invalidation API only consumes an
 external authority digest, while `review_digest` is controller-supplied/content-bound.
 The signer-free
@@ -697,15 +723,15 @@ OCI boundary.**
   controller-owned teardown. Static scanning remains a tripwire rather than the boundary.
   The trusted controller and pristine T authority are outside that worker.
 
-### 8.2 Fake the result — pass KL without doing the real work
+### 8.2 Fake the result — pass fidelity without doing the real work
 
 | # | Attack | Verdict | How |
 |---|---|---|---|
-| 1 | Return wrong `out` cheaply, hope it's "close enough" | **Mitigated** | KL gate. Demonstrated: broken silo → KL 14 → score 0. |
-| 2 | Compute only some tokens/positions, leave the rest stale | **Mitigated** | The gate is no longer mean-only: `kl_gate_ok` also caps the **argmax-disagreement rate** and (opt-in) **p99 KL** (`kl.py`). A sparse cheat that keeps `mean_kl` low by corrupting a few positions still trips the flip-rate, which is magnitude-independent. (CPU regression test: a 3%-flip cheat with `mean_kl=1e-3` passes the old mean-only gate, fails the new one.) |
-| 3 | Memoize/replay op outputs across calls | **Mitigated** | Activations differ per prompt/token; and prompts are fresh per epoch (`sample_prompts(seed)`). Caching doesn't help at the op level. |
-| 4 | Behave correctly when measured for correctness, garbage when measured for speed | **Mitigated** | Quality and speed are measured on the **same** candidate run; there's no separate "correctness mode" to detect. |
-| 5 | Special-case the op-correctness inputs (fixed seed/shapes in `verify_entry`) | **Partial** | Re-randomize the verify seed/shapes per epoch (the caller can pass `shapes`/`seed`). End-to-end KL on fresh prompts is the backstop. Residual: a kernel can still branch on shape. |
+| 1 | Return wrong `out` cheaply, hope it's "close enough" | **Mitigated** | M3's separate audit role compares sampled real slot outputs with stock under the slot tolerance; pristine-T task/distribution evidence is the semantic backstop. Rollout-KL is advisory there. |
+| 2 | Compute only some tokens/positions, leave the rest stale | **Mitigated** | An audited call compares the complete model-facing slot output, exact slot×rank minimum coverage fails closed, and pristine-T catches downstream degradation. |
+| 3 | Memoize/replay op outputs across calls | **Mitigated** | Audit baselines use pre-call clones from the real engine distribution; activations and per-epoch prompts vary. |
+| 4 | Behave in the eager audit role, garbage in charged graph-on roles | **Partially open** | Charged B/C/B′ are audit-free and pristine-T grades charged candidate evidence, but miner code can distinguish the eager audit role from charged execution. Audit-role fingerprinting remains explicit risk. |
+| 5 | Special-case verify/audit inputs or tamper with the in-process audit | **Open/partial** | Verify jitters shapes and the typed witness is host-regraded, but miner host code shares the audit rank process. In-process tampering and role fingerprinting require isolation or an indistinguishable audit design. |
 
 ### 8.3 Fake the speed — inflate throughput
 
@@ -714,7 +740,7 @@ OCI boundary.**
 | 6 | Monkeypatch the timer | **Mitigated** | `seam.mark_driver()` — the timing process never imports miner code (Part 5.5). |
 | 7 | Fabricate the token count | **Mitigated** | The controller fixes the token budget and validates authenticated, fixed-width worker evidence; candidate output is not trusted as an unconstrained throughput numerator. |
 | 8 | Offload work to an untimed stream / return early | **Mitigated** | `torch.cuda.synchronize()` brackets the timer; async work is counted. |
-| 9 | Be fast only on the benchmark shapes | **Partial** | The scoring corpus is now **real benchmarks** (GSM8K + MMLU, long CoT generation), sampled per epoch — far more shape-diverse than the old 40-prompt toy set — and a kernel that corrupts only certain shapes trips the argmax-rate gate (#2). Residual: a kernel can still *branch* on shape to be fast-where-measured; rotate/expand toward the serving distribution and consider random sequence lengths. |
+| 9 | Be fast only on charged benchmark shapes | **Partial** | Fresh prompts and pristine-T reduce the attack surface, but stable charged-workload features remain visible. Timed-workload fingerprinting stays open until charged work is drawn from a broader serving distribution with randomized regimes. |
 | 10 | Manipulate GPU clocks | **Needs host op** | Lock clocks (`nvidia-smi -lgc`) at the validator host; not enforced in code yet. |
 
 ### 8.4 Escape the abstraction — arbitrary code execution
@@ -733,8 +759,9 @@ boundary is the validator-owned OCI session, not Python-level sandboxing.
 
 **Bottom line for Part 8:** untrusted code may control its own candidate engine, but not
 the chain/control plane, arm schedule, trusted evidence authority, settlement record, or
-serving release. Timed-workload fingerprinting, numerical calibration, and hardware-
-specific coverage remain ongoing concerns rather than isolation gaps.
+serving release. The mandatory audit witness does not close in-process tampering,
+audit-role fingerprinting, or timed-workload fingerprinting. The first is a known isolation
+gap; the latter two remain partially open even after the required GPU canary.
 
 ### 8.5 Mechanism / economic attacks
 
@@ -751,7 +778,7 @@ specific coverage remain ongoing concerns rather than isolation gaps.
 | # | Issue | Verdict | How |
 |---|---|---|---|
 | 22 | Reference itself wrong/drifting (if pinned to an API) | **Avoided** | Local stock-kernel reference, not an API (Part 2.2). |
-| 23 | Per-op tolerance ≠ end-to-end quality | **Mitigated** | We gate end-to-end KL, not just per-op correctness. |
+| 23 | Per-op tolerance ≠ end-to-end quality | **Mitigated** | M3 gates sampled in-engine slot outputs plus pristine-T task/distribution evidence; rollout-KL is advisory there. |
 | 24 | Cross-validator score divergence (noise, HW) | **Partial** | Pooled charged arm rates + B/C/B′ noise margin now; locked clocks + determinism + pinned HW still needed. |
 | 25 | Numerical nondeterminism fails a faithful kernel | **Mitigated** | Tolerance in verify; `enable_deterministic_inference` available; greedy decoding for alignment. |
 
@@ -782,7 +809,8 @@ up to gpt-oss-120b:
   (`mark_driver`) remains in place, and a faithful-but-slower kernel earns no title.
 - **The current authority is stricter than the original mechanism:** finalized native
   commit-reveal intake, immutable publication, registered non-crown screening, isolated
-  B/C/B′/T qualification, independent reproduction, and transactional target settlement.
+  graph-on/audit-free B/C/B′, mandatory separate audit witness, pristine-T qualification,
+  independent reproduction, and transactional target settlement.
 - **gpt-oss-120b fits one 80 GB H100** (~69 GB at its native quantization), so the
   bootstrap doesn't need a B200 cluster.
 
@@ -808,7 +836,8 @@ ones are caught by the gate.
    false-crown, charged-tail, drift, SM103 and NVLink behavior still require B300 proof.
 3. **Cross-validator determinism**: locked clocks, pinned HW/driver, deterministic
    mode on, more medians — so independent validators agree (Bittensor consensus).
-4. **Full-logit KL** at a reference seam (vs top-k) for the tightest fidelity gate.
+4. **Full-logit KL** at a reference seam (vs top-k) as a tighter supplemental
+   distribution gate where its stock-control premise holds.
 5. **Mainnet operation** — chain integration, finalized SQLite intake, registered arena
    screening, settlement, and journaled weight publication exist. Deployment still needs
    an owned subnet, production validator permits/cadence, hosted bundle storage, backups,
@@ -849,19 +878,21 @@ The harness package, [../optima/](../optima):
 | [eval/engine_worker.py](../optima/eval/engine_worker.py) | In-worker engine session: isolation probes, `engine_kwargs`, active/completed receipt gates. |
 | [eval/oci_backend.py](../optima/eval/oci_backend.py) | Validator-owned OCI policy, no-egress/resource fence, leases, native prebuild and authoritative teardown. |
 | [eval/oci_outer_session.py](../optima/eval/oci_outer_session.py) | Trusted-controller protocol for isolated candidate engine sessions and bounded evidence frames. |
-| [eval/qualification_runner.py](../optima/eval/qualification_runner.py) | B/C/B′/pristine-T role schedule, authenticated raw evidence, quality authority, graph proof, and aggregate verdict. |
+| [eval/qualification_runner.py](../optima/eval/qualification_runner.py) | Graph-on/audit-free charged B/C/B′, mandatory separate eager/untimed audit role and typed host-regraded witness, pristine-T authority, graph proof, and aggregate verdict. |
 | [bundle_hash.py](../optima/bundle_hash.py) | `content_hash` — deterministic bundle identity. |
 | [finite_debt.py](../optima/finite_debt.py) | Pure content-addressed finite-claim issuance, expiry/cancellation, pro-rata allocation, and reserve-conserving projection arithmetic. |
 | [incentive_shadow.py](../optima/incentive_shadow.py) | Signer-free, explicitly synthetic finite-debt projection against twice-reopened finalized membership; writes only `submitted=false` receipts. |
 | [incentive_composition.py](../optima/incentive_composition.py) | Pure reviewed-discovery issuance/lifecycle and deterministic two-class epoch composition. |
 | [incentive_composition_shadow.py](../optima/incentive_composition_shadow.py) | Signer-free synthetic composed projection against twice-reopened finalized membership; writes only `submitted=false` receipts. |
-| [chain/intake.py](../optima/chain/intake.py) | SQLite production authority for finalized intake, screens, qualifications, reproductions, stacks, settlement and legacy weight-publication journal state; exposes the inactive schema-5 finite-debt/composition stores. |
-| [chain/finite_debt_store.py](../optima/chain/finite_debt_store.py) | Additive schema-4 V2 authority: exact activation, seeded clocks, atomic CROWN claim issuance, lifecycle, finalized family invalidation, projection, and idempotent confirmed-epoch close. Runtime-invalidity truth and publication confirmation remain external. |
-| [chain/incentive_composition_store.py](../optima/chain/incentive_composition_store.py) | Additive schema-5 authority: exact D-013 discovery plus D-015 campaign-core selection, review-pending win retention/expiry, bounded bounty-only disposition, discovery balances, gapless composed projection, and externally confirmed epoch close. Registered promotion is intentionally rejected; inactive by default. |
+| [chain/intake.py](../optima/chain/intake.py) | SQLite production authority for finalized intake, screens, qualifications, reproductions, stacks, settlement and publication journals; exposes schema-5 pre-activation and schema-6 active incentive stores. |
+| [chain/finite_debt_store.py](../optima/chain/finite_debt_store.py) | Additive schema-4 V2 authority: seeded clocks, atomic CROWN claim issuance, lifecycle, finalized family invalidation, projection, and confirmed-epoch close. Runtime-invalidity truth remains external. |
+| [chain/incentive_composition_store.py](../optima/chain/incentive_composition_store.py) | Schema-5 D-013/D-015 authority plus atomic one-campaign schema-6 activation: review-pending retention/expiry, bounded bounty-only disposition, balances, and gapless composed projection. Registered promotion is intentionally rejected. |
+| [chain/incentive_activation.py](../optima/chain/incentive_activation.py) | Wallet-free one-campaign cutover: canonical manifests/approval, finalized cursor, retained arena/catalog/family roster, reserve membership, and schema-6 receipt binding. |
+| [chain/debt_publication.py](../optima/chain/debt_publication.py) | Restart-safe gapless V2 publication binding, finalized readback confirmation, rate-limited catch-up, and only-then debt-debit authority. |
 | [chain/validator_loop.py](../optima/chain/validator_loop.py) | Finalized reveal → private fetch → immutable publication → registered arena screen/qualification → transactional settlement. |
 | [model_provision.py](../optima/model_provision.py) | Exact all-file model-tree hashing and independently reopenable content-addressed receipts. |
 | [release.py](../optima/release.py) | Signed chain-independent Engine release descriptor, deterministic source/wheel, SBOM/provenance, and OCI build context. |
-| [cli.py](../optima/cli.py) | User/operator commands for verification/evaluation, chain intake, legacy weight reconciliation, signer-free registered and composed incentive shadows, model provisioning, and release verification/context construction. |
+| [cli.py](../optima/cli.py) | User/operator commands for verification/evaluation, chain intake, legacy/V2 weight reconciliation, one-campaign activation, signer-free incentive shadows, model provisioning, and release verification/context construction. |
 
 Examples [../examples/](../examples): one (or more) bundle per slot —
 `miner_silu_{triton,torch,broken,sparse}`, `miner_rmsnorm_{triton,broken}`,
@@ -909,10 +940,12 @@ qualification bracket in no-egress workers ([TESTNET.md](TESTNET.md)).
   (`bootstrap.py` + `seam.py` + `dispatch.py`).
 - **Controller / worker** — the trusted validator authority vs the isolated OCI process
   that constructs an engine and runs a candidate.
-- **B / C / B′ / T** — baseline bookend, candidate, second baseline bookend, and the
-  separate pristine teacher-forced quality authority.
-- **KL** — divergence between the candidate's and baseline's output distributions;
-  the fidelity gate.
+- **B / C / B′ / audit / T** — graph-on/audit-free baseline bookend, candidate, second
+  baseline bookend; the separate eager/untimed audited candidate role; and the pristine
+  teacher-forced quality authority.
+- **KL** — divergence between candidate and baseline output distributions; the fidelity
+  gate only where a stock-vs-stock control is approximately zero, and advisory on M3 where
+  the in-engine audit is primary.
 - **Champion / challenger** — the standing target contribution vs a paired,
   independently reproduced candidate trying to clear the measured bar.
 - **Commit-reveal** — commit a hash first, reveal the bundle later; makes copying

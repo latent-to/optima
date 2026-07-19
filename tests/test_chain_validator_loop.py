@@ -371,3 +371,80 @@ def test_settlement_head_refresh_failure_cannot_create_a_lease():
             finalized_block_provider=unavailable_head,
         )
     assert store.lease_calls == 0
+
+
+def test_active_settlement_uses_exact_retained_cursor_block_and_hash(monkeypatch):
+    from types import SimpleNamespace
+
+    candidate = object()
+    lease = SimpleNamespace(
+        candidates=(candidate,),
+        stack=SimpleNamespace(manifest=object(), tree_digest="tree"),
+        initial_event_sequence=0,
+        previous_event_digest="",
+        lease_id="lease",
+    )
+    plan = SimpleNamespace(digest="plan")
+
+    class Store:
+        pending = True
+        committed = None
+
+        def has_pending_settlement(self):
+            return self.pending
+
+        def active_finite_debt_policy(self, *, at_block):
+            assert at_block >= BLOCK
+            return object()
+
+        def finalized_cursor(self):
+            return BLOCK, BLOCK_HASH
+
+        def lease_settlement_cohort(self, *, current_block):
+            assert current_block == BLOCK
+            return lease
+
+        def reopen_settlement_evidence(self, value):
+            assert value is candidate
+            return "evidence"
+
+        def commit_settlement(self, retained, retained_plan, evidence, **kwargs):
+            assert retained is lease and retained_plan is plan
+            assert evidence == ("evidence",)
+            self.committed = kwargs
+            self.pending = False
+
+    monkeypatch.setattr("optima.settlement.plan_settlement", lambda *_, **__: plan)
+    store = Store()
+    observed_hash = "0x" + "a" * 64
+    assert loop._settle_pending(
+        store,
+        current_block=BLOCK,
+        finalized_block_provider=lambda: (BLOCK + 100, observed_hash),
+    ) == {"lease": "plan"}
+    assert store.committed == {
+        "current_block": BLOCK,
+        "current_block_hash": BLOCK_HASH,
+    }
+
+
+def test_active_settlement_fails_closed_without_retained_cursor():
+    class Store:
+        def has_pending_settlement(self):
+            return True
+
+        def active_finite_debt_policy(self, *, at_block):
+            return object()
+
+        def finalized_cursor(self):
+            return None
+
+        def lease_settlement_cohort(self, *, current_block):
+            raise AssertionError("lease must not be created without authority")
+
+    with pytest.raises(loop.IntakeControllerError, match="exact finalized cursor"):
+        loop._settle_pending(
+            Store(),
+            current_block=BLOCK,
+            finalized_block_provider=lambda: (BLOCK, BLOCK_HASH),
+        )

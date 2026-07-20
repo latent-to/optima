@@ -1450,16 +1450,26 @@ def _validated_topk_position(position: object) -> list[list[object]]:
 
 
 def _trajectory_rows(lifecycle: object):
+    from optima.eval.crossover_runtime import ResidentMarginalLifecycleEvidence
     from optima.eval.marginal_runtime import MarginalLifecycleEvidence
     from optima.eval.oci_session_protocol import PromptEvidence
     from optima.eval.scoring import marginal_workload_digest
 
-    if type(lifecycle) is not MarginalLifecycleEvidence:
+    if type(lifecycle) not in {
+        MarginalLifecycleEvidence,
+        ResidentMarginalLifecycleEvidence,
+    }:
         raise QualificationError("trajectory lifecycle is not typed")
     plan = lifecycle.prepared.baseline_session_plan
-    executions = (lifecycle.baseline_before,) + tuple(
-        row.execution for row in lifecycle.candidates
-    ) + (lifecycle.baseline_after,)
+    if type(lifecycle) is ResidentMarginalLifecycleEvidence:
+        batch_sets = tuple(
+            lifecycle.role_batches(role) for role in lifecycle.role_names
+        )
+    else:
+        executions = (lifecycle.baseline_before,) + tuple(
+            row.execution for row in lifecycle.candidates
+        ) + (lifecycle.baseline_after,)
+        batch_sets = tuple(row.session.batches for row in executions)
     workload = marginal_workload_digest(plan)
     rows = []
     for batch_index, prompts in enumerate(plan.prompt_batches):
@@ -1474,8 +1484,8 @@ def _trajectory_rows(lifecycle: object):
                 },
             )
             frames = []
-            for execution in executions:
-                evidence = execution.session.batches[batch_index].evidence.prompts[prompt_index]
+            for batches in batch_sets:
+                evidence = batches[batch_index].evidence.prompts[prompt_index]
                 if (
                     type(evidence) is not PromptEvidence
                     or len(evidence.output_ids) != plan.max_new_tokens
@@ -1500,12 +1510,21 @@ def _quality_leg_lifecycle(lifecycle: object, candidate_read: int):
     B/C/B-prime and B-prime/C-prime/B-double-prime.
     """
 
+    from optima.eval.crossover_runtime import ResidentMarginalLifecycleEvidence
     from optima.eval.marginal_runtime import MarginalLifecycleEvidence
 
-    if type(lifecycle) is not MarginalLifecycleEvidence:
+    if type(lifecycle) not in {
+        MarginalLifecycleEvidence,
+        ResidentMarginalLifecycleEvidence,
+    }:
         raise QualificationError("quality lifecycle is not typed")
     if type(candidate_read) is not int or candidate_read not in (1, 2):
         raise QualificationError("candidate read must be exactly 1 or 2")
+    if type(lifecycle) is ResidentMarginalLifecycleEvidence:
+        try:
+            return lifecycle.quality_leg(candidate_read)
+        except (TypeError, ValueError, RuntimeError) as exc:
+            raise QualificationError(str(exc)) from None
     if candidate_read == 1:
         return MarginalLifecycleEvidence(
             lifecycle.prepared,
@@ -1560,9 +1579,13 @@ def candidate_lifecycle_digest(
 ) -> str:
     """Bind the exact retained B/C/B-prime execution used by one qualifier."""
 
+    from optima.eval.crossover_runtime import ResidentMarginalLifecycleEvidence
     from optima.eval.marginal_runtime import MarginalLifecycleEvidence
 
-    if type(lifecycle) is not MarginalLifecycleEvidence:
+    if type(lifecycle) not in {
+        MarginalLifecycleEvidence,
+        ResidentMarginalLifecycleEvidence,
+    }:
         raise QualificationError("candidate lifecycle is not typed")
     candidates = tuple(
         row
@@ -1572,6 +1595,20 @@ def candidate_lifecycle_digest(
     if len(candidates) != 1:
         raise QualificationError("candidate lifecycle is absent or ambiguous")
     candidate = candidates[0]
+    if type(lifecycle) is ResidentMarginalLifecycleEvidence:
+        return canonical_digest(
+            "optima.qualification.candidate-lifecycle.resident-v1",
+            {
+                "arm_digest": candidate.arm.digest,
+                "cohort_trajectory_digest": cohort_trajectory_digest(lifecycle),
+                "crossover_evidence_digest": lifecycle.crossover.digest,
+                "crossover_plan_digest": lifecycle.plan.digest,
+                "selected_delta_digest": _digest(
+                    selected_delta_digest, "selected delta"
+                ),
+                "source_digest": lifecycle.source.digest,
+            },
+        )
     executions = (
         lifecycle.baseline_before,
         candidate.execution,

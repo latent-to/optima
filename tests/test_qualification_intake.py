@@ -292,6 +292,25 @@ class _FakeAttempt:
     pass
 
 
+class _FakeStageExit:
+    def __init__(
+        self,
+        manifest: intake.QualificationAuthorityManifest,
+        decision: QualificationDecision,
+    ) -> None:
+        self.authority_digest = manifest.authority_digest
+        self.source_digest = manifest.source_digest
+        self.selected_delta_digest = manifest.reservations[0].selected_delta_digest
+        self.stage = "speed"
+        self.decision = decision
+        self.reason = (
+            "speed_noise"
+            if decision is QualificationDecision.NO_DECISION
+            else "speed_regression"
+        )
+        self.digest = _d(f"stage-exit-{decision.value}")
+
+
 def _install_success_runner(monkeypatch, manifest, decisions):
     reference = EvidenceArtifactRef(
         "qualification.cohort-attempt",
@@ -319,6 +338,80 @@ def _install_success_runner(monkeypatch, manifest, decisions):
         intake, "reopen_causal_qualification", lambda *_args, **_kwargs: attempt
     )
     return reference
+
+
+@pytest.mark.parametrize(
+    ("decision", "reason", "expects_retry"),
+    (
+        (QualificationDecision.FAIL, "speed_regression", False),
+        (QualificationDecision.NO_DECISION, "speed_noise", True),
+    ),
+)
+def test_speed_stage_exit_projects_terminal_outcome_without_settlement(
+    monkeypatch,
+    decision: QualificationDecision,
+    reason: str,
+    expects_retry: bool,
+) -> None:
+    plan, manifest = _fake_plan(monkeypatch, count=1)
+    reference = EvidenceArtifactRef(
+        "qualification.stage-exit",
+        _d(f"stage-exit-artifact-{decision.value}"),
+        1,
+        "application/json",
+        intake.STAGE_EXIT_SCHEMA,
+    )
+    terminal = _FakeStageExit(manifest, decision)
+    resident_baseline_executor = object()
+    runner_kwargs = {}
+
+    def run(*_args, **kwargs):
+        runner_kwargs.update(kwargs)
+        return reference
+
+    monkeypatch.setattr(intake, "QualificationStageExit", _FakeStageExit)
+    monkeypatch.setattr(intake, "run_causal_qualification", run)
+    monkeypatch.setattr(
+        intake,
+        "reopen_qualification_stage_exit",
+        lambda *_args, **_kwargs: terminal,
+    )
+    monkeypatch.setattr(
+        intake,
+        "reopen_causal_qualification",
+        lambda *_args, **_kwargs: pytest.fail(
+            "a terminal stage exit must not reopen a full qualification attempt"
+        ),
+    )
+
+    result = intake.run_qualification_intake(
+        _factory(plan, manifest),
+        executor=object(),
+        resident_baseline_executor=resident_baseline_executor,
+        entropy_provider=lambda *_args: None,
+        hidden_judge=lambda **_kwargs: None,
+        deadline=100.0,
+    )
+
+    assert runner_kwargs["resident_baseline_executor"] is resident_baseline_executor
+    assert result.attempt_ref == reference
+    assert len(result.outcomes) == 1
+    outcome = result.outcomes[0]
+    assert outcome.decision is decision
+    assert outcome.reason == reason
+    assert outcome.retryable is expects_retry
+    assert outcome.attempt_artifact_sha256 == reference.sha256
+    assert outcome.report_digest == terminal.digest
+    assert outcome.failure_digest is None
+    assert outcome.settlement_qualification is None
+    if expects_retry:
+        assert result.retry_plan is not None
+        assert result.retry_plan.strategy == "requeue"
+        assert result.retry_plan.reservation_groups == (
+            (manifest.reservations[0].reservation_digest,),
+        )
+    else:
+        assert result.retry_plan is None
 
 
 def test_batch_service_projects_per_reservation_tristate_and_retry(monkeypatch) -> None:

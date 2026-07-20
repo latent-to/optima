@@ -119,6 +119,7 @@ class _Harness:
         self.calls: list[str] = []
         self.reference_calls = 0
         self.reference_request_counts: list[int] = []
+        self.reference_session_plans: list[object] = []
         self.secret = b"s" * 32
         secret_commitment = hashlib.sha256(
             b"optima-selection-secret-v1\0" + self.secret
@@ -290,9 +291,11 @@ class _Harness:
 
         def execute_reference(_executor, _launch, _binding, _mount, plan, *, deadline):
             del deadline
+            assert plan is not getattr(self.value, "resident_audit_plan", None)
             self.calls.append("reference")
             self.reference_calls += 1
             self.reference_request_counts.append(len(plan.requests))
+            self.reference_session_plans.append(plan)
             requests = tuple(plan.requests)
             if swap_exchanges:
                 requests = tuple(reversed(requests))
@@ -692,6 +695,335 @@ class _Harness:
         assert reference == self.attempt_reference
         assert type(self.published_attempt) is runner.CohortQualificationAttempt
         return self.published_attempt
+
+
+def _install_resident_runner_path(
+    monkeypatch,
+    harness: _Harness,
+    *,
+    speed_decision: QualificationDecision,
+    escalated: bool,
+):
+    """Install only the resident orchestration seam around the existing runner harness."""
+
+    assert len(harness.value.candidates) == 1
+    harness.value.speed_evidence_policy = runner.SpeedEvidencePolicy.resident()
+    harness.value.resident_audit_plan = SimpleNamespace(
+        authority="resident-audit-only"
+    )
+    harness.resident_speed_plans = []
+    harness.value.resident_speed_plan = SimpleNamespace(
+        digest=_d("resident-plan"),
+        policy=SimpleNamespace(
+            digest=_d("resident-policy"),
+            max_qualification_seconds=7_200,
+        ),
+        baseline_lane_digest=_d("resident-baseline-lane"),
+        candidate_lane_digest=_d("resident-candidate-lane"),
+        baseline=SimpleNamespace(
+            launch=SimpleNamespace(digest=_d("resident-baseline-launch")),
+            runtime_resource_policy_digest=_d(
+                "resident-baseline-runtime-policy"
+            ),
+        ),
+        candidate=SimpleNamespace(
+            launch=harness.value.prepared.candidates[0].launch,
+            runtime_resource_policy_digest=(
+                harness.value.expected_runtime_resource_policy_digest
+            ),
+        ),
+    )
+    harness.attempt_reference = EvidenceArtifactRef(
+        runner.ATTEMPT_DOMAIN,
+        _d("resident-causal-attempt-artifact"),
+        2,
+        "application/json",
+        runner.ATTEMPT_SCHEMA_V3,
+    )
+
+    class FakeResidentCrossover:
+        def __init__(self) -> None:
+            self.escalated = escalated
+
+    crossover = FakeResidentCrossover()
+
+    class FakeResidentLifecycle:
+        def __init__(self, prepared, plan, observed) -> None:
+            assert prepared is harness.value.prepared
+            assert plan is harness.value.resident_speed_plan
+            assert observed is crossover
+            self.candidates = harness.lifecycle.candidates
+            self.final_baseline = harness.lifecycle.final_baseline
+
+    class FakeResidentSpeedWitness:
+        def __init__(self) -> None:
+            plan = harness.value.resident_speed_plan
+            self.selected_delta_digest = (
+                harness.value.candidates[0].selected_delta_digest
+            )
+            self.candidate_launch_digest = plan.candidate.launch.digest
+            self.calibration_digest = harness.calibration.digest
+            self.calibration_context_digest = harness.value.calibration_context.digest
+            self.workload_digest = harness.value.calibration_context.workload_digest
+            self.baseline_runtime_resource_policy_digest = (
+                plan.baseline.runtime_resource_policy_digest
+            )
+            self.candidate_runtime_resource_policy_digest = (
+                plan.candidate.runtime_resource_policy_digest
+            )
+            self.plan_digest = plan.digest
+            self.baseline_lane_digest = plan.baseline_lane_digest
+            self.candidate_lane_digest = plan.candidate_lane_digest
+            self.baseline_quiescence_digest = _d("resident-baseline-quiescence")
+            self.candidate_quiescence_digest = _d("resident-candidate-quiescence")
+            self.raw_crossover_digest = _d("resident-raw-crossover")
+            self.evidence_digest = _d("resident-speed-evidence")
+            self.started_monotonic_s = 1.0
+            self.completed_monotonic_s = 3.0
+            self.resident_policy = plan.policy
+            roles = (
+                ("B", "C", "B_prime", "C_prime", "B_double_prime")
+                if escalated
+                else ("B", "C", "B_prime")
+            )
+            self.rates = tuple(
+                SimpleNamespace(
+                    role=role,
+                    lane_digest=(
+                        plan.baseline_lane_digest
+                        if role.startswith("B")
+                        else plan.candidate_lane_digest
+                    ),
+                    launch_digest=(
+                        plan.baseline.launch.digest
+                        if role.startswith("B")
+                        else plan.candidate.launch.digest
+                    ),
+                    session_id=("a" if role.startswith("B") else "b") * 32,
+                )
+                for role in roles
+            )
+
+        @classmethod
+        def from_evidence(cls, observed, plan):
+            assert observed is crossover
+            assert plan is harness.value.resident_speed_plan
+            return cls()
+
+        @property
+        def policy(self):
+            return runner.SpeedEvidencePolicy.resident()
+
+        @property
+        def has_repeat(self) -> bool:
+            return escalated
+
+        def regrade(self, *_args, **_kwargs):
+            return speed_decision, "1.1000000000000001"
+
+        def to_dict(self):
+            return {
+                "evidence_digest": self.evidence_digest,
+                "selected_delta_digest": self.selected_delta_digest,
+            }
+
+    def run_resident(plan, *, baseline_executor, candidate_executor, model_mount, deadline):
+        assert plan is harness.value.resident_speed_plan
+        assert plan is not harness.value.resident_audit_plan
+        harness.resident_speed_plans.append(plan)
+        assert baseline_executor is resident_baseline_executor
+        assert candidate_executor is harness.executor
+        assert model_mount is harness.value.model_mount
+        assert deadline == 100.0
+        harness.calls.append("resident.speed")
+        return crossover
+
+    def forbidden_legacy(*_args, **_kwargs):
+        raise AssertionError("resident v3 must not execute the legacy cold lifecycle")
+
+    def forbidden_projection(*_args, **_kwargs):
+        raise AssertionError("resident v3 must not execute legacy speed projection")
+
+    monkeypatch.setattr(runner, "ResidentMarginalLifecycleEvidence", FakeResidentLifecycle)
+    monkeypatch.setattr(runner, "ResidentSpeedWitness", FakeResidentSpeedWitness)
+    monkeypatch.setattr(runner, "run_resident_crossover_speed", run_resident)
+    monkeypatch.setattr(runner, "run_marginal_lifecycle", forbidden_legacy)
+    monkeypatch.setattr(runner, "project_marginal_speed", forbidden_projection)
+
+    published_stage_exits = []
+    stage_reference = EvidenceArtifactRef(
+        runner.STAGE_EXIT_DOMAIN,
+        _d("resident-stage-exit"),
+        2,
+        "application/json",
+        runner.STAGE_EXIT_SCHEMA,
+    )
+
+    def publish_stage(root, result):
+        assert root is harness.value.evidence_root
+        harness.calls.append("stage.publish")
+        published_stage_exits.append(result)
+        return stage_reference
+
+    def reopen_stage(root, reference, *, expected):
+        assert root is harness.value.evidence_root
+        assert reference == stage_reference
+        assert expected is harness.value
+        assert len(published_stage_exits) == 1
+        harness.calls.append("stage.reopen")
+        return published_stage_exits[0]
+
+    monkeypatch.setattr(runner, "publish_qualification_stage_exit", publish_stage)
+    monkeypatch.setattr(runner, "reopen_qualification_stage_exit", reopen_stage)
+
+    clock_values = iter((3.1, 3.4, 3.5, 3.6))
+    harness.executor.manager.clock = lambda: next(clock_values)
+    resident_baseline_executor = object.__new__(OCIEngineExecutor)
+    resident_baseline_executor.manager = SimpleNamespace(clock=lambda: 0.0)
+    return resident_baseline_executor, stage_reference, published_stage_exits
+
+
+def _run_resident_harness(harness: _Harness, resident_baseline_executor):
+    ids = iter(f"{index + 1:032x}" for index in range(16))
+    return runner.run_causal_qualification(
+        harness.value,
+        executor=harness.executor,
+        resident_baseline_executor=resident_baseline_executor,
+        entropy_provider=harness.entropy_provider,
+        hidden_judge=harness.hidden_judge,
+        deadline=100.0,
+        id_factory=lambda: next(ids),
+    )
+
+
+def test_resident_speed_fail_exits_before_audit_t_and_legacy_lifecycle(
+    monkeypatch,
+) -> None:
+    harness = _Harness(
+        monkeypatch,
+        graph=(QualificationDecision.PASS,),
+        speed=(QualificationDecision.PASS,),
+        quality=(QualificationDecision.PASS,),
+    )
+    baseline, stage_reference, exits = _install_resident_runner_path(
+        monkeypatch,
+        harness,
+        speed_decision=QualificationDecision.FAIL,
+        escalated=False,
+    )
+
+    reference = _run_resident_harness(harness, baseline)
+
+    assert reference == stage_reference
+    assert len(exits) == 1
+    assert exits[0].stage == "speed"
+    assert exits[0].decision is QualificationDecision.FAIL
+    assert harness.calls == [
+        "prevalidate",
+        "resident.speed",
+        "stage.publish",
+        "stage.reopen",
+    ]
+    assert harness.reference_calls == 0
+
+
+def test_resident_audit_fail_exits_before_t(monkeypatch) -> None:
+    harness = _Harness(
+        monkeypatch,
+        graph=(QualificationDecision.PASS,),
+        speed=(QualificationDecision.PASS,),
+        quality=(QualificationDecision.PASS,),
+        audit=(QualificationDecision.FAIL,),
+    )
+    baseline, stage_reference, exits = _install_resident_runner_path(
+        monkeypatch,
+        harness,
+        speed_decision=QualificationDecision.PASS,
+        escalated=False,
+    )
+
+    reference = _run_resident_harness(harness, baseline)
+
+    assert reference == stage_reference
+    assert len(exits) == 1
+    assert exits[0].stage == "audit"
+    assert exits[0].decision is QualificationDecision.FAIL
+    assert "audit" in harness.calls
+    assert "reference" not in harness.calls
+    assert "attempt.publish" not in harness.calls
+    assert harness.reference_calls == 0
+
+
+@pytest.mark.parametrize(
+    ("escalated", "quality", "expected_requests"),
+    (
+        (False, (QualificationDecision.PASS,), 1),
+        (
+            True,
+            (QualificationDecision.PASS, QualificationDecision.PASS),
+            2,
+        ),
+    ),
+)
+def test_resident_pass_uses_adaptive_t_coverage_without_legacy_speed_projection(
+    monkeypatch,
+    escalated: bool,
+    quality: tuple[QualificationDecision, ...],
+    expected_requests: int,
+) -> None:
+    harness = _Harness(
+        monkeypatch,
+        graph=(QualificationDecision.PASS,),
+        speed=(QualificationDecision.PASS,),
+        quality=quality,
+        repeat=escalated,
+    )
+    baseline, _stage_reference, exits = _install_resident_runner_path(
+        monkeypatch,
+        harness,
+        speed_decision=QualificationDecision.PASS,
+        escalated=escalated,
+    )
+
+    reference = _run_resident_harness(harness, baseline)
+
+    assert reference == harness.attempt_reference
+    assert reference.schema == runner.ATTEMPT_SCHEMA_V3
+    assert exits == []
+    assert harness.reference_request_counts == [expected_requests]
+    assert harness.reference_calls == 1
+    assert "resident.speed" in harness.calls
+    assert "lifecycle" not in harness.calls
+    assert not any(call.startswith("speed.") for call in harness.calls)
+    assert harness.published_attempt is not None
+    report = harness.published_attempt.reports[0]
+    assert (report.repeat_quality is not None) is escalated
+
+
+def test_resident_operational_timing_round_trip_and_total_budget() -> None:
+    timing = runner.QualificationTimingWitness(
+        _d("resident-policy"),
+        _d("resident-speed"),
+        _d("resident-audit"),
+        _d("resident-t"),
+        3_600,
+        10.0,
+        100.0,
+        101.0,
+        200.0,
+        201.0,
+        300.0,
+        301.0,
+    )
+    assert runner.QualificationTimingWitness.from_dict(timing.to_dict()) == timing
+    assert timing.digest
+
+    with pytest.raises(runner.QualificationRunnerError, match="total wall time"):
+        replace(
+            timing,
+            max_qualification_seconds=60,
+            qualification_completed_monotonic_s=301.0,
+        )
 
 
 def _discovery_harness(monkeypatch, tmp_path: Path) -> _Harness:
@@ -1691,3 +2023,545 @@ def test_reference_execution_witness_rejects_launch_and_causal_tamper(
         runner._validate_reference_execution(
             replace(honest, reference_execution=forged_witness), harness.value
         )
+
+
+def _typed_resident_qualification_input(
+    tmp_path: Path,
+    *,
+    candidate_lane: str = "right",
+) -> runner.CausalQualificationInput:
+    """Build the real registered-lane authority boundary for resident speed."""
+
+    from optima.eval.calibration import (
+        CalibrationContext,
+        CalibrationThresholdPolicy,
+    )
+    from optima.eval.crossover_runtime import (
+        ResidentArmPlan,
+        ResidentCrossoverPlan,
+        ResidentSpeedPolicy,
+    )
+    from optima.eval.marginal_runtime import (
+        MaterializedArmBinding,
+        prepare_marginal_runtime,
+    )
+    from optima.eval.oci_backend import expected_runtime_preflight
+    from optima.eval.qualification import (
+        GRAPH_EVIDENCE_DOMAIN,
+        GRAPH_EVIDENCE_MEDIA_TYPE,
+        GRAPH_EVIDENCE_SCHEMA,
+        GraphVerificationEvidenceRef,
+        QualificationProfile,
+        ReferenceManifest,
+    )
+    from tests.test_calibration import _manifest as calibration_manifest
+    from tests.test_marginal_runtime import _case
+    from tests.test_qualification import _requirement
+
+    if candidate_lane not in {"left", "right"}:
+        raise AssertionError("test candidate lane is unsupported")
+    baseline_lane = "left" if candidate_lane == "right" else "right"
+    case = _case(tmp_path / "runtime")
+
+    def logical_hardware(lane: str):
+        return replace(
+            case.launch.hardware,
+            device_policy_digest=_d(f"typed-resident-{lane}-device-policy"),
+        )
+
+    def physical_hardware(lane: str):
+        return replace(
+            case.baseline_binding.launch_binding.physical_hardware,
+            physical_gpu_ids=(("0",) if lane == "left" else ("1",)),
+            device_policy_digest=_d(f"typed-resident-{lane}-device-policy"),
+        )
+
+    candidate_hardware = logical_hardware(candidate_lane)
+    candidate_physical = physical_hardware(candidate_lane)
+    candidate_launch_policy_digest = _d(
+        f"typed-resident-{candidate_lane}-launch-policy"
+    )
+    baseline_launch_policy_digest = _d(
+        f"typed-resident-{baseline_lane}-launch-policy"
+    )
+    incumbent_launch = replace(
+        case.launch,
+        hardware=candidate_hardware,
+        resource_policy_digest=candidate_launch_policy_digest,
+    )
+    incumbent_binding = MaterializedArmBinding(
+        case.baseline_binding.tree,
+        replace(
+            case.baseline_binding.launch_binding,
+            physical_hardware=candidate_physical,
+        ),
+    )
+    candidate_binding = MaterializedArmBinding(
+        case.candidate_binding.tree,
+        replace(
+            case.candidate_binding.launch_binding,
+            physical_hardware=candidate_physical,
+        ),
+    )
+    baseline_session = replace(
+        case.session,
+        launch_digest=incumbent_launch.digest,
+        expected_preflight=expected_runtime_preflight(
+            incumbent_launch,
+            case.preflight,
+        ),
+    )
+    prepared = prepare_marginal_runtime(
+        case.arm,
+        catalog=case.catalog,
+        expected_context=case.context,
+        incumbent_launch=incumbent_launch,
+        incumbent_binding=incumbent_binding,
+        candidate_binding=candidate_binding,
+        baseline_session_plan=baseline_session,
+    )
+    candidate = prepared.candidates[0]
+    runtime_policy_digest = _d(
+        f"typed-resident-{candidate_lane}-runtime-policy"
+    )
+    baseline_runtime_policy_digest = _d(
+        f"typed-resident-{baseline_lane}-runtime-policy"
+    )
+
+    requirement = _requirement(atomic=False)
+    requirement = replace(
+        requirement,
+        binding=replace(
+            requirement.binding,
+            marginal_arm_digest=candidate.arm.digest,
+            candidate_launch_digest=candidate.launch.digest,
+            contribution_ref_digest=candidate.arm.transition.replacement.digest,
+            selected_delta_digest=candidate.arm.selected_delta_digest,
+            target_id=candidate.arm.transition.target_id,
+            target_spec_digest=candidate.arm.transition.target_spec_digest,
+            catalog_digest=candidate.arm.candidate.catalog_digest,
+        ),
+    )
+    workload_digest = runner.marginal_workload_digest(
+        prepared.baseline_session_plan
+    )
+    reference = ReferenceManifest.from_pristine(
+        case.incumbent,
+        prepared.baseline_launch,
+        prepared.incumbent_binding,
+        workload_digest=workload_digest,
+        tokenizer_digest=_d(f"typed-resident-{candidate_lane}-tokenizer"),
+        hidden_corpus_commitment=_d(
+            f"typed-resident-{candidate_lane}-hidden-corpus"
+        ),
+        hidden_judge_digest=_d(
+            f"typed-resident-{candidate_lane}-hidden-judge"
+        ),
+        selection_policy_digest=_d(
+            f"typed-resident-{candidate_lane}-selection-policy"
+        ),
+    )
+    resident_baseline_launch = replace(
+        prepared.baseline_launch,
+        hardware=logical_hardware(baseline_lane),
+        resource_policy_digest=baseline_launch_policy_digest,
+    )
+    resident_baseline_plan = replace(
+        prepared.baseline_session_plan,
+        launch_digest=resident_baseline_launch.digest,
+        expected_preflight=expected_runtime_preflight(
+            resident_baseline_launch,
+            case.preflight,
+        ),
+    )
+    baseline_arm = ResidentArmPlan(
+        resident_baseline_launch,
+        replace(
+            prepared.incumbent_binding.launch_binding,
+            physical_hardware=physical_hardware(baseline_lane),
+        ),
+        resident_baseline_plan,
+        _d(f"typed-resident-{baseline_lane}-namespace"),
+        baseline_runtime_policy_digest,
+        _d(f"typed-resident-{baseline_lane}-device-configuration"),
+    )
+    candidate_arm = ResidentArmPlan(
+        candidate.launch,
+        candidate.binding.launch_binding,
+        candidate.session_plan,
+        _d(f"typed-resident-{candidate_lane}-namespace"),
+        runtime_policy_digest,
+        _d(f"typed-resident-{candidate_lane}-device-configuration"),
+    )
+    calibration_context = CalibrationContext(
+        reference.digest,
+        reference.arena_digest,
+        reference.runtime_digest,
+        reference.base_engine_digest,
+        reference.model_revision_digest,
+        reference.model_manifest_digest,
+        reference.model_content_digest,
+        reference.logical_hardware_digest,
+        reference.workload_digest,
+        requirement.binding.verification_policy_digest,
+        reference.controller_distribution_digest,
+    )
+    calibration = replace(
+        calibration_manifest(),
+        context=calibration_context,
+        raw_evidence_digest=_d(
+            f"typed-resident-{candidate_lane}-calibration-raw"
+        ),
+    )
+    threshold_policy = CalibrationThresholdPolicy.from_manifest(calibration)
+    resident_plan = ResidentCrossoverPlan(
+        candidate.arm.selected_delta_digest,
+        baseline_arm,
+        candidate_arm,
+        ResidentSpeedPolicy.from_calibration(
+            max_stage_seconds=60,
+            calibration=calibration,
+            context=calibration_context,
+        ),
+    )
+    profile = QualificationProfile(
+        reference,
+        calibration_context.digest,
+        calibration.digest,
+        requirement.digest,
+        tuple(row.name for row in calibration.quality_metrics),
+        "2",
+        prepared.baseline_session_plan.max_new_tokens,
+        prepared.baseline_session_plan.top_logprobs_num,
+        1,
+        _d("typed-resident-support-policy"),
+        _d("typed-resident-hidden-task-policy"),
+        runtime_policy_digest,
+        True,
+        2,
+    )
+    graph_evidence_ref = GraphVerificationEvidenceRef(
+        requirement.binding,
+        requirement.digest,
+        _d(f"typed-resident-{candidate_lane}-graph-raw"),
+    )
+    authority = runner.CandidateQualificationAuthority(
+        candidate.arm.selected_delta_digest,
+        profile,
+        requirement,
+        EvidenceArtifactRef(
+            GRAPH_EVIDENCE_DOMAIN,
+            _d(f"typed-resident-{candidate_lane}-graph-artifact"),
+            1,
+            GRAPH_EVIDENCE_MEDIA_TYPE,
+            GRAPH_EVIDENCE_SCHEMA,
+        ),
+        graph_evidence_ref,
+    )
+    secret = (f"typed resident {candidate_lane} qualification secret").encode()
+    commitment = SelectionCommitment.seal(
+        source_plan_digest=prepared.source.digest,
+        reference_manifest=reference,
+        entropy_source_digest=reference.selection_policy_digest,
+        prompt_digests=runner._planned_prompt_digests(prepared),
+        select_count=2,
+        secret=secret,
+    )
+    audit_policy = runner.SlotAuditPolicy(
+        "1" * 32,
+        250_000,
+        32,
+        (requirement.binding.members[0].slot_id,),
+        prepared.baseline_session_plan.engine_config.tp_size,
+    )
+    resident_audit_plan = replace(
+        candidate.session_plan,
+        prompt_batches=(
+            *candidate.session_plan.prompt_batches,
+            candidate.session_plan.prompt_batches[-1],
+        ),
+        audit_policy=audit_policy,
+    )
+    return runner.CausalQualificationInput(
+        prepared=prepared,
+        model_mount=case.mount,
+        candidates=(authority,),
+        commitment=commitment,
+        selection_secret=secret,
+        evidence_root=tmp_path,
+        calibration_threshold_policy=threshold_policy,
+        calibration_manifest=calibration,
+        calibration_context=calibration_context,
+        calibration_artifact_ref=EvidenceArtifactRef(
+            "qualification-calibration",
+            _d(f"typed-resident-{candidate_lane}-calibration-artifact"),
+            1,
+            "application/json",
+            "calibration-evidence-set-v1",
+        ),
+        pristine_stack=case.incumbent,
+        pristine_launch=prepared.baseline_launch,
+        pristine_binding=prepared.incumbent_binding.launch_binding,
+        reference_engine_config=prepared.baseline_session_plan.engine_config,
+        reference_preflight=prepared.baseline_session_plan.expected_preflight,
+        expected_launch_resource_policy_digest=(
+            prepared.baseline_launch.resource_policy_digest
+        ),
+        expected_runtime_resource_policy_digest=runtime_policy_digest,
+        expected_device_policy_digest=(
+            prepared.baseline_launch.hardware.device_policy_digest
+        ),
+        audit_policies=(audit_policy,),
+        speed_evidence_policy=runner.SpeedEvidencePolicy.resident(),
+        resident_speed_plan=resident_plan,
+        resident_audit_plan=resident_audit_plan,
+    )
+
+
+def test_typed_resident_input_derives_calibration_from_candidate_reference(
+    tmp_path: Path,
+) -> None:
+    value = _typed_resident_qualification_input(tmp_path)
+    plan = value.resident_speed_plan
+    assert plan is not None
+    reference = value.candidates[0].profile.reference
+    verification_policy = value.candidates[0].graph_requirement.binding
+    assert (
+        plan.baseline.runtime_resource_policy_digest
+        != plan.candidate.runtime_resource_policy_digest
+    )
+    assert (
+        plan.baseline.launch.resource_policy_digest
+        != plan.candidate.launch.resource_policy_digest
+    )
+    assert value.calibration_context == runner.CalibrationContext(
+        reference.digest,
+        reference.arena_digest,
+        reference.runtime_digest,
+        reference.base_engine_digest,
+        reference.model_revision_digest,
+        reference.model_manifest_digest,
+        reference.model_content_digest,
+        reference.logical_hardware_digest,
+        reference.workload_digest,
+        verification_policy.verification_policy_digest,
+        reference.controller_distribution_digest,
+    )
+    assert reference.logical_hardware_digest == plan.candidate.launch.hardware.digest
+    assert reference.workload_digest == runner.marginal_workload_digest(
+        plan.baseline.session_plan
+    )
+    assert plan.policy.calibration_context_digest == value.calibration_context.digest
+
+
+def test_typed_resident_input_rejects_self_consistent_mismatched_context(
+    tmp_path: Path,
+) -> None:
+    from optima.eval.calibration import CalibrationThresholdPolicy
+    from optima.eval.crossover_runtime import ResidentSpeedPolicy
+
+    value = _typed_resident_qualification_input(tmp_path)
+    assert value.resident_speed_plan is not None
+    mismatched = replace(
+        value.calibration_context,
+        logical_hardware_digest=_d("wrong-resident-candidate-hardware"),
+    )
+    calibration = replace(value.calibration_manifest, context=mismatched)
+    policy = ResidentSpeedPolicy.from_calibration(
+        max_stage_seconds=value.resident_speed_plan.policy.max_stage_seconds,
+        max_qualification_seconds=(
+            value.resident_speed_plan.policy.max_qualification_seconds
+        ),
+        calibration=calibration,
+        context=mismatched,
+    )
+    profile = replace(
+        value.candidates[0].profile,
+        calibration_context_digest=mismatched.digest,
+        calibration_digest=calibration.digest,
+    )
+    authority = replace(value.candidates[0], profile=profile)
+
+    with pytest.raises(
+        runner.QualificationRunnerError,
+        match="resident speed plan differs from qualification authority",
+    ):
+        replace(
+            value,
+            candidates=(authority,),
+            calibration_threshold_policy=CalibrationThresholdPolicy.from_manifest(
+                calibration
+            ),
+            calibration_manifest=calibration,
+            calibration_context=mismatched,
+            resident_speed_plan=replace(
+                value.resident_speed_plan,
+                policy=policy,
+            ),
+        )
+
+
+def test_typed_resident_input_accepts_exact_swapped_lane_authority(
+    tmp_path: Path,
+) -> None:
+    primary = _typed_resident_qualification_input(
+        tmp_path / "primary",
+        candidate_lane="right",
+    )
+    reproduction = _typed_resident_qualification_input(
+        tmp_path / "reproduction",
+        candidate_lane="left",
+    )
+    assert primary.resident_speed_plan is not None
+    assert reproduction.resident_speed_plan is not None
+    primary_plan = primary.resident_speed_plan
+    reproduction_plan = reproduction.resident_speed_plan
+
+    assert (
+        primary_plan.baseline_lane_digest
+        == reproduction_plan.candidate_lane_digest
+    )
+    assert (
+        primary_plan.candidate_lane_digest
+        == reproduction_plan.baseline_lane_digest
+    )
+    assert (
+        primary.calibration_context.logical_hardware_digest
+        == primary_plan.candidate.launch.hardware.digest
+    )
+    assert (
+        reproduction.calibration_context.logical_hardware_digest
+        == reproduction_plan.candidate.launch.hardware.digest
+    )
+    assert primary.calibration_context != reproduction.calibration_context
+    assert primary.calibration_artifact_ref != reproduction.calibration_artifact_ref
+    assert (
+        primary.calibration_threshold_policy.speed,
+        primary.calibration_threshold_policy.quality_metrics,
+        primary.calibration_threshold_policy.familywise_z,
+        primary.calibration_manifest.controls,
+    ) == (
+        reproduction.calibration_threshold_policy.speed,
+        reproduction.calibration_threshold_policy.quality_metrics,
+        reproduction.calibration_threshold_policy.familywise_z,
+        reproduction.calibration_manifest.controls,
+    )
+
+
+def test_resident_audit_plan_is_distinct_and_bound_by_authority(
+    tmp_path: Path,
+) -> None:
+    value = _typed_resident_qualification_input(tmp_path)
+    audit_plan = value.resident_audit_plan
+    assert audit_plan is not None
+    assert audit_plan.audit_policy == value.audit_policies[0]
+    assert runner.marginal_workload_digest(audit_plan) != runner.marginal_workload_digest(
+        value.prepared.candidates[0].session_plan
+    )
+
+    changed_plan = replace(
+        audit_plan,
+        prompt_batches=(*audit_plan.prompt_batches, audit_plan.prompt_batches[-1]),
+    )
+    changed = replace(value, resident_audit_plan=changed_plan)
+    assert runner.qualification_authority_digest(changed) != (
+        runner.qualification_authority_digest(value)
+    )
+
+    with pytest.raises(
+        runner.QualificationRunnerError,
+        match="resident audit plan differs",
+    ):
+        replace(
+            value,
+            resident_audit_plan=replace(
+                value.prepared.candidates[0].session_plan,
+                audit_policy=value.audit_policies[0],
+            ),
+        )
+
+
+def test_resident_slot_audit_executes_the_sealed_audit_only_plan(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    value = _typed_resident_qualification_input(tmp_path)
+    audit_plan = value.resident_audit_plan
+    assert audit_plan is not None
+    timed_baseline = SimpleNamespace(session=SimpleNamespace(session_id="a" * 32))
+    timed_candidate = SimpleNamespace(session=SimpleNamespace(session_id="b" * 32))
+    lifecycle = object.__new__(runner.ResidentMarginalLifecycleEvidence)
+    object.__setattr__(
+        lifecycle,
+        "crossover",
+        SimpleNamespace(
+            baseline_execution=timed_baseline,
+            candidate_execution=timed_candidate,
+        ),
+    )
+    execution = SimpleNamespace(
+        session=SimpleNamespace(session_id="c" * 32),
+        resource_policy_digest=value.expected_runtime_resource_policy_digest,
+        device_receipts=(SimpleNamespace(completed_monotonic_s=9.0),),
+    )
+
+    class CapturingExecutor:
+        def __init__(self) -> None:
+            self.plans: list[object] = []
+
+        def execute(self, launch, binding, mount, plan, *, deadline):
+            assert launch is value.prepared.candidates[0].launch
+            assert binding is value.prepared.candidates[0].binding.launch_binding
+            assert mount is value.model_mount
+            assert deadline == 10.0
+            self.plans.append(plan)
+            return execution
+
+    witness = object()
+
+    def from_execution(observed, *, selected_delta_digest, policy):
+        assert observed is execution
+        assert selected_delta_digest == value.candidates[0].selected_delta_digest
+        assert policy == value.audit_policies[0]
+        return witness
+
+    monkeypatch.setattr(
+        runner.AuditWitness,
+        "from_execution",
+        staticmethod(from_execution),
+    )
+    executor = CapturingExecutor()
+    witnesses, completed = runner._run_slot_audits(
+        value,
+        lifecycle,
+        executor=executor,  # type: ignore[arg-type]
+        deadline=10.0,
+    )
+
+    assert executor.plans == [audit_plan]
+    assert executor.plans[0] is not value.prepared.candidates[0].session_plan
+    assert witnesses == {value.candidates[0].selected_delta_digest: witness}
+    assert completed == 9.0
+
+
+def test_resident_audit_plan_is_not_used_by_speed_or_pristine_t(monkeypatch) -> None:
+    harness = _Harness(
+        monkeypatch,
+        graph=(QualificationDecision.PASS,),
+        speed=(QualificationDecision.PASS,),
+        quality=(QualificationDecision.PASS,),
+    )
+    baseline, _stage_reference, _exits = _install_resident_runner_path(
+        monkeypatch,
+        harness,
+        speed_decision=QualificationDecision.PASS,
+        escalated=False,
+    )
+    audit_plan = harness.value.resident_audit_plan
+
+    _run_resident_harness(harness, baseline)
+
+    assert harness.resident_speed_plans == [harness.value.resident_speed_plan]
+    assert audit_plan not in harness.resident_speed_plans
+    assert len(harness.reference_session_plans) == 1
+    assert harness.reference_session_plans[0] is not audit_plan

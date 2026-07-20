@@ -17,6 +17,7 @@ from optima.discovery_overlay import (
 )
 from optima.eval.oci_outer_session import (
     AttachedSessionTransport,
+    OpenedOuterSession,
     OuterSessionInfrastructureError,
     OuterSessionProcessError,
     OuterSessionProtocolError,
@@ -339,6 +340,108 @@ def test_happy_path_accepts_preflight_before_ready_and_returns_raw_host_interval
     )
     assert result.preflight == plan.expected_preflight
     assert result.discovery_activation is None
+
+
+def test_opened_session_runs_a_validated_prefix_without_reloading_engine() -> None:
+    clock = _Clock()
+    plan = _plan(
+        prompt_batches=(
+            ("warmup-a",),
+            ("warmup-b",),
+            ("timed-a",),
+            ("timed-b",),
+            ("timed-c",),
+        )
+    )
+    transport = _FakeTransport(clock, plan.expected_preflight)
+    session = OpenedOuterSession(
+        plan,
+        transport=transport,
+        deadline=1000.0,
+        init_timeout_s=30.0,
+        batch_timeout_s=30.0,
+        clock=clock,
+    )
+
+    session.start()
+    for expected_index in range(plan.warmup_count + 1):
+        assert session.execute_next().batch_index == expected_index
+    assert session.next_batch_index == 3
+    assert transport.started and not transport.finalized and not transport.aborted
+
+    receipt = session.finish(require_all=False)
+    assert tuple(row.batch_index for row in receipt.batches) == (0, 1, 2)
+    assert transport.finalized and not transport.aborted
+    with pytest.raises(OuterSessionInfrastructureError, match="not open"):
+        session.execute_next()
+
+
+def test_opened_session_cannot_finish_before_first_timed_batch() -> None:
+    clock = _Clock()
+    plan = _plan()
+    transport = _FakeTransport(clock, plan.expected_preflight)
+    session = OpenedOuterSession(
+        plan,
+        transport=transport,
+        deadline=1000.0,
+        init_timeout_s=30.0,
+        batch_timeout_s=30.0,
+        clock=clock,
+    )
+    session.start()
+    for _ in range(plan.warmup_count):
+        session.execute_next()
+
+    with pytest.raises(OuterSessionInfrastructureError, match="coverage"):
+        session.finish(require_all=False)
+    assert not transport.finalized and not transport.aborted
+    session.execute_next()
+    assert session.finish(require_all=False).batches[-1].batch_index == plan.warmup_count
+
+
+def test_opened_session_rejects_delayed_output_before_prefix_cleanup() -> None:
+    clock = _Clock()
+    plan = _plan()
+    # Startup probes=1..2, pre-request/response checks for three batches=3..8,
+    # and the final pre-cleanup probe=9.
+    transport = _FakeTransport(
+        clock, plan.expected_preflight, pending_calls={9}
+    )
+    session = OpenedOuterSession(
+        plan,
+        transport=transport,
+        deadline=1000.0,
+        init_timeout_s=30.0,
+        batch_timeout_s=30.0,
+        clock=clock,
+    )
+    session.start()
+    for _ in plan.prompt_batches:
+        session.execute_next()
+
+    with pytest.raises(OuterSessionProtocolError, match="before cleanup"):
+        session.finish(require_all=False)
+    assert transport.aborted and not transport.finalized
+
+
+def test_opened_session_abort_is_idempotent_and_terminal() -> None:
+    clock = _Clock()
+    plan = _plan()
+    transport = _FakeTransport(clock, plan.expected_preflight)
+    session = OpenedOuterSession(
+        plan,
+        transport=transport,
+        deadline=1000.0,
+        init_timeout_s=30.0,
+        batch_timeout_s=30.0,
+        clock=clock,
+    )
+    session.start()
+    session.abort()
+    session.abort()
+    assert transport.aborted and not transport.finalized
+    with pytest.raises(OuterSessionInfrastructureError, match="not open"):
+        session.execute_next()
 
 
 def test_audit_role_transports_policy_bound_raw_slot_rank_facts() -> None:

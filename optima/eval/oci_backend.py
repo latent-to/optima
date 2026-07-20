@@ -48,6 +48,7 @@ from optima.eval.native_artifact import (
 from optima.eval.oci_cpuset import validate_cpuset_pair
 from optima.eval.oci_outer_session import (
     AttachedSessionTransport,
+    OpenedOuterSession,
     OuterSessionError,
     SessionExecutionEvidence,
     SessionExecutionPlan,
@@ -727,6 +728,12 @@ class OuterSessionRunner(Protocol):
     def __call__(self, plan: SessionExecutionPlan, **kwargs: object) -> SessionExecutionEvidence: ...
 
 
+class OpenedSessionDriver(Protocol):
+    """Trusted host callback that drives one already-started resident engine."""
+
+    def __call__(self, session: OpenedOuterSession) -> SessionExecutionEvidence: ...
+
+
 class ReferenceSessionRunner(Protocol):
     def __call__(
         self, plan: ReferenceSessionPlan, **kwargs: object
@@ -1242,7 +1249,7 @@ class OCIEngineExecutor:
             value,
         )
 
-    def execute(
+    def _execute_ordinary(
         self,
         launch: EngineLaunchSpec,
         binding: TrustedLaunchBinding,
@@ -1250,6 +1257,7 @@ class OCIEngineExecutor:
         plan: SessionExecutionPlan,
         *,
         deadline: float,
+        opened_driver: OpenedSessionDriver | None,
     ) -> EngineExecutionEvidence:
         if not self._lock.acquire(blocking=False):
             raise OCIBackendError("one executor instance cannot run concurrent sessions")
@@ -1274,15 +1282,34 @@ class OCIEngineExecutor:
                     clock=self.manager.clock,
                 )
                 try:
-                    session = self.session_runner(
-                        plan,
-                        transport=transport,
-                        deadline=session_deadline,
-                        init_timeout_s=self.config.runtime.init_timeout_seconds,
-                        batch_timeout_s=self.config.runtime.batch_timeout_seconds,
-                        clock=self.manager.clock,
-                        boundary_callback=conditioner.boundary,
-                    )
+                    kwargs = {
+                        "transport": transport,
+                        "deadline": session_deadline,
+                        "init_timeout_s": self.config.runtime.init_timeout_seconds,
+                        "batch_timeout_s": self.config.runtime.batch_timeout_seconds,
+                        "clock": self.manager.clock,
+                        "boundary_callback": conditioner.boundary,
+                    }
+                    if opened_driver is None:
+                        session = self.session_runner(plan, **kwargs)
+                    else:
+                        controller = OpenedOuterSession(plan, **kwargs)
+                        controller.start()
+                        try:
+                            session = opened_driver(controller)
+                            if not controller.closed:
+                                raise OCIBackendError(
+                                    "opened session driver returned without closing the engine"
+                                )
+                            if (
+                                type(session) is not SessionExecutionEvidence
+                                or session.session_id != controller.session_id
+                            ):
+                                raise OCIBackendError(
+                                    "opened session driver returned another session receipt"
+                                )
+                        finally:
+                            controller.abort()
                     return session, conditioner.require_complete()
                 finally:
                     conditioner.cancel()
@@ -1317,7 +1344,11 @@ class OCIEngineExecutor:
             receipts = (raw.pre_receipt, active_receipt, raw.post_receipt)
             _validate_device_receipts(receipts, launch_id=raw.launch_id)
             return EngineExecutionEvidence(
-                "optima.oci-engine-execution.v1",
+                (
+                    "optima.oci-engine-execution.v1"
+                    if opened_driver is None
+                    else "optima.oci-resident-engine-execution.v1"
+                ),
                 launch.digest,
                 identity,
                 preflight.sha256,
@@ -1332,6 +1363,49 @@ class OCIEngineExecutor:
             )
         finally:
             self._lock.release()
+
+    def execute(
+        self,
+        launch: EngineLaunchSpec,
+        binding: TrustedLaunchBinding,
+        mount: TrustedArenaModelMountReceipt,
+        plan: SessionExecutionPlan,
+        *,
+        deadline: float,
+    ) -> EngineExecutionEvidence:
+        """Execute one complete ordinary session (the historical API)."""
+
+        return self._execute_ordinary(
+            launch,
+            binding,
+            mount,
+            plan,
+            deadline=deadline,
+            opened_driver=None,
+        )
+
+    def execute_opened(
+        self,
+        launch: EngineLaunchSpec,
+        binding: TrustedLaunchBinding,
+        mount: TrustedArenaModelMountReceipt,
+        plan: SessionExecutionPlan,
+        *,
+        deadline: float,
+        driver: OpenedSessionDriver,
+    ) -> EngineExecutionEvidence:
+        """Drive a resident engine incrementally while retaining normal teardown."""
+
+        if not callable(driver):
+            raise OCIBackendError("opened session driver must be callable")
+        return self._execute_ordinary(
+            launch,
+            binding,
+            mount,
+            plan,
+            deadline=deadline,
+            opened_driver=driver,
+        )
 
     def execute_reference(
         self,

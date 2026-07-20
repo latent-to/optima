@@ -15,7 +15,7 @@ import select
 import struct
 import time
 from dataclasses import dataclass
-from typing import Callable, Protocol, Sequence
+from typing import Callable, NoReturn, Protocol, Sequence
 
 from optima.discovery_overlay import DiscoveryActivationReceipt
 from optima.eval.oci_process import (
@@ -591,6 +591,331 @@ def _fresh_id(seen: set[str]) -> str:
     return value
 
 
+class OpenedOuterSession:
+    """Incremental trusted-host controller for one already-open engine lifetime.
+
+    The plan is validated in full before ``start``. Callers may inspect retained
+    batch evidence between ``execute_next`` calls, but only ``finish`` returns a
+    session receipt. The compatibility runner below still requires every planned
+    batch; crossover scheduling may close a validated prefix after its first read.
+    """
+
+    def __init__(
+        self,
+        plan: SessionExecutionPlan,
+        *,
+        transport: SessionTransport,
+        deadline: float,
+        init_timeout_s: float,
+        batch_timeout_s: float,
+        clock: Callable[[], float] = time.monotonic,
+        boundary_callback: BoundaryCallback | None = None,
+    ) -> None:
+        if type(plan) is not SessionExecutionPlan:
+            raise OuterSessionInfrastructureError("session plan is not typed")
+        started_at = _now(clock)
+        for name, value in (
+            ("deadline", deadline),
+            ("init_timeout_s", init_timeout_s),
+            ("batch_timeout_s", batch_timeout_s),
+        ):
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(float(value))
+                or (name == "deadline" and value <= started_at)
+                or (name != "deadline" and value <= 0)
+            ):
+                raise OuterSessionInfrastructureError(f"{name} is invalid")
+        self.plan = plan
+        self.transport = transport
+        self.deadline = float(deadline)
+        self.init_timeout_s = float(init_timeout_s)
+        self.batch_timeout_s = float(batch_timeout_s)
+        self.clock = clock
+        self.boundary_callback = boundary_callback
+        self.started_at = started_at
+        self.seen: set[str] = set()
+        self.session_id = _fresh_id(self.seen)
+        self.batch_rows: list[BatchExecutionEvidence] = []
+        self.conditioning_start_index = plan.warmup_count - plan.conditioning_count
+        self.conditioning_started_at: float | None = None
+        self.first_timed_completed_at: float | None = None
+        self.preflight: RuntimePreflightFacts | None = None
+        self.discovery_activation: DiscoveryActivationReceipt | None = None
+        self.ready_completed_at = 0.0
+        self.last_host_time = started_at
+        self.started = False
+        self.closed = False
+
+    @property
+    def next_batch_index(self) -> int:
+        return len(self.batch_rows)
+
+    def _phase_deadline(self, limit: float) -> float:
+        return min(self.deadline, _now(self.clock) + limit)
+
+    def _fail(self, original: BaseException) -> NoReturn:
+        if isinstance(original, OuterSessionError):
+            original.attach_diagnostic(diagnostic_provider(self.transport))
+        try:
+            self.transport.abort()
+        except BaseException as cleanup:
+            error = OuterSessionInfrastructureError(
+                f"session cleanup could not be proven: {cleanup}"
+            )
+            error.attach_diagnostic(diagnostic_provider(self.transport))
+            self.closed = True
+            raise error from original
+        self.closed = True
+        raise original
+
+    def start(self) -> None:
+        if self.started or self.closed:
+            raise OuterSessionInfrastructureError("session start order is invalid")
+        try:
+            self.transport.start()
+            if self.transport.has_pending_output():
+                raise OuterSessionProtocolError("worker emitted output before init")
+            init_deadline = self._phase_deadline(self.init_timeout_s)
+            init = make_init(
+                self.plan.engine_config,
+                session_id=self.session_id,
+                launch_digest=self.plan.launch_digest,
+                expected_engine_config_digest=self.plan.expected_engine_config_digest,
+                audit_policy=self.plan.audit_policy,
+            )
+            self.transport.write_frame(
+                frame_message(init, max_bytes=MAX_INIT_BYTES), deadline=init_deadline
+            )
+            try:
+                self.preflight = validate_preflight(
+                    _control_or_error(
+                        self.transport,
+                        session_id=self.session_id,
+                        launch_digest=self.plan.launch_digest,
+                        deadline=init_deadline,
+                    ),
+                    session_id=self.session_id,
+                    launch_digest=self.plan.launch_digest,
+                    expected_facts=self.plan.expected_preflight,
+                )
+            except (
+                SessionProtocolError,
+                OuterSessionProtocolError,
+                OuterSessionWorkerError,
+            ) as exc:
+                detail = exc.message if isinstance(exc, OuterSessionError) else str(exc)
+                raise OuterSessionInfrastructureError(
+                    f"runtime preflight failed: {detail}",
+                    diagnostic_provider(self.transport),
+                ) from None
+            self.transport.write_frame(
+                frame_message(
+                    preflight_accept_message(
+                        session_id=self.session_id,
+                        launch_digest=self.plan.launch_digest,
+                        facts=self.preflight,
+                    ),
+                    max_bytes=MAX_CONTROL_BYTES,
+                ),
+                deadline=init_deadline,
+            )
+            ready = _control_or_error(
+                self.transport,
+                session_id=self.session_id,
+                launch_digest=self.plan.launch_digest,
+                deadline=init_deadline,
+            )
+            try:
+                expected_identity = self.plan.expected_discovery_overlay_identity_digest
+                self.discovery_activation = validate_ready(
+                    ready,
+                    session_id=self.session_id,
+                    launch_digest=self.plan.launch_digest,
+                    expected_discovery_identity_digest=expected_identity,
+                    expected_discovery_tp_size=(
+                        self.plan.engine_config.tp_size
+                        if expected_identity is not None
+                        else None
+                    ),
+                    expected_discovery_sglang_version=(
+                        self.plan.expected_preflight.sglang_version
+                        if expected_identity is not None
+                        else None
+                    ),
+                )
+            except SessionProtocolError as exc:
+                raise OuterSessionProtocolError(str(exc)) from None
+            self.ready_completed_at = _now(self.clock, previous=self.started_at)
+            self.last_host_time = self.ready_completed_at
+            if self.conditioning_start_index == 0:
+                self.conditioning_started_at = self.ready_completed_at
+            if self.transport.has_pending_output():
+                raise OuterSessionProtocolError(
+                    "worker emitted output before first request"
+                )
+            self.started = True
+        except BaseException as exc:
+            self._fail(exc)
+
+    def execute_next(self) -> BatchExecutionEvidence:
+        if not self.started or self.closed:
+            raise OuterSessionInfrastructureError("session is not open")
+        index = self.next_batch_index
+        if index >= len(self.plan.prompt_batches):
+            raise OuterSessionInfrastructureError("session has no remaining planned batch")
+        prompts = self.plan.prompt_batches[index]
+        try:
+            request_id, nonce = _fresh_id(self.seen), _fresh_id(self.seen)
+            request = validate_batch_request(
+                batch_request(
+                    session_id=self.session_id,
+                    launch_digest=self.plan.launch_digest,
+                    request_id=request_id,
+                    nonce=nonce,
+                    batch_index=index,
+                    prompts=prompts,
+                    max_new_tokens=self.plan.max_new_tokens,
+                    top_logprobs_num=self.plan.top_logprobs_num,
+                    temperature=self.plan.temperature,
+                )
+            )
+            final_warmup = index == self.plan.warmup_count - 1
+            first_timed = index == self.plan.warmup_count
+            if final_warmup and self.boundary_callback is not None:
+                self.boundary_callback("before_final_warmup", index, self.deadline)
+            if first_timed and self.boundary_callback is not None:
+                self.boundary_callback("before_first_timed", index, self.deadline)
+            if self.transport.has_pending_output():
+                raise OuterSessionProtocolError("worker emitted early or duplicate output")
+            batch_deadline = self._phase_deadline(self.batch_timeout_s)
+            request_started = _now(self.clock, previous=self.last_host_time)
+            self.transport.write_frame(
+                frame_message(request.to_dict(), max_bytes=MAX_BATCH_REQUEST_BYTES),
+                deadline=batch_deadline,
+            )
+            evidence = self.transport.read_evidence(request, deadline=batch_deadline)
+            audit_receipts: tuple[AuditReceiptFacts, ...] = ()
+            if self.plan.audit_policy is not None:
+                try:
+                    audit_receipts = validate_audit_evidence(
+                        _control_or_error(
+                            self.transport,
+                            session_id=self.session_id,
+                            launch_digest=self.plan.launch_digest,
+                            deadline=batch_deadline,
+                        ),
+                        request=request,
+                        policy=self.plan.audit_policy,
+                    )
+                except SessionProtocolError as exc:
+                    raise OuterSessionProtocolError(str(exc)) from None
+            completed = _now(self.clock, previous=request_started)
+            if completed <= request_started:
+                raise OuterSessionInfrastructureError("host batch clock did not advance")
+            token_numerator = len(prompts) * self.plan.max_new_tokens
+            if evidence.observed_tokens != token_numerator:
+                raise OuterSessionProtocolError("worker evidence token count is not exact")
+            row = BatchExecutionEvidence(
+                index,
+                request_id,
+                nonce,
+                request_started,
+                completed,
+                token_numerator,
+                evidence,
+                audit_receipts,
+            )
+            self.batch_rows.append(row)
+            self.last_host_time = completed
+            if index + 1 == self.conditioning_start_index:
+                self.conditioning_started_at = completed
+            if final_warmup and self.boundary_callback is not None:
+                self.boundary_callback("after_final_warmup", index, self.deadline)
+            if first_timed:
+                self.first_timed_completed_at = completed
+            if self.transport.has_pending_output():
+                raise OuterSessionProtocolError(
+                    "worker emitted trailing or duplicate output"
+                )
+            return row
+        except BaseException as exc:
+            self._fail(exc)
+
+    def finish(self, *, require_all: bool = True) -> SessionExecutionEvidence:
+        if type(require_all) is not bool or not self.started or self.closed:
+            raise OuterSessionInfrastructureError("session finish order is invalid")
+        minimum = self.plan.warmup_count + 1
+        if len(self.batch_rows) < minimum or (
+            require_all and len(self.batch_rows) != len(self.plan.prompt_batches)
+        ):
+            raise OuterSessionInfrastructureError(
+                "session lacks the required planned batch coverage"
+            )
+        try:
+            if self.transport.has_pending_output():
+                raise OuterSessionProtocolError(
+                    "worker emitted trailing or duplicate output before cleanup"
+                )
+            if _now(self.clock, previous=self.last_host_time) >= self.deadline:
+                raise OuterSessionTimeoutError("session deadline expired before cleanup")
+            self.transport.finalize()
+            session_completed_at = _now(
+                self.clock, previous=self.batch_rows[-1].response_completed_at
+            )
+            if session_completed_at > self.deadline:
+                raise OuterSessionTimeoutError(
+                    "session cleanup exceeded its absolute deadline"
+                )
+        except BaseException as exc:
+            self._fail(exc)
+        self.closed = True
+        if (
+            self.preflight is None
+            or self.conditioning_started_at is None
+            or self.first_timed_completed_at is None
+        ):
+            raise OuterSessionInfrastructureError(
+                "session lacks required conditioning evidence"
+            )
+        conditioning_tokens = sum(
+            row.token_numerator
+            for row in self.batch_rows[
+                self.conditioning_start_index : self.plan.warmup_count + 1
+            ]
+        )
+        if self.first_timed_completed_at <= self.conditioning_started_at:
+            raise OuterSessionInfrastructureError(
+                "conditioning interval did not advance"
+            )
+        return SessionExecutionEvidence(
+            session_id=self.session_id,
+            launch_digest=self.plan.launch_digest,
+            preflight=self.preflight,
+            ready_completed_at=self.ready_completed_at,
+            batches=tuple(self.batch_rows),
+            warmup_count=self.plan.warmup_count,
+            conditioning_count=self.plan.conditioning_count,
+            conditioning_started_at=self.conditioning_started_at,
+            first_timed_completed_at=self.first_timed_completed_at,
+            conditioning_token_numerator=conditioning_tokens,
+            session_completed_at=session_completed_at,
+            discovery_activation=self.discovery_activation,
+            audit_policy_digest=(
+                None if self.plan.audit_policy is None else self.plan.audit_policy.digest
+            ),
+        )
+
+    def abort(self) -> None:
+        if self.closed:
+            return
+        try:
+            self.transport.abort()
+        finally:
+            self.closed = True
+
+
 def run_outer_session(
     plan: SessionExecutionPlan,
     *,
@@ -601,219 +926,18 @@ def run_outer_session(
     clock: Callable[[], float] = time.monotonic,
     boundary_callback: BoundaryCallback | None = None,
 ) -> SessionExecutionEvidence:
-    """Execute one session and return host-timed raw facts, then destroy it."""
+    """Execute every planned batch and destroy the engine (legacy wrapper)."""
 
-    if not isinstance(plan, SessionExecutionPlan):
-        raise OuterSessionInfrastructureError("session plan is not typed")
-    started_at = _now(clock)
-    for name, value in (
-        ("deadline", deadline),
-        ("init_timeout_s", init_timeout_s),
-        ("batch_timeout_s", batch_timeout_s),
-    ):
-        if (
-            isinstance(value, bool)
-            or not isinstance(value, (int, float))
-            or not math.isfinite(float(value))
-            or (name == "deadline" and value <= started_at)
-            or (name != "deadline" and value <= 0)
-        ):
-            raise OuterSessionInfrastructureError(f"{name} is invalid")
-    deadline = float(deadline)
-
-    def phase_deadline(limit: float) -> float:
-        return min(deadline, _now(clock) + float(limit))
-
-    seen: set[str] = set()
-    session_id = _fresh_id(seen)
-    batch_rows: list[BatchExecutionEvidence] = []
-    conditioning_start_index = plan.warmup_count - plan.conditioning_count
-    conditioning_started_at: float | None = None
-    first_timed_completed_at: float | None = None
-    preflight: RuntimePreflightFacts | None = None
-    ready_completed_at = 0.0
-    try:
-        transport.start()
-        if transport.has_pending_output():
-            raise OuterSessionProtocolError("worker emitted output before init")
-        init_deadline = phase_deadline(init_timeout_s)
-        init = make_init(
-            plan.engine_config,
-            session_id=session_id,
-            launch_digest=plan.launch_digest,
-            expected_engine_config_digest=plan.expected_engine_config_digest,
-            audit_policy=plan.audit_policy,
-        )
-        transport.write_frame(
-            frame_message(init, max_bytes=MAX_INIT_BYTES), deadline=init_deadline
-        )
-        try:
-            preflight = validate_preflight(
-                _control_or_error(
-                    transport,
-                    session_id=session_id,
-                    launch_digest=plan.launch_digest,
-                    deadline=init_deadline,
-                ),
-                session_id=session_id,
-                launch_digest=plan.launch_digest,
-                expected_facts=plan.expected_preflight,
-            )
-        except (SessionProtocolError, OuterSessionProtocolError, OuterSessionWorkerError) as exc:
-            detail = exc.message if isinstance(exc, OuterSessionError) else str(exc)
-            raise OuterSessionInfrastructureError(
-                f"runtime preflight failed: {detail}",
-                diagnostic_provider(transport),
-            ) from None
-        transport.write_frame(
-            frame_message(
-                preflight_accept_message(
-                    session_id=session_id,
-                    launch_digest=plan.launch_digest,
-                    facts=preflight,
-                ),
-                max_bytes=MAX_CONTROL_BYTES,
-            ),
-            deadline=init_deadline,
-        )
-        ready = _control_or_error(
-            transport,
-            session_id=session_id,
-            launch_digest=plan.launch_digest,
-            deadline=init_deadline,
-        )
-        try:
-            expected_identity = plan.expected_discovery_overlay_identity_digest
-            discovery_activation = validate_ready(
-                ready,
-                session_id=session_id,
-                launch_digest=plan.launch_digest,
-                expected_discovery_identity_digest=expected_identity,
-                expected_discovery_tp_size=(
-                    plan.engine_config.tp_size if expected_identity is not None else None
-                ),
-                expected_discovery_sglang_version=(
-                    plan.expected_preflight.sglang_version
-                    if expected_identity is not None
-                    else None
-                ),
-            )
-        except SessionProtocolError as exc:
-            raise OuterSessionProtocolError(str(exc)) from None
-        ready_completed_at = _now(clock, previous=started_at)
-        last_host_time = ready_completed_at
-        if conditioning_start_index == 0:
-            conditioning_started_at = ready_completed_at
-        if transport.has_pending_output():
-            raise OuterSessionProtocolError("worker emitted output before first request")
-
-        for index, prompts in enumerate(plan.prompt_batches):
-            request_id, nonce = _fresh_id(seen), _fresh_id(seen)
-            request = validate_batch_request(batch_request(
-                session_id=session_id,
-                launch_digest=plan.launch_digest,
-                request_id=request_id,
-                nonce=nonce,
-                batch_index=index,
-                prompts=prompts,
-                max_new_tokens=plan.max_new_tokens,
-                top_logprobs_num=plan.top_logprobs_num,
-                temperature=plan.temperature,
-            ))
-            final_warmup = index == plan.warmup_count - 1
-            first_timed = index == plan.warmup_count
-            if final_warmup and boundary_callback is not None:
-                boundary_callback("before_final_warmup", index, deadline)
-            if first_timed and boundary_callback is not None:
-                boundary_callback("before_first_timed", index, deadline)
-            if transport.has_pending_output():
-                raise OuterSessionProtocolError("worker emitted early or duplicate output")
-            batch_deadline = phase_deadline(batch_timeout_s)
-            request_started = _now(clock, previous=last_host_time)
-            transport.write_frame(
-                frame_message(request.to_dict(), max_bytes=MAX_BATCH_REQUEST_BYTES),
-                deadline=batch_deadline,
-            )
-            evidence = transport.read_evidence(request, deadline=batch_deadline)
-            audit_receipts: tuple[AuditReceiptFacts, ...] = ()
-            if plan.audit_policy is not None:
-                try:
-                    audit_receipts = validate_audit_evidence(
-                        _control_or_error(
-                            transport,
-                            session_id=session_id,
-                            launch_digest=plan.launch_digest,
-                            deadline=batch_deadline,
-                        ),
-                        request=request,
-                        policy=plan.audit_policy,
-                    )
-                except SessionProtocolError as exc:
-                    raise OuterSessionProtocolError(str(exc)) from None
-            completed = _now(clock, previous=request_started)
-            if completed <= request_started:
-                raise OuterSessionInfrastructureError("host batch clock did not advance")
-            last_host_time = completed
-            token_numerator = len(prompts) * plan.max_new_tokens
-            if evidence.observed_tokens != token_numerator:
-                raise OuterSessionProtocolError("worker evidence token count is not exact")
-            batch_rows.append(BatchExecutionEvidence(
-                index, request_id, nonce, request_started, completed,
-                token_numerator, evidence, audit_receipts,
-            ))
-            if index + 1 == conditioning_start_index:
-                conditioning_started_at = completed
-            if final_warmup and boundary_callback is not None:
-                boundary_callback("after_final_warmup", index, deadline)
-            if first_timed:
-                first_timed_completed_at = completed
-            if transport.has_pending_output():
-                raise OuterSessionProtocolError("worker emitted trailing or duplicate output")
-
-        # There is no close frame.  The host destroys the engine immediately after
-        # the final exact response and the manager proves process/container absence.
-        if _now(clock, previous=last_host_time) >= deadline:
-            raise OuterSessionTimeoutError("session deadline expired before cleanup")
-        transport.finalize()
-        session_completed_at = _now(clock, previous=batch_rows[-1].response_completed_at)
-        if session_completed_at > deadline:
-            raise OuterSessionTimeoutError("session cleanup exceeded its absolute deadline")
-    except BaseException as original:
-        if isinstance(original, OuterSessionError):
-            original.attach_diagnostic(diagnostic_provider(transport))
-        try:
-            transport.abort()
-        except BaseException as cleanup:
-            error = OuterSessionInfrastructureError(
-                f"session cleanup could not be proven: {cleanup}"
-            )
-            error.attach_diagnostic(diagnostic_provider(transport))
-            raise error from original
-        raise
-
-    if preflight is None or conditioning_started_at is None or first_timed_completed_at is None:
-        raise OuterSessionInfrastructureError("session lacks required conditioning evidence")
-    conditioning_end = plan.warmup_count
-    conditioning_tokens = sum(
-        row.token_numerator
-        for row in batch_rows[conditioning_start_index : conditioning_end + 1]
+    session = OpenedOuterSession(
+        plan,
+        transport=transport,
+        deadline=deadline,
+        init_timeout_s=init_timeout_s,
+        batch_timeout_s=batch_timeout_s,
+        clock=clock,
+        boundary_callback=boundary_callback,
     )
-    if first_timed_completed_at <= conditioning_started_at:
-        raise OuterSessionInfrastructureError("conditioning interval did not advance")
-    return SessionExecutionEvidence(
-        session_id=session_id,
-        launch_digest=plan.launch_digest,
-        preflight=preflight,
-        ready_completed_at=ready_completed_at,
-        batches=tuple(batch_rows),
-        warmup_count=plan.warmup_count,
-        conditioning_count=plan.conditioning_count,
-        conditioning_started_at=conditioning_started_at,
-        first_timed_completed_at=first_timed_completed_at,
-        conditioning_token_numerator=conditioning_tokens,
-        session_completed_at=session_completed_at,
-        discovery_activation=discovery_activation,
-        audit_policy_digest=(
-            None if plan.audit_policy is None else plan.audit_policy.digest
-        ),
-    )
+    session.start()
+    while session.next_batch_index < len(plan.prompt_batches):
+        session.execute_next()
+    return session.finish()

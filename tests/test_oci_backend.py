@@ -1099,6 +1099,103 @@ def test_execute_shares_deadline_and_returns_raw_triplet(
     ]
 
 
+def test_execute_opened_keeps_normal_isolation_and_teardown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    case = _case(tmp_path)
+    manager = _manager(case)
+    opened: list[object] = []
+
+    class FakeOpenedSession:
+        def __init__(self, plan: SessionExecutionPlan, **kwargs) -> None:
+            assert plan is case.plan
+            self.kwargs = kwargs
+            self.session_id = "1" * 32
+            self.closed = False
+            opened.append(self)
+
+        def start(self) -> None:
+            callback = self.kwargs["boundary_callback"]
+            deadline = self.kwargs["deadline"]
+            callback("before_final_warmup", 0, deadline)
+            callback("after_final_warmup", 0, deadline)
+            callback("before_first_timed", 1, deadline)
+
+        def finish(self, *, require_all: bool = True) -> SessionExecutionEvidence:
+            assert require_all is False
+            self.closed = True
+            return _session_evidence(case)
+
+        def abort(self) -> None:
+            self.closed = True
+
+    monkeypatch.setattr(backend, "OpenedOuterSession", FakeOpenedSession)
+    executor = OCIEngineExecutor(case.config, case.device_policy, manager=manager)
+    _install_execution_fakes(case, executor, monkeypatch)
+
+    def driver(session) -> SessionExecutionEvidence:
+        assert session is opened[0]
+        return session.finish(require_all=False)
+
+    result = executor.execute_opened(
+        case.launch,
+        case.binding,
+        case.mount,
+        case.plan,
+        deadline=200.0,
+        driver=driver,
+    )
+
+    assert result.schema == "optima.oci-resident-engine-execution.v1"
+    assert result.session == _session_evidence(case)
+    assert not tuple(manager.leases_root.glob("*.json"))
+    assert not tuple(manager.resources_root.iterdir())
+    assert executor.device_guard.deadlines == [  # type: ignore[attr-defined]
+        ("pre", 200.0),
+        ("active", 198.0),
+        ("post", 200.0),
+    ]
+
+
+def test_execute_opened_rejects_driver_that_leaves_engine_live(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    case = _case(tmp_path)
+    manager = _manager(case)
+
+    class FakeOpenedSession:
+        session_id = "1" * 32
+
+        def __init__(self, _plan: SessionExecutionPlan, **_kwargs) -> None:
+            self.closed = False
+
+        def start(self) -> None:
+            return None
+
+        def abort(self) -> None:
+            self.closed = True
+
+    monkeypatch.setattr(backend, "OpenedOuterSession", FakeOpenedSession)
+    executor = OCIEngineExecutor(case.config, case.device_policy, manager=manager)
+    _install_execution_fakes(case, executor, monkeypatch)
+
+    with pytest.raises(OCIBackendError, match="without closing"):
+        executor.execute_opened(
+            case.launch,
+            case.binding,
+            case.mount,
+            case.plan,
+            deadline=200.0,
+            driver=lambda _session: _session_evidence(case),
+        )
+    assert not tuple(manager.leases_root.glob("*.json"))
+    assert not tuple(manager.resources_root.iterdir())
+    assert executor.device_guard.deadlines == [  # type: ignore[attr-defined]
+        ("pre", 200.0),
+        ("post", 200.0),
+    ]
+
+
 def test_execute_failure_still_releases_lease_and_post_drains(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

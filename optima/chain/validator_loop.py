@@ -218,6 +218,7 @@ def _apply_qualification(
     batch = run_qualification_intake(
         work.factory,
         executor=work.executor,
+        resident_baseline_executor=work.resident_baseline_executor,
         entropy_provider=work.entropy_provider,
         hidden_judge=work.hidden_judge,
         deadline=float(work.deadline),

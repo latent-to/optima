@@ -17,6 +17,7 @@ from optima.eval.oci_process import (
     CommandResult,
     GPU_RESERVATION_ENV,
     GPU_RESERVATION_LABEL,
+    NAMESPACE_LABEL,
     OCIAttachedDiagnostic,
     OCIStderrArtifactReceipt,
     OCIQuiescenceReceipt,
@@ -39,6 +40,8 @@ class Commands:
         self.rows: list[tuple[str, ...]] = []
         self.present: set[str] = set()
         self.labels: dict[str, tuple[str, str]] = {}
+        self.namespace_labels: dict[str, str | None] = {}
+        self.default_namespace: str | None = None
         self.gpu_labels: dict[str, str] = {}
 
     def __call__(self, argv, *, timeout_s, max_output_bytes):
@@ -46,8 +49,29 @@ class Commands:
         self.rows.append(row)
         if row[1:3] == ("container", "ls"):
             names = [value for value in row if value.startswith("name=^/")]
-            present = bool(self.present) if not names else names[0][7:-1] in self.present
-            return CommandResult(0, (CONTAINER_ID + "\n").encode() if present else b"", b"")
+            labels = [value[6:] for value in row if value.startswith("label=")]
+            matching = []
+            for name in self.present:
+                if names and names[0][7:-1] != name:
+                    continue
+                executor, lease = self.labels.get(name, ("validator-a", "lease-1"))
+                observed = {
+                    "optima.executor_id": executor,
+                    "optima.lease_id": lease,
+                }
+                namespace = self.namespace_labels.get(name, self.default_namespace)
+                if namespace is not None:
+                    observed[NAMESPACE_LABEL] = namespace
+                parsed_labels = tuple(item.split("=", 1) for item in labels if "=" in item)
+                if len(parsed_labels) == len(labels) and all(
+                    observed.get(key) == value for key, value in parsed_labels
+                ):
+                    matching.append(name)
+            return CommandResult(
+                0,
+                (CONTAINER_ID + "\n").encode() if matching else b"",
+                b"",
+            )
         if row[1:3] == ("container", "inspect"):
             name = next(iter(self.present))
             executor, lease = self.labels.get(name, ("validator-a", "lease-1"))
@@ -55,6 +79,9 @@ class Commands:
                 "optima.executor_id": executor,
                 "optima.lease_id": lease,
             }
+            namespace = self.namespace_labels.get(name, self.default_namespace)
+            if namespace is not None:
+                labels[NAMESPACE_LABEL] = namespace
             if name in self.gpu_labels:
                 labels[GPU_RESERVATION_LABEL] = self.gpu_labels[name]
             payload = {
@@ -121,12 +148,15 @@ class FakeStream:
 
 
 def _manager(tmp_path: Path, commands: Commands | None = None) -> OCIProcessManager:
-    return OCIProcessManager(
+    selected = commands or Commands()
+    manager = OCIProcessManager(
         docker_binary="/usr/bin/docker",
         recovery_root=tmp_path / "recovery",
         executor_id="validator-a",
-        runner=commands or Commands(),
+        runner=selected,
     )
+    selected.default_namespace = manager.namespace_digest
+    return manager
 
 
 def test_register_writes_exact_lease_and_run_prefix(tmp_path: Path) -> None:
@@ -140,6 +170,7 @@ def test_register_writes_exact_lease_and_run_prefix(tmp_path: Path) -> None:
     assert json.loads(lease.record_path.read_text()) == {
         "schema": "optima.oci-process-lease.v1",
         "executor_id": "validator-a",
+        "namespace_digest": manager.namespace_digest,
         "lease_id": "lease-1",
         "container_name": "optima-prebuild-1",
         "mount_relpaths": ["mounts/work"],
@@ -151,6 +182,7 @@ def test_register_writes_exact_lease_and_run_prefix(tmp_path: Path) -> None:
         "--name=optima-prebuild-1",
         f"--cidfile={lease.cid_path}",
         "--label=optima.executor_id=validator-a",
+        f"--label={NAMESPACE_LABEL}={manager.namespace_digest}",
         "--label=optima.lease_id=lease-1",
     )
     assert lease.record_path.stat().st_mode & 0o777 == 0o600
@@ -172,6 +204,7 @@ def test_register_propagates_gpu_reservation_label(
         "--name=container-1",
         f"--cidfile={lease.cid_path}",
         "--label=optima.executor_id=validator-a",
+        f"--label={NAMESPACE_LABEL}={manager.namespace_digest}",
         "--label=optima.lease_id=lease-1",
         f"--label={GPU_RESERVATION_LABEL}={reservation_id}",
     )
@@ -217,6 +250,7 @@ def test_quiescence_receipt_requires_empty_executor_namespace(tmp_path: Path) ->
         runner=commands,
         clock=lambda: next(times),
     )
+    commands.default_namespace = manager.namespace_digest
     first = manager.prove_quiescent()
     second = manager.prove_quiescent()
     assert type(first) is OCIQuiescenceReceipt
@@ -265,6 +299,32 @@ def test_executor_namespace_has_one_live_manager_owner(tmp_path: Path) -> None:
     replacement = _manager(tmp_path)
     assert replacement.namespace_digest == manager.namespace_digest
     assert replacement.manager_instance_id != manager.manager_instance_id
+
+
+def test_quiescence_ignores_same_executor_in_another_recovery_namespace(
+    tmp_path: Path,
+) -> None:
+    commands = Commands()
+    first = OCIProcessManager(
+        docker_binary="/usr/bin/docker",
+        recovery_root=tmp_path / "first",
+        executor_id="validator-a",
+        runner=commands,
+    )
+    second = OCIProcessManager(
+        docker_binary="/usr/bin/docker",
+        recovery_root=tmp_path / "second",
+        executor_id="validator-a",
+        runner=commands,
+    )
+    assert first.namespace_digest != second.namespace_digest
+    commands.present.add("second-container")
+    commands.labels["second-container"] = ("validator-a", "second-lease")
+    commands.namespace_labels["second-container"] = second.namespace_digest
+
+    assert first.prove_quiescent().container_ids == ()
+    with pytest.raises(OCIProcessError, match="not quiescent"):
+        second.prove_quiescent()
 
 
 def test_quiescence_rejects_malformed_label_listing(tmp_path: Path) -> None:

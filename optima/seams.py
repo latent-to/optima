@@ -129,6 +129,14 @@ SEAM_ADAPTERS: tuple[SeamAdapter, ...] = (
     # processes because only scheduler_gate can create the pending marker.
     SeamAdapter("artifact_context", "sglang.srt.model_executor.model_runner",
                 "sglang_artifact_context", "ModelRunner.init_torch_distributed", ()),
+    # NOT a slot seam: the resident-SCREEN-tier hot-swap hook. Inert unless the
+    # validator sets OPTIMA_RESIDENT_SWAP (a control directory) — which only the
+    # persistent screening engine does, never qualification/crown launches. BEFORE
+    # hook on decode-graph (re)capture: applies a pending bundle swap in-process so
+    # the recapture warmup JIT-compiles the new kernel and the recorded graphs bake
+    # it in. See optima/integrations/sglang_resident_swap.py.
+    SeamAdapter("resident_swap", "sglang.srt.model_executor.model_runner",
+                "sglang_resident_swap", "ModelRunner.init_decode_cuda_graph", ()),
     # NOT a slot seam: the dep_patches runtime consume side. When the active bundle
     # declared dependency patches (materialized as a csrc OVERLAY by the reviewed
     # patcher — optima/patchers/apply_dep_patch.py), this adapter repoints

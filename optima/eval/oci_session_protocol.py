@@ -60,6 +60,7 @@ _ENGINE_KWARG_KINDS: Mapping[str, str] = {
     "chunked_prefill_size": "positive_int",
     "context_length": "positive_int",
     "cuda_graph_backend_prefill": "token",
+    "cuda_graph_bs": "int_list",
     "disable_radix_cache": "bool",
     "enable_flashinfer_allreduce_fusion": "bool",
     "kv_cache_dtype": "token",
@@ -67,6 +68,9 @@ _ENGINE_KWARG_KINDS: Mapping[str, str] = {
     "page_size": "positive_int",
     "quantization": "token",
     "trust_remote_code": "bool",
+    # Resident sessions recapture CUDA graphs on a LIVE scheduler loop; the
+    # default 300s watchdog kills the rank mid-capture (measured 2026-07-20).
+    "watchdog_timeout": "positive_int",
 }
 
 ENGINE_CONFIG_FIELDS = frozenset("""
@@ -429,6 +433,20 @@ def _validate_engine_kwargs(value: object) -> dict[str, object]:
             result[key] = _optional_token(item, field_name=field_name)
             if result[key] is None:
                 raise SessionProtocolError(f"{field_name} must not be null")
+        elif kind == "int_list":
+            if (
+                not isinstance(item, (list, tuple))
+                or not 1 <= len(item) <= 128
+                or any(
+                    type(value) is not int or not 1 <= value <= 16_777_216
+                    for value in item
+                )
+                or list(item) != sorted(set(item))
+            ):
+                raise SessionProtocolError(
+                    f"{field_name} must be a strictly increasing bounded int array"
+                )
+            result[key] = list(item)
         else:  # pragma: no cover - validator-owned table invariant
             raise AssertionError(f"unknown engine kwarg kind {kind!r}")
     return result
@@ -1047,6 +1065,185 @@ def validate_ready(
             "discovery ready activation differs from host policy"
         )
     return receipt
+
+
+CONTAINER_SWAP_INTAKE_PATH = "/optima/swap-intake"
+MAX_SWAP_SLOTS = 64
+MAX_SWAP_RANKS = 64
+
+
+@dataclass(frozen=True)
+class SwapRequest:
+    """One host-ordered resident-lane bundle swap (or return to stock).
+
+    ``bundle_digest`` names a content-addressed staged tree under the read-only
+    swap-intake mount; ``None`` returns the engine to stock dispatch.  The
+    worker must re-hash the staged tree against the digest before loading, so a
+    tampered mount fails closed.  ``generation`` is strictly increasing across
+    the session and binds every later batch to the kernel that was live.
+    """
+
+    session_id: str
+    launch_digest: str
+    request_id: str
+    nonce: str
+    swap_index: int
+    generation: int
+    bundle_digest: str | None
+
+    def __post_init__(self) -> None:
+        for name in ("session_id", "request_id", "nonce"):
+            object.__setattr__(self, name, _binding_id(getattr(self, name), field_name=name))
+        if len({self.session_id, self.request_id, self.nonce}) != 3:
+            raise SessionProtocolError("session_id, request_id, and nonce must be distinct")
+        object.__setattr__(self, "launch_digest", _digest(
+            self.launch_digest, field_name="launch_digest"
+        ))
+        object.__setattr__(self, "swap_index", _bounded_int(
+            self.swap_index, field_name="swap_index", minimum=0,
+            maximum=2_147_483_647,
+        ))
+        object.__setattr__(self, "generation", _bounded_int(
+            self.generation, field_name="generation", minimum=1,
+            maximum=2_147_483_647,
+        ))
+        if self.bundle_digest is not None:
+            object.__setattr__(self, "bundle_digest", _digest(
+                self.bundle_digest, field_name="bundle_digest"
+            ))
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "schema": SESSION_SCHEMA, "type": "swap_request",
+            "session_id": self.session_id, "launch_digest": self.launch_digest,
+            "request_id": self.request_id, "nonce": self.nonce,
+            "swap_index": self.swap_index, "generation": self.generation,
+            "bundle_digest": self.bundle_digest,
+        }
+
+
+_SWAP_REQUEST_FIELDS = frozenset("""
+bundle_digest generation launch_digest nonce request_id schema session_id
+swap_index type
+""".split())
+
+
+def swap_request(
+    *,
+    session_id: str,
+    launch_digest: str,
+    request_id: str,
+    nonce: str,
+    swap_index: int,
+    generation: int,
+    bundle_digest: str | None,
+) -> dict[str, object]:
+    return SwapRequest(
+        session_id, launch_digest, request_id, nonce, swap_index, generation,
+        bundle_digest,
+    ).to_dict()
+
+
+def validate_swap_request(message: object) -> SwapRequest:
+    row = _exact_object(message, fields=_SWAP_REQUEST_FIELDS, label="swap request")
+    if row["schema"] != SESSION_SCHEMA or row["type"] != "swap_request":
+        raise SessionProtocolError("swap request schema/type mismatch")
+    return SwapRequest(
+        row["session_id"], row["launch_digest"], row["request_id"], row["nonce"],
+        row["swap_index"], row["generation"], row["bundle_digest"],
+    )  # type: ignore[arg-type]
+
+
+_SWAP_EVIDENCE_FIELDS = frozenset("""
+bundle_digest generation launch_digest nonce rank_count request_id schema
+session_id slots swap_index type
+""".split())
+
+
+def _swap_slots(value: object) -> tuple[str, ...]:
+    if not isinstance(value, (tuple, list)) or len(value) > MAX_SWAP_SLOTS:
+        raise SessionProtocolError("swap slots must be a bounded array")
+    slots = tuple(value)
+    if slots != tuple(sorted(set(slots))) or any(
+        not isinstance(slot, str) or _TOKEN.fullmatch(slot) is None for slot in slots
+    ):
+        raise SessionProtocolError("swap slots must be sorted unique tokens")
+    return slots
+
+
+def swap_evidence_message(
+    *,
+    request: SwapRequest,
+    slots: Sequence[str],
+    rank_count: int,
+) -> dict[str, object]:
+    """The worker's post-swap report; carries no worker timing or verdict.
+
+    A worker sends this only after EVERY scheduler rank acknowledged the exact
+    generation with an identical slot set; any rank failure must surface as a
+    session error frame instead, leaving the registry empty (stock dispatch).
+    """
+
+    if type(request) is not SwapRequest:
+        raise SessionProtocolError("swap evidence binding is not exactly typed")
+    clean_slots = _swap_slots(tuple(slots))
+    if request.bundle_digest is None and clean_slots:
+        raise SessionProtocolError("stock swap evidence must register no slots")
+    if request.bundle_digest is not None and not clean_slots:
+        raise SessionProtocolError("bundle swap evidence must register slots")
+    return {
+        "bundle_digest": request.bundle_digest,
+        "generation": request.generation,
+        "launch_digest": request.launch_digest,
+        "nonce": request.nonce,
+        "rank_count": _bounded_int(
+            rank_count, field_name="swap rank_count", minimum=1,
+            maximum=MAX_SWAP_RANKS,
+        ),
+        "request_id": request.request_id,
+        "schema": SESSION_SCHEMA,
+        "session_id": request.session_id,
+        "slots": list(clean_slots),
+        "swap_index": request.swap_index,
+        "type": "swap_evidence",
+    }
+
+
+def validate_swap_evidence(
+    message: object,
+    *,
+    request: SwapRequest,
+    expected_rank_count: int,
+) -> tuple[str, ...]:
+    if type(request) is not SwapRequest:
+        raise SessionProtocolError("swap evidence expectation is not exactly typed")
+    expected_ranks = _bounded_int(
+        expected_rank_count, field_name="expected swap rank_count", minimum=1,
+        maximum=MAX_SWAP_RANKS,
+    )
+    row = _exact_object(message, fields=_SWAP_EVIDENCE_FIELDS, label="swap evidence")
+    expected = {
+        "bundle_digest": request.bundle_digest,
+        "generation": request.generation,
+        "launch_digest": request.launch_digest,
+        "nonce": request.nonce,
+        "rank_count": expected_ranks,
+        "request_id": request.request_id,
+        "schema": SESSION_SCHEMA,
+        "session_id": request.session_id,
+        "swap_index": request.swap_index,
+        "type": "swap_evidence",
+    }
+    if any(row[name] != value for name, value in expected.items()):
+        raise SessionProtocolError(
+            "swap evidence nonce/request/session/launch/generation binding mismatch"
+        )
+    slots = _swap_slots(row["slots"])
+    if request.bundle_digest is None and slots:
+        raise SessionProtocolError("stock swap evidence must register no slots")
+    if request.bundle_digest is not None and not slots:
+        raise SessionProtocolError("bundle swap evidence must register slots")
+    return slots
 
 
 _BATCH_REQUEST_FIELDS = frozenset("""

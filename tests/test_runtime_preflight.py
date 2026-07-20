@@ -70,7 +70,11 @@ class ControlRunner:
     def __init__(self):
         self.calls = []
         self.present = False
-        self.labels = ("preflight", "preflight-" + "1" * 20)
+        self.labels = (
+            "preflight",
+            "0" * 64,
+            "preflight-" + "1" * 20,
+        )
 
     def __call__(self, argv, *, timeout_s, max_output_bytes):
         row = tuple(argv)
@@ -80,7 +84,7 @@ class ControlRunner:
                 0, (CONTAINER_ID + "\n").encode() if self.present else b"", b""
             )
         if row[1:3] == ("container", "inspect"):
-            executor, lease = self.labels
+            executor, namespace, lease = self.labels
             return CommandResult(
                 0,
                 json.dumps(
@@ -89,6 +93,7 @@ class ControlRunner:
                         "Name": f"/{CONTAINER_NAME}",
                         "Labels": {
                             "optima.executor_id": executor,
+                            "optima.namespace_digest": namespace,
                             "optima.lease_id": lease,
                         },
                     }
@@ -339,6 +344,11 @@ def test_production_preflight_is_lease_owned_and_released(tmp_path, monkeypatch)
         executor_id="preflight",
         runner=controls,
     )
+    controls.labels = (
+        "preflight",
+        manager.namespace_digest,
+        "preflight-" + "1" * 20,
+    )
     runner = _successful_runner()
 
     receipt = run_runtime_preflight(
@@ -347,12 +357,13 @@ def test_production_preflight_is_lease_owned_and_released(tmp_path, monkeypatch)
 
     run_argv = runner.calls[1][0]
     lease_id = "preflight-" + "1" * 20
-    assert run_argv[:7] == (
+    assert run_argv[:8] == (
         DOCKER,
         "run",
         f"--name={CONTAINER_NAME}",
         f"--cidfile={manager.resources_root / lease_id / 'container.cid'}",
         "--label=optima.executor_id=preflight",
+        f"--label=optima.namespace_digest={manager.namespace_digest}",
         f"--label=optima.lease_id={lease_id}",
         "--rm",
     )
@@ -379,6 +390,11 @@ def test_leased_preflight_timeout_removes_exact_labeled_container(
         recovery_root=tmp_path / "recovery",
         executor_id="preflight",
         runner=controls,
+    )
+    controls.labels = (
+        "preflight",
+        manager.namespace_digest,
+        "preflight-" + "1" * 20,
     )
 
     class TimeoutRunner(ScriptedRunner):

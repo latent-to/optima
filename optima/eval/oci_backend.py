@@ -15,6 +15,7 @@ import math
 import os
 import re
 import secrets
+import shutil
 import stat
 import threading
 import time
@@ -48,6 +49,7 @@ from optima.eval.native_artifact import (
 from optima.eval.oci_cpuset import validate_cpuset_pair
 from optima.eval.oci_outer_session import (
     AttachedSessionTransport,
+    OpenedOuterSession,
     OuterSessionError,
     SessionExecutionEvidence,
     SessionExecutionPlan,
@@ -71,7 +73,15 @@ from optima.eval.oci_reference_session import (
     ReferenceSessionPlan,
     run_reference_session,
 )
-from optima.eval.oci_session_protocol import RuntimePreflightFacts
+from optima.eval.oci_resident_session import (
+    ResidentOuterSession,
+    ResidentSessionEvidence,
+    ResidentSessionPlan,
+)
+from optima.eval.oci_session_protocol import (
+    CONTAINER_SWAP_INTAKE_PATH,
+    RuntimePreflightFacts,
+)
 from optima.eval.runtime_preflight import (
     HOST_RECEIPT_SCHEMA,
     RuntimePreflightReceipt,
@@ -549,11 +559,16 @@ def build_runtime_argv(
     runtime: OCIRuntimeResourcePolicy,
     session_protocol: str = "ordinary",
     discovery_overlay_identity_digest: str | None = None,
+    swap_intake_root: Path | None = None,
 ) -> tuple[str, ...]:
     """Construct the exact runtime argv from trusted, already-reopened inputs."""
-    launch = resolved.spec
-    if session_protocol not in {"ordinary", "reference"}:
+    if session_protocol not in {"ordinary", "reference", "resident"}:
         raise OCIBackendError("runtime session protocol is not registered")
+    if (session_protocol == "resident") != (swap_intake_root is not None):
+        raise OCIBackendError(
+            "swap-intake mounts exist exactly for resident sessions"
+        )
+    launch = resolved.spec
     if preflight.local_image_id is None or _IMAGE_ID.fullmatch(preflight.local_image_id) is None:
         raise OCIBackendError("runtime preflight local image ID is malformed")
     artifact_destination = (
@@ -610,7 +625,9 @@ def build_runtime_argv(
             )
     else:
         if session_protocol != "ordinary":
-            raise OCIBackendError("reference runtime cannot activate discovery")
+            raise OCIBackendError(
+                "reference/resident runtimes cannot activate discovery"
+            )
         from optima.discovery import DiscoveryError, reopen_discovery_overlay
         from optima.discovery_overlay import ARMED, EXPECTED_IDENTITY
 
@@ -673,6 +690,11 @@ def build_runtime_argv(
         _mount(resolved.materialized_tree_root, CONTAINER_TREE, readonly=True),
         _mount(publication.root, artifact_destination, readonly=True),
         _mount(cache_root, CONTAINER_CACHE, readonly=False),
+        *(
+            (_mount(swap_intake_root, CONTAINER_SWAP_INTAKE_PATH, readonly=True),)
+            if swap_intake_root is not None
+            else ()
+        ),
     ]
     argv.extend(f"--env={key}={environment[key]}" for key in sorted(environment))
     argv.extend(
@@ -723,8 +745,44 @@ class PristineReferenceExecutionEvidence:
     session: ReferenceSessionEvidence
 
 
+@dataclass(frozen=True)
+class ResidentEngineExecutionEvidence:
+    """Raw evidence from one resident (hot-swap) engine lifetime.
+
+    Screen/routing tier: one stock launch served an ordered stream of swaps and
+    timed reads. Device state is proven pre/post the whole lifetime (like the
+    reference role); per-read noise policy lives in the queue layer's
+    bracketing, not in an active-conditioning receipt.
+    """
+
+    schema: str
+    launch_digest: str
+    runtime_identity: CandidateFreeRuntimeIdentity
+    runtime_preflight_receipt_sha256: str
+    arena_model_receipt_digest: str
+    resource_policy_digest: str
+    prebuild: OCIPrebuildResult
+    native_publication_digest: str
+    runtime_argv_sha256: str
+    recovered_lease_ids: tuple[str, ...]
+    device_receipts: tuple[DeviceStateReceipt, DeviceStateReceipt]
+    session: ResidentSessionEvidence
+
+
+class ResidentSessionDriver(Protocol):
+    """Trusted host callback that drives one open resident engine lifetime."""
+
+    def __call__(self, session: ResidentOuterSession) -> ResidentSessionEvidence: ...
+
+
 class OuterSessionRunner(Protocol):
     def __call__(self, plan: SessionExecutionPlan, **kwargs: object) -> SessionExecutionEvidence: ...
+
+
+class OpenedSessionDriver(Protocol):
+    """Trusted host callback that drives one already-started resident engine."""
+
+    def __call__(self, session: OpenedOuterSession) -> SessionExecutionEvidence: ...
 
 
 class ReferenceSessionRunner(Protocol):
@@ -1075,6 +1133,7 @@ class OCIEngineExecutor:
         session_protocol: str,
         discovery_overlay_identity_digest: str | None,
         run: Callable[[AttachedSessionTransport, float, str], object],
+        swap_intake_root: Path | None = None,
     ) -> _RawRuntimeExecution:
         """Own the common prebuild/lease/mount/teardown shell for ordinary and T."""
 
@@ -1099,16 +1158,19 @@ class OCIEngineExecutor:
             expected_publication_digest=prebuild.publication.publication_digest,
             limits=self.config.native_limits,
         )
-        if (
-            session_protocol == "reference"
-            and not _reference_publication_is_control_only(publication)
-        ):
-            raise OCIBackendError("pristine reference exposes candidate native artifacts")
+        if session_protocol in (
+            "reference",
+            "resident",
+        ) and not _reference_publication_is_control_only(publication):
+            raise OCIBackendError(
+                "stock-launched session exposes candidate native artifacts"
+            )
         _validate_mount_roots(
             model_root,
             resolved.materialized_tree_root,
             publication.root,
             self.config.prebuild.recovery_root,
+            *(() if swap_intake_root is None else (swap_intake_root,)),
         )
         launch_id = _new_runtime_id()
         pre_receipt = self.device_guard.before_launch(launch_id, deadline=absolute)
@@ -1150,11 +1212,13 @@ class OCIEngineExecutor:
                 expected_publication_digest=publication.publication_digest,
                 limits=self.config.native_limits,
             )
-            if session_protocol == "reference" and (
+            if session_protocol in ("reference", "resident") and (
                 resolved.materialized_tree.runtime_manifest is not None
                 or not _reference_publication_is_control_only(publication)
             ):
-                raise OCIBackendError("pristine reference inputs acquired contribution state")
+                raise OCIBackendError(
+                    "stock-launched session inputs acquired contribution state"
+                )
             reopen_launch_tree(launch, resolved.materialized_tree_root)
             argv = build_runtime_argv(
                 lease=lease,
@@ -1169,6 +1233,7 @@ class OCIEngineExecutor:
                 discovery_overlay_identity_digest=(
                     discovery_overlay_identity_digest
                 ),
+                swap_intake_root=swap_intake_root,
             )
             argv_digest = hashlib.sha256(
                 json.dumps(argv, separators=(",", ":")).encode("utf-8")
@@ -1242,7 +1307,7 @@ class OCIEngineExecutor:
             value,
         )
 
-    def execute(
+    def _execute_ordinary(
         self,
         launch: EngineLaunchSpec,
         binding: TrustedLaunchBinding,
@@ -1250,6 +1315,7 @@ class OCIEngineExecutor:
         plan: SessionExecutionPlan,
         *,
         deadline: float,
+        opened_driver: OpenedSessionDriver | None,
     ) -> EngineExecutionEvidence:
         if not self._lock.acquire(blocking=False):
             raise OCIBackendError("one executor instance cannot run concurrent sessions")
@@ -1274,15 +1340,34 @@ class OCIEngineExecutor:
                     clock=self.manager.clock,
                 )
                 try:
-                    session = self.session_runner(
-                        plan,
-                        transport=transport,
-                        deadline=session_deadline,
-                        init_timeout_s=self.config.runtime.init_timeout_seconds,
-                        batch_timeout_s=self.config.runtime.batch_timeout_seconds,
-                        clock=self.manager.clock,
-                        boundary_callback=conditioner.boundary,
-                    )
+                    kwargs = {
+                        "transport": transport,
+                        "deadline": session_deadline,
+                        "init_timeout_s": self.config.runtime.init_timeout_seconds,
+                        "batch_timeout_s": self.config.runtime.batch_timeout_seconds,
+                        "clock": self.manager.clock,
+                        "boundary_callback": conditioner.boundary,
+                    }
+                    if opened_driver is None:
+                        session = self.session_runner(plan, **kwargs)
+                    else:
+                        controller = OpenedOuterSession(plan, **kwargs)
+                        controller.start()
+                        try:
+                            session = opened_driver(controller)
+                            if not controller.closed:
+                                raise OCIBackendError(
+                                    "opened session driver returned without closing the engine"
+                                )
+                            if (
+                                type(session) is not SessionExecutionEvidence
+                                or session.session_id != controller.session_id
+                            ):
+                                raise OCIBackendError(
+                                    "opened session driver returned another session receipt"
+                                )
+                        finally:
+                            controller.abort()
                     return session, conditioner.require_complete()
                 finally:
                     conditioner.cancel()
@@ -1317,7 +1402,11 @@ class OCIEngineExecutor:
             receipts = (raw.pre_receipt, active_receipt, raw.post_receipt)
             _validate_device_receipts(receipts, launch_id=raw.launch_id)
             return EngineExecutionEvidence(
-                "optima.oci-engine-execution.v1",
+                (
+                    "optima.oci-engine-execution.v1"
+                    if opened_driver is None
+                    else "optima.oci-resident-engine-execution.v1"
+                ),
                 launch.digest,
                 identity,
                 preflight.sha256,
@@ -1332,6 +1421,49 @@ class OCIEngineExecutor:
             )
         finally:
             self._lock.release()
+
+    def execute(
+        self,
+        launch: EngineLaunchSpec,
+        binding: TrustedLaunchBinding,
+        mount: TrustedArenaModelMountReceipt,
+        plan: SessionExecutionPlan,
+        *,
+        deadline: float,
+    ) -> EngineExecutionEvidence:
+        """Execute one complete ordinary session (the historical API)."""
+
+        return self._execute_ordinary(
+            launch,
+            binding,
+            mount,
+            plan,
+            deadline=deadline,
+            opened_driver=None,
+        )
+
+    def execute_opened(
+        self,
+        launch: EngineLaunchSpec,
+        binding: TrustedLaunchBinding,
+        mount: TrustedArenaModelMountReceipt,
+        plan: SessionExecutionPlan,
+        *,
+        deadline: float,
+        driver: OpenedSessionDriver,
+    ) -> EngineExecutionEvidence:
+        """Drive a resident engine incrementally while retaining normal teardown."""
+
+        if not callable(driver):
+            raise OCIBackendError("opened session driver must be callable")
+        return self._execute_ordinary(
+            launch,
+            binding,
+            mount,
+            plan,
+            deadline=deadline,
+            opened_driver=driver,
+        )
 
     def execute_reference(
         self,
@@ -1409,6 +1541,195 @@ class OCIEngineExecutor:
             )
         finally:
             self._lock.release()
+
+    def execute_resident(
+        self,
+        launch: EngineLaunchSpec,
+        binding: TrustedLaunchBinding,
+        mount: TrustedArenaModelMountReceipt,
+        plan: ResidentSessionPlan,
+        *,
+        deadline: float,
+        swap_intake_root: str | Path,
+        driver: ResidentSessionDriver,
+    ) -> ResidentEngineExecutionEvidence:
+        """Launch ONE stock engine and drive a whole candidate queue through it.
+
+        The engine loads once per call; the driver issues swap/read verbs for
+        any number of candidates and must close the session before returning.
+        Swap timeouts reuse the init timeout: a swap is a graph recapture, which
+        is strictly cheaper than the engine boot the init timeout already
+        covers. Quiescence between queue passes is unchanged — teardown at the
+        end of this call proves the usual zero-state.
+        """
+
+        if not callable(driver):
+            raise OCIBackendError("resident session driver must be callable")
+        if type(plan) is not ResidentSessionPlan:
+            raise OCIBackendError("resident session plan has the wrong type")
+        if not self._lock.acquire(blocking=False):
+            raise OCIBackendError("one executor instance cannot run concurrent sessions")
+        try:
+            absolute = _deadline(deadline, clock=self.manager.clock)
+            recovered = self._recover_once()
+            resolved, preflight, identity, expected, model_root = (
+                self._validate_launch_identity(
+                    launch,
+                    binding,
+                    mount,
+                    engine_config_digest=plan.expected_engine_config_digest,
+                    engine_tp_size=plan.engine_config.tp_size,
+                    expected_preflight=plan.expected_preflight,
+                )
+            )
+            if plan.launch_digest != launch.digest:
+                raise OCIBackendError("resident session plan names another launch")
+            if resolved.materialized_tree.runtime_manifest is not None:
+                raise OCIBackendError(
+                    "resident launch tree contains a contribution manifest"
+                )
+            swap_root, _ = _reopen_directory(
+                swap_intake_root, field="swap intake root"
+            )
+
+            def run(
+                transport: AttachedSessionTransport,
+                session_deadline: float,
+                _launch_id: str,
+            ) -> ResidentSessionEvidence:
+                controller = ResidentOuterSession(
+                    plan,
+                    transport=transport,
+                    deadline=session_deadline,
+                    init_timeout_s=self.config.runtime.init_timeout_seconds,
+                    batch_timeout_s=self.config.runtime.batch_timeout_seconds,
+                    swap_timeout_s=self.config.runtime.init_timeout_seconds,
+                    clock=self.manager.clock,
+                )
+                controller.start()
+                try:
+                    session = driver(controller)
+                    if not controller.closed:
+                        raise OCIBackendError(
+                            "resident driver returned without closing the engine"
+                        )
+                    if (
+                        type(session) is not ResidentSessionEvidence
+                        or session.session_id != controller.session_id
+                    ):
+                        raise OCIBackendError(
+                            "resident driver returned another session receipt"
+                        )
+                finally:
+                    controller.abort()
+                return session
+
+            raw = self._execute_runtime(
+                launch,
+                binding,
+                mount,
+                absolute=absolute,
+                resolved=resolved,
+                preflight=preflight,
+                model_root=model_root,
+                session_protocol="resident",
+                discovery_overlay_identity_digest=None,
+                run=run,
+                swap_intake_root=swap_root,
+            )
+            if (
+                type(raw.value) is not ResidentSessionEvidence
+                or raw.value.launch_digest != launch.digest
+                or raw.value.preflight != expected
+            ):
+                raise OCIBackendError(
+                    "resident runtime returned malformed raw evidence"
+                )
+            receipts = (raw.pre_receipt, raw.post_receipt)
+            _validate_reference_device_receipts(receipts, launch_id=raw.launch_id)
+            return ResidentEngineExecutionEvidence(
+                "optima.oci-resident-queue-execution.v1",
+                launch.digest,
+                identity,
+                preflight.sha256,
+                mount.digest,
+                self.config.runtime.digest,
+                raw.prebuild,
+                raw.publication_digest,
+                raw.argv_digest,
+                recovered,
+                receipts,
+                raw.value,
+            )
+        finally:
+            self._lock.release()
+
+
+def stage_swap_bundle(
+    swap_intake_root: str | Path,
+    source_tree: str | Path,
+    *,
+    expected_digest: str | None = None,
+) -> str:
+    """Publish one validated worker tree into the content-addressed swap intake.
+
+    The destination is ``<swap_intake_root>/<content_hash>``, published by
+    atomic rename so the in-container worker never observes a partial tree.
+    The worker independently re-hashes before loading, so this helper is a
+    convenience, not a trust boundary.  Symlinks are preserved (not followed):
+    bundle identity skips them and the load-time scan rejects them, so a
+    symlinked source fails closed rather than folding foreign bytes in.
+
+    Worker-storage metadata is not part of bundle identity: the root-level
+    native-artifact receipt that immutable publication plants next to the
+    committed bytes is skipped, so staging from a worker publication
+    reproduces the chain-committed content hash exactly.  The digest is
+    computed over the staged COPY (the bytes actually published), never over
+    the source it was copied from.
+    """
+
+    from optima.bundle_hash import content_hash
+    from optima.eval.native_artifact import _MANIFEST as _PUBLICATION_RECEIPT
+
+    root, _ = _reopen_directory(swap_intake_root, field="swap intake root")
+    source, _ = _reopen_directory(source_tree, field="staged bundle source")
+
+    def _ignore_receipt(directory: str, names: list[str]) -> set[str]:
+        if Path(directory) == source:
+            return {name for name in names if name == _PUBLICATION_RECEIPT}
+        return set()
+
+    staging = root / f".staging-{secrets.token_hex(16)}"
+    try:
+        shutil.copytree(source, staging, symlinks=True, ignore=_ignore_receipt)
+        try:
+            digest = content_hash(staging)
+        except (OSError, ValueError) as exc:
+            raise OCIBackendError(
+                f"staged bundle source is unhashable: {exc}"
+            ) from None
+        if expected_digest is not None and digest != _digest(
+            expected_digest, field="expected bundle digest"
+        ):
+            raise OCIBackendError("staged bundle differs from its committed digest")
+        destination = root / digest
+        if destination.is_symlink():
+            raise OCIBackendError("swap intake destination must not be a symlink")
+        if destination.exists():
+            try:
+                if content_hash(destination) != digest:
+                    raise OCIBackendError(
+                        "swap intake already holds different bytes for this digest"
+                    )
+            except (OSError, ValueError) as exc:
+                raise OCIBackendError(
+                    f"existing staged bundle is unreadable: {exc}"
+                ) from None
+            return digest
+        os.rename(staging, destination)
+        return digest
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
 
 
 def _new_runtime_id() -> str:
@@ -1498,8 +1819,11 @@ __all__ = [
     "OCIEngineExecutor",
     "OCIRuntimeResourcePolicy",
     "PristineReferenceExecutionEvidence",
+    "ResidentEngineExecutionEvidence",
+    "ResidentSessionDriver",
     "TrustedArenaModelMountReceipt",
     "build_runtime_argv",
     "expected_runtime_preflight",
     "runtime_identity_from_preflight",
+    "stage_swap_bundle",
 ]

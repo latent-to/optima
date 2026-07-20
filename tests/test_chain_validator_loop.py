@@ -205,6 +205,7 @@ def test_live_loop_calls_batch_qualification_and_retains_fail_outcome(
     calls = []
     progress_events = []
     retained_blocks = []
+    resident_baseline_executor = object()
     service = object.__new__(ArenaService)
     service.manifest = type(
         "Manifest",
@@ -248,6 +249,7 @@ def test_live_loop_calls_batch_qualification_and_retains_fail_outcome(
             lambda **_: None,
             30.0,
             _self.manifest.qualification_policy_digest,
+            resident_baseline_executor,
         )
 
     monkeypatch.setattr(ArenaService, "plan_qualification", plan)
@@ -255,6 +257,9 @@ def test_live_loop_calls_batch_qualification_and_retains_fail_outcome(
     monkeypatch.setattr(loop, "QualificationAuthorityManifest", type("NotManifest", (), {}))
 
     def qualify(factory, **_kwargs):
+        assert (
+            _kwargs["resident_baseline_executor"] is resident_baseline_executor
+        )
         progress_events.append("qualification_complete")
         calls.append(factory.manifest.digest)
         authority = factory.manifest.reservations[0]

@@ -119,9 +119,16 @@ def _binding(tmp_path: Path, *, attempt: int = 1) -> ArenaCandidateBinding:
 class _Provider:
     provider_digest = _h("provider")
 
-    def __init__(self, grades=None, *, wrong_stage: bool = False):
+    def __init__(
+        self,
+        grades=None,
+        *,
+        wrong_stage: bool = False,
+        resident_baseline_executor=None,
+    ):
         self.grades = dict(grades or {})
         self.wrong_stage = wrong_stage
+        self.resident_baseline_executor = resident_baseline_executor
         self.screen_calls = []
         self.plan_calls = []
 
@@ -153,6 +160,7 @@ class _Provider:
             lambda **_: None,
             99.0,
             request.qualification_policy_digest,
+            self.resident_baseline_executor,
         )
 
 
@@ -313,6 +321,7 @@ def test_only_exact_promoted_coverage_reaches_qualification(tmp_path: Path) -> N
     work = service.plan_qualification((binding,), (promoted,))
     assert type(work) is ArenaQualificationWork
     assert work.factory.manifest.reservations == (binding.reservation,)
+    assert work.resident_baseline_executor is None
     assert provider.plan_calls[0].service_digest == service.identity
 
     rejected_provider = _Provider({"static": (ScreenGrade.FAIL, 1)})
@@ -324,6 +333,21 @@ def test_only_exact_promoted_coverage_reaches_qualification(tmp_path: Path) -> N
     other = dataclasses.replace(promoted, service_digest=_h("other-service"))
     with pytest.raises(ArenaServiceError, match="promoted coverage"):
         service.plan_qualification((binding,), (other,))
+
+
+def test_qualification_work_preserves_resident_baseline_executor(
+    tmp_path: Path,
+) -> None:
+    resident_baseline_executor = object()
+    provider = _Provider(
+        resident_baseline_executor=resident_baseline_executor
+    )
+    service = ArenaService(_manifest(), provider)
+    binding = _binding(tmp_path)
+
+    work = service.plan_qualification((binding,), (service.screen(binding),))
+
+    assert work.resident_baseline_executor is resident_baseline_executor
 
 
 def test_provider_cannot_change_finalized_order(tmp_path: Path) -> None:

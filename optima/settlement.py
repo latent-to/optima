@@ -33,6 +33,14 @@ _LEGACY_SPEED_POLICY_DIGEST = canonical_digest(
         "version": 1,
     },
 )
+_RESIDENT_SPEED_POLICY_DIGEST = canonical_digest(
+    "optima.qualification.speed-evidence-policy",
+    {
+        "candidate_reads": 0,
+        "estimator": "resident-adaptive-bcbp-v1",
+        "version": 3,
+    },
+)
 _LEGACY_AUDIT_CONTROL_DIGEST = canonical_digest(
     "optima.settlement.legacy-audit-control", {"status": "absent"}
 )
@@ -108,6 +116,107 @@ class SettlementReproductionIdentity:
 
 
 @dataclass(frozen=True)
+class ResidentLaneOrientation:
+    """Physical TP-lane roles retained by one resident crossover PASS.
+
+    ``control_digest`` identifies the validator-owned rule used to derive the
+    physical lane digests.  It is deliberately orientation-independent: an
+    independent reproduction must retain the same control and the same two
+    physical lanes while reversing their stock/candidate roles.
+    """
+
+    speed_evidence_policy_digest: str
+    control_digest: str
+    baseline_physical_lane_digest: str
+    candidate_physical_lane_digest: str
+
+    def __post_init__(self) -> None:
+        for field in self.__dataclass_fields__:
+            value = _digest(getattr(self, field), field)
+            if value == "0" * 64:
+                raise SettlementError(f"{field} must not be all-zero")
+            object.__setattr__(self, field, value)
+        if self.baseline_physical_lane_digest == self.candidate_physical_lane_digest:
+            raise SettlementError("resident crossover reused one physical TP lane")
+
+    def to_dict(self) -> dict[str, str]:
+        return {
+            field: getattr(self, field)
+            for field in self.__dataclass_fields__
+        }
+
+    @classmethod
+    def from_dict(cls, value: object) -> "ResidentLaneOrientation":
+        fields = set(cls.__dataclass_fields__)
+        if type(value) is not dict or set(value) != fields:
+            raise SettlementError("resident lane orientation fields do not match")
+        return cls(**value)  # type: ignore[arg-type]
+
+    @classmethod
+    def from_resident_speed_witness(cls, value: object) -> "ResidentLaneOrientation":
+        """Project only the orientation-independent control and physical roles."""
+
+        from optima.eval.qualification_runner import ResidentSpeedWitness
+
+        if type(value) is not ResidentSpeedWitness:
+            raise SettlementError("resident lane orientation lacks its exact speed witness")
+        policy_digest = value.policy.digest
+        control_digest = canonical_digest(
+            "optima.settlement.resident-lane-control.v1",
+            {
+                # Calibration evidence is frozen per candidate/T physical lane,
+                # so its context and manifest digests legitimately change after
+                # the required A/B -> B/A reproduction swap.  The common control
+                # binds the estimator itself; each witness independently binds
+                # and reopens its lane-specific calibration authority.
+                "max_noise": format(value.resident_policy.max_noise, ".17g"),
+                "max_qualification_seconds": (
+                    value.resident_policy.max_qualification_seconds
+                ),
+                "max_stage_seconds": value.resident_policy.max_stage_seconds,
+                "min_margin": format(value.resident_policy.min_margin, ".17g"),
+                "noise_multiplier": format(
+                    value.resident_policy.noise_multiplier, ".17g"
+                ),
+                "resident_policy_version": value.resident_policy.version,
+                "runtime_resource_policies": sorted(
+                    (
+                        value.baseline_runtime_resource_policy_digest,
+                        value.candidate_runtime_resource_policy_digest,
+                    )
+                ),
+                "speed_evidence_policy": policy_digest,
+                "workload": value.workload_digest,
+            },
+        )
+        return cls(
+            policy_digest,
+            control_digest,
+            value.baseline_lane_digest,
+            value.candidate_lane_digest,
+        )
+
+    def is_exact_swap_of(self, primary: "ResidentLaneOrientation") -> bool:
+        if type(primary) is not ResidentLaneOrientation:
+            return False
+        return (
+            self.speed_evidence_policy_digest
+            == primary.speed_evidence_policy_digest
+            and self.control_digest == primary.control_digest
+            and self.baseline_physical_lane_digest
+            == primary.candidate_physical_lane_digest
+            and self.candidate_physical_lane_digest
+            == primary.baseline_physical_lane_digest
+        )
+
+    @property
+    def digest(self) -> str:
+        return canonical_digest(
+            "optima.settlement.resident-lane-orientation.v1", self.to_dict()
+        )
+
+
+@dataclass(frozen=True)
 class SettlementQualification:
     """One independently selected, reopened, and regraded PASS projection.
 
@@ -145,6 +254,7 @@ class SettlementQualification:
     audit_control_digest: str = _LEGACY_AUDIT_CONTROL_DIGEST
     audit_policy: SlotAuditPolicy | None = None
     audit_evidence_digest: str = _LEGACY_AUDIT_EVIDENCE_DIGEST
+    resident_lane_orientation: ResidentLaneOrientation | None = None
 
     def __post_init__(self) -> None:
         if self.lane not in _LANES:
@@ -197,6 +307,28 @@ class SettlementQualification:
         ):
             raise SettlementError(
                 "settlement audit policy differs from its seed-independent control"
+            )
+        if self.resident_lane_orientation is not None and (
+            type(self.resident_lane_orientation) is not ResidentLaneOrientation
+            or self.lane != "registered"
+            or self.audit_policy is None
+        ):
+            raise SettlementError(
+                "resident lane orientation requires one audited registered qualification"
+            )
+        if (
+            self.resident_lane_orientation is not None
+            and self.resident_lane_orientation.speed_evidence_policy_digest
+            != self.speed_evidence_policy_digest
+        ):
+            raise SettlementError(
+                "resident lane orientation differs from the speed evidence policy"
+            )
+        if (
+            self.speed_evidence_policy_digest == _RESIDENT_SPEED_POLICY_DIGEST
+        ) != (self.resident_lane_orientation is not None):
+            raise SettlementError(
+                "resident speed evidence requires its physical lane orientation"
             )
         if (
             type(self.incumbent_manifest) is not EvaluationStackManifest
@@ -303,6 +435,7 @@ class SettlementQualification:
             CohortQualificationAttempt,
             DiscoveryCandidateQualificationReport,
             DiscoveryQualificationAttempt,
+            ResidentSpeedWitness,
         )
         from optima.stack_plan import MarginalArmPlan
 
@@ -359,6 +492,24 @@ class SettlementQualification:
             or sum(row.digest == report.digest for row in attempt.reports) != 1
         ):
             raise SettlementError("qualification attempt differs from its authority/report")
+        resident_witness = (
+            report.speed_witness
+            if type(report.speed_witness) is ResidentSpeedWitness
+            else None
+        )
+        if resident_witness is not None and (
+            lane != "registered"
+            or len(authority.reservations) != 1
+            or len(attempt.reports) != 1
+        ):
+            raise SettlementError(
+                "resident crossover settlement requires one registered candidate"
+            )
+        resident_lane_orientation = (
+            None
+            if resident_witness is None
+            else ResidentLaneOrientation.from_resident_speed_witness(resident_witness)
+        )
         if (
             reservation.selected_delta_digest != arm.selected_delta_digest
             or report.selected_delta_digest != arm.selected_delta_digest
@@ -404,6 +555,7 @@ class SettlementQualification:
             audit_control_digest=report.audit_witness.policy.control.digest,
             audit_policy=report.audit_witness.policy,
             audit_evidence_digest=report.audit_evidence_digest,
+            resident_lane_orientation=resident_lane_orientation,
         )
 
     def to_dict(self) -> dict[str, object]:
@@ -452,11 +604,16 @@ class SettlementQualification:
                     "audit_policy": self.audit_policy.to_dict(),
                 }
             )
+        if self.resident_lane_orientation is not None:
+            result["resident_lane_orientation"] = (
+                self.resident_lane_orientation.to_dict()
+            )
         return result
 
     @classmethod
     def from_dict(cls, value: object) -> "SettlementQualification":
-        fields_v3 = set(cls.__dataclass_fields__)
+        fields_v4 = set(cls.__dataclass_fields__)
+        fields_v3 = fields_v4 - {"resident_lane_orientation"}
         audit_fields = {
             "audit_control_digest",
             "audit_evidence_digest",
@@ -465,7 +622,8 @@ class SettlementQualification:
         fields_v2 = fields_v3 - audit_fields
         fields_v1 = fields_v2 - {"speed_evidence_policy_digest"}
         if type(value) is not dict or frozenset(value) not in {
-            frozenset(fields_v1), frozenset(fields_v2), frozenset(fields_v3)
+            frozenset(fields_v1), frozenset(fields_v2), frozenset(fields_v3),
+            frozenset(fields_v4),
         }:
             raise SettlementError("settlement qualification fields do not match")
         row = dict(value)
@@ -480,6 +638,12 @@ class SettlementQualification:
                     "audit_policy": None,
                 }
             )
+        if "resident_lane_orientation" in row:
+            row["resident_lane_orientation"] = ResidentLaneOrientation.from_dict(
+                row["resident_lane_orientation"]
+            )
+        else:
+            row["resident_lane_orientation"] = None
         members = row.get("members")
         if type(members) is not list:
             raise SettlementError("settlement qualification members are malformed")
@@ -496,7 +660,9 @@ class SettlementQualification:
     @property
     def digest(self) -> str:
         domain = (
-            "optima.settlement.qualification"
+            "optima.settlement.qualification.resident-lane-v1"
+            if self.resident_lane_orientation is not None
+            else "optima.settlement.qualification"
             if self.audit_policy is None
             else "optima.settlement.qualification.audit-v1"
         )
@@ -565,6 +731,20 @@ class SettlementCandidate:
                 raise SettlementError(
                     "independent reproduction reuses or changes slot-audit authority"
                 )
+        primary_orientation = self.primary.resident_lane_orientation
+        reproduction_orientation = self.reproduction.resident_lane_orientation
+        if (primary_orientation is None) != (reproduction_orientation is None):
+            raise SettlementError(
+                "independent reproduction has incomplete resident lane orientation"
+            )
+        if (
+            primary_orientation is not None
+            and reproduction_orientation is not None
+            and not reproduction_orientation.is_exact_swap_of(primary_orientation)
+        ):
+            raise SettlementError(
+                "independent reproduction did not swap physical TP lane orientation"
+            )
 
     @classmethod
     def from_reproductions(
@@ -632,7 +812,9 @@ class SettlementCandidate:
     @property
     def digest(self) -> str:
         domain = (
-            "optima.settlement.candidate.v2"
+            "optima.settlement.candidate.v4"
+            if self.primary.resident_lane_orientation is not None
+            else "optima.settlement.candidate.v2"
             if self.primary.audit_policy is None
             else "optima.settlement.candidate.v3"
         )
@@ -1019,7 +1201,8 @@ def plan_settlement(
 
 
 __all__ = [
-    "SettlementCandidate", "SettlementError", "SettlementEvidence", "SettlementEvent",
+    "ResidentLaneOrientation", "SettlementCandidate", "SettlementError",
+    "SettlementEvidence", "SettlementEvent",
     "SettlementEventType", "SettlementPlan", "SettlementQualification",
     "SettlementReproductionIdentity", "StackTransitionOutput",
     "plan_settlement",

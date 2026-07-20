@@ -28,6 +28,7 @@ from typing import BinaryIO, Callable, Iterable, Protocol
 
 LEASE_SCHEMA = "optima.oci-process-lease.v1"
 EXECUTOR_LABEL = "optima.executor_id"
+NAMESPACE_LABEL = "optima.namespace_digest"
 LEASE_LABEL = "optima.lease_id"
 GPU_RESERVATION_ENV = "OPTIMA_GPU_RESERVATION_ID"
 GPU_RESERVATION_LABEL = "optima.gpu_reservation_id"
@@ -629,6 +630,7 @@ def _bounded_command_runner(
 @dataclass(frozen=True)
 class OCILease:
     executor_id: str
+    namespace_digest: str | None
     lease_id: str
     container_name: str
     recovery_root: Path
@@ -646,6 +648,11 @@ class OCILease:
             f"--name={self.container_name}",
             f"--cidfile={self.cid_path}",
             f"--label={EXECUTOR_LABEL}={self.executor_id}",
+            *(
+                ()
+                if self.namespace_digest is None
+                else (f"--label={NAMESPACE_LABEL}={self.namespace_digest}",)
+            ),
             f"--label={LEASE_LABEL}={self.lease_id}",
         )
         if self.gpu_reservation_id is not None:
@@ -880,6 +887,8 @@ class OCIProcessManager:
                 "--no-trunc",
                 "--filter",
                 f"label={EXECUTOR_LABEL}={self.executor_id}",
+                "--filter",
+                f"label={NAMESPACE_LABEL}={self.namespace_digest}",
                 "--format={{.ID}}",
             ),
             allow_failure=False,
@@ -970,6 +979,7 @@ class OCIProcessManager:
         payload = {
             "schema": LEASE_SCHEMA,
             "executor_id": self.executor_id,
+            "namespace_digest": self.namespace_digest,
             "lease_id": lease_id,
             "container_name": container_name,
             "mount_relpaths": list(mount_rows),
@@ -999,6 +1009,7 @@ class OCIProcessManager:
             raise
         return OCILease(
             self.executor_id,
+            self.namespace_digest,
             lease_id,
             container_name,
             self.recovery_root,
@@ -1338,6 +1349,12 @@ class OCIProcessManager:
             or row["Name"] != f"/{lease.container_name}"
             or not isinstance(labels, dict)
             or labels.get(EXECUTOR_LABEL) != lease.executor_id
+            or (
+                labels.get(NAMESPACE_LABEL)
+                != lease.namespace_digest
+                if lease.namespace_digest is not None
+                else NAMESPACE_LABEL in labels
+            )
             or labels.get(LEASE_LABEL) != lease.lease_id
             or (
                 lease.gpu_reservation_id is not None
@@ -1691,11 +1708,14 @@ class OCIProcessManager:
             "mount_relpaths",
             "stage_relpaths",
         }
+        namespace_fields = required_fields | {"namespace_digest"}
         if (
             not isinstance(row, dict)
             or set(row) not in (
                 required_fields,
                 required_fields | {"gpu_reservation_id"},
+                namespace_fields,
+                namespace_fields | {"gpu_reservation_id"},
             )
             or row["schema"] != LEASE_SCHEMA
         ):
@@ -1708,6 +1728,13 @@ class OCIProcessManager:
         ):
             raise OCIProcessError("OCI lease record is not canonical and single-linked")
         executor_id = _simple_id(row["executor_id"], field="executor_id")
+        namespace_digest = row.get("namespace_digest")
+        if namespace_digest is not None and (
+            not isinstance(namespace_digest, str)
+            or _SHA256.fullmatch(namespace_digest) is None
+            or namespace_digest != self.namespace_digest
+        ):
+            raise OCIProcessError("OCI lease record is in the wrong recovery namespace")
         lease_id = _simple_id(row["lease_id"], field="lease_id")
         container_name = _simple_id(row["container_name"], field="container_name")
         gpu_reservation_id = (
@@ -1741,6 +1768,7 @@ class OCIProcessManager:
         )
         return OCILease(
             executor_id,
+            namespace_digest,
             lease_id,
             container_name,
             self.recovery_root,

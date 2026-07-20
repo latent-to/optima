@@ -739,6 +739,7 @@ def _require_execution(
     seen_request_ids: set[str],
     seen_nonces: set[str],
     seen_runtime_policies: set[str],
+    expected_schema: str = "optima.oci-engine-execution.v1",
 ) -> EngineExecutionEvidence:
     if type(execution) is not EngineExecutionEvidence:
         raise MarginalRuntimeError("executor returned the wrong evidence type")
@@ -747,7 +748,7 @@ def _require_execution(
         raise MarginalRuntimeError("execution binding lacks a typed runtime preflight")
     expected_runtime = runtime_identity_from_preflight(receipt)
     if (
-        execution.schema != "optima.oci-engine-execution.v1"
+        execution.schema != expected_schema
         or execution.launch_digest != launch.digest
         or execution.runtime_identity != expected_runtime
         or execution.runtime_preflight_receipt_sha256 != receipt.sha256

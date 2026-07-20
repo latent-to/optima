@@ -41,9 +41,13 @@ from optima.eval.qualification_runner import (
     CohortQualificationAttempt,
     DiscoveryCandidateQualificationReport,
     DiscoveryQualificationAttempt,
+    QualificationStageExit,
     QualificationRunnerError,
+    STAGE_EXIT_SCHEMA,
+    SpeedStageDisposition,
     qualification_authority_digest,
     reopen_causal_qualification,
+    reopen_qualification_stage_exit,
     run_causal_qualification,
 )
 from optima.eval.oci_backend import OCIBackendError
@@ -750,6 +754,7 @@ def run_qualification_intake(
     factory: QualificationPlanFactory,
     *,
     executor,
+    resident_baseline_executor=None,
     entropy_provider,
     hidden_judge,
     deadline: float,
@@ -761,18 +766,65 @@ def run_qualification_intake(
     manifest = factory.manifest
     try:
         value = factory.build()
+        if value.speed_stage_disposition is not SpeedStageDisposition.TERMINAL:
+            raise QualificationIntakeError(
+                "economic qualification cannot use calibration speed continuation"
+            )
     except (QualificationIntakeError, QualificationRunnerError, OSError) as exc:
         return _no_decision_batch(manifest, exc, reason="qualification_plan")
     try:
         reference = run_causal_qualification(
             value,
             executor=executor,
+            resident_baseline_executor=resident_baseline_executor,
             entropy_provider=entropy_provider,
             hidden_judge=hidden_judge,
             deadline=deadline,
         )
         if type(reference) is not EvidenceArtifactRef:
             raise QualificationIntakeError("qualification runner returned no typed artifact")
+        if reference.schema == STAGE_EXIT_SCHEMA:
+            terminal = reopen_qualification_stage_exit(
+                value.evidence_root, reference, expected=value
+            )
+            if (
+                type(terminal) is not QualificationStageExit
+                or len(manifest.reservations) != 1
+                or terminal.authority_digest != manifest.authority_digest
+                or terminal.source_digest != manifest.source_digest
+                or terminal.selected_delta_digest
+                != manifest.reservations[0].selected_delta_digest
+            ):
+                raise QualificationIntakeError(
+                    "qualification stage exit differs from intake authority"
+                )
+            reservation = manifest.reservations[0]
+            outcome = QualificationIntakeOutcome(
+                reservation.reservation_digest,
+                reservation.selected_delta_digest,
+                manifest.digest,
+                terminal.decision,
+                terminal.reason,
+                terminal.decision is QualificationDecision.NO_DECISION,
+                attempt_artifact_sha256=reference.sha256,
+                report_digest=terminal.digest,
+            )
+            retry_plan = None
+            if terminal.decision is QualificationDecision.NO_DECISION:
+                retry_failure = canonical_digest(
+                    "optima.qualification.intake-stage-retry",
+                    {
+                        "artifact": reference.sha256,
+                        "authority_manifest_digest": manifest.digest,
+                        "report": terminal.digest,
+                    },
+                )
+                retry_plan = _retry_plan(
+                    manifest, (reservation,), retry_failure, bisect=False
+                )
+            return QualificationIntakeBatch(
+                manifest.digest, (outcome,), reference, retry_plan
+            )
         attempt = reopen_causal_qualification(
             value.evidence_root, reference, expected=value
         )

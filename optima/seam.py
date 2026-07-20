@@ -240,6 +240,72 @@ def finalize_pending_candidate_bundle() -> None:
     _load_candidate_bundle_locked(bundle, REGISTRY, release_required)
 
 
+def swap_resident_bundle(bundle: str | None) -> dict[str, object]:
+    """EXPERIMENTAL (resident screen tier): re-arm the bundle in a LIVE rank.
+
+    Only the validator-owned resident SCREENING engine calls this, via the
+    ``resident_swap`` seam's pre-recapture hook (gated by OPTIMA_RESIDENT_SWAP —
+    production qualification/crown paths never set it). Clears the registry,
+    drops previously imported kernel modules, resets the deep-epilogue export
+    state, and loads the new bundle — or returns the engine to stock dispatch
+    when ``bundle`` is None. The caller MUST immediately recapture CUDA graphs:
+    already-captured graphs replay the previously baked kernel regardless of
+    registry state. Direct device-artifact bundles (aot_exports) are out of the
+    screen tier's scope and are rejected here.
+    """
+
+    global _bundle_loaded, _bundle_pending
+    import time
+
+    from optima.registry import REGISTRY
+
+    started = time.perf_counter()
+    REGISTRY.disable()
+    REGISTRY.clear()
+    _bundle_pending = None
+    _bundle_loaded = False
+    # Drop prior candidates' imported kernel modules so a same-stem source file
+    # re-executes instead of aliasing a previous miner's module.
+    for name in [k for k in list(sys.modules) if k.startswith("optima_kernel_")]:
+        sys.modules.pop(name, None)
+    try:
+        from optima import moe_export
+
+        moe_export.reset()
+    except Exception:  # noqa: BLE001 - deep-seam state reset is best-effort here
+        logger.exception("optima: moe_export reset failed during resident swap")
+    result: dict[str, object] = {"bundle": bundle or "", "slots": []}
+    if bundle:
+        from optima.manifest import load_manifest
+
+        manifest = load_manifest(bundle)
+        if any(op.aot_exports for op in manifest.ops):
+            raise RuntimeError(
+                "direct device-artifact bundles are not swappable in the screen tier"
+            )
+        if getattr(manifest, "dep_patches", None):
+            # A dep-patched tree changes the pinned flashinfer csrc through a
+            # prebuild overlay; a live engine cannot adopt that, so such
+            # bundles must run through a dedicated launch instead.
+            raise RuntimeError(
+                "dep-patched bundles are not swappable in the screen tier"
+            )
+        os.environ["OPTIMA_BUNDLE_PATH"] = bundle
+        os.environ["OPTIMA_ACTIVE"] = "1"
+        _load_bundle_into_registry(bundle)
+        REGISTRY.enable()
+        _bundle_loaded = True
+        result["slots"] = sorted(REGISTRY.slots())
+        logger.info(
+            "optima: resident swap -> bundle %s slots %s", bundle, result["slots"]
+        )
+    else:
+        os.environ.pop("OPTIMA_BUNDLE_PATH", None)
+        logger.info("optima: resident swap -> stock dispatch")
+    result["load_seconds"] = time.perf_counter() - started
+    return result
+
+
 def teardown_candidate_bundle(*, suppress_errors: bool = False) -> None:
     """Release sealed-artifact lifecycle state at scheduler-process exit.
 

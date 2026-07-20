@@ -8,6 +8,7 @@ from optima.discovery import DiscoveryArmPlan
 from optima.eval.evidence_store import EvidenceArtifactRef
 from optima.eval.oci_session_protocol import SlotAuditPolicy
 from optima.settlement import (
+    ResidentLaneOrientation,
     SettlementCandidate,
     SettlementError,
     SettlementEvidence,
@@ -16,7 +17,7 @@ from optima.settlement import (
     SettlementQualification,
     plan_settlement,
 )
-from optima.stack_identity import sha256_hex
+from optima.stack_identity import canonical_digest, sha256_hex
 from optima.stack_manifest import (
     EvaluationStackContext,
     EvaluationStackManifest,
@@ -33,6 +34,14 @@ from optima.target_catalog import (
 
 MSA = "attention.msa_prefill_block_score"
 SILU = "activation.silu_and_mul"
+RESIDENT_SPEED_POLICY_DIGEST = canonical_digest(
+    "optima.qualification.speed-evidence-policy",
+    {
+        "candidate_reads": 0,
+        "estimator": "resident-adaptive-bcbp-v1",
+        "version": 3,
+    },
+)
 
 
 def _h(label: str) -> str:
@@ -229,6 +238,130 @@ def test_candidate_json_round_trip_and_digest_are_canonical() -> None:
         replace(candidate.primary, speedup="1.050")
     with pytest.raises(SettlementError, match="target/delta"):
         replace(candidate.primary, selected_delta_digest=_h("other"))
+
+
+def _resident_orientation(
+    baseline: str = "lane-a",
+    candidate: str = "lane-b",
+    *,
+    control: str = "resident-lane-control",
+) -> ResidentLaneOrientation:
+    return ResidentLaneOrientation(
+        RESIDENT_SPEED_POLICY_DIGEST,
+        _h(control),
+        _h(baseline),
+        _h(candidate),
+    )
+
+
+def test_resident_reproduction_requires_exact_physical_lane_role_swap() -> None:
+    catalog = default_target_catalog()
+    candidate = _candidate(
+        _stack(catalog), _ref(catalog, MSA, "resident"), catalog,
+        label="resident",
+    )
+    primary_orientation = _resident_orientation()
+    reproduction_orientation = _resident_orientation("lane-b", "lane-a")
+    primary = replace(
+        candidate.primary,
+        speed_evidence_policy_digest=(
+            primary_orientation.speed_evidence_policy_digest
+        ),
+        resident_lane_orientation=primary_orientation,
+    )
+    reproduction = replace(
+        candidate.reproduction,
+        speed_evidence_policy_digest=(
+            reproduction_orientation.speed_evidence_policy_digest
+        ),
+        resident_lane_orientation=reproduction_orientation,
+    )
+
+    resident = SettlementCandidate.from_reproductions(primary, reproduction)
+    assert SettlementCandidate.from_dict(resident.to_dict()) == resident
+    assert resident.primary.resident_lane_orientation is not None
+    assert resident.reproduction.resident_lane_orientation is not None
+    assert resident.primary.resident_lane_orientation.digest != (
+        resident.reproduction.resident_lane_orientation.digest
+    )
+
+    with pytest.raises(SettlementError, match="did not swap physical TP lane"):
+        SettlementCandidate.from_reproductions(
+            primary,
+            replace(
+                candidate.reproduction,
+                speed_evidence_policy_digest=(
+                    primary_orientation.speed_evidence_policy_digest
+                ),
+                resident_lane_orientation=primary_orientation,
+            ),
+        )
+    with pytest.raises(SettlementError, match="did not swap physical TP lane"):
+        SettlementCandidate.from_reproductions(
+            primary,
+            replace(
+                candidate.reproduction,
+                speed_evidence_policy_digest=(
+                    reproduction_orientation.speed_evidence_policy_digest
+                ),
+                resident_lane_orientation=replace(
+                    reproduction_orientation,
+                    control_digest=_h("other-control"),
+                ),
+            ),
+        )
+    with pytest.raises(SettlementError, match="physical lane orientation"):
+        replace(
+            candidate.reproduction,
+            speed_evidence_policy_digest=(
+                primary_orientation.speed_evidence_policy_digest
+            ),
+        )
+
+
+def test_resident_lane_orientation_is_registered_audited_and_nonoverlapping() -> None:
+    with pytest.raises(SettlementError, match="reused one physical TP lane"):
+        _resident_orientation("lane-a", "lane-a")
+    with pytest.raises(SettlementError, match="all-zero"):
+        ResidentLaneOrientation(
+            "0" * 64,
+            _h("resident-lane-control"),
+            _h("lane-a"),
+            _h("lane-b"),
+        )
+
+    catalog = default_target_catalog()
+    discovery = _discovery(_stack(catalog), label="resident-discovery")
+    with pytest.raises(SettlementError, match="audited registered"):
+        replace(
+            discovery.primary,
+            resident_lane_orientation=_resident_orientation(),
+        )
+
+    candidate = _candidate(
+        _stack(catalog), _ref(catalog, MSA, "resident-policy"), catalog,
+        label="resident-policy",
+    )
+    with pytest.raises(SettlementError, match="physical lane orientation"):
+        replace(
+            candidate.primary,
+            speed_evidence_policy_digest=RESIDENT_SPEED_POLICY_DIGEST,
+        )
+
+
+def test_resident_extension_preserves_legacy_settlement_bytes_and_digests() -> None:
+    catalog = default_target_catalog()
+    candidate = _candidate(
+        _stack(catalog), _ref(catalog, MSA, "a"), catalog, label="a"
+    )
+    assert "resident_lane_orientation" not in candidate.primary.to_dict()
+    assert "resident_lane_orientation" not in candidate.reproduction.to_dict()
+    assert candidate.primary.digest == (
+        "a4590bd5542b2108a559efce5af22a48aa51711dc3ece0317730ffc6e800b12c"
+    )
+    assert candidate.digest == (
+        "a0466a07d7067cc11945a331fd553a1d8b760bd19e210ec36f22a7efe3831034"
+    )
 
 
 def test_single_pass_or_reused_evidence_cannot_become_settlement_candidate() -> None:

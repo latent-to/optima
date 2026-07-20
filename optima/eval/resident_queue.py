@@ -94,13 +94,21 @@ class ScreenCandidate:
 
 @dataclass(frozen=True)
 class ScreenPolicy:
-    """Bar, escalation, canary, and recycle policy for one screen pass."""
+    """Bar, escalation, canary, and recycle policy for one screen pass.
 
-    min_margin: float = 0.005
+    Defaults are pinned from the 2026-07-21 noise-qualification campaign on
+    the production 4xB300 lane (8 interleaved null/bundle swap cycles, 9 stock
+    reads, 16 recaptures): stock band 0.30%, worst null-cycle excursion 0.21%,
+    zero nulls above a 1.005 bar.  min_margin sits above 2x the worst null
+    excursion; canary_tolerance sits at ~4x the stock band so contamination
+    trips it but honest drift does not.
+    """
+
+    min_margin: float = 0.0075
     noise_multiplier: float = 2.0
     max_noise: float = 0.10
     escalation_band: float = 0.02
-    canary_tolerance: float = 0.03
+    canary_tolerance: float = 0.012
     max_candidates_per_lifetime: int = 8
 
     def __post_init__(self) -> None:

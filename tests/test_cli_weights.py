@@ -8,6 +8,7 @@ import optima.cli as cli
 from optima import chain
 from optima.chain.intake import (
     FinalizedIntakeStore,
+    IntakeError,
     IntakeScope,
     SQLiteWeightPublicationJournal,
 )
@@ -114,6 +115,7 @@ def _args(path, **updates) -> argparse.Namespace:
         "discovery_pool_ppm": 100_000,
         "refresh_blocks": 20,
         "release_hold": "",
+        "burn_hotkey": "",
         "dry_run": False,
         "reconcile_only": True,
     }
@@ -287,3 +289,129 @@ def test_reconcile_only_cli_rejects_public_authority_mismatch_before_readback(
         journal = SQLiteWeightPublicationJournal.reopen_from_head(store)
         assert journal.projection == projection
         assert journal.load() == pending
+
+
+def test_burn_hotkey_cli_dry_run_projects_the_full_pool_pre_crown(
+    tmp_path, monkeypatch, capsys
+):
+    import sys
+    import types
+
+    path = tmp_path / "private" / "intake.sqlite3"
+    with FinalizedIntakeStore(path, scope=SCOPE):
+        pass  # an empty all-uncrowned store is the entire precondition
+    _install_chain_readback(monkeypatch)
+
+    class _Hotkey:
+        ss58_address = "validator"
+
+    class _PublicWallet:
+        def __init__(self, name, hotkey):
+            assert name == "must-not-load"
+            self.hotkey = _Hotkey()
+
+    monkeypatch.setitem(
+        sys.modules, "bittensor", types.SimpleNamespace(Wallet=_PublicWallet)
+    )
+
+    assert cli.cmd_set_weights(
+        _args(
+            path,
+            reconcile_only=False,
+            dry_run=True,
+            validator_hotkey="",
+            burn_hotkey="miner",
+        )
+    ) == 0
+    out = capsys.readouterr().out
+    assert "burn projection: full pool -> uid 1 hotkey miner" in out
+    assert "status=dry_run" in out
+    assert "submitted=False" in out
+
+    with FinalizedIntakeStore(path, scope=SCOPE) as store:
+        with pytest.raises(IntakeError, match="no retained head"):
+            SQLiteWeightPublicationJournal.reopen_from_head(store)
+
+
+def test_burn_hotkey_cli_refuses_head_only_combinations(tmp_path):
+    path = tmp_path / "private" / "intake.sqlite3"
+    with pytest.raises(SystemExit, match="burn-hotkey"):
+        cli.cmd_set_weights(_args(path, burn_hotkey="miner"))
+    with pytest.raises(SystemExit, match="burn-hotkey"):
+        cli.cmd_set_weights(
+            _args(
+                path,
+                reconcile_only=False,
+                release_hold="operator request",
+                burn_hotkey="miner",
+            )
+        )
+
+
+def test_burn_hotkey_cli_publishes_real_weights_without_a_crown(
+    tmp_path, monkeypatch, capsys
+):
+    import sys
+    import types
+
+    path = tmp_path / "private" / "intake.sqlite3"
+    with FinalizedIntakeStore(path, scope=SCOPE):
+        pass
+    monkeypatch.setattr(chain, "connect", lambda _network: _Subtensor())
+    monkeypatch.setattr(
+        chain,
+        "fetch_metagraph",
+        lambda _subtensor, _netuid, *, block=None: _view(
+            11 if block is None else block
+        ),
+    )
+    snapshots = [
+        chain.ValidatorWeightSnapshot({"validator": 1.0}, 5),
+        chain.ValidatorWeightSnapshot({"miner": 1.0}, 11),
+    ]
+    monkeypatch.setattr(
+        chain,
+        "read_validator_weight_snapshot",
+        lambda *_args, **_kwargs: snapshots.pop(0),
+    )
+    submissions = []
+
+    def _set_weights(_subtensor, wallet, netuid, weights, **kwargs):
+        submissions.append((wallet, netuid, dict(weights), kwargs))
+        return {"submitted": True}
+
+    monkeypatch.setattr(chain, "set_weights", _set_weights)
+
+    class _Hotkey:
+        ss58_address = "validator"
+
+    class _SignerWallet:
+        def __init__(self, name, hotkey):
+            self.hotkey = _Hotkey()
+
+    monkeypatch.setitem(
+        sys.modules, "bittensor", types.SimpleNamespace(Wallet=_SignerWallet)
+    )
+
+    assert cli.cmd_set_weights(
+        _args(
+            path,
+            reconcile_only=False,
+            validator_hotkey="",
+            burn_hotkey="miner",
+        )
+    ) == 0
+    out = capsys.readouterr().out
+    assert "status=confirmed" in out
+    assert "submitted=True" in out
+    assert len(submissions) == 1
+    assert submissions[0][2] == {"miner": 1.0}
+    assert submissions[0][3]["dry_run"] is False
+
+    with FinalizedIntakeStore(path, scope=SCOPE) as store:
+        journal = SQLiteWeightPublicationJournal.reopen_from_head(store)
+        assert journal.projection.weights == {"miner": 1.0}
+        assert journal.projection.crown_count == 0
+        confirmed = journal.load()
+        assert confirmed is not None
+        assert confirmed.status == "confirmed"

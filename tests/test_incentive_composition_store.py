@@ -1686,3 +1686,29 @@ def test_atomic_cutover_requires_quiescence_and_exact_replay_is_idempotent(
         assert replay == first
         assert len(store._finite_debt.policy_activations()) == 1
         assert len(store._incentive_composition.policy_activations()) == 1
+
+
+def test_active_composition_disables_burn_weight_projection(tmp_path) -> None:
+    from optima.economics import (
+        EmissionsPolicyManifest,
+        GlobalRewardProjectionContext,
+        MetagraphMember,
+    )
+
+    with _store(tmp_path) as store:
+        core = _selected_core(_default_family())
+        _activate_core(store, core)
+        context = GlobalRewardProjectionContext(
+            store.scope.digest,
+            "validator",
+            10,
+            "0x" + f"{10:064x}",
+            (MetagraphMember(0, "owner-burn"), MetagraphMember(1, "validator")),
+        )
+        with pytest.raises(IntakeError, match="legacy V1 weight projection"):
+            store.build_burn_weight_projection(
+                policy=EmissionsPolicyManifest(100, 20, 100_000),
+                context=context,
+                netuid=store.scope.netuid,
+                burn_hotkey="owner-burn",
+            )

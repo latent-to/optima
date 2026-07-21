@@ -1698,6 +1698,113 @@ def test_all_uncrowned_bootstrap_remains_an_explicit_fail_closed_policy(tmp_path
         ).fetchone() is None
 
 
+def test_burn_weight_projection_covers_only_the_all_uncrowned_bootstrap(tmp_path):
+    catalog = default_target_catalog()
+    policy = EmissionsPolicyManifest(100, 20, 100_000)
+    context = GlobalRewardProjectionContext(
+        SCOPE.digest,
+        "validator",
+        12,
+        "0x" + f"{12:064x}",
+        (MetagraphMember(0, "owner-burn"), MetagraphMember(1, "validator")),
+    )
+    staging = EvaluationStackManifest(
+        runtime_digest=_h("bootstrap-runtime"),
+        base_engine_digest=_h("bootstrap-base"),
+        arena_digest=_h("bootstrap-arena"),
+        catalog_snapshot=catalog.snapshot(),
+        catalog_digest=catalog.digest,
+        entries={},
+    )
+    with _store(tmp_path) as store:
+        store.initialize_evaluation_stack(staging, tree_digest=_h("bootstrap-tree"))
+        with pytest.raises(IntakeError, match="not registered"):
+            store.build_burn_weight_projection(
+                policy=policy,
+                context=context,
+                netuid=SCOPE.netuid,
+                burn_hotkey="stranger",
+            )
+        assert store._db.execute(
+            "SELECT value FROM metadata WHERE key='emissions_policy_digest'"
+        ).fetchone() is None
+        projection = store.build_burn_weight_projection(
+            policy=policy,
+            context=context,
+            netuid=SCOPE.netuid,
+            burn_hotkey="owner-burn",
+        )
+        assert projection.weights_ppm == (("owner-burn", 1_000_000),)
+        assert projection.crown_count == 0
+        assert projection.stack_generation == 0
+        assert projection.evidence_digests == ()
+        assert projection.settlement_state_digest == store.settlement_state_digest()
+        again = store.build_burn_weight_projection(
+            policy=policy,
+            context=context,
+            netuid=SCOPE.netuid,
+            burn_hotkey="owner-burn",
+        )
+        assert again.digest == projection.digest
+        journal = SQLiteWeightPublicationJournal(store, projection)
+        pending = WeightPublicationRecord(
+            projection.digest,
+            "pending",
+            submit_block=projection.effective_block,
+            retry_after_block=projection.effective_block + 20,
+            reason="sdk_result_unconfirmed",
+        )
+        journal.compare_and_swap(None, pending)
+
+    with _store(tmp_path) as reopened:
+        head = SQLiteWeightPublicationJournal.reopen_from_head(reopened)
+        assert head.projection.digest == projection.digest
+        assert head.projection.weights == {"owner-burn": 1.0}
+
+
+def test_burn_weight_projection_refuses_any_real_economic_authority(tmp_path):
+    policy = EmissionsPolicyManifest(100, 20, 100_000)
+    with _store(tmp_path) as store:
+        lease_candidate = _qualified_settlement_candidate(store)
+        lease = store.lease_settlement_cohort(current_block=11)
+        assert lease is not None
+        plan = plan_settlement(
+            lease.candidates,
+            current_manifest=lease.stack.manifest,
+            current_tree_digest=lease.stack.tree_digest,
+            initial_event_sequence=lease.initial_event_sequence,
+            previous_event_digest=lease.previous_event_digest,
+        )
+        evidence = tuple(
+            store.reopen_settlement_evidence(row) for row in lease.candidates
+        )
+        store.commit_settlement(lease, plan, evidence, current_block=11)
+        assert lease_candidate.arena_digest in {
+            row.arena_digest for row in store.evaluation_stacks()
+        }
+        context = GlobalRewardProjectionContext(
+            SCOPE.digest,
+            "validator",
+            12,
+            "0x" + f"{12:064x}",
+            (
+                MetagraphMember(0, "owner-burn"),
+                MetagraphMember(1, "validator"),
+                MetagraphMember(2, "miner"),
+            ),
+        )
+        with pytest.raises(IntakeError, match="burn weights refused"):
+            store.build_burn_weight_projection(
+                policy=policy,
+                context=context,
+                netuid=SCOPE.netuid,
+                burn_hotkey="owner-burn",
+            )
+        assert store._db.execute(
+            "SELECT value FROM metadata WHERE key='emissions_policy_digest'"
+        ).fetchone() is None
+
+
 def test_expired_settlement_lease_cannot_commit(tmp_path):
     with _store(tmp_path) as store:
         _qualified_settlement_candidate(store)

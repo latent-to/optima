@@ -229,6 +229,10 @@ def cmd_set_weights(args: argparse.Namespace) -> int:
         raise SystemExit("--reconcile-only cannot be combined with --release-hold")
     if args.release_hold and args.dry_run:
         raise SystemExit("--release-hold cannot be combined with --dry-run")
+    if args.burn_hotkey and (args.reconcile_only or args.release_hold):
+        raise SystemExit(
+            "--burn-hotkey cannot be combined with --reconcile-only or --release-hold"
+        )
     head_only = args.reconcile_only or bool(args.release_hold)
     if head_only and args.validator_hotkey:
         validator_hotkey = args.validator_hotkey
@@ -271,9 +275,6 @@ def cmd_set_weights(args: argparse.Namespace) -> int:
                     "retained projection differs from the supplied emissions policy"
                 )
         else:
-            from optima.target_catalog import default_target_catalog
-
-            catalog = default_target_catalog()
             metagraph = chain.fetch_metagraph(subtensor, args.netuid)
             context = GlobalRewardProjectionContext(
                 scope.digest,
@@ -287,14 +288,32 @@ def cmd_set_weights(args: argparse.Namespace) -> int:
                     )
                 ),
             )
-            states = store.evaluation_stacks()
-            catalogs = {state.arena_digest: catalog for state in states}
-            projection = store.build_weight_projection(
-                policy=policy,
-                context=context,
-                catalogs=catalogs,
-                netuid=args.netuid,
-            )
+            if args.burn_hotkey:
+                projection = store.build_burn_weight_projection(
+                    policy=policy,
+                    context=context,
+                    netuid=args.netuid,
+                    burn_hotkey=args.burn_hotkey,
+                )
+                burn_uid = dict(
+                    zip(metagraph.hotkeys, metagraph.uids, strict=True)
+                )[args.burn_hotkey]
+                print(
+                    f"burn projection: full pool -> uid {burn_uid} "
+                    f"hotkey {args.burn_hotkey} (all-uncrowned bootstrap)"
+                )
+            else:
+                from optima.target_catalog import default_target_catalog
+
+                catalog = default_target_catalog()
+                states = store.evaluation_stacks()
+                catalogs = {state.arena_digest: catalog for state in states}
+                projection = store.build_weight_projection(
+                    policy=policy,
+                    context=context,
+                    catalogs=catalogs,
+                    netuid=args.netuid,
+                )
             journal = SQLiteWeightPublicationJournal(store, projection)
         if args.release_hold:
             released = release_weight_publication_hold(
@@ -316,6 +335,11 @@ def cmd_set_weights(args: argparse.Namespace) -> int:
             refresh_blocks=args.refresh_blocks,
             dry_run=args.dry_run,
             reconcile_only=args.reconcile_only,
+            # The burn projection is crownless BY CONSTRUCTION (its store-side
+            # builder already refused every real-economic-authority state), so
+            # the pre-crown submission gate must not veto exactly the vector
+            # that exists for the pre-crown world.
+            require_current_crown=not bool(args.burn_hotkey),
         )
     print(
         f"weight projection={projection.digest} status={result.status} "
@@ -1154,6 +1178,15 @@ def build_parser() -> argparse.ArgumentParser:
         default="",
         metavar="REASON",
         help="append an audited release of the current held publication; does not submit",
+    )
+    sp.add_argument(
+        "--burn-hotkey",
+        default="",
+        help=(
+            "all-uncrowned bootstrap only: project the full pool to this registered "
+            "hotkey (the subnet owner's burn registration) instead of failing closed; "
+            "refused the moment any crown or active reward claim exists"
+        ),
     )
     sp.add_argument("--dry-run", action="store_true",
                     help="build + print the (uids, weights) payload, do NOT submit")

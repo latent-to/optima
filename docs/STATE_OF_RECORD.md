@@ -299,6 +299,22 @@ parse or regrade the canary receipt. Non-PASS evidence must be rejected by the e
 reviewed evidence-package and approval process; digest equality alone is not a PASS
 judgment.
 
+The legacy-V1 `set-weights` command additionally supports the **all-uncrowned
+bootstrap burn**: `--burn-hotkey <ss58>` projects the full pool to one designated
+registered hotkey (the subnet owner's burn registration) instead of failing closed
+before the first crown. `FinalizedIntakeStore.build_burn_weight_projection` refuses
+on any active reward claim, any crowned (generation > 0) arena, any activated
+incentive composition, or an unregistered hotkey, and digest-binds the empty
+settlement state — so a burn vector cannot survive past the first real crown. The
+projection flows through the normal journal/CAS/reconcile/confirmation path with
+one explicit override: the burn CLI branch passes `require_current_crown=False`
+to `reconcile_weight_publication` (the burn vector is crownless by construction;
+all other invocations keep the pre-crown submission gate). The store's write-once
+emissions-policy binding applies: the policy parameters chosen at burn time are
+the parameters every later V1 projection on that database must reuse.
+Unit/CLI-tested incl. a mocked-chain non-dry-run publish-to-confirmed flow and a
+live testnet-307 dry-run (2026-07-21); no live burn publication receipt yet.
+
 `optima/chain/debt_publication.py` and `set-debt-weights` implement the active V2
 publication authority. The command retains the earliest gapless economic boundary,
 binds the exact signer-facing vector, resumes in-flight journals after restart, grades

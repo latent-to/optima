@@ -98,6 +98,23 @@ optima set-weights --intake-db chain_intake/intake.sqlite3 \
   --discovery-pool-ppm <PPM> --refresh-blocks <N> --dry-run
 ```
 
+**All-uncrowned bootstrap (burn-to-owner).** Before the first crown exists the
+normal projection fails closed (a crown is a payment claim; stock cannot hold
+one). The explicit operator policy for that world is `--burn-hotkey <ss58>`:
+it projects the full pool to one designated registered hotkey (the subnet
+owner's own burn registration, e.g. uid 0) so the miner emission share is not
+left to squatters. The burn projection digest-binds the empty settlement
+state and is refused the moment any crown, active reward claim, or activated
+incentive composition exists — the transition to real payouts is forced, not
+optional. The flow reuses the normal journal/CAS/reconcile/confirmation path,
+with one explicit difference: the burn branch disables reconcile's pre-crown
+submission gate (`require_current_crown=False`), because the burn vector is
+crownless by construction; every other invocation keeps the gate. Two
+operational notes: use `--dry-run` first, and pick the launch emissions-policy
+parameters (`--half-life-blocks` etc.) deliberately — the store binds the
+policy digest write-once, so the same parameters must be used for every later
+V1 projection on that intake database.
+
 The signer-free synthetic shadow surface constructs no wallet, accepts no intake
 database, and cannot submit
 weights:

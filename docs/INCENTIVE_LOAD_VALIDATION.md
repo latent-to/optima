@@ -1,4 +1,4 @@
-# D-015 one-campaign launch-load sensitivity
+# One-campaign incentive load validation
 
 Status: deterministic replay complete.
 
@@ -99,11 +99,11 @@ experiment ledger:
 
 ```bash
 python -m scripts.d015_launch_load \
-  --config evidence/incentives/d015_launch_load_config.json \
+  --config tests/fixtures/incentives/d015_launch_load_config.json \
   --out /tmp/d015_launch_load_report.json
 ```
 
-The tracked CI test regenerates all 64 matrix cells and four burst controls,
+The tracked test regenerates all 64 matrix cells and four burst controls,
 checks the semantic digest above, and separately proves that campaign shares
 size claim principal rather than creating hard payout silos.
 

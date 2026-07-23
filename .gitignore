@@ -1,42 +1,55 @@
-sglang/
-.venv/
+# Python
 __pycache__/
-*.pyc
+*.py[cod]
 *.egg-info/
-optima_ledger.json
-l.json
-._*
-.DS_Store
-.claude/
-.cursor/
-.opencode/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+.venv/
+venv/
+dist/
+build/
 
-# Private working log — candid history, live pod access, strategy. NOT for GitHub.
+# Native build products
+*.o
+*.a
+*.so
+
+# Local engine checkouts and runtime state
+/sglang/
+/chain_intake/
+*.sqlite3
+*.sqlite3-*
+*.log
+
+# Local research, validation, and operator records
+/audits/
+/evidence/
+/experiments/
 WORKLOG.md
+/plan.md
+/plan_*.md
+/*_SESSION.md
 
-# Local audit ledger — adversarial reports, reproductions, and compaction-proof handoffs.
-audits/
-
-# Local planning / design docs (proposals; local-only, like WORKLOG.md).
-plan.md
-plan_*.md
-
-# Local miner-workbench experiments; keep out of the eventual public validator repo.
-experiments/
-scripts/gptoss_tp_bench.py
-scripts/moe_config_microbench.py
-
-# Local scratch / one-off experiment files (single-underscore prefix, repo root only).
+# Local benchmark and data-generation work
+/scripts/*bench.py
+/datagen_*.py
+/*_datagen.json
 /_*.py
 /_*.sh
 /_*.json
 
-# Datagen workbench + its configs (local tooling, like the scripts/ entries above).
-/datagen_magpie.py
-/v4_engine_datagen.json
-
-# Per-session handoff log (local, like WORKLOG.md — references box specifics / tmp paths).
-/H200_SESSION.md
-
-# Build artifacts (e.g. compiled models, etc.)
-build/
+# Editors, agent tooling, and operating-system metadata
+.claude/
+.codex/
+.cursor/
+.idea/
+.opencode/
+.vscode/
+.DS_Store
+._*

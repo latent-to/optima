@@ -189,8 +189,8 @@ result from becoming a permanent promise. With saturated discovery, weekly 1/2/5
 family streams collected 100%, 85.6341%, 37.1198%, and 18.5635% respectively.
 Finite expiry prevents unbounded liability, but miners cannot assume full collection
 if many families keep producing large wins indefinitely. The tracked config,
-simulator, report, and CI replay are in
-[`evidence/incentives/D015_LAUNCH_LOAD_REPORT.md`](../evidence/incentives/D015_LAUNCH_LOAD_REPORT.md);
+simulator, report, and deterministic replay are documented in
+[`INCENTIVE_LOAD_VALIDATION.md`](INCENTIVE_LOAD_VALIDATION.md);
 the supplemental semantic report digest is
 `505fed4d40a6acc6bc92d6330170e8e2260a52e5f3099c22a6c0eb4b2308c672`.
 

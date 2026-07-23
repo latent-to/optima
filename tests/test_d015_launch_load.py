@@ -25,8 +25,8 @@ from scripts import d015_launch_load as d015
 
 
 ROOT = Path(__file__).resolve().parents[1]
-CONFIG = ROOT / "evidence" / "incentives" / "d015_launch_load_config.json"
-REPORT = ROOT / "evidence" / "incentives" / "D015_LAUNCH_LOAD_REPORT.md"
+CONFIG = ROOT / "tests" / "fixtures" / "incentives" / "d015_launch_load_config.json"
+REPORT = ROOT / "docs" / "INCENTIVE_LOAD_VALIDATION.md"
 
 
 def _digest(label: str) -> str:

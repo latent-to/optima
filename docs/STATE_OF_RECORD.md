@@ -313,7 +313,13 @@ all other invocations keep the pre-crown submission gate). The store's write-onc
 emissions-policy binding applies: the policy parameters chosen at burn time are
 the parameters every later V1 projection on that database must reuse.
 Unit/CLI-tested incl. a mocked-chain non-dry-run publish-to-confirmed flow and a
-live testnet-307 dry-run (2026-07-21); no live burn publication receipt yet.
+live testnet-307 signed publication and finalized readback (2026-07-23). The
+same retained projection was then signer-free reconciled to `confirmed`, a
+second reconciliation made no submission or journal change, and the intake
+loop restarted with zero duplicate work. `set-weights --watch` now repeats
+that journaled reconcile/refresh transaction in a separate signer process,
+with bounded transient retry; after the first CROWN the operator restarts it
+without `--burn-hotkey`.
 
 `optima/chain/debt_publication.py` and `set-debt-weights` implement the active V2
 publication authority. The command retains the earliest gapless economic boundary,

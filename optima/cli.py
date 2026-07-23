@@ -204,7 +204,7 @@ def cmd_chain_activate_incentives(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_set_weights(args: argparse.Namespace) -> int:
+def _cmd_set_weights_once(args: argparse.Namespace) -> int:
     from optima import chain
     from optima.chain.intake import (
         FinalizedIntakeStore,
@@ -350,6 +350,48 @@ def cmd_set_weights(args: argparse.Namespace) -> int:
     if result.refresh_due:
         return 3
     return 0 if result.status in {"dry_run", "confirmed", "pending"} else 2
+
+
+def cmd_set_weights(args: argparse.Namespace) -> int:
+    """Publish once, or keep the separate signer control plane reconciled."""
+
+    if not bool(getattr(args, "watch", False)):
+        return _cmd_set_weights_once(args)
+    if args.dry_run or args.reconcile_only or args.release_hold:
+        raise SystemExit(
+            "--watch requires the signer path and cannot be combined with "
+            "--dry-run, --reconcile-only, or --release-hold"
+        )
+    interval = getattr(args, "interval", 60.0)
+    if (
+        isinstance(interval, bool)
+        or not isinstance(interval, (int, float))
+        or not 1 <= float(interval) <= 86_400
+    ):
+        raise SystemExit("--interval must be between 1 and 86400 seconds")
+
+    import logging
+    import time
+
+    logger = logging.getLogger("optima.chain.weights")
+    failures = 0
+    while True:
+        try:
+            status = _cmd_set_weights_once(args)
+        except Exception as exc:
+            if getattr(exc, "retryable", True) is False:
+                raise
+            failures += 1
+            logger.exception(
+                "weight publication pass failed (%d consecutive)", failures
+            )
+            if failures >= 10:
+                raise
+        else:
+            failures = 0
+            if status not in {0, 3}:
+                return status
+        time.sleep(float(interval) * (1 + min(failures, 5)))
 
 
 def cmd_set_debt_weights(args: argparse.Namespace) -> int:
@@ -1188,6 +1230,20 @@ def build_parser() -> argparse.ArgumentParser:
             "hotkey (the subnet owner's burn registration) instead of failing closed; "
             "refused the moment any crown or active reward claim exists"
         ),
+    )
+    sp.add_argument(
+        "--watch",
+        action="store_true",
+        help=(
+            "keep the signer process reconciling and refreshing this policy; "
+            "restart with --burn-hotkey removed after the first CROWN"
+        ),
+    )
+    sp.add_argument(
+        "--interval",
+        type=float,
+        default=60.0,
+        help="seconds between --watch passes (default: 60)",
     )
     sp.add_argument("--dry-run", action="store_true",
                     help="build + print the (uids, weights) payload, do NOT submit")

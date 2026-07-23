@@ -118,6 +118,8 @@ def _args(path, **updates) -> argparse.Namespace:
         "burn_hotkey": "",
         "dry_run": False,
         "reconcile_only": True,
+        "watch": False,
+        "interval": 60.0,
     }
     values.update(updates)
     return argparse.Namespace(**values)
@@ -423,3 +425,61 @@ def test_burn_hotkey_cli_publishes_real_weights_without_a_crown(
         confirmed = journal.load()
         assert confirmed is not None
         assert confirmed.status == "confirmed"
+
+
+def test_watch_retries_transport_then_reconciles_without_external_scheduler(
+    tmp_path, monkeypatch
+):
+    calls = []
+    statuses = iter((3, 0))
+
+    def run_once(args):
+        calls.append(args)
+        if len(calls) == 1:
+            raise ConnectionError("temporary chain disconnect")
+        try:
+            return next(statuses)
+        except StopIteration:
+            raise KeyboardInterrupt
+
+    sleeps = []
+    monkeypatch.setattr(cli, "_cmd_set_weights_once", run_once)
+    monkeypatch.setattr("time.sleep", sleeps.append)
+    args = _args(
+        tmp_path / "unused.sqlite3",
+        reconcile_only=False,
+        watch=True,
+        interval=7.0,
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        cli.cmd_set_weights(args)
+
+    assert calls == [args, args, args, args]
+    assert sleeps == [14.0, 7.0, 7.0]
+
+
+@pytest.mark.parametrize("field", ("dry_run", "reconcile_only", "release_hold"))
+def test_watch_refuses_non_signer_modes(tmp_path, field):
+    updates = {
+        "reconcile_only": False,
+        "watch": True,
+        field: True if field != "release_hold" else "reviewed",
+    }
+    with pytest.raises(SystemExit, match="watch requires the signer path"):
+        cli.cmd_set_weights(_args(tmp_path / "unused.sqlite3", **updates))
+
+
+def test_watch_does_not_retry_nonretryable_publication_fault(tmp_path, monkeypatch):
+    def fail(_args):
+        raise WeightPublicationError("operator action required")
+
+    monkeypatch.setattr(cli, "_cmd_set_weights_once", fail)
+    with pytest.raises(WeightPublicationError, match="operator action"):
+        cli.cmd_set_weights(
+            _args(
+                tmp_path / "unused.sqlite3",
+                reconcile_only=False,
+                watch=True,
+            )
+        )

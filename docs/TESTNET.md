@@ -113,7 +113,21 @@ crownless by construction; every other invocation keeps the gate. Two
 operational notes: use `--dry-run` first, and pick the launch emissions-policy
 parameters (`--half-life-blocks` etc.) deliberately — the store binds the
 policy digest write-once, so the same parameters must be used for every later
-V1 projection on that intake database.
+V1 projection on that intake database. After the dry-run and first real
+publication, the separate signer process can stay current without cron:
+
+```bash
+optima set-weights --intake-db chain_intake/intake.sqlite3 \
+  --netuid 307 --network "$NET" --wallet default --hotkey default \
+  --half-life-blocks <N> --discovery-lifetime-blocks <N> \
+  --discovery-pool-ppm <PPM> --refresh-blocks <N> \
+  --burn-hotkey <owner-ss58> --watch --interval 60
+```
+
+The journal prevents duplicate signing while a commit/reveal is pending. Once
+the first CROWN exists, the burn authority fails closed; restart the same
+command without `--burn-hotkey` to publish normal winner weights. `--watch`
+does not merge signer authority into `chain-validate`.
 
 The signer-free synthetic shadow surface constructs no wallet, accepts no intake
 database, and cannot submit

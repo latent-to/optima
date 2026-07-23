@@ -204,13 +204,18 @@ def test_live_loop_calls_batch_qualification_and_retains_fail_outcome(
 
     calls = []
     progress_events = []
+    promoted_limits = []
     retained_blocks = []
     resident_baseline_executor = object()
     service = object.__new__(ArenaService)
     service.manifest = type(
         "Manifest",
         (),
-        {"digest": "e" * 64, "qualification_policy_digest": "f" * 64},
+        {
+            "digest": "e" * 64,
+            "qualification_policy_digest": "f" * 64,
+            "capacity": type("Capacity", (), {"max_cohort_size": 1})(),
+        },
     )()
     registry = object.__new__(ArenaServiceRegistry)
     monkeypatch.setattr(ArenaServiceRegistry, "require", lambda *_: service)
@@ -292,6 +297,13 @@ def test_live_loop_calls_batch_qualification_and_retains_fail_outcome(
         "apply_qualification_batch",
         apply_with_progress,
     )
+    original_promoted = FinalizedIntakeStore.promoted
+
+    def promoted_with_limit(self, *, limit=None):
+        promoted_limits.append(limit)
+        return original_promoted(self, limit=limit)
+
+    monkeypatch.setattr(FinalizedIntakeStore, "promoted", promoted_with_limit)
 
     def refreshed_head():
         progress_events.append("finalized_head")
@@ -308,6 +320,7 @@ def test_live_loop_calls_batch_qualification_and_retains_fail_outcome(
         arena_id="test-arena",
     )
     assert len(calls) == 1 and len(calls[0]) == 64
+    assert promoted_limits == [1]
     assert progress_events == ["qualification_complete", "finalized_head", "apply"]
     assert retained_blocks == [BLOCK + 100]
     assert set(result.decisions.values()) == {"FAIL"}

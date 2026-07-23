@@ -18,9 +18,10 @@ the candidate on the fresh lifetime automatically, while a canary withdrawal
 is surfaced to the caller because evidence was consumed.
 
 Trust tier: screen/routing only, exactly like the queue module underneath.
-Non-swappable bundles (AOT device artifacts, dep-patched trees) never enter
-the lane: :class:`ResidentServingScreenStage` records an explicit waiver and
-routes them to qualification, which is the deciding authority either way.
+Non-swappable bundles (AOT device artifacts, native rebuild inputs,
+dep-patched trees, or engine-wide setup hooks) never enter the lane:
+:class:`ResidentServingScreenStage` records an explicit waiver and routes them
+to qualification, which is the deciding authority either way.
 """
 
 from __future__ import annotations
@@ -70,6 +71,12 @@ def screen_swappability(manifest: Manifest) -> str | None:
         return "aot device artifacts are not swappable in the screen tier"
     if manifest.dep_patches:
         return "dep-patched bundles are not swappable in the screen tier"
+    if any(op.cuda_sources for op in manifest.ops):
+        # Native products are built for a dedicated candidate launch.
+        return "native-rebuild bundles are not swappable in the screen tier"
+    if any(op.setup is not None for op in manifest.ops):
+        # Registry.clear() cannot reverse arbitrary engine-wide mutations.
+        return "engine-setup bundles are not swappable in the screen tier"
     return None
 
 

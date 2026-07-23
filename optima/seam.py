@@ -250,8 +250,9 @@ def swap_resident_bundle(bundle: str | None) -> dict[str, object]:
     state, and loads the new bundle — or returns the engine to stock dispatch
     when ``bundle`` is None. The caller MUST immediately recapture CUDA graphs:
     already-captured graphs replay the previously baked kernel regardless of
-    registry state. Direct device-artifact bundles (aot_exports) are out of the
-    screen tier's scope and are rejected here.
+    registry state. Direct device artifacts, candidate native rebuilds,
+    dependency overlays, and engine-wide setup hooks are out of the screen
+    tier's scope and are rejected here.
     """
 
     global _bundle_loaded, _bundle_pending
@@ -289,6 +290,14 @@ def swap_resident_bundle(bundle: str | None) -> dict[str, object]:
             # bundles must run through a dedicated launch instead.
             raise RuntimeError(
                 "dep-patched bundles are not swappable in the screen tier"
+            )
+        if any(op.cuda_sources for op in manifest.ops):
+            raise RuntimeError(
+                "native-rebuild bundles are not swappable in the screen tier"
+            )
+        if any(op.setup is not None for op in manifest.ops):
+            raise RuntimeError(
+                "engine-setup bundles are not swappable in the screen tier"
             )
         os.environ["OPTIMA_BUNDLE_PATH"] = bundle
         os.environ["OPTIMA_ACTIVE"] = "1"

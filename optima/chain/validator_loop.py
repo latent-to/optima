@@ -515,7 +515,14 @@ def run_pass(
                     store, service, current_block=result.finalized_block
                 )
             )
-            cohort = store.promoted(limit=policy.max_cohort)
+            # Drain only what this arena can seal; otherwise a singleton arena
+            # sees an oversized cohort and holds the entire promoted queue.
+            cohort = store.promoted(
+                limit=min(
+                    policy.max_cohort,
+                    service.manifest.capacity.max_cohort_size,
+                )
+            )
             if cohort:
                 admission = service.admit_qualification(
                     store.arena_queue_snapshot(

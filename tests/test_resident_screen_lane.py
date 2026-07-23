@@ -7,6 +7,7 @@ import threading
 
 import pytest
 
+from optima import seam
 from optima.arena_service import ArenaCandidateBinding, ScreenGrade
 from optima.bundle_hash import content_hash
 from optima.chain.publication import publish_worker_bundle
@@ -236,7 +237,13 @@ class TestResidentScreenLane:
         lane.close()
 
 
-def _bundle_tree(tmp_path, *, dep_patch: bool = False):
+def _bundle_tree(
+    tmp_path,
+    *,
+    dep_patch: bool = False,
+    cuda_sources: bool = False,
+    setup: bool = False,
+):
     source = tmp_path / "source"
     kernels = source / "kernels"
     kernels.mkdir(parents=True)
@@ -263,6 +270,14 @@ def _bundle_tree(tmp_path, *, dep_patch: bool = False):
         "entry = 'k'",
         "dtypes = ['bfloat16']",
     ]
+    if cuda_sources:
+        (kernels / "native.cu").write_text(
+            'extern "C" __global__ void optima_test_native() {}\n'
+        )
+        (source / "rebuild.json").write_text('{"steps": []}\n')
+        lines.append("cuda_sources = ['kernels/native.cu']")
+    if setup:
+        lines.append("setup = 'setup'")
     (source / "manifest.toml").write_text("\n".join(lines) + "\n")
     for path in sorted(source.rglob("*")):
         path.chmod(0o700 if path.is_dir() else 0o600)
@@ -270,8 +285,13 @@ def _bundle_tree(tmp_path, *, dep_patch: bool = False):
     return source
 
 
-def _binding(tmp_path, *, dep_patch: bool = False) -> ArenaCandidateBinding:
-    source = _bundle_tree(tmp_path, dep_patch=dep_patch)
+def _binding(
+    tmp_path,
+    *,
+    dep_patch: bool = False,
+    **bundle_options,
+) -> ArenaCandidateBinding:
+    source = _bundle_tree(tmp_path, dep_patch=dep_patch, **bundle_options)
     committed = content_hash(source)
     publication = publish_worker_bundle(source, tmp_path / "publications", committed)
     reservation = QualificationReservation(
@@ -305,6 +325,35 @@ class TestScreenSwappability:
             ops=(dataclasses.replace(manifest.ops[0], aot_exports=("aot",)),),
         )
         assert "aot" in screen_swappability(patched)
+
+    @pytest.mark.parametrize(
+        ("bundle_options", "reason"),
+        [
+            ({"cuda_sources": True}, "native-rebuild"),
+            ({"setup": True}, "engine-setup"),
+        ],
+    )
+    def test_native_or_setup_bundle_is_not_swappable(
+        self, tmp_path, bundle_options, reason
+    ) -> None:
+        manifest = load_manifest(_bundle_tree(tmp_path, **bundle_options))
+        assert reason in screen_swappability(manifest)
+
+    @pytest.mark.parametrize(
+        ("bundle_options", "reason"),
+        [
+            ({"cuda_sources": True}, "native-rebuild"),
+            ({"setup": True}, "engine-setup"),
+        ],
+    )
+    def test_worker_seam_rejects_the_same_unsafe_categories(
+        self, tmp_path, monkeypatch, bundle_options, reason
+    ) -> None:
+        bundle = _bundle_tree(tmp_path, **bundle_options)
+        monkeypatch.delenv("OPTIMA_BUNDLE_PATH", raising=False)
+        monkeypatch.delenv("OPTIMA_ACTIVE", raising=False)
+        with pytest.raises(RuntimeError, match=reason):
+            seam.swap_resident_bundle(str(bundle))
 
 
 class TestResidentServingScreenStage:
@@ -364,8 +413,13 @@ class TestResidentServingScreenStage:
         assert stage.run_screen(binding).grade is ScreenGrade.NO_DECISION
         lane.close()
 
-    def test_unswappable_bundle_gets_waiver_pass(self, tmp_path) -> None:
-        binding = _binding(tmp_path, dep_patch=True)
+    @pytest.mark.parametrize(
+        "bundle_options", [{"dep_patch": True}, {"cuda_sources": True}]
+    )
+    def test_unswappable_bundle_gets_waiver_pass(
+        self, tmp_path, bundle_options
+    ) -> None:
+        binding = _binding(tmp_path, **bundle_options)
         factory = FakeLifetimeFactory(
             lambda _n: FakeResidentSession(100.0, {DIGEST_A: 112.0})
         )

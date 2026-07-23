@@ -37,3 +37,6 @@ scripts/moe_config_microbench.py
 
 # Per-session handoff log (local, like WORKLOG.md — references box specifics / tmp paths).
 /H200_SESSION.md
+
+# Build artifacts (e.g. compiled models, etc.)
+build/

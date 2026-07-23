@@ -369,3 +369,18 @@ This repo's `AGENTS.md`, the `CLAUDE.md` shim, and `docs/` are the canonical
 `WORKLOG.md` (gitignored, local-only — keep it off GitHub). Auto-memory is a
 per-cwd supplement. Keep docs/STATE_OF_RECORD.md + this file current when state changes; keep the
 blow-by-blow in `WORKLOG.md`, not in the committed docs.
+
+## Launch-change discipline
+
+- Historical agent ledgers are evidence, not product authority. Revalidate their
+  scope decisions against Shiv's latest intent and the live code before acting.
+- Before delegating implementation, name the concrete launch blocker, existing
+  APIs to reuse, files allowed to change, and a production/test line budget.
+- Start subagents read-only when necessity or ownership is uncertain. A new
+  module or substantial LOC needs evidence that an existing boundary cannot do
+  the job; stop and reassess rather than growing a parallel framework.
+- At every checkpoint, count tracked and untracked changes. Do not let ignored
+  experiment glue or untracked extraction hide the real size of a launch patch.
+- A LOC budget is a design constraint, not permission to minify: keep normal
+  readable formatting and reduce duplicated semantics instead of making long,
+  compressed lines.

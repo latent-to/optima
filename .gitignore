@@ -1,55 +1,16 @@
-# Python
+# Python and build artifacts
 __pycache__/
 *.py[cod]
 *.egg-info/
 .pytest_cache/
-.mypy_cache/
-.ruff_cache/
-.coverage
-.coverage.*
-htmlcov/
-.tox/
-.nox/
 .venv/
-venv/
-dist/
 build/
+dist/
 
-# Native build products
-*.o
-*.a
-*.so
-
-# Local engine checkouts and runtime state
-/sglang/
-/chain_intake/
-*.sqlite3
-*.sqlite3-*
+# Local runtime state
+sglang/
+chain_intake/
+*.sqlite3*
 *.log
-
-# Local research, validation, and operator records
-/audits/
-/evidence/
-/experiments/
-WORKLOG.md
-/plan.md
-/plan_*.md
-/*_SESSION.md
-
-# Local benchmark and data-generation work
-/scripts/*bench.py
-/datagen_*.py
-/*_datagen.json
-/_*.py
-/_*.sh
-/_*.json
-
-# Editors, agent tooling, and operating-system metadata
-.claude/
-.codex/
-.cursor/
-.idea/
-.opencode/
-.vscode/
+.env
 .DS_Store
-._*

@@ -301,6 +301,14 @@ def test_burn_hotkey_cli_dry_run_projects_the_full_pool_pre_crown(
     with FinalizedIntakeStore(path, scope=SCOPE):
         pass  # an empty all-uncrowned store is the entire precondition
     _install_chain_readback(monkeypatch)
+    fresh_blocks = iter((10, 11))
+    monkeypatch.setattr(
+        chain,
+        "fetch_metagraph",
+        lambda _subtensor, _netuid, *, block=None: _view(
+            next(fresh_blocks) if block is None else block
+        ),
+    )
 
     class _Hotkey:
         ss58_address = "validator"

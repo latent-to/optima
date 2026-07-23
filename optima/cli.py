@@ -335,6 +335,7 @@ def cmd_set_weights(args: argparse.Namespace) -> int:
             refresh_blocks=args.refresh_blocks,
             dry_run=args.dry_run,
             reconcile_only=args.reconcile_only,
+            allow_stale_initial=True,
             # The burn projection is crownless BY CONSTRUCTION (its store-side
             # builder already refused every real-economic-authority state), so
             # the pre-crown submission gate must not veto exactly the vector

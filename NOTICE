@@ -26,3 +26,8 @@ terminal LF appended.
 
 Exact source revisions, derivation bases, runtime-target preimages, sizes,
 hashes, and transformations are recorded in optima/vendor_provenance.json.
+
+Optional object-store support (`pip install -e ".[object-store]"`) uses
+boto3/botocore (Apache-2.0) against S3-compatible APIs. Hippius is configured
+as one endpoint/region preset in optima/object_store.py; no Hippius or other
+provider SDK source is vendored.

@@ -327,6 +327,27 @@ def _cmd_set_weights_once(args: argparse.Namespace) -> int:
         if not args.dry_run and not args.reconcile_only:
             projection = resume_weight_projection(projection, journal)
             journal = SQLiteWeightPublicationJournal(store, projection)
+        from optima.chain.weight_share import (
+            default_offer_path,
+            publish_current_weight_offer,
+        )
+
+        offer_path = (
+            args.weight_offer_path
+            if getattr(args, "weight_offer_path", "")
+            else default_offer_path(args.intake_db)
+        )
+        remote_store, remote_key = _object_store_from_args(args)
+        from optima.chain.weight_share import CurrentWeightOffer
+
+        offer = CurrentWeightOffer.from_legacy_projection(projection)
+        publish_current_weight_offer(
+            offer,
+            local_path=offer_path,
+            remote_store=remote_store,
+            remote_key=remote_key or "current_weights.json",
+            async_remote=not bool(getattr(args, "object_store_sync", False)),
+        )
         result = reconcile_weight_publication(
             subtensor,
             None if args.dry_run else wallet,
@@ -350,6 +371,593 @@ def _cmd_set_weights_once(args: argparse.Namespace) -> int:
     if result.refresh_due:
         return 3
     return 0 if result.status in {"dry_run", "confirmed", "pending"} else 2
+
+
+def _object_store_from_args(args: argparse.Namespace):
+    """Build a swappable ObjectStore from CLI flags + OPTIMA_OBJECT_STORE_* env."""
+
+    import os
+
+    from optima.object_store import ObjectStoreConfig, open_configured_object_store
+
+    provider = (getattr(args, "object_store_provider", "") or "").strip().lower()
+    if not provider or provider == "none":
+        return None, ""
+    bucket = (
+        getattr(args, "object_store_bucket", "")
+        or os.environ.get("OPTIMA_OBJECT_STORE_BUCKET", "")
+    )
+    root = (
+        getattr(args, "object_store_root", "")
+        or os.environ.get("OPTIMA_OBJECT_STORE_ROOT_DIR", "")
+    )
+    if provider in {"hippius", "s3", "minio"} and not bucket:
+        raise SystemExit(
+            f"--object-store-bucket or OPTIMA_OBJECT_STORE_BUCKET is required "
+            f"for provider={provider}"
+        )
+    if provider == "local" and not root:
+        raise SystemExit(
+            "--object-store-root or OPTIMA_OBJECT_STORE_ROOT_DIR is required "
+            "for provider=local"
+        )
+    def _opt(name: str, env_name: str) -> str | None:
+        value = getattr(args, name, "") or os.environ.get(env_name, "")
+        return value or None
+
+    cfg = ObjectStoreConfig.from_env(
+        defaults=ObjectStoreConfig(
+            provider=provider,
+            bucket=bucket,
+            key_prefix=getattr(args, "object_store_prefix", "")
+            or os.environ.get("OPTIMA_OBJECT_STORE_KEY_PREFIX", "")
+            or "",
+            endpoint_url=_opt("object_store_endpoint", "OPTIMA_OBJECT_STORE_ENDPOINT_URL"),
+            region_name=_opt("object_store_region", "OPTIMA_OBJECT_STORE_REGION"),
+            access_key_id=_opt(
+                "object_store_access_key", "OPTIMA_OBJECT_STORE_ACCESS_KEY_ID"
+            ),
+            secret_access_key=_opt(
+                "object_store_secret_key", "OPTIMA_OBJECT_STORE_SECRET_ACCESS_KEY"
+            ),
+            addressing_style=_opt(
+                "object_store_addressing", "OPTIMA_OBJECT_STORE_ADDRESSING_STYLE"
+            ),
+            root_dir=root or None,
+        )
+    )
+    key = (
+        getattr(args, "object_store_key", "")
+        or os.environ.get("OPTIMA_OBJECT_STORE_KEY", "")
+        or "current_weights.json"
+    )
+    return open_configured_object_store(cfg), key
+
+
+def _add_object_store_args(parser: argparse.ArgumentParser, *, for_publish: bool) -> None:
+    parser.add_argument(
+        "--object-store-provider",
+        default="",
+        help=(
+            "swappable object-store backend: hippius | s3 | minio | local | none "
+            "(default: none; env OPTIMA_OBJECT_STORE_PROVIDER). "
+            "Same API for every provider — swap by changing this flag/endpoint."
+        ),
+    )
+    parser.add_argument("--object-store-bucket", default="", help="bucket name")
+    parser.add_argument(
+        "--object-store-prefix",
+        default="",
+        help="optional key prefix inside the bucket",
+    )
+    parser.add_argument(
+        "--object-store-key",
+        default="",
+        help="object key for the current weights offer (default: current_weights.json)",
+    )
+    parser.add_argument(
+        "--object-store-endpoint",
+        default="",
+        help="override provider endpoint URL (e.g. custom MinIO or Hippius region)",
+    )
+    parser.add_argument("--object-store-region", default="", help="override region")
+    parser.add_argument(
+        "--object-store-access-key",
+        default="",
+        help="access key (or OPTIMA_OBJECT_STORE_ACCESS_KEY_ID / AWS_ACCESS_KEY_ID)",
+    )
+    parser.add_argument(
+        "--object-store-secret-key",
+        default="",
+        help="secret key (or OPTIMA_OBJECT_STORE_SECRET_ACCESS_KEY / AWS_SECRET_ACCESS_KEY)",
+    )
+    parser.add_argument(
+        "--object-store-addressing",
+        default="",
+        help="S3 addressing style: path | auto (Hippius/MinIO need path)",
+    )
+    parser.add_argument(
+        "--object-store-root",
+        default="",
+        help="filesystem root for provider=local",
+    )
+    if for_publish:
+        parser.add_argument(
+            "--object-store-sync",
+            action="store_true",
+            help=(
+                "wait for the object-store upload inline (default: async publish so "
+                "eval/signer never blocks on remote latency)"
+            ),
+        )
+
+
+def cmd_serve_weights(args: argparse.Namespace) -> int:
+    """Serve the current weight offer from object storage to permitted validators.
+
+    Intended to run on cheap compute separate from eval: it only reads/writes the
+    offer via a swappable object store and never opens the intake DB or signs
+    chain weights. Eval pushes with rotatable credentials; validators GET with
+    hotkey+permit signatures.
+    """
+
+    import bittensor as bt
+
+    from optima import chain
+    from optima.chain.weight_push_auth import resolve_push_credentials
+    from optima.chain.weight_share import (
+        DEFAULT_MAX_SKEW_SECONDS,
+        default_offer_path,
+        local_offer_loader,
+        object_store_offer_loader,
+        object_store_offer_sink,
+        serve_current_weights,
+        write_current_weight_offer,
+    )
+
+    skew = int(getattr(args, "max_skew_seconds", DEFAULT_MAX_SKEW_SECONDS))
+    if not 1 <= skew <= 600:
+        raise SystemExit("--max-skew-seconds must be between 1 and 600")
+    remote_store, remote_key = _object_store_from_args(args)
+    push_credentials = resolve_push_credentials(
+        getattr(args, "push_credentials", "") or None
+    )
+    if remote_store is not None:
+        key = remote_key or "current_weights.json"
+        load_offer = object_store_offer_loader(remote_store, key=key)
+        save_offer = object_store_offer_sink(remote_store, key=key)
+        source = (
+            f"object-store[{getattr(args, 'object_store_provider', '')}] "
+            f"key={key}"
+        )
+    else:
+        offer_path = args.weight_offer_path or default_offer_path(
+            getattr(args, "intake_db", None) or "chain_intake/intake.sqlite3"
+        )
+        load_offer = local_offer_loader(offer_path)
+
+        def save_offer(offer):
+            write_current_weight_offer(offer_path, offer)
+
+        source = str(offer_path)
+    wallet = bt.Wallet(name=args.wallet, hotkey=args.hotkey)
+    subtensor = chain.connect(args.network)
+    server = serve_current_weights(
+        host=args.host,
+        port=args.port,
+        load_offer=load_offer,
+        save_offer=save_offer,
+        push_credentials=push_credentials,
+        authority=wallet.hotkey,
+        subtensor=subtensor,
+        netuid=args.netuid,
+        max_skew_seconds=skew,
+    )
+    push_note = (
+        f" push=enabled({len(push_credentials.active())} active)"
+        if push_credentials is not None
+        else " push=disabled"
+    )
+    print(
+        f"serving current weights from {source} on "
+        f"http://{args.host}:{args.port}/v1/current-weights "
+        f"(authority={wallet.hotkey.ss58_address}{push_note})"
+    )
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("weight-share server stopped")
+    finally:
+        server.server_close()
+    return 0
+
+
+def _cmd_follow_weights_once(args: argparse.Namespace) -> int:
+    import bittensor as bt
+
+    from optima import chain
+    from optima.chain.debt_publication import build_confirmed_debt_weight_publication
+    from optima.chain.intake import (
+        FinalizedIntakeStore,
+        IntakeScope,
+        SQLiteWeightPublicationJournal,
+    )
+    from optima.chain.weight_share import (
+        DEFAULT_MAX_SKEW_SECONDS,
+        LANE_LEGACY_V1,
+        WeightShareError,
+        fetch_current_weights,
+        publish_followed_weights,
+        rebind_offer_signer,
+    )
+
+    skew = int(getattr(args, "max_skew_seconds", DEFAULT_MAX_SKEW_SECONDS))
+    if not 1 <= skew <= 600:
+        raise SystemExit("--max-skew-seconds must be between 1 and 600")
+    wallet = bt.Wallet(name=args.wallet, hotkey=args.hotkey)
+    subtensor = chain.connect(args.network)
+    metagraph = chain.fetch_metagraph(subtensor, args.netuid)
+    offer = fetch_current_weights(
+        args.url,
+        signer=wallet.hotkey,
+        netuid=args.netuid,
+        max_skew_seconds=skew,
+        expected_authority=args.expected_authority or None,
+        metagraph=metagraph,
+    )
+    scope = IntakeScope(str(subtensor.get_block_hash(0)).lower(), args.netuid)
+    if offer.projection.chain_scope_digest != scope.digest:
+        raise WeightShareError(
+            "fetched projection chain scope differs from the connected network"
+        )
+    if offer.projection.netuid != args.netuid:
+        raise WeightShareError("fetched projection netuid mismatch")
+    rebound = rebind_offer_signer(offer, wallet.hotkey.ss58_address)
+    with FinalizedIntakeStore(args.journal_db, scope=scope) as store:
+        if rebound.lane == LANE_LEGACY_V1:
+            journal = SQLiteWeightPublicationJournal(store, rebound.projection)
+        else:
+            if rebound.debt_binding is None:
+                raise WeightShareError("debt-lane offer is missing its binding")
+            journal = store.debt_weight_publication_journal(rebound.debt_binding)
+        result = publish_followed_weights(
+            subtensor=subtensor,
+            signer_wallet=wallet,
+            offer=offer,
+            journal=journal,
+            refresh_blocks=args.refresh_blocks,
+            dry_run=args.dry_run,
+        )
+        closed = None
+        if (
+            not args.dry_run
+            and result.status == "confirmed"
+            and rebound.lane != LANE_LEGACY_V1
+            and rebound.debt_binding is not None
+            and result.record is not None
+        ):
+            # Epoch debit needs composition authority in this DB. Pure signers
+            # without an intake replica publish on-chain and leave close to a
+            # host that retained the composed campaign state.
+            activation = store.active_incentive_composition(
+                at_block=rebound.debt_binding.economic_projection.effective_block
+            )
+            if activation is not None:
+                confirmed_metagraph = chain.fetch_metagraph(
+                    subtensor, args.netuid, block=result.record.confirmed_block
+                )
+                confirmed_snapshot = chain.read_validator_weight_snapshot(
+                    subtensor,
+                    args.netuid,
+                    wallet.hotkey.ss58_address,
+                    metagraph_view=confirmed_metagraph,
+                )
+                confirmation = build_confirmed_debt_weight_publication(
+                    rebound.debt_binding,
+                    result.record,
+                    confirmed_metagraph=confirmed_metagraph,
+                    confirmed_snapshot=confirmed_snapshot,
+                )
+                close_cursor = store.finalized_cursor()
+                if (
+                    close_cursor is not None
+                    and close_cursor[0] >= confirmation.readback.block
+                ):
+                    closed = store.close_confirmed_composed_epoch(
+                        rebound.debt_binding.economic_projection,
+                        confirmation=confirmation,
+                        eligible_hotkeys=tuple(
+                            chain.fetch_metagraph(
+                                subtensor,
+                                args.netuid,
+                                block=rebound.debt_binding.economic_projection.effective_block,
+                            ).hotkeys
+                        ),
+                    )
+    print(
+        f"follow-weights lane={rebound.lane} projection={result.projection_digest} "
+        f"status={result.status} chain_matches={result.chain_matches} "
+        f"submitted={result.submitted} refresh_due={result.refresh_due}"
+        + (f" closed_epoch={closed.digest}" if closed is not None else "")
+    )
+    if result.refresh_due:
+        return 3
+    return 0 if result.status in {"dry_run", "confirmed", "pending"} else 2
+
+
+def cmd_follow_weights(args: argparse.Namespace) -> int:
+    """Pull shared weights and publish them on-chain (eval never does this)."""
+
+    if not bool(getattr(args, "watch", False)):
+        return _cmd_follow_weights_once(args)
+    if args.dry_run:
+        raise SystemExit("--watch cannot be combined with --dry-run")
+    interval = getattr(args, "interval", 60.0)
+    if (
+        isinstance(interval, bool)
+        or not isinstance(interval, (int, float))
+        or not 1 <= float(interval) <= 86_400
+    ):
+        raise SystemExit("--interval must be between 1 and 86400 seconds")
+
+    import logging
+    import time
+
+    logger = logging.getLogger("optima.chain.weight_share")
+    failures = 0
+    while True:
+        try:
+            status = _cmd_follow_weights_once(args)
+        except Exception as exc:
+            if getattr(exc, "retryable", True) is False:
+                raise
+            failures += 1
+            logger.exception(
+                "follow-weights pass failed (%d consecutive)", failures
+            )
+            if failures >= 10:
+                raise
+        else:
+            failures = 0
+            if status not in {0, 3}:
+                return status
+        time.sleep(float(interval) * (1 + min(failures, 5)))
+
+
+def cmd_mint_push_credentials(args: argparse.Namespace) -> int:
+    """Create or rotate HMAC credentials for eval → serve-weights push."""
+
+    import dataclasses
+    import time
+    from pathlib import Path
+
+    from optima.chain.weight_push_auth import (
+        PushCredentialSet,
+        load_push_credentials,
+        mint_push_credential,
+        write_push_credentials,
+    )
+
+    path = Path(args.path)
+    credential_id = args.credential_id or f"push-{int(time.time())}"
+    minted = mint_push_credential(credential_id=credential_id)
+    if path.exists():
+        existing = load_push_credentials(path)
+        if any(row.credential_id == minted.credential_id for row in existing.credentials):
+            raise SystemExit(f"credential id already exists: {minted.credential_id}")
+        rows = list(existing.credentials)
+        if args.retire_active:
+            rows = [
+                (
+                    dataclasses.replace(row, status="retired")
+                    if row.status == "active"
+                    else row
+                )
+                for row in rows
+            ]
+        rows.append(minted)
+        credentials = PushCredentialSet(tuple(rows))
+    else:
+        credentials = PushCredentialSet((minted,))
+    write_push_credentials(path, credentials)
+    print(
+        f"wrote push credentials to {path} "
+        f"(active_id={minted.credential_id}; keep this file secret)"
+    )
+    return 0
+
+
+def cmd_push_weight_offer(args: argparse.Namespace) -> int:
+    """Eval: build the current V1/V2 weight offer and push it; never publish on-chain."""
+
+    import os
+
+    from optima import chain
+    from optima.chain.debt_publication import (
+        PUBLICATION_KIND_COMPOSED,
+        build_debt_weight_publication_binding,
+        next_debt_boundary_schedule,
+    )
+    from optima.chain.intake import FinalizedIntakeStore, IntakeError, IntakeScope
+    from optima.chain.weight_push_auth import (
+        ENV_PUSH_CREDENTIAL_ID,
+        resolve_push_credentials,
+    )
+    from optima.chain.weight_share import (
+        CurrentWeightOffer,
+        push_current_weights,
+        write_current_weight_offer,
+    )
+    from optima.economics import (
+        EmissionsPolicyManifest,
+        GlobalRewardProjectionContext,
+        MetagraphMember,
+    )
+
+    attribution = args.attribution_hotkey
+    if (
+        not isinstance(attribution, str)
+        or not attribution
+        or attribution.strip() != attribution
+        or len(attribution) > 256
+    ):
+        raise SystemExit("--attribution-hotkey must be a non-empty ss58 hotkey")
+
+    credentials = resolve_push_credentials(
+        getattr(args, "push_credentials", "") or None,
+        required=True,
+    )
+    assert credentials is not None
+    active = credentials.active()
+    credential_id = (
+        args.credential_id or os.environ.get(ENV_PUSH_CREDENTIAL_ID, "")
+    ).strip()
+    if credential_id:
+        credential = credentials.get(credential_id)
+        if credential is None or credential.status != "active":
+            raise SystemExit(
+                f"push credential {credential_id!r} is unknown or retired"
+            )
+    else:
+        credential = active[0]
+
+    subtensor = chain.connect(args.network)
+    scope = IntakeScope(str(subtensor.get_block_hash(0)).lower(), args.netuid)
+    finalized_block, _ = chain.read_finalized_head(subtensor)
+    with FinalizedIntakeStore(args.intake_db, scope=scope) as store:
+        cursor = store.finalized_cursor()
+        if cursor is None:
+            raise IntakeError("weight offer push requires a retained finalized intake cursor")
+        activation = store.active_incentive_composition(at_block=cursor[0])
+        if activation is not None:
+            live = store.active_incentive_composition(at_block=finalized_block)
+            if live is None or live.digest != activation.digest:
+                raise IntakeError(
+                    "active composition differs between retained intake and chain head"
+                )
+            epochs = store.incentive_composition_reward_epochs()
+            prior_confirmed = (
+                None
+                if not epochs
+                else store.confirmed_debt_weight_publication(
+                    epochs[-1].publication_record_digest
+                ).readback.block
+            )
+            schedule = next_debt_boundary_schedule(
+                policy_digest=activation.policy.digest,
+                activation_block=activation.activation_block,
+                epoch_blocks=activation.policy.epoch_blocks,
+                closed_effective_blocks=tuple(row.effective_block for row in epochs),
+                finalized_block=finalized_block,
+                previous_confirmed_block=prior_confirmed,
+            )
+            if schedule.status == "not_due":
+                print(
+                    f"push-weight-offer lane=incentive_composition "
+                    f"boundary={schedule.next_effective_block} status=not_due "
+                    f"not_before={schedule.not_before_block} finalized={finalized_block}"
+                )
+                return 0
+            boundary_metagraph = chain.fetch_metagraph(
+                subtensor,
+                args.netuid,
+                block=schedule.next_effective_block,
+            )
+            economic = store.project_incentive_composition_epoch(
+                effective_block=schedule.next_effective_block,
+                eligible_hotkeys=tuple(boundary_metagraph.hotkeys),
+            )
+            binding = build_debt_weight_publication_binding(
+                economic,
+                publication_kind=PUBLICATION_KIND_COMPOSED,
+                activation_digest=activation.digest,
+                chain_scope_digest=scope.digest,
+                netuid=args.netuid,
+                validator_hotkey=attribution,
+                boundary_metagraph=boundary_metagraph,
+                epoch_index=schedule.next_epoch_index,
+            )
+            offer = CurrentWeightOffer.from_debt_binding(binding)
+        else:
+            if (
+                args.half_life_blocks is None
+                or args.discovery_lifetime_blocks is None
+                or args.discovery_pool_ppm is None
+            ):
+                raise SystemExit(
+                    "legacy V1 push requires --half-life-blocks, "
+                    "--discovery-lifetime-blocks, and --discovery-pool-ppm "
+                    "(or activate incentive composition for a debt-lane offer)"
+                )
+            policy = EmissionsPolicyManifest(
+                args.half_life_blocks,
+                args.discovery_lifetime_blocks,
+                args.discovery_pool_ppm,
+            )
+            metagraph = chain.fetch_metagraph(subtensor, args.netuid)
+            context = GlobalRewardProjectionContext(
+                scope.digest,
+                attribution,
+                metagraph.block,
+                metagraph.block_hash.lower(),
+                tuple(
+                    MetagraphMember(uid, hotkey)
+                    for uid, hotkey in zip(
+                        metagraph.uids, metagraph.hotkeys, strict=True
+                    )
+                ),
+            )
+            if args.burn_hotkey:
+                projection = store.build_burn_weight_projection(
+                    policy=policy,
+                    context=context,
+                    netuid=args.netuid,
+                    burn_hotkey=args.burn_hotkey,
+                )
+            else:
+                from optima.target_catalog import default_target_catalog
+
+                catalog = default_target_catalog()
+                states = store.evaluation_stacks()
+                catalogs = {state.arena_digest: catalog for state in states}
+                projection = store.build_weight_projection(
+                    policy=policy,
+                    context=context,
+                    catalogs=catalogs,
+                    netuid=args.netuid,
+                )
+            offer = CurrentWeightOffer.from_legacy_projection(projection)
+
+    if args.weight_offer_path:
+        write_current_weight_offer(args.weight_offer_path, offer)
+    if args.dry_run:
+        print(
+            json.dumps(
+                {
+                    "lane": offer.lane,
+                    "offer_digest": offer.digest,
+                    "projection_digest": offer.projection.digest,
+                    "weights_ppm": list(offer.projection.weights_ppm),
+                },
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+        )
+        return 0
+
+    # Eval path ends here: HTTP push only. No wallet, no set_weights, no commit-reveal.
+    response = push_current_weights(
+        args.url,
+        offer,
+        credential=credential,
+    )
+    print(
+        f"push-weight-offer lane={offer.lane} offer={offer.digest} "
+        f"projection={offer.projection.digest} "
+        f"status={response.get('status')} "
+        f"credential={response.get('credential_id')}"
+    )
+    return 0
 
 
 def cmd_set_weights(args: argparse.Namespace) -> int:
@@ -1245,9 +1853,201 @@ def build_parser() -> argparse.ArgumentParser:
         default=60.0,
         help="seconds between --watch passes (default: 60)",
     )
+    sp.add_argument(
+        "--weight-offer-path",
+        default="",
+        help=(
+            "local atomic JSON path for the current publishable WeightProjection "
+            "(default: <intake-db>.current_weights.json); also published to the "
+            "configured object store for the separate serve-weights process"
+        ),
+    )
+    _add_object_store_args(sp, for_publish=True)
     sp.add_argument("--dry-run", action="store_true",
                     help="build + print the (uids, weights) payload, do NOT submit")
     sp.set_defaults(func=cmd_set_weights)
+
+    sp = sub.add_parser(
+        "serve-weights",
+        help=(
+            "serve the current weight offer (from a swappable object store) to "
+            "validators that currently hold validator_permit; run on cheap "
+            "compute separate from eval"
+        ),
+    )
+    sp.add_argument(
+        "--intake-db",
+        default="",
+        help="only used for the local-file fallback path when no object store is set",
+    )
+    sp.add_argument(
+        "--weight-offer-path",
+        default="",
+        help="local-file fallback when --object-store-provider is unset",
+    )
+    _add_object_store_args(sp, for_publish=False)
+    sp.add_argument("--netuid", type=int, required=True)
+    sp.add_argument(
+        "--network",
+        default="finney",
+        help="named network or an explicit wss:// endpoint URL",
+    )
+    sp.add_argument("--wallet", default="default")
+    sp.add_argument("--hotkey", default="default")
+    sp.add_argument("--host", default="127.0.0.1")
+    sp.add_argument("--port", type=int, default=8080)
+    sp.add_argument(
+        "--max-skew-seconds",
+        type=int,
+        default=60,
+        help="accepted timestamp skew for signed requests (default: 60)",
+    )
+    sp.add_argument(
+        "--push-credentials",
+        default="",
+        help=(
+            "path to rotatable HMAC credentials enabling PUT /v1/current-weights "
+            "from the eval host (or OPTIMA_WEIGHT_PUSH_CREDENTIALS / "
+            "OPTIMA_WEIGHT_PUSH_KEY); omit to disable push"
+        ),
+    )
+    sp.set_defaults(func=cmd_serve_weights)
+
+    sp = sub.add_parser(
+        "mint-push-credentials",
+        help="create or rotate HMAC credentials for eval → serve-weights push",
+    )
+    sp.add_argument(
+        "--path",
+        required=True,
+        help="credentials JSON path (mode 0600); share only with eval + serve host",
+    )
+    sp.add_argument(
+        "--credential-id",
+        default="",
+        help="optional stable id for the new secret (default: push-<unix-ts>)",
+    )
+    sp.add_argument(
+        "--retire-active",
+        action="store_true",
+        help="when rotating into an existing file, retire every currently active secret",
+    )
+    sp.set_defaults(func=cmd_mint_push_credentials)
+
+    sp = sub.add_parser(
+        "push-weight-offer",
+        help=(
+            "eval-only: build the current V1 or debt/composition weight offer and "
+            "push it to serve-weights; never submits on-chain weights"
+        ),
+    )
+    sp.add_argument("--intake-db", default="chain_intake/intake.sqlite3")
+    sp.add_argument("--netuid", type=int, required=True)
+    sp.add_argument(
+        "--network",
+        default="finney",
+        help="named network or an explicit wss:// endpoint URL",
+    )
+    sp.add_argument(
+        "--url",
+        required=True,
+        help="base URL of the serve-weights endpoint (no path suffix)",
+    )
+    sp.add_argument(
+        "--push-credentials",
+        default="",
+        help=(
+            "path to the eval-side push credentials file "
+            "(or OPTIMA_WEIGHT_PUSH_CREDENTIALS / OPTIMA_WEIGHT_PUSH_KEY)"
+        ),
+    )
+    sp.add_argument(
+        "--credential-id",
+        default="",
+        help="optional active credential id (default: first active secret)",
+    )
+    sp.add_argument(
+        "--attribution-hotkey",
+        required=True,
+        help=(
+            "placeholder validator hotkey stamped into the offer; followers rebind "
+            "to their own signer before chain publish"
+        ),
+    )
+    sp.add_argument("--half-life-blocks", type=int, default=None)
+    sp.add_argument("--discovery-lifetime-blocks", type=int, default=None)
+    sp.add_argument("--discovery-pool-ppm", type=int, default=None)
+    sp.add_argument(
+        "--burn-hotkey",
+        default="",
+        help="legacy V1 all-uncrowned bootstrap burn target (same semantics as set-weights)",
+    )
+    sp.add_argument(
+        "--weight-offer-path",
+        default="",
+        help="optional local atomic copy of the offer JSON for operator inspection",
+    )
+    sp.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="build + print the offer summary; do not HTTP push",
+    )
+    sp.set_defaults(func=cmd_push_weight_offer)
+
+    sp = sub.add_parser(
+        "follow-weights",
+        help=(
+            "fetch the shared current weights and publish them on-chain via the "
+            "commit-reveal reconciler (signer role; not the eval host)"
+        ),
+    )
+    sp.add_argument(
+        "--url",
+        required=True,
+        help="base URL of the authority serve-weights endpoint (no path suffix)",
+    )
+    sp.add_argument(
+        "--journal-db",
+        default="chain_intake/follow_weights.sqlite3",
+        help="local exclusive journal DB for this follower's publication state",
+    )
+    sp.add_argument("--netuid", type=int, required=True)
+    sp.add_argument(
+        "--network",
+        default="finney",
+        help="named network or an explicit wss:// endpoint URL",
+    )
+    sp.add_argument("--wallet", default="default")
+    sp.add_argument("--hotkey", default="default")
+    sp.add_argument("--refresh-blocks", type=int, required=True)
+    sp.add_argument(
+        "--expected-authority",
+        default="",
+        help="optional pin of the authority hotkey that must sign offers",
+    )
+    sp.add_argument(
+        "--max-skew-seconds",
+        type=int,
+        default=60,
+        help="accepted timestamp skew for signed responses (default: 60)",
+    )
+    sp.add_argument(
+        "--watch",
+        action="store_true",
+        help="keep fetching and reconciling on --interval",
+    )
+    sp.add_argument(
+        "--interval",
+        type=float,
+        default=60.0,
+        help="seconds between --watch passes (default: 60)",
+    )
+    sp.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="fetch + exercise reconciler dry-run; do not submit",
+    )
+    sp.set_defaults(func=cmd_follow_weights)
 
     sp = sub.add_parser(
         "set-debt-weights",

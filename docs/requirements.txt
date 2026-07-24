@@ -1,0 +1,6 @@
+# Isolated documentation toolchain. This file intentionally does not alter the
+# package's runtime or optional dependency metadata.
+Markdown>=3.5,<4
+PyYAML>=6,<7
+mkdocs>=1.6,<2
+mkdocs-material>=9.6,<10

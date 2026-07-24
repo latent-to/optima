@@ -1,13 +1,13 @@
-"""Permit-gated sharing of the current on-chain weight projection.
+"""Permit-gated sharing of current publishable weights (V1 or debt/composition).
 
-Authority validators persist the exact ``WeightProjection`` that should be
-published — locally on the eval/signer host and asynchronously to a swappable
-object store (Hippius/S3/MinIO/local). A separate cheap ``serve-weights``
-process reads only from that object store and gates access with timestamp-bound
-hotkey signatures so DoS traffic never hits the eval box. Followers rebind the
-projection to their own signer and publish through the same
-``reconcile_weight_publication`` / ``set_weights`` commit-reveal path used by
-``optima set-weights``.
+Eval builds a :class:`CurrentWeightOffer` — legacy V1 projection or a full
+:class:`DebtWeightPublicationBinding` — and pushes it to ``serve-weights`` with
+rotatable HMAC credentials. Eval never opens a chain-signing weight path.
+
+Cheap ``serve-weights`` hosts persist the offer (object store or local file),
+accept authenticated PUT from eval, and serve permit-gated GET to validators.
+Followers rebind the signer-facing projection and publish via
+``reconcile_weight_publication`` / commit-reveal (``follow-weights``).
 
 This module is original Optima code (Apache-2.0). Similar subnet patterns
 (public weight APIs, hotkey-signed request headers) exist elsewhere; no third-
@@ -30,6 +30,19 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from optima import chain
+from optima.chain.debt_publication import (
+    PUBLICATION_KIND_COMPOSED,
+    PUBLICATION_KIND_CORE,
+    DebtPublicationError,
+    DebtWeightPublicationBinding,
+)
+from optima.chain.weight_push_auth import (
+    PushCredential,
+    PushCredentialSet,
+    WeightPushAuthError,
+    sign_push_request,
+    verify_push_request,
+)
 from optima.chain.weights import (
     WeightProjection,
     WeightPublicationError,
@@ -47,7 +60,12 @@ from optima.stack_identity import (
 
 logger = logging.getLogger("optima.chain.weight_share")
 
-OFFER_SCHEMA = "optima.current-weight-offer.v1"
+OFFER_SCHEMA_V1 = "optima.current-weight-offer.v1"
+OFFER_SCHEMA = "optima.current-weight-offer.v2"
+LANE_LEGACY_V1 = "legacy_v1"
+LANE_COMPOSED = "incentive_composition"
+LANE_CORE = "finite_debt"
+OFFER_LANES = frozenset({LANE_LEGACY_V1, LANE_COMPOSED, LANE_CORE})
 REQUEST_DOMAIN = "optima.weight-share.request.v1"
 RESPONSE_DOMAIN = "optima.weight-share.response.v1"
 CURRENT_WEIGHTS_PATH = "/v1/current-weights"
@@ -59,6 +77,7 @@ OFFER_CONTENT_TYPE = "application/json; charset=utf-8"
 SignFn = Callable[[bytes], bytes]
 VerifyFn = Callable[[str, bytes, bytes], bool]
 OfferLoader = Callable[[], "CurrentWeightOffer"]
+OfferSink = Callable[["CurrentWeightOffer"], None]
 
 
 class WeightShareError(RuntimeError):
@@ -84,38 +103,127 @@ class HotkeySigner(Protocol):
 
 @dataclass(frozen=True)
 class CurrentWeightOffer:
-    """Exact on-disk / on-wire weight projection peers may publish."""
+    """Exact publishable weights for peer validators.
 
+    V2 debt / composition offers carry the full
+    :class:`DebtWeightPublicationBinding` so followers can rebind the signer
+    hotkey and publish the same economic vector through the debt reconciler.
+    Legacy V1 offers carry only a :class:`WeightProjection`.
+    """
+
+    lane: str
     projection: WeightProjection
+    debt_binding: DebtWeightPublicationBinding | None = None
 
     def __post_init__(self) -> None:
+        if self.lane not in OFFER_LANES:
+            raise WeightShareError("current weight offer lane is unsupported")
         if type(self.projection) is not WeightProjection:
             raise WeightShareError("current weight offer projection is untyped")
+        if self.lane == LANE_LEGACY_V1:
+            if self.debt_binding is not None:
+                raise WeightShareError("legacy V1 offer cannot carry a debt binding")
+            return
+        if type(self.debt_binding) is not DebtWeightPublicationBinding:
+            raise WeightShareError("debt-lane offer requires an exact debt binding")
+        expected_kind = (
+            PUBLICATION_KIND_COMPOSED
+            if self.lane == LANE_COMPOSED
+            else PUBLICATION_KIND_CORE
+        )
+        if (
+            self.debt_binding.publication_kind != expected_kind
+            or self.debt_binding.weight_projection != self.projection
+            or self.debt_binding.weight_projection.digest != self.projection.digest
+        ):
+            raise WeightShareError(
+                "debt-lane offer projection differs from its economic binding"
+            )
+        economic_weights = tuple(
+            (row.hotkey, row.units) for row in self.debt_binding.weights
+        )
+        if self.projection.weights_ppm != economic_weights:
+            raise WeightShareError(
+                "offer weights_ppm differ from the debt economic projection"
+            )
 
     @property
     def digest(self) -> str:
-        return self.projection.digest
+        return canonical_digest("optima.current-weight-offer", self.to_dict())
 
     def to_dict(self) -> dict[str, object]:
-        return {
+        row: dict[str, object] = {
+            "lane": self.lane,
             "projection": self.projection.to_dict(),
             "projection_digest": self.projection.digest,
             "schema": OFFER_SCHEMA,
         }
+        if self.debt_binding is not None:
+            row["debt_binding"] = self.debt_binding.to_dict()
+            row["debt_binding_digest"] = self.debt_binding.digest
+        else:
+            row["debt_binding"] = None
+            row["debt_binding_digest"] = None
+        return row
 
     def to_bytes(self) -> bytes:
         return canonical_json_bytes(self.to_dict()) + b"\n"
 
     @classmethod
+    def from_legacy_projection(cls, projection: WeightProjection) -> "CurrentWeightOffer":
+        return cls(LANE_LEGACY_V1, projection, None)
+
+    @classmethod
+    def from_debt_binding(cls, binding: DebtWeightPublicationBinding) -> "CurrentWeightOffer":
+        if type(binding) is not DebtWeightPublicationBinding:
+            raise WeightShareError("debt offer requires an exact binding")
+        lane = (
+            LANE_COMPOSED
+            if binding.publication_kind == PUBLICATION_KIND_COMPOSED
+            else LANE_CORE
+            if binding.publication_kind == PUBLICATION_KIND_CORE
+            else ""
+        )
+        if not lane:
+            raise WeightShareError("debt offer publication kind is unsupported")
+        return cls(lane, binding.weight_projection, binding)
+
+    @classmethod
     def from_dict(cls, value: object) -> "CurrentWeightOffer":
-        if type(value) is not dict or set(value) != {
+        if type(value) is not dict:
+            raise WeightShareError("current weight offer fields do not match")
+        schema = value.get("schema")
+        if schema == OFFER_SCHEMA_V1:
+            # Historical local files: projection-only legacy V1.
+            if set(value) != {"projection", "projection_digest", "schema"}:
+                raise WeightShareError("legacy weight offer fields do not match")
+            try:
+                projection = WeightProjection.from_dict(value["projection"])
+            except WeightPublicationError as exc:
+                raise WeightShareError(
+                    f"current weight offer projection is malformed: {exc}"
+                ) from None
+            digest = require_sha256_hex(
+                value["projection_digest"], field="projection_digest"
+            )
+            if projection.digest != digest:
+                raise WeightShareError(
+                    "current weight offer projection digest does not match"
+                )
+            return cls.from_legacy_projection(projection)
+        if schema != OFFER_SCHEMA:
+            raise WeightShareError("current weight offer schema is unsupported")
+        expected = {
+            "debt_binding",
+            "debt_binding_digest",
+            "lane",
             "projection",
             "projection_digest",
             "schema",
-        }:
+        }
+        if set(value) != expected:
             raise WeightShareError("current weight offer fields do not match")
-        if value["schema"] != OFFER_SCHEMA:
-            raise WeightShareError("current weight offer schema is unsupported")
+        lane = value["lane"]
         try:
             projection = WeightProjection.from_dict(value["projection"])
         except WeightPublicationError as exc:
@@ -129,7 +237,24 @@ class CurrentWeightOffer:
             raise WeightShareError(
                 "current weight offer projection digest does not match"
             )
-        return cls(projection)
+        binding = None
+        if value["debt_binding"] is not None:
+            try:
+                binding = DebtWeightPublicationBinding.from_dict(value["debt_binding"])
+            except DebtPublicationError as exc:
+                raise WeightShareError(
+                    f"current weight offer debt binding is malformed: {exc}"
+                ) from None
+            binding_digest = require_sha256_hex(
+                value["debt_binding_digest"], field="debt_binding_digest"
+            )
+            if binding.digest != binding_digest:
+                raise WeightShareError(
+                    "current weight offer debt binding digest does not match"
+                )
+        elif value["debt_binding_digest"] is not None:
+            raise WeightShareError("debt binding digest present without binding")
+        return cls(str(lane), projection, binding)
 
     @classmethod
     def from_bytes(cls, raw: bytes) -> "CurrentWeightOffer":
@@ -151,15 +276,18 @@ def default_offer_path(intake_db: str | Path) -> Path:
     return path.with_name(path.name + ".current_weights.json")
 
 
-def write_current_weight_offer(path: str | Path, projection: WeightProjection) -> Path:
-    """Atomically persist the projection locally."""
+def write_current_weight_offer(
+    path: str | Path, offer: CurrentWeightOffer | WeightProjection
+) -> Path:
+    """Atomically persist the current offer locally."""
 
-    if type(projection) is not WeightProjection:
-        raise WeightShareError("weight offer requires an exact WeightProjection")
+    if type(offer) is WeightProjection:
+        offer = CurrentWeightOffer.from_legacy_projection(offer)
+    if type(offer) is not CurrentWeightOffer:
+        raise WeightShareError("weight offer requires an exact CurrentWeightOffer")
     target = Path(path)
     if target.exists() and not target.is_file():
         raise WeightShareError("weight offer path is not a regular file")
-    offer = CurrentWeightOffer(projection)
     payload = offer.to_bytes()
     target.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_name = tempfile.mkstemp(
@@ -200,15 +328,16 @@ def read_current_weight_offer(path: str | Path) -> CurrentWeightOffer:
 
 def put_current_weight_offer(
     store: ObjectStore,
-    projection: WeightProjection,
+    offer: CurrentWeightOffer | WeightProjection,
     *,
     key: str = DEFAULT_REMOTE_OFFER_KEY,
 ) -> str:
     """Upload the exact offer bytes to a swappable object store."""
 
-    if type(projection) is not WeightProjection:
-        raise WeightShareError("weight offer requires an exact WeightProjection")
-    offer = CurrentWeightOffer(projection)
+    if type(offer) is WeightProjection:
+        offer = CurrentWeightOffer.from_legacy_projection(offer)
+    if type(offer) is not CurrentWeightOffer:
+        raise WeightShareError("weight offer requires an exact CurrentWeightOffer")
     try:
         store.put_bytes(key, offer.to_bytes(), content_type=OFFER_CONTENT_TYPE)
     except ObjectStoreError as exc:
@@ -235,36 +364,35 @@ def load_current_weight_offer_from_store(
 
 
 def publish_current_weight_offer(
-    projection: WeightProjection,
+    offer: CurrentWeightOffer | WeightProjection,
     *,
     local_path: str | Path,
     remote_store: ObjectStore | None = None,
     remote_key: str = DEFAULT_REMOTE_OFFER_KEY,
     async_remote: bool = True,
 ) -> Path:
-    """Write locally, then publish to the object store (optionally in the background).
+    """Write locally, then publish to the object store (optionally in the background)."""
 
-    Local durability is synchronous so the eval/signer never depends on remote
-    latency. Remote upload is best-effort async by default so a slow object-store
-    path cannot stall weight publication on the eval host.
-    """
-
-    path = write_current_weight_offer(local_path, projection)
+    if type(offer) is WeightProjection:
+        offer = CurrentWeightOffer.from_legacy_projection(offer)
+    if type(offer) is not CurrentWeightOffer:
+        raise WeightShareError("weight offer requires an exact CurrentWeightOffer")
+    path = write_current_weight_offer(local_path, offer)
     if remote_store is None:
         return path
 
     def _upload() -> None:
         try:
-            put_current_weight_offer(remote_store, projection, key=remote_key)
+            put_current_weight_offer(remote_store, offer, key=remote_key)
             logger.info(
                 "published weight offer %s to object store key %s",
-                projection.digest,
+                offer.digest,
                 remote_key,
             )
         except Exception:
             logger.exception(
                 "async weight-offer object-store publish failed for %s",
-                projection.digest,
+                offer.digest,
             )
 
     if async_remote:
@@ -274,7 +402,7 @@ def publish_current_weight_offer(
             daemon=True,
         ).start()
     else:
-        put_current_weight_offer(remote_store, projection, key=remote_key)
+        put_current_weight_offer(remote_store, offer, key=remote_key)
     return path
 
 
@@ -298,6 +426,17 @@ def object_store_offer_loader(
     return load
 
 
+def object_store_offer_sink(
+    store: ObjectStore,
+    *,
+    key: str = DEFAULT_REMOTE_OFFER_KEY,
+) -> OfferSink:
+    def save(offer: CurrentWeightOffer) -> None:
+        put_current_weight_offer(store, offer, key=key)
+
+    return save
+
+
 def rebind_projection_signer(
     projection: WeightProjection, signer_hotkey: str
 ) -> WeightProjection:
@@ -315,6 +454,26 @@ def rebind_projection_signer(
     if signer_hotkey == projection.validator_hotkey:
         return projection
     return replace(projection, validator_hotkey=signer_hotkey)
+
+
+def rebind_offer_signer(
+    offer: CurrentWeightOffer, signer_hotkey: str
+) -> CurrentWeightOffer:
+    """Rebind the signer-facing projection (and debt binding, when present)."""
+
+    if type(offer) is not CurrentWeightOffer:
+        raise WeightShareError("rebind requires an exact CurrentWeightOffer")
+    projection = rebind_projection_signer(offer.projection, signer_hotkey)
+    if offer.debt_binding is None:
+        return CurrentWeightOffer.from_legacy_projection(projection)
+    binding = DebtWeightPublicationBinding(
+        offer.debt_binding.publication_kind,
+        offer.debt_binding.activation_digest,
+        offer.debt_binding.effective_block_hash,
+        offer.debt_binding.economic_projection,
+        projection,
+    )
+    return CurrentWeightOffer.from_debt_binding(binding)
 
 
 def request_auth_digest(
@@ -487,12 +646,13 @@ def build_signed_offer_response(
     netuid: int,
     timestamp: int,
 ) -> tuple[bytes, dict[str, str]]:
+    if type(offer) is not CurrentWeightOffer:
+        raise WeightShareError("signed response requires an exact CurrentWeightOffer")
     if offer.projection.netuid != netuid:
         raise WeightShareError("offer netuid differs from the served netuid")
-    if authority.ss58_address != offer.projection.validator_hotkey:
-        raise WeightShareError(
-            "authority hotkey differs from the stored projection authority"
-        )
+    # The HTTP response signer is the weights-service hotkey. It need not equal
+    # the offer's projection.validator_hotkey: eval builds the economic vector,
+    # followers rebind before chain publish.
     body_obj = {
         "authority_hotkey": authority.ss58_address,
         "netuid": netuid,
@@ -581,10 +741,6 @@ def parse_signed_offer_response(
     if metagraph is not None:
         assert_validator_permit(metagraph, authority_hotkey)
     offer = CurrentWeightOffer.from_dict(payload["offer"])
-    if offer.projection.validator_hotkey != authority_hotkey:
-        raise WeightShareError(
-            "stored projection authority differs from the response signer"
-        )
     if offer.projection.netuid != netuid:
         raise WeightShareError("offer projection netuid mismatch")
     return offer
@@ -605,6 +761,8 @@ class _WeightShareHTTPServer(ThreadingHTTPServer):
         handler,
         *,
         load_offer: OfferLoader,
+        save_offer: OfferSink | None,
+        push_credentials: PushCredentialSet | None,
         authority: HotkeySigner,
         subtensor,
         netuid: int,
@@ -614,6 +772,8 @@ class _WeightShareHTTPServer(ThreadingHTTPServer):
     ) -> None:
         super().__init__(server_address, handler)
         self.load_offer = load_offer
+        self.save_offer = save_offer
+        self.push_credentials = push_credentials
         self.authority = authority
         self.subtensor = subtensor
         self.netuid = netuid
@@ -675,10 +835,6 @@ class _WeightShareHandler(BaseHTTPRequestHandler):
                 offer = server.load_offer()
             if offer.projection.netuid != server.netuid:
                 raise WeightShareError("stored offer netuid differs from server netuid")
-            if offer.projection.validator_hotkey != server.authority.ss58_address:
-                raise WeightShareError(
-                    "stored offer authority differs from the serving wallet"
-                )
             body, headers = build_signed_offer_response(
                 offer,
                 authority=server.authority,
@@ -694,6 +850,65 @@ class _WeightShareHandler(BaseHTTPRequestHandler):
             return
         self._send(200, body, headers)
 
+    def do_PUT(self) -> None:  # noqa: N802 - stdlib handler API
+        if self.path.split("?", 1)[0] != CURRENT_WEIGHTS_PATH:
+            self._error(404, "not found")
+            return
+        server = self.server
+        if server.push_credentials is None or server.save_offer is None:
+            self._error(405, "weight push is not enabled on this server")
+            return
+        try:
+            length_raw = self.headers.get("Content-Length", "")
+            try:
+                length = int(length_raw)
+            except ValueError as exc:
+                raise WeightShareError("push Content-Length is malformed") from exc
+            if length < 2 or length > 8_000_000:
+                raise WeightShareError("push body length is out of bounds")
+            body = self.rfile.read(length)
+            if len(body) != length:
+                raise WeightShareError("push body length mismatch")
+            now = int(server.clock())
+            credential_id = verify_push_request(
+                server.push_credentials,
+                headers=dict(self.headers.items()),
+                body=body,
+                now=now,
+                max_skew_seconds=server.max_skew_seconds,
+            )
+            offer = CurrentWeightOffer.from_bytes(body)
+            if offer.projection.netuid != server.netuid:
+                raise WeightShareError("pushed offer netuid differs from server netuid")
+            with server._offer_lock:
+                server.save_offer(offer)
+            logger.info(
+                "accepted weight offer %s lane=%s via push credential %s",
+                offer.digest,
+                offer.lane,
+                credential_id,
+            )
+            response = canonical_json_bytes(
+                {
+                    "credential_id": credential_id,
+                    "offer_digest": offer.digest,
+                    "projection_digest": offer.projection.digest,
+                    "status": "accepted",
+                }
+            ) + b"\n"
+        except (WeightShareError, WeightPushAuthError) as exc:
+            self._error(403, str(exc))
+            return
+        except Exception as exc:
+            logger.exception("weight-share push failed")
+            self._error(500, f"internal error: {type(exc).__name__}")
+            return
+        self._send(
+            200,
+            response,
+            {"Content-Type": "application/json; charset=utf-8"},
+        )
+
 
 def serve_current_weights(
     *,
@@ -703,6 +918,8 @@ def serve_current_weights(
     subtensor,
     netuid: int,
     load_offer: OfferLoader | None = None,
+    save_offer: OfferSink | None = None,
+    push_credentials: PushCredentialSet | None = None,
     offer_path: str | Path | None = None,
     max_skew_seconds: int = DEFAULT_MAX_SKEW_SECONDS,
     verify: VerifyFn | None = None,
@@ -710,8 +927,9 @@ def serve_current_weights(
 ) -> ThreadingHTTPServer:
     """Start the permit-gated current-weights HTTP server (caller serves forever).
 
-    Prefer ``load_offer`` from an object store on a host separate from eval.
-    ``offer_path`` remains a local-file convenience for tests and air-gapped runs.
+    Prefer ``load_offer`` / ``save_offer`` backed by object storage on a host
+    separate from eval. ``PUT /v1/current-weights`` accepts eval pushes only when
+    rotatable ``push_credentials`` are configured. Eval must not chain-publish.
     """
 
     if not isinstance(host, str) or not host.strip():
@@ -724,10 +942,23 @@ def serve_current_weights(
                 "serve-weights requires load_offer or offer_path"
             )
         load_offer = local_offer_loader(offer_path)
+        if save_offer is None:
+            path = Path(offer_path)
+
+            def _save(offer: CurrentWeightOffer) -> None:
+                write_current_weight_offer(path, offer)
+
+            save_offer = _save
+    if push_credentials is not None and save_offer is None:
+        raise WeightShareError("push credentials require a configured save_offer")
+    if push_credentials is not None and type(push_credentials) is not PushCredentialSet:
+        raise WeightShareError("push credentials are untyped")
     server = _WeightShareHTTPServer(
         (host, port),
         _WeightShareHandler,
         load_offer=load_offer,
+        save_offer=save_offer,
+        push_credentials=push_credentials,
         authority=authority,
         subtensor=subtensor,
         netuid=netuid,
@@ -736,6 +967,96 @@ def serve_current_weights(
         clock=clock or (lambda: int(time.time())),
     )
     return server
+
+
+def push_current_weights(
+    url: str,
+    offer: CurrentWeightOffer,
+    *,
+    credential: PushCredential,
+    timeout_seconds: float = DEFAULT_HTTP_TIMEOUT_SECONDS,
+    clock: Callable[[], int] | None = None,
+    opener: Callable[..., object] | None = None,
+) -> dict[str, object]:
+    """Eval-side: push one offer to the weights service. Never touches the chain."""
+
+    if type(offer) is not CurrentWeightOffer:
+        raise WeightShareError("push requires an exact CurrentWeightOffer")
+    if type(credential) is not PushCredential:
+        raise WeightShareError("push requires an exact PushCredential")
+    if not isinstance(url, str) or not url.startswith(("http://", "https://")):
+        raise WeightShareError("weight-share URL must be http(s)")
+    timeout = float(timeout_seconds)
+    if not 0.1 <= timeout <= 600:
+        raise WeightShareError("timeout is out of bounds")
+    body = offer.to_bytes()
+    now = int((clock or (lambda: int(time.time())))())
+    headers = sign_push_request(credential, timestamp=now, body=body)
+    endpoint = url.rstrip("/") + CURRENT_WEIGHTS_PATH
+    request = Request(endpoint, data=body, method="PUT", headers=headers)
+    open_url = opener or urlopen
+    try:
+        with open_url(request, timeout=timeout) as response:  # type: ignore[arg-type]
+            raw = response.read()
+            status = int(getattr(response, "status", 200))
+    except HTTPError as exc:
+        detail = ""
+        try:
+            detail = exc.read().decode("utf-8", errors="replace")
+        except Exception:
+            detail = str(exc)
+        if 500 <= int(exc.code) <= 599:
+            raise WeightShareRetryableError(
+                f"weight-share push server error {exc.code}: {detail}"
+            ) from None
+        raise WeightShareError(
+            f"weight-share push rejected ({exc.code}): {detail}"
+        ) from None
+    except URLError as exc:
+        raise WeightShareRetryableError(
+            f"weight-share push transport failed: {exc}"
+        ) from None
+    if status != 200:
+        raise WeightShareError(f"weight-share push unexpected status {status}")
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise WeightShareError(f"weight-share push response is not JSON: {exc}") from None
+    if type(payload) is not dict:
+        raise WeightShareError("weight-share push response is malformed")
+    return payload
+
+
+def publish_followed_weights(
+    *,
+    subtensor,
+    signer_wallet,
+    offer: CurrentWeightOffer,
+    journal: WeightPublicationJournal,
+    refresh_blocks: int,
+    dry_run: bool = False,
+):
+    """Publish a fetched offer through the normal weight reconciler / commit-reveal."""
+
+    if type(offer) is not CurrentWeightOffer:
+        raise WeightShareError("follow publish requires an exact CurrentWeightOffer")
+    try:
+        follower_hotkey = signer_wallet.hotkey.ss58_address
+    except AttributeError as exc:
+        raise WeightShareError("follower publish requires a signer wallet") from exc
+    rebound = rebind_offer_signer(offer, follower_hotkey)
+    # Debt / composition epochs are crownless by construction relative to the
+    # legacy V1 require_current_crown gate; match set-debt-weights.
+    require_crown = rebound.lane == LANE_LEGACY_V1 and rebound.projection.crown_count > 0
+    return reconcile_weight_publication(
+        subtensor,
+        None if dry_run else signer_wallet,
+        rebound.projection,
+        journal,
+        refresh_blocks=refresh_blocks,
+        dry_run=dry_run,
+        require_current_crown=require_crown,
+    )
 
 
 def fetch_current_weights(
@@ -818,38 +1139,14 @@ def fetch_current_weights(
     )
 
 
-def publish_followed_weights(
-    *,
-    subtensor,
-    signer_wallet,
-    offer: CurrentWeightOffer,
-    journal: WeightPublicationJournal,
-    refresh_blocks: int,
-    dry_run: bool = False,
-):
-    """Publish a fetched offer through the normal weight reconciler."""
-
-    try:
-        follower_hotkey = signer_wallet.hotkey.ss58_address
-    except AttributeError as exc:
-        raise WeightShareError("follower publish requires a signer wallet") from exc
-    projection = rebind_projection_signer(offer.projection, follower_hotkey)
-    return reconcile_weight_publication(
-        subtensor,
-        None if dry_run else signer_wallet,
-        projection,
-        journal,
-        refresh_blocks=refresh_blocks,
-        dry_run=dry_run,
-        require_current_crown=projection.crown_count > 0,
-    )
-
-
 __all__ = [
     "CURRENT_WEIGHTS_PATH",
     "CurrentWeightOffer",
     "DEFAULT_MAX_SKEW_SECONDS",
     "DEFAULT_REMOTE_OFFER_KEY",
+    "LANE_COMPOSED",
+    "LANE_CORE",
+    "LANE_LEGACY_V1",
     "WeightShareError",
     "WeightShareRetryableError",
     "assert_fresh_timestamp",
@@ -861,11 +1158,14 @@ __all__ = [
     "load_current_weight_offer_from_store",
     "local_offer_loader",
     "object_store_offer_loader",
+    "object_store_offer_sink",
     "parse_signed_offer_response",
     "publish_current_weight_offer",
     "publish_followed_weights",
+    "push_current_weights",
     "put_current_weight_offer",
     "read_current_weight_offer",
+    "rebind_offer_signer",
     "rebind_projection_signer",
     "request_auth_digest",
     "response_auth_digest",

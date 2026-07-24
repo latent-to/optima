@@ -30,9 +30,11 @@ installed `optima` console script resolves to the same parser.
 | `chain-incentive-shadow` | policy operator | signer-free evidence | Project explicit synthetic registered-CROWN debt against finalized membership |
 | `chain-incentive-composition-shadow` | policy operator | signer-free evidence | Project explicit synthetic CROWN and discovery debt against finalized membership |
 | `chain-activate-incentives` | policy operator | wallet-free durable transition | Atomically activate one independently approved campaign/composition |
-| `set-weights` | validator | legacy production control plane | Reconcile the journaled V1 projection, including bounded burn bootstrap/watch operation |
-| `serve-weights` | validator | peer weight distribution | Serve the persisted current weight offer to live `validator_permit` holders |
-| `follow-weights` | validator | peer weight publication | Fetch the shared offer and publish through the same V1 reconciler |
+| `set-weights` | signer | legacy production control plane | Reconcile the journaled V1 projection, including bounded burn bootstrap/watch operation |
+| `mint-push-credentials` | operator | weight-share push auth | Create/rotate HMAC secrets for eval → serve-weights |
+| `push-weight-offer` | eval | peer weight distribution | Build V1/V2 offer and HTTP-push; never chain-publishes |
+| `serve-weights` | weights gateway | peer weight distribution | Serve/store the offer; optional authenticated PUT from eval |
+| `follow-weights` | signer | peer weight publication | Fetch the shared offer and publish through the commit-reveal reconciler |
 | `set-debt-weights` | validator | active-V2 production control plane | Publish, confirm, and debit the next gapless finite-debt boundary |
 | `model-provision` | release operator | production artifact | Seal model bytes into a content-addressed publication and receipt |
 | `release-verify` | release consumer | production verification | Reopen a signed Engine release under an externally trusted key |
@@ -206,36 +208,55 @@ burn hotkey before restarting after the first CROWN.
 
 Every non-hold `set-weights` pass also writes the exact publishable projection to
 `<intake-db>.current_weights.json` (or `--weight-offer-path`) and, when configured,
-asynchronously to a swappable object store (`--object-store-provider hippius|s3|minio|local`)
-so a separate `serve-weights` process can gate access without touching the eval host.
+asynchronously to a swappable object store (`--object-store-provider hippius|s3|minio|local`).
+Prefer the eval/serve/follow split below when eval must not hold a chain-signing
+weight path: `push-weight-offer` → `serve-weights` → `follow-weights`.
 
-### `serve-weights` / `follow-weights`
+### `mint-push-credentials` / `push-weight-offer` / `serve-weights` / `follow-weights`
 
 ```bash
+python -m optima.cli mint-push-credentials --path /secret/push-credentials.json
+
 python -m optima.cli serve-weights \
   --object-store-provider hippius \
   --object-store-bucket optima-weights \
+  --push-credentials /secret/push-credentials.json \
   --network <network> --netuid <netuid> \
-  --wallet default --hotkey validator \
+  --wallet default --hotkey weights-gateway \
   --host 0.0.0.0 --port 8080
+
+python -m optima.cli push-weight-offer \
+  --intake-db chain_intake/intake.sqlite3 \
+  --network <network> --netuid <netuid> \
+  --url http://weights-gateway:8080 \
+  --push-credentials /secret/push-credentials.json \
+  --attribution-hotkey <placeholder-ss58> \
+  --half-life-blocks <blocks> \
+  --discovery-lifetime-blocks <blocks> \
+  --discovery-pool-ppm <ppm>
 
 python -m optima.cli follow-weights \
   --url http://weights-gateway:8080 \
   --network <network> --netuid <netuid> \
   --wallet default --hotkey follower \
   --refresh-blocks <blocks> \
-  --expected-authority <authority-hotkey> \
+  --expected-authority <weights-gateway-hotkey> \
   --watch
 ```
 
-`serve-weights` exposes `GET /v1/current-weights` from the object store (or a local
-file fallback). Callers must present a hotkey signature over a fresh timestamp; the
-server checks live `validator_permit` and returns an authority-signed body.
-`follow-weights` pulls that offer, rebinds it to the follower hotkey, and publishes
-through `reconcile_weight_publication` / `set_weights` so commit-reveal and journal
-confirmation stay identical to the authority path. Provider swap is config-only via
-`--object-store-provider` / `OPTIMA_OBJECT_STORE_*` (optional dep:
-`pip install -e ".[object-store]"`, boto3 Apache-2.0). See
+`push-weight-offer` is the eval path: it builds a V2 debt/composition offer when
+incentive composition is active (else legacy V1), and HTTP-PUTs it. It never
+opens a weight-signing wallet or calls `set_weights`. Credentials resolve from
+`--push-credentials`, else `OPTIMA_WEIGHT_PUSH_CREDENTIALS` (JSON path), else
+`OPTIMA_WEIGHT_PUSH_KEY` (+ optional `OPTIMA_WEIGHT_PUSH_CREDENTIAL_ID`).
+`serve-weights` exposes `GET /v1/current-weights` (permit + hotkey signature) and
+optional `PUT /v1/current-weights` (same credential resolution). `follow-weights`
+rebinds the offer to the follower hotkey and publishes through
+`reconcile_weight_publication` / commit-reveal. Debt-lane offers carry the full
+`DebtWeightPublicationBinding` so follower `weights_ppm` match the economic
+projection. Provider swap is config-only via `--object-store-provider` /
+`OPTIMA_OBJECT_STORE_*` (optional dep: `pip install -e ".[object-store]"`, boto3
+Apache-2.0). See
 [Settlement and weights](../validator-guide/settlement-and-weights.md#shared-current-weights-endpoint).
 
 ### Incentive shadows

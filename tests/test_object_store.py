@@ -108,8 +108,8 @@ def test_publish_writes_local_and_remote_sync(tmp_path: Path) -> None:
         remote_key="current_weights.json",
         async_remote=False,
     )
-    assert read_current_weight_offer(local_path).digest == projection.digest
-    assert load_current_weight_offer_from_store(remote).digest == projection.digest
+    assert read_current_weight_offer(local_path).projection.digest == projection.digest
+    assert load_current_weight_offer_from_store(remote).projection.digest == projection.digest
 
 
 def test_publish_async_remote_does_not_block_local(tmp_path: Path) -> None:
@@ -134,7 +134,7 @@ def test_publish_async_remote_does_not_block_local(tmp_path: Path) -> None:
         async_remote=True,
     )
     # Local durability completes without waiting on the remote upload.
-    assert read_current_weight_offer(local_path).digest == projection.digest
+    assert read_current_weight_offer(local_path).projection.digest == projection.digest
     assert started.wait(timeout=2)
     released.set()
     time.sleep(0.05)
@@ -152,7 +152,7 @@ def test_object_store_offer_loader(tmp_path: Path) -> None:
         async_remote=False,
     )
     loaded = object_store_offer_loader(store)()
-    assert loaded.digest == projection.digest
+    assert loaded.projection.digest == projection.digest
 
 
 def test_hippius_to_s3_swap_is_config_only() -> None:

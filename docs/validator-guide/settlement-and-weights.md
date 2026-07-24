@@ -307,6 +307,55 @@ transport/chain failures and stops on nonretryable publication faults. Watch mod
 `--dry-run`, `--reconcile-only`, and `--release-hold`; signer-free inspection remains a
 deliberate one-shot operation.
 
+### Shared current-weights endpoint
+
+Eval/signer writes the exact publishable `WeightProjection` to a local sibling
+file (`<intake-db>.current_weights.json`) and asynchronously to a **swappable
+object store** (Hippius by default, or AWS S3 / MinIO / local filesystem — same
+`ObjectStore` API, change `--object-store-provider`). The gated HTTP service is
+meant to run on **cheap compute separate from eval**, reading only from that
+object store so peer traffic cannot DoS the GPU box.
+
+```bash
+# Eval/signer host: local + async remote publish
+optima set-weights <POLICY_AND_SIGNER_ARGUMENTS> \
+  --object-store-provider hippius \
+  --object-store-bucket optima-weights \
+  --object-store-prefix sn307 \
+  --watch
+
+# Cheap separate host: gated serve from object store (no intake DB)
+optima serve-weights \
+  --object-store-provider hippius \
+  --object-store-bucket optima-weights \
+  --object-store-prefix sn307 \
+  --netuid <NETUID> \
+  --network <NETWORK_OR_WSS_URL> \
+  --wallet default \
+  --hotkey validator \
+  --host 0.0.0.0 \
+  --port 8080
+
+# Follower: pull periodically and publish via the same reconciler/commit-reveal path
+optima follow-weights \
+  --url http://weights-gateway:8080 \
+  --journal-db chain_intake/follow_weights.sqlite3 \
+  --netuid <NETUID> \
+  --network <NETWORK_OR_WSS_URL> \
+  --wallet default \
+  --hotkey follower \
+  --refresh-blocks <BLOCKS> \
+  --expected-authority <AUTHORITY_HOTKEY> \
+  --watch
+```
+
+Swap providers without code changes: `--object-store-provider s3|minio|local`
+(and endpoint/region/credentials as needed), or set `OPTIMA_OBJECT_STORE_*`.
+Install the optional client with `pip install -e ".[object-store]"` (boto3,
+Apache-2.0). `GET /v1/current-weights` still requires a request signed by the
+caller's hotkey over a fresh timestamp; the server checks live `validator_permit`
+and returns an authority-signed body.
+
 ## Finite-debt V2
 
 V2 is an explicit one-way activation, not a reinterpretation of legacy claims. Before

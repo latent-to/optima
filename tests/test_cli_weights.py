@@ -120,6 +120,18 @@ def _args(path, **updates) -> argparse.Namespace:
         "reconcile_only": True,
         "watch": False,
         "interval": 60.0,
+        "weight_offer_path": "",
+        "object_store_provider": "",
+        "object_store_bucket": "",
+        "object_store_prefix": "",
+        "object_store_key": "",
+        "object_store_endpoint": "",
+        "object_store_region": "",
+        "object_store_access_key": "",
+        "object_store_secret_key": "",
+        "object_store_addressing": "",
+        "object_store_root": "",
+        "object_store_sync": False,
     }
     values.update(updates)
     return argparse.Namespace(**values)

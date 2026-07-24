@@ -25,6 +25,8 @@ dependencies = [
 cpu = ["torch"]
 dev = ["pytest>=7"]
 release = ["cryptography>=41"]
+# S3-compatible object stores (Hippius / AWS / MinIO). boto3 is Apache-2.0.
+object-store = ["boto3>=1.34"]
 
 [project.scripts]
 optima = "optima.cli:main"

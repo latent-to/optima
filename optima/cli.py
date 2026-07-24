@@ -327,6 +327,24 @@ def _cmd_set_weights_once(args: argparse.Namespace) -> int:
         if not args.dry_run and not args.reconcile_only:
             projection = resume_weight_projection(projection, journal)
             journal = SQLiteWeightPublicationJournal(store, projection)
+        from optima.chain.weight_share import (
+            default_offer_path,
+            publish_current_weight_offer,
+        )
+
+        offer_path = (
+            args.weight_offer_path
+            if getattr(args, "weight_offer_path", "")
+            else default_offer_path(args.intake_db)
+        )
+        remote_store, remote_key = _object_store_from_args(args)
+        publish_current_weight_offer(
+            projection,
+            local_path=offer_path,
+            remote_store=remote_store,
+            remote_key=remote_key or "current_weights.json",
+            async_remote=not bool(getattr(args, "object_store_sync", False)),
+        )
         result = reconcile_weight_publication(
             subtensor,
             None if args.dry_run else wallet,
@@ -350,6 +368,288 @@ def _cmd_set_weights_once(args: argparse.Namespace) -> int:
     if result.refresh_due:
         return 3
     return 0 if result.status in {"dry_run", "confirmed", "pending"} else 2
+
+
+def _object_store_from_args(args: argparse.Namespace):
+    """Build a swappable ObjectStore from CLI flags + OPTIMA_OBJECT_STORE_* env."""
+
+    import os
+
+    from optima.object_store import ObjectStoreConfig, open_configured_object_store
+
+    provider = (getattr(args, "object_store_provider", "") or "").strip().lower()
+    if not provider or provider == "none":
+        return None, ""
+    bucket = (
+        getattr(args, "object_store_bucket", "")
+        or os.environ.get("OPTIMA_OBJECT_STORE_BUCKET", "")
+    )
+    root = (
+        getattr(args, "object_store_root", "")
+        or os.environ.get("OPTIMA_OBJECT_STORE_ROOT_DIR", "")
+    )
+    if provider in {"hippius", "s3", "minio"} and not bucket:
+        raise SystemExit(
+            f"--object-store-bucket or OPTIMA_OBJECT_STORE_BUCKET is required "
+            f"for provider={provider}"
+        )
+    if provider == "local" and not root:
+        raise SystemExit(
+            "--object-store-root or OPTIMA_OBJECT_STORE_ROOT_DIR is required "
+            "for provider=local"
+        )
+    def _opt(name: str, env_name: str) -> str | None:
+        value = getattr(args, name, "") or os.environ.get(env_name, "")
+        return value or None
+
+    cfg = ObjectStoreConfig.from_env(
+        defaults=ObjectStoreConfig(
+            provider=provider,
+            bucket=bucket,
+            key_prefix=getattr(args, "object_store_prefix", "")
+            or os.environ.get("OPTIMA_OBJECT_STORE_KEY_PREFIX", "")
+            or "",
+            endpoint_url=_opt("object_store_endpoint", "OPTIMA_OBJECT_STORE_ENDPOINT_URL"),
+            region_name=_opt("object_store_region", "OPTIMA_OBJECT_STORE_REGION"),
+            access_key_id=_opt(
+                "object_store_access_key", "OPTIMA_OBJECT_STORE_ACCESS_KEY_ID"
+            ),
+            secret_access_key=_opt(
+                "object_store_secret_key", "OPTIMA_OBJECT_STORE_SECRET_ACCESS_KEY"
+            ),
+            addressing_style=_opt(
+                "object_store_addressing", "OPTIMA_OBJECT_STORE_ADDRESSING_STYLE"
+            ),
+            root_dir=root or None,
+        )
+    )
+    key = (
+        getattr(args, "object_store_key", "")
+        or os.environ.get("OPTIMA_OBJECT_STORE_KEY", "")
+        or "current_weights.json"
+    )
+    return open_configured_object_store(cfg), key
+
+
+def _add_object_store_args(parser: argparse.ArgumentParser, *, for_publish: bool) -> None:
+    parser.add_argument(
+        "--object-store-provider",
+        default="",
+        help=(
+            "swappable object-store backend: hippius | s3 | minio | local | none "
+            "(default: none; env OPTIMA_OBJECT_STORE_PROVIDER). "
+            "Same API for every provider — swap by changing this flag/endpoint."
+        ),
+    )
+    parser.add_argument("--object-store-bucket", default="", help="bucket name")
+    parser.add_argument(
+        "--object-store-prefix",
+        default="",
+        help="optional key prefix inside the bucket",
+    )
+    parser.add_argument(
+        "--object-store-key",
+        default="",
+        help="object key for the current weights offer (default: current_weights.json)",
+    )
+    parser.add_argument(
+        "--object-store-endpoint",
+        default="",
+        help="override provider endpoint URL (e.g. custom MinIO or Hippius region)",
+    )
+    parser.add_argument("--object-store-region", default="", help="override region")
+    parser.add_argument(
+        "--object-store-access-key",
+        default="",
+        help="access key (or OPTIMA_OBJECT_STORE_ACCESS_KEY_ID / AWS_ACCESS_KEY_ID)",
+    )
+    parser.add_argument(
+        "--object-store-secret-key",
+        default="",
+        help="secret key (or OPTIMA_OBJECT_STORE_SECRET_ACCESS_KEY / AWS_SECRET_ACCESS_KEY)",
+    )
+    parser.add_argument(
+        "--object-store-addressing",
+        default="",
+        help="S3 addressing style: path | auto (Hippius/MinIO need path)",
+    )
+    parser.add_argument(
+        "--object-store-root",
+        default="",
+        help="filesystem root for provider=local",
+    )
+    if for_publish:
+        parser.add_argument(
+            "--object-store-sync",
+            action="store_true",
+            help=(
+                "wait for the object-store upload inline (default: async publish so "
+                "eval/signer never blocks on remote latency)"
+            ),
+        )
+
+
+def cmd_serve_weights(args: argparse.Namespace) -> int:
+    """Serve the current weight offer from object storage to permitted validators.
+
+    Intended to run on cheap compute separate from eval: it only reads the offer
+    from a swappable object store and never opens the intake DB.
+    """
+
+    import bittensor as bt
+
+    from optima import chain
+    from optima.chain.weight_share import (
+        DEFAULT_MAX_SKEW_SECONDS,
+        default_offer_path,
+        local_offer_loader,
+        object_store_offer_loader,
+        serve_current_weights,
+    )
+
+    skew = int(getattr(args, "max_skew_seconds", DEFAULT_MAX_SKEW_SECONDS))
+    if not 1 <= skew <= 600:
+        raise SystemExit("--max-skew-seconds must be between 1 and 600")
+    remote_store, remote_key = _object_store_from_args(args)
+    if remote_store is not None:
+        load_offer = object_store_offer_loader(
+            remote_store, key=remote_key or "current_weights.json"
+        )
+        source = (
+            f"object-store[{getattr(args, 'object_store_provider', '')}] "
+            f"key={remote_key or 'current_weights.json'}"
+        )
+    else:
+        offer_path = args.weight_offer_path or default_offer_path(
+            getattr(args, "intake_db", None) or "chain_intake/intake.sqlite3"
+        )
+        load_offer = local_offer_loader(offer_path)
+        source = str(offer_path)
+    wallet = bt.Wallet(name=args.wallet, hotkey=args.hotkey)
+    subtensor = chain.connect(args.network)
+    server = serve_current_weights(
+        host=args.host,
+        port=args.port,
+        load_offer=load_offer,
+        authority=wallet.hotkey,
+        subtensor=subtensor,
+        netuid=args.netuid,
+        max_skew_seconds=skew,
+    )
+    print(
+        f"serving current weights from {source} on "
+        f"http://{args.host}:{args.port}/v1/current-weights "
+        f"(authority={wallet.hotkey.ss58_address})"
+    )
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("weight-share server stopped")
+    finally:
+        server.server_close()
+    return 0
+
+
+def _cmd_follow_weights_once(args: argparse.Namespace) -> int:
+    import bittensor as bt
+
+    from optima import chain
+    from optima.chain.intake import (
+        FinalizedIntakeStore,
+        IntakeScope,
+        SQLiteWeightPublicationJournal,
+    )
+    from optima.chain.weight_share import (
+        DEFAULT_MAX_SKEW_SECONDS,
+        WeightShareError,
+        fetch_current_weights,
+        publish_followed_weights,
+        rebind_projection_signer,
+    )
+
+    skew = int(getattr(args, "max_skew_seconds", DEFAULT_MAX_SKEW_SECONDS))
+    if not 1 <= skew <= 600:
+        raise SystemExit("--max-skew-seconds must be between 1 and 600")
+    wallet = bt.Wallet(name=args.wallet, hotkey=args.hotkey)
+    subtensor = chain.connect(args.network)
+    metagraph = chain.fetch_metagraph(subtensor, args.netuid)
+    offer = fetch_current_weights(
+        args.url,
+        signer=wallet.hotkey,
+        netuid=args.netuid,
+        max_skew_seconds=skew,
+        expected_authority=args.expected_authority or None,
+        metagraph=metagraph,
+    )
+    scope = IntakeScope(str(subtensor.get_block_hash(0)).lower(), args.netuid)
+    if offer.projection.chain_scope_digest != scope.digest:
+        raise WeightShareError(
+            "fetched projection chain scope differs from the connected network"
+        )
+    if offer.projection.netuid != args.netuid:
+        raise WeightShareError("fetched projection netuid mismatch")
+    with FinalizedIntakeStore(args.journal_db, scope=scope) as store:
+        # Seed the journal with the rebound projection so digest/head identity
+        # matches the follower signer used by reconcile_weight_publication.
+        projection = rebind_projection_signer(
+            offer.projection, wallet.hotkey.ss58_address
+        )
+        journal = SQLiteWeightPublicationJournal(store, projection)
+        result = publish_followed_weights(
+            subtensor=subtensor,
+            signer_wallet=wallet,
+            offer=offer,
+            journal=journal,
+            refresh_blocks=args.refresh_blocks,
+            dry_run=args.dry_run,
+        )
+    print(
+        f"follow-weights projection={result.projection_digest} "
+        f"status={result.status} chain_matches={result.chain_matches} "
+        f"submitted={result.submitted} refresh_due={result.refresh_due}"
+    )
+    if result.refresh_due:
+        return 3
+    return 0 if result.status in {"dry_run", "confirmed", "pending"} else 2
+
+
+def cmd_follow_weights(args: argparse.Namespace) -> int:
+    """Pull the shared current weights and publish them with this validator."""
+
+    if not bool(getattr(args, "watch", False)):
+        return _cmd_follow_weights_once(args)
+    if args.dry_run:
+        raise SystemExit("--watch cannot be combined with --dry-run")
+    interval = getattr(args, "interval", 60.0)
+    if (
+        isinstance(interval, bool)
+        or not isinstance(interval, (int, float))
+        or not 1 <= float(interval) <= 86_400
+    ):
+        raise SystemExit("--interval must be between 1 and 86400 seconds")
+
+    import logging
+    import time
+
+    logger = logging.getLogger("optima.chain.weight_share")
+    failures = 0
+    while True:
+        try:
+            status = _cmd_follow_weights_once(args)
+        except Exception as exc:
+            if getattr(exc, "retryable", True) is False:
+                raise
+            failures += 1
+            logger.exception(
+                "follow-weights pass failed (%d consecutive)", failures
+            )
+            if failures >= 10:
+                raise
+        else:
+            failures = 0
+            if status not in {0, 3}:
+                return status
+        time.sleep(float(interval) * (1 + min(failures, 5)))
 
 
 def cmd_set_weights(args: argparse.Namespace) -> int:
@@ -1245,9 +1545,111 @@ def build_parser() -> argparse.ArgumentParser:
         default=60.0,
         help="seconds between --watch passes (default: 60)",
     )
+    sp.add_argument(
+        "--weight-offer-path",
+        default="",
+        help=(
+            "local atomic JSON path for the current publishable WeightProjection "
+            "(default: <intake-db>.current_weights.json); also published to the "
+            "configured object store for the separate serve-weights process"
+        ),
+    )
+    _add_object_store_args(sp, for_publish=True)
     sp.add_argument("--dry-run", action="store_true",
                     help="build + print the (uids, weights) payload, do NOT submit")
     sp.set_defaults(func=cmd_set_weights)
+
+    sp = sub.add_parser(
+        "serve-weights",
+        help=(
+            "serve the current weight offer (from a swappable object store) to "
+            "validators that currently hold validator_permit; run on cheap "
+            "compute separate from eval"
+        ),
+    )
+    sp.add_argument(
+        "--intake-db",
+        default="",
+        help="only used for the local-file fallback path when no object store is set",
+    )
+    sp.add_argument(
+        "--weight-offer-path",
+        default="",
+        help="local-file fallback when --object-store-provider is unset",
+    )
+    _add_object_store_args(sp, for_publish=False)
+    sp.add_argument("--netuid", type=int, required=True)
+    sp.add_argument(
+        "--network",
+        default="finney",
+        help="named network or an explicit wss:// endpoint URL",
+    )
+    sp.add_argument("--wallet", default="default")
+    sp.add_argument("--hotkey", default="default")
+    sp.add_argument("--host", default="127.0.0.1")
+    sp.add_argument("--port", type=int, default=8080)
+    sp.add_argument(
+        "--max-skew-seconds",
+        type=int,
+        default=60,
+        help="accepted timestamp skew for signed requests (default: 60)",
+    )
+    sp.set_defaults(func=cmd_serve_weights)
+
+    sp = sub.add_parser(
+        "follow-weights",
+        help=(
+            "periodically fetch the shared current weights and publish them with "
+            "this validator via the same commit-reveal reconciler as set-weights"
+        ),
+    )
+    sp.add_argument(
+        "--url",
+        required=True,
+        help="base URL of the authority serve-weights endpoint (no path suffix)",
+    )
+    sp.add_argument(
+        "--journal-db",
+        default="chain_intake/follow_weights.sqlite3",
+        help="local exclusive journal DB for this follower's publication state",
+    )
+    sp.add_argument("--netuid", type=int, required=True)
+    sp.add_argument(
+        "--network",
+        default="finney",
+        help="named network or an explicit wss:// endpoint URL",
+    )
+    sp.add_argument("--wallet", default="default")
+    sp.add_argument("--hotkey", default="default")
+    sp.add_argument("--refresh-blocks", type=int, required=True)
+    sp.add_argument(
+        "--expected-authority",
+        default="",
+        help="optional pin of the authority hotkey that must sign offers",
+    )
+    sp.add_argument(
+        "--max-skew-seconds",
+        type=int,
+        default=60,
+        help="accepted timestamp skew for signed responses (default: 60)",
+    )
+    sp.add_argument(
+        "--watch",
+        action="store_true",
+        help="keep fetching and reconciling on --interval",
+    )
+    sp.add_argument(
+        "--interval",
+        type=float,
+        default=60.0,
+        help="seconds between --watch passes (default: 60)",
+    )
+    sp.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="fetch + exercise reconciler dry-run; do not submit",
+    )
+    sp.set_defaults(func=cmd_follow_weights)
 
     sp = sub.add_parser(
         "set-debt-weights",

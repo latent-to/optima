@@ -1,0 +1,199 @@
+site_name: Optima
+site_description: >-
+  Engineering documentation for Optima's contribution, evaluation, settlement,
+  and release systems.
+site_url: https://latent-to.github.io/cacheon/
+docs_dir: docs
+site_dir: site
+# Developer-private operational notes can exist in a local checkout but are
+# never part of the published documentation source set.
+exclude_docs: |
+  WORKLOG.md
+# These pages preserve paths embedded in content-addressed release or example
+# inputs. Their bodies are checker-validated links, never duplicate guidance.
+not_in_nav: |
+  DEV_ENVIRONMENT.md
+  EMISSIONS_POLICY.md
+  FIDELITY.md
+  GPU_SETUP.md
+  HOW_OPTIMA_WORKS.md
+  INCENTIVES.md
+  INCENTIVE_LOAD_VALIDATION.md
+  MINER_GUIDE.md
+  PRODUCT_CONTRACT.md
+  REFEREE_HARDENING_AUDIT.md
+  REFEREE_HARDENING_DONOR_MAP.md
+  REFEREE_HARDENING_SPLIT_PLAN.md
+  SGLANG_TRACKING.md
+  SLOT_CONTRACT.md
+  STATE_OF_RECORD.md
+  SUBMISSION_MODEL.md
+  SUBMISSION_MODEL_BUILD_SPEC.md
+  SUBMISSION_TERMS.md
+  SUBNET_BLUEPRINT.md
+  TESTNET.md
+
+repo_url: https://github.com/latent-to/cacheon
+repo_name: latent-to/cacheon
+edit_uri: edit/main/docs/
+
+theme:
+  name: material
+  language: en
+  logo: assets/images/optima-mark.svg
+  favicon: assets/images/favicon.svg
+  icon:
+    repo: fontawesome/brands/github
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: custom
+      accent: custom
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: custom
+      accent: custom
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to light mode
+  features:
+    - announce.dismiss
+    - content.code.annotate
+    - content.code.copy
+    - content.tabs.link
+    - navigation.footer
+    - navigation.indexes
+    - navigation.instant
+    - navigation.sections
+    - navigation.tabs
+    - navigation.top
+    - search.highlight
+    - search.share
+    - search.suggest
+    - toc.follow
+
+plugins:
+  - search
+
+markdown_extensions:
+  - abbr
+  - admonition
+  - attr_list
+  - def_list
+  - footnotes
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.details
+  - pymdownx.highlight:
+      anchor_linenums: true
+      line_spans: __span
+      pygments_lang_class: true
+  - pymdownx.inlinehilite
+  - pymdownx.keys
+  - pymdownx.snippets
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.tasklist:
+      custom_checkbox: true
+
+extra_css:
+  - assets/stylesheets/extra.css
+
+extra_javascript:
+  - https://unpkg.com/mermaid@10.9.1/dist/mermaid.min.js
+  - assets/javascripts/mermaid.js
+
+extra:
+  generator: false
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/latent-to/cacheon
+      name: Optima source code
+
+copyright: Optima contributors
+
+nav:
+  - Home: index.md
+  - Start here:
+      - What Optima is: get-started/concepts.md
+      - Local quickstart: get-started/quickstart.md
+      - Current status: reference/state-of-record.md
+  - Architecture:
+      - System overview: architecture/overview.md
+      - Product model: architecture/product-model.md
+      - Proposal to release: architecture/pipeline.md
+      - Target and slot contract: architecture/slot-contract.md
+      - Evaluation and release stacks: architecture/stacks.md
+      - Sealed direct artifacts: architecture/direct-artifacts.md
+      - Runtime injection seam: architecture/seam.md
+      - Release architecture: architecture/releases.md
+  - Miner guide:
+      - Overview: miner-guide/overview.md
+      - Your first kernel: miner-guide/your-first-kernel.md
+      - Choose a target: miner-guide/slots.md
+      - Bundle format: miner-guide/bundle-format.md
+      - Kernel ABI and variants: miner-guide/kernel-abi.md
+      - Graph correctness: miner-guide/graph-safety.md
+      - Finding an improvement: miner-guide/finding-a-win.md
+      - Example bundles: miner-guide/examples.md
+      - Submit on-chain: miner-guide/submitting.md
+      - Troubleshooting: miner-guide/diagnostics.md
+      - Discovery lane: miner-guide/discovery-lane.md
+      - Incentives: miner-guide/incentives.md
+      - Override points: miner-guide/override-points.md
+      - Dependency patches: miner-guide/dep-patches.md
+  - Validator guide:
+      - Overview: validator-guide/overview.md
+      - Deployment readiness: validator-guide/first-hour.md
+      - Arena service: validator-guide/arena-service.md
+      - Finalized intake: validator-guide/chain-loop.md
+      - Qualification: validator-guide/qualification.md
+      - Scoring: validator-guide/scoring.md
+      - Fidelity and pristine T: validator-guide/fidelity.md
+      - Settlement and weights: validator-guide/settlement-and-weights.md
+      - Release operations: validator-guide/releases.md
+      - Verification and diagnostics: validator-guide/running-evals.md
+      - Testnet: validator-guide/testnet.md
+  - Optima Engine:
+      - Overview: engine/overview.md
+      - Integrating a contribution: engine/integration.md
+      - Model provisioning: engine/model-provision.md
+      - Build and sign: engine/release-workflow.md
+      - Verify and run: engine/verify-run.md
+  - Security:
+      - Threat model: security/threat-model.md
+      - OCI isolation: security/isolation.md
+      - Evidence authority: security/evidence.md
+      - Anti-copy and attribution: security/anti-copy.md
+  - Reference:
+      - CLI: reference/cli.md
+      - Slot catalog: reference/slots-table.md
+      - Target catalog: reference/target-catalog.md
+      - Bundle manifest: reference/manifest-schema.md
+      - Stack manifests: reference/stack-manifests.md
+      - Emissions policy: reference/emissions-policy.md
+      - Arena service types: reference/arenas.md
+      - Codebase map: reference/codebase-map.md
+      - Glossary: reference/glossary.md
+  - Results and development:
+      - MiniMax-M3 case study: results/minimax-m3.md
+      - Incentive load validation: results/incentive-load-validation.md
+      - Design evolution: history/changelog.md
+      - GPU setup: dev/gpu-setup.md
+      - Development environment: dev/environment.md
+      - SGLang compatibility: dev/sglang-tracking.md
+  - Contributing:
+      - Documentation standards: contributing/documentation.md
+  - Legal:
+      - Submission terms: legal/submission-terms.md
+  - Source code: https://github.com/latent-to/cacheon

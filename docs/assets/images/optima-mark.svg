@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="Optima">
+  <defs>
+    <linearGradient id="g" x1="8" y1="8" x2="56" y2="56" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#58F3D1"/>
+      <stop offset="1" stop-color="#6F7CFF"/>
+    </linearGradient>
+  </defs>
+  <path d="M32 4 54.5 17v30L32 60 9.5 47V17L32 4Z" fill="#0B1020" stroke="url(#g)" stroke-width="3"/>
+  <path d="M32 15.5c-9.1 0-16.5 7.4-16.5 16.5S22.9 48.5 32 48.5 48.5 41.1 48.5 32 41.1 15.5 32 15.5Zm0 8.2a8.3 8.3 0 1 1 0 16.6 8.3 8.3 0 0 1 0-16.6Z" fill="url(#g)"/>
+  <path d="M47.1 21.8 55 17.2M9 46.8l7.9-4.6" stroke="url(#g)" stroke-width="3" stroke-linecap="round"/>
+</svg>
